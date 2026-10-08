@@ -21,43 +21,111 @@ to plain sequential NumPy execution.
 ### How parallelism is found
 
 - **At runtime, by local decisions only.** There is no dependency graph
-  (DAG) of the program and no ahead-of-time (AOT) analysis. Each array
-  carries its own state (`pending` or `completed`); that per-array state
-  is the only dependency bookkeeping. Do not introduce global analysis
-  structures.
+  (DAG) of the program and no ahead-of-time (AOT) analysis. Every decision
+  is local: is this argument array `ready` or `pending`? Do not introduce
+  global analysis structures.
 - **The main thread runs ahead.** The Python main thread never waits for
   results (except at sync points). It races (far) ahead of the
   computation, and that implicit look-ahead is where the parallelism comes
-  from: by the time early results complete, many later instructions are
-  already issued and waiting on exactly their inputs.
+  from: by the time early results complete, many later ops are already
+  issued and waiting on exactly their inputs.
 
-### Issuing an array op (main thread)
+## Execution model
 
-For every array op, the main thread only does this, then continues with
-the next op:
+### Arrays
 
-1. **Create a task** for the op and store its input arrays in it, for
-   later use when the task runs.
-2. **Allocate the output array** as metadata only (shape, strides, dtype);
-   no element memory yet. Mark it `pending` and reference it from the
-   task. The element memory is allocated when the task runs.
-3. **Register the task** with every input that is still `pending`. The task
-   is triggered when the last of them becomes `completed` (completed by
-   the preceding tasks that produce them).
-4. **If all inputs are already `completed`,** trigger the task right away
+- An array is either **`ready`** (its data is final) or **`pending`** (a
+  task will still compute it).
+- A pending array references **the task that computes it** (its producer).
+  For an in/out array this is the **last** task that writes it.
+- Arrays do **not** reference the tasks that consume them as inputs.
+- A pending array may have no element memory yet; the producer allocates
+  it.
+
+### Tasks
+
+- Exactly **one task per array op** (per op invocation). It represents and
+  communicates the op's progress.
+- Task states, in this order:
+  `created → size_completed → (device_selected, future) → allocated → completed`
+  - `size_completed`: output shape (and dtype) is known.
+  - `allocated`: output element memory exists.
+  - `completed`: output data is computed; the outputs become `ready`.
+- A task passes through each state **at most once and only forward**. It
+  may skip states, never go back.
+- The task holds references to its input arrays, its output arrays and the
+  resolved NumPy loop.
+- TODO: performance, caching / pooling of task objects.
+
+### Issuing an op (main thread)
+
+1. **Create the task** (state `created`).
+2. **Create the output array(s)** as `pending`, referencing the new task.
+   For an **in/out argument** the array may already be `pending`; it then
+   gets the new task as its producer (the *last* task that computes its
+   data). A `ready` in/out array is switched to `pending` here, by the main
+   thread.
+3. **Register a callback for every `pending` input or in/out array** on
+   that array's producer task. The callback informs the new task about the
+   producer's stage events (partial completion such as `size_completed`,
+   and full completion).
+4. **If all inputs are `ready`,** the main thread triggers the task itself
    (see "Dispatch decision").
+5. Continue with the next op.
 
-When a task finishes, it marks its output `completed` and triggers the
-waiting tasks whose inputs are now all completed.
+When a producer reaches `completed`, its callbacks run on the completing
+thread. The callback that reports the last pending input of a task
+triggers that task (hands it to a worker).
 
-Consequences:
-- The output's shape and dtype must be known at issue time without
-  looking at data (broadcasting, `resolve_dtypes`). Ops whose result shape
-  depends on data (boolean indexing, `nonzero`, `unique`, …) are sync
-  points and fall back to eager NumPy.
-- Registering a task on an input and that input completing can happen at
-  the same time on different threads; the check "still pending? then
-  register" must be atomic per array so no task is lost or triggered twice.
+### Eventing
+
+- Tasks communicate only through these **multi-stage completion events**.
+  Stage events can be used early: once all inputs are `size_completed`, a
+  task can compute its own output shape (and go to `size_completed`) and
+  allocate (`allocated`) before any input data is computed.
+- The whole event system must be **asynchronous and robust**: a callback
+  can be registered while the producer advances concurrently on a worker.
+  Registration is atomic with respect to the producer's state: if the
+  producer already passed the stage, the registering thread learns that
+  immediately and handles it itself; no event is lost or delivered twice.
+- **Sync points** (reading data, `print`, `float(x)`, handing memory back to
+  plain NumPy) wait for `completed` of the array's producer. Querying only
+  metadata (`x.shape`, `x.dtype`) waits for `size_completed` only. Because
+  shape is a stage of its own, ops with data-dependent result shapes
+  (`nonzero`, boolean indexing, `unique`) fit the model too; in the MVP
+  they still fall back to eager NumPy.
+
+### Thread rules
+
+- **Creating** tasks and arrays: **main thread only.**
+- **Advancing / completing** tasks and arrays: worker threads or the main
+  thread.
+- Only the main thread switches an array `ready → pending` (when it issues
+  an op writing it). Only the array's current producer switches it
+  `pending → ready`, on `completed`. A task that is no longer an array's
+  last producer (a later in/out op took over) does not make it `ready`.
+- Consequence: **once the main thread sees an array `ready`, it stays
+  `ready`** until the main thread itself changes it. Checks of `ready`
+  on the main thread need no lock; only the `pending` path (callback
+  registration on a producer) needs synchronization. The same holds for
+  in/out arrays.
+
+### Reference counting
+
+- Tasks, arrays and array memory (buffers) are **reference counted**,
+  with atomic counts (they are shared across threads).
+- References: Python object → array; array → producer task (while
+  `pending`); task → its input and output arrays; producer task →
+  registered callbacks → consumer tasks.
+- Cycles (array → producer → callback → consumer → array) are broken on
+  `completed`: the producer releases its callbacks and its inputs, and a
+  `ready` array drops its producer reference.
+- Proposal (to confirm): **write-after-read safety via buffer reference
+  counts.** Since arrays do not know their pending readers, a task that
+  writes an array in place (in/out) while other tasks still hold the old
+  buffer as an input must not overwrite it. It allocates a new buffer
+  instead (copy-on-write, in its `allocated` stage) when the buffer's
+  reference count shows other holders.
 
 ### Goals and non-goals
 
@@ -83,7 +151,7 @@ multicore CPUs.
   C API and calls them on viproc buffers. No kernels of our own.
 - **Async execution / glue layer (ours):** sits between the user ops
   (`add`, `sum`, `max`, …) and the NumPy ndarray layer. It owns the
-  per-array readiness state, the queue of instructions handed to worker
+  arrays and tasks, the completion events between tasks, the worker
   threads, and synchronization when the caller needs a concrete value.
 - **Python integration: adopted from Bohrium's `npbackend`**
   (`bridge/npbackend` in https://github.com/bh107/bohrium): an `ndarray`
@@ -149,7 +217,7 @@ Python user code  (import viproc as np / python -m viproc)
         │
 Python bridge     ndarray subclass, op interception      ← from Bohrium npbackend
         │  C ABI (viproc.h)
-Runtime           per-array readiness · local dispatch decision ·
+Runtime           arrays (ready/pending) · tasks · stage events ·
                   worker threads · sync                   ← ours
         │
 Kernel adapters   map an instruction onto a NumPy loop
@@ -157,34 +225,17 @@ Kernel adapters   map an instruction onto a NumPy loop
 NumPy C kernels   ufunc inner loops, SIMD                ← installed NumPy
 ```
 
-Core concepts:
-- **Array handle:** opaque runtime handle with shape, byte strides,
-  element type, state (`pending` / `completed`) and a reference to its
-  buffer. A pending array has no element memory until its producing task
-  runs. Readers and writers of a buffer are tracked per handle and buffer.
-- **Task:** an op plus references to its input and output arrays and the
-  resolved NumPy loop. Issuing one never blocks (except for back-pressure
-  if the main thread gets too far ahead).
-- **Dispatch decision (per task, at issue time):**
-  - If any input array is still `pending`, the task waits on those inputs
-    and later runs on a worker thread.
-  - If all inputs are `completed`, `should_offload(task)` decides: `true`
-    → hand it to a worker, `false` → execute it immediately on the main
-    thread. `should_offload` is a heuristic still to be defined
-    (candidates: element count, op cost class, current queue length).
-    Keep it a single, swappable function.
-  - Readiness also covers the output buffer: if pending instructions still
-    read or write it (WAR/WAW), the task counts as pending.
-- **Dependencies:** read-after-write, write-after-read and write-after-write
-  on overlapping buffers, tracked locally on each buffer (no global graph).
-  Start conservatively: any instruction touching the same buffer is
-  ordered. When a pending instruction finishes, it marks its outputs
-  ready and releases the instructions waiting on exactly those buffers.
-- **Sync points:** reading data from the caller (printing, converting to a
-  scalar, handing memory back to plain NumPy) waits only for the
-  instructions that produce that data.
-- **Errors** from asynchronous execution are stored on the affected result
-  and raised at the next sync point that touches it.
+See "Execution model" for arrays, tasks, eventing, thread rules and
+reference counting.
+
+- **Dispatch decision (when the main thread triggers a task whose inputs
+  are all `ready`):** `should_offload(task)` decides: `true` → hand it to a
+  worker, `false` → execute it immediately on the main thread.
+  `should_offload` is a heuristic still to be defined (candidates: element
+  count, op cost class, number of pending tasks). Keep it a single,
+  swappable function. Tasks triggered by a callback run on a worker thread.
+- **Errors** from asynchronous execution are stored on the task and its
+  outputs and raised at the next sync point that touches them.
 
 ### Notes on the reference projects
 
@@ -350,6 +401,11 @@ functions.
       `det`, `fft` and `argmax`; FP flags are visible on the worker
       (`tests/test_numpy_loops.cpp`, NumPy 2.5.3).
 - [ ] `should_offload` heuristic for tasks whose inputs are all completed.
+- [ ] Copy-on-write for in-place writes to buffers still read by pending
+      tasks (see "Reference counting") — confirm.
+- [ ] Callbacks of a completing producer: run each consumer's trigger on
+      the completing thread (it may then run the consumer itself) or always
+      enqueue to the pool?
 - [ ] Back-pressure: how far may the main thread run ahead (number of
       pending tasks, or memory of pending outputs) before it blocks?
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.
