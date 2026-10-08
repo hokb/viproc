@@ -22,9 +22,10 @@ results. Results must always be identical to plain sequential execution.
 Goal: autonomous, asynchronous execution of array instructions on
 multicore CPUs.
 
-- **Compute kernels: official NumPy C code.** We reuse NumPy's
-  implementation (ufunc inner loops, reductions, SIMD dispatch, strided
-  iteration, `npymath`) instead of writing our own kernels.
+- **Compute kernels: official NumPy C code, taken from the installed
+  NumPy at runtime.** We do not vendor or compile NumPy. The runtime looks
+  up NumPy's ufunc inner loops (with their SIMD dispatch) through the NumPy
+  C API and calls them on viproc buffers. No kernels of our own.
 - **Async execution / glue layer (ours):** sits between the user ops
   (`add`, `sum`, `max`, …) and the NumPy ndarray layer. It owns the
   instruction queue, dependency tracking, scheduling onto worker threads,
@@ -45,6 +46,9 @@ handling behind an interface).
   interfaces with NumPy's C sources. Same languages as NumPy (C) and
   Bohrium (C/C++).
 - **CMake ≥ 3.24** with Ninja.
+- **CPython ≥ 3.12 and NumPy ≥ 2.0** are runtime and build dependencies
+  (NumPy headers via `numpy.get_include()`). Phase 1 always runs inside a
+  Python process.
 - Tests: CTest. Plain C/C++ test executables for now; pytest once the
   Python bridge exists.
 - Formatting: `.clang-format` (LLVM style, 4 spaces, 100 columns).
@@ -60,8 +64,7 @@ tests/            CTest test executables
 Planned (not created yet):
 
 ```
-third_party/numpy/   Pinned NumPy sources (git submodule), kernels only
-src/kernels/         Thin adapters that call NumPy's loops on viproc buffers
+src/kernels/         Adapters that resolve and call NumPy's ufunc loops
 python/              Python bridge derived from Bohrium npbackend
 ```
 
@@ -95,8 +98,8 @@ Runtime           instruction queue · dependency tracking ·
                   scheduler · worker threads · sync       ← ours
         │
 Kernel adapters   map an instruction onto a NumPy loop
-        │
-NumPy C kernels   ufunc loops, reductions, SIMD          ← from NumPy
+        │  function pointers resolved once, called without the GIL
+NumPy C kernels   ufunc inner loops, SIMD                ← installed NumPy
 ```
 
 Core concepts:
@@ -122,9 +125,31 @@ Core concepts:
   (`ve/openmp`, …). We adopt the **bridge**, not the JIT backends. It
   targets NumPy 1.x and Python ≤ 3.7, so porting to current NumPy 2.x and
   Python 3.12+ is expected work.
-- **NumPy**: ufunc loops are reachable through the ufunc C API
-  (`char **args, npy_intp const *dimensions, npy_intp const *steps, void *data`);
-  this is the calling convention our kernel adapters target.
+- **NumPy**: inner loops have the signature
+  `void loop(char **args, npy_intp const *dimensions, npy_intp const *steps, void *data)`.
+  That is the calling convention our kernel adapters target.
+
+### Calling NumPy kernels
+
+- **Resolve once, with the GIL:** at runtime init, look up the loop
+  function pointer and its `data` for every (op, dtype) pair in the MVP set
+  (e.g. via `np.add`'s loop for `dd->d`) and store them in a dispatch table.
+  Fail init if a required loop is missing.
+- **Call without the GIL:** worker threads call the stored function
+  pointers directly. They never touch Python objects, never call the
+  Python C API, and never acquire the GIL. Only the bridge (caller thread)
+  and runtime init/shutdown use the C API.
+- **Element-wise ops:** one loop call per contiguous block;
+  `dimensions[0]` is the element count, `steps` are the byte strides.
+- **Reductions** (`sum` = `add`, `max` = `maximum`): use NumPy's reduce
+  trick. Call the binary loop with `args = {acc, in, acc}` and
+  `steps = {0, in_stride, 0}`, after seeding `acc` with the first element.
+  `axis=None` first; `axis=k` later.
+- **Dtype semantics follow NumPy:** `divide` on `int64` is true division
+  and yields `float64` (`ll` inputs cast, loop `dd->d`). Casting rules,
+  overflow and NaN behavior must match eager NumPy exactly.
+- Keep NumPy objects (ufuncs, dtypes) alive for the whole runtime lifetime
+  so the resolved function pointers stay valid.
 
 ## Conventions
 
@@ -148,16 +173,23 @@ Core concepts:
   headers intact.
 - viproc itself has no license file yet.
 
+## MVP scope (decided)
+
+- **Ops:** element-wise `add`, `subtract`, `multiply`, `divide`;
+  reductions `sum`, `max`.
+- **Dtypes:** `float64`, `int64`.
+- **Kernels:** from the installed NumPy at runtime (see "Calling NumPy
+  kernels").
+
+Anything beyond this set falls back to plain NumPy in the bridge (after a
+sync), the way Bohrium falls back for unsupported functions.
+
 ## Open questions
 
-- [ ] Which NumPy version to pin, and how much of it to vendor (full
-      submodule vs. just `numpy/_core/src/umath`, `npymath`, …)?
-- [ ] Do we call NumPy's kernels through the installed NumPy at runtime
-      (ufunc C API, needs CPython) or compile its loops into the runtime
-      (no CPython dependency, much more build work)?
 - [ ] Threading inside a single instruction (split large arrays across
       workers) or only between instructions in the MVP?
-- [ ] Which ops are in the MVP set? Proposal: element-wise `add`,
-      `subtract`, `multiply`, `divide`, plus reductions `sum` and `max`, on
-      `float64` and `int64`.
+- [ ] How exactly to obtain loop pointers in NumPy 2.x: legacy
+      `PyUFuncObject->functions`/`types`, or the `ArrayMethod`
+      `get_strided_loop` API? Verify with a spike before building on it.
+- [ ] Broadcasting and scalar operands in the MVP, or same-shape arrays only?
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.
