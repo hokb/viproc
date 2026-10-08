@@ -59,6 +59,8 @@ handling behind an interface).
 include/viproc/   Public C ABI (viproc.h). The only interface bridges may use.
 src/runtime/      C++ async execution / glue layer
 tests/            CTest test executables
+                  test_numpy_loops.cpp: embeds CPython and proves that NumPy
+                  loops run bit-identically on a worker thread without the GIL
 ```
 
 Planned (not created yet):
@@ -108,6 +110,17 @@ Core concepts:
   buffer are tracked per handle and buffer.
 - **Instruction:** an opcode plus input and output handles. Issuing one
   never blocks (except for back-pressure when the queue is full).
+- **Dispatch decision (per instruction, at issue time):**
+  - If any input array is still *pending* (produced by an instruction that
+    has not finished), the instruction is queued for asynchronous
+    execution on a worker thread.
+  - If all inputs are *ready*, `should_offload(instruction)` decides: `true`
+    → queue it for a worker, `false` → execute it immediately on the
+    caller thread. `should_offload` is a heuristic still to be defined
+    (candidates: element count, op cost class, current queue length).
+    Keep it a single, swappable function.
+  - Readiness also covers the output buffer: if pending instructions still
+    read or write it (WAR/WAW), the instruction counts as pending.
 - **Dependencies:** read-after-write, write-after-read and write-after-write
   on overlapping buffers. Start conservatively: any instruction touching the
   same buffer is ordered.
@@ -165,8 +178,17 @@ reductions and gufuncs alike):
    `no_floatingpoint_errors`.
 3. The loop has the new-style signature
    `int loop(PyArrayMethod_Context *ctx, char *const data[], npy_intp const dims[], npy_intp const strides[], NpyAuxData *aux)`
-   and returns 0 on success, -1 on failure. For gufuncs, `dims` and
-   `strides` also carry the core dimensions.
+   and returns 0 on success, -1 on failure.
+4. Argument layout: `dims = {outer_count, core dims…}`,
+   `strides = {outer stride per operand…, core strides per operand…}`.
+   E.g. `det` `(m,m)->()`: `dims = {N, m}`,
+   `strides = {in_outer, out_outer, in_row, in_col}`; `fft` `(n),()->(m)`:
+   `dims = {N, n, m}`, `strides = {in_outer, fct_outer, out_outer, in_n, out_m}`.
+
+Mirror only the leading fields of the capsule struct (`strided_loop`,
+`context`, `auxdata`, `requires_pyapi`, `no_floatingpoint_errors`). The
+embedded `PyArrayMethod_Context` behind them changes size between NumPy
+versions (extra fields when `NPY_FEATURE_VERSION > NPY_2_3_API_VERSION`).
 
 Rules:
 - **Resolve with the GIL, on the caller thread,** when an instruction is
@@ -186,7 +208,13 @@ Rules:
 - **Reductions** (`sum`, `prod`, `min`, `max`, `any`, `all`, …) use the
   binary loop resolved with `reduction=True`, called with an output stride
   of 0 (`args = {acc, in, acc}`), seeded with the identity or the first
-  element. `axis=None` first, `axis=k` and `keepdims` later.
+  element. `axis=None` first, `axis=k` and `keepdims` later. NumPy's float
+  `add` loop does pairwise summation inside one call, so splitting a
+  reduction into chunks changes rounding; call the loop with the same
+  blocks NumPy would to stay bit-identical.
+- **`argmin`/`argmax`** come from NumPy too: the per-dtype functions in
+  `PyDataType_GetArrFuncs(descr)->argmax` / `->argmin`
+  (`int f(void *data, npy_intp n, npy_intp *index, void *arr)`).
 - **Linalg:** the Python wrappers (`np.linalg.inv`, …) do argument checks
   and raise `LinAlgError` via an `errstate(invalid='call')` callback when
   the gufunc sets the invalid flag. We replicate those checks in the
@@ -199,6 +227,12 @@ Rules:
   logic into the bridge and issue the gufunc as an instruction.
 - **Dtype semantics follow NumPy exactly:** promotion, `divide` on integers
   yielding `float64`, overflow wrap-around, NaN handling.
+- **Broadcasting and scalars:** NumPy broadcasting rules apply to all
+  ops. Scalars are true 0-d arrays (`ndim == 0`, one element), not
+  1-element 1-d arrays; Python scalars become 0-d arrays at issue time.
+  A broadcast operand is passed to the loop with stride 0.
+- The proven calling patterns are in `tests/test_numpy_loops.cpp`; keep
+  that test green when changing how loops are called.
 
 ## Conventions
 
@@ -246,18 +280,18 @@ functions.
   the `n`-dimensional variants built on them).
 - **Kernels:** from the installed NumPy at runtime (see "Calling NumPy
   kernels").
+- **Dtypes:** `bool`, `int32`, `int64`, `float32`, `float64`, `complex64`,
+  `complex128`. Object, string, datetime, `float16` and `longdouble` fall
+  back to eager NumPy.
+- **Shapes:** full NumPy broadcasting; true 0-d scalars.
 
 ## Open questions
 
-- [ ] Threading inside a single instruction (split large arrays across
-      workers) or only between instructions in the MVP?
-- [ ] Which dtypes in the MVP? Proposal: `bool`, `int32`, `int64`,
-      `float32`, `float64`, `complex64`, `complex128` (complex is needed
-      for FFT and `eig`). Exclude object, string, datetime, `float16`,
-      `longdouble`.
-- [ ] `argmin`/`argmax`: NumPy's per-dtype `argmax` functions
-      (`PyArray_ArrFuncs`) or our own kernel?
-- [ ] Spike: call a loop obtained via `_get_strided_loop` from a worker
-      thread without the GIL (ufunc, reduction, linalg gufunc, fft gufunc).
-- [ ] Broadcasting and scalar operands in the MVP, or same-shape arrays only?
+- [x] Spike: NumPy loops from a worker thread without the GIL work for
+      element-wise ufuncs (incl. 0-d broadcast), `add.reduce`, linalg
+      `det`, `fft` and `argmax`; FP flags are visible on the worker
+      (`tests/test_numpy_loops.cpp`, NumPy 2.5.3).
+- [ ] `should_offload` heuristic for instructions whose inputs are all ready.
+- [ ] Splitting one large instruction across several workers (later; must
+      not change results, see the note on reductions).
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.

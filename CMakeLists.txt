@@ -9,6 +9,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(VIPROC_BUILD_TESTS "Build viproc tests" ON)
+find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter Development.Embed NumPy)
+
 option(VIPROC_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 
 add_library(viproc_warnings INTERFACE)
