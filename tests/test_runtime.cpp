@@ -51,6 +51,11 @@ RuntimeOptions opts(std::size_t workers, std::size_t max_active = kDefaultMaxAct
 
 double* f64(const Operand& op) { return reinterpret_cast<double*>(op.first()); }
 
+// Element i of a 1-d (possibly strided) float64 operand.
+double& at(const Operand& op, std::int64_t i) {
+    return *reinterpret_cast<double*>(op.first() + i * op.layout.strides[0]);
+}
+
 Layout vec(std::int64_t n) { return Layout::contiguous(DType::Float64, {n}); }
 
 ArrayPtr make_ready(Runtime& rt, std::int64_t n, double value) {
@@ -67,7 +72,7 @@ std::shared_ptr<Kernel> add_const(double c, std::chrono::milliseconds delay = 0m
         std::this_thread::sleep_for(delay);
         const std::int64_t n = out[0].layout.size();
         for (std::int64_t i = 0; i < n; ++i) {
-            f64(out[0])[i] = f64(in[0])[i] + c;
+            at(out[0], i) = at(in[0], i) + c;
         }
         return KernelResult{};
     });
@@ -80,9 +85,9 @@ std::shared_ptr<Kernel> add_all() {
         for (std::int64_t i = 0; i < n; ++i) {
             double s = 0;
             for (const Operand& op : in) {
-                s += f64(op)[i];
+                s += at(op, i);
             }
-            f64(out[0])[i] = s;
+            at(out[0], i) = s;
         }
         return KernelResult{};
     });
@@ -97,7 +102,25 @@ ArrayPtr issue1(Runtime& rt, std::shared_ptr<Kernel> k, std::initializer_list<Ar
 
 double value(Runtime& rt, const ArrayPtr& a, std::int64_t i = 0) {
     rt.wait(*a);
-    return reinterpret_cast<const double*>(a->buffer()->data() + a->layout().offset)[i];
+    const Layout& l = a->layout();
+    const std::int64_t stride = l.strides.empty() ? 0 : l.strides[0];
+    return *reinterpret_cast<const double*>(a->buffer()->data() + l.offset + i * stride);
+}
+
+// View of a 1-d float64 array: elements start, start+step, ... (n of them).
+ArrayPtr slice(Runtime& rt, const ArrayPtr& base, std::int64_t start, std::int64_t step,
+               std::int64_t n) {
+    Layout l = base->layout();
+    l.offset += start * l.strides[0];
+    l.strides[0] *= step;
+    l.shape[0] = n;
+    return rt.view(base, l);
+}
+
+void inplace_add(Runtime& rt, const ArrayPtr& target, const ArrayPtr& other) {
+    std::vector<ArrayPtr> in{other};
+    std::vector<ArrayPtr> io{target};
+    rt.issue(add_all(), in, io, {}, "target += other");
 }
 
 void test_chain() {
@@ -210,6 +233,94 @@ void test_copy_on_write() {
     rt.wait_all();
 }
 
+void test_view_write_visible_in_base() {
+    Runtime rt(opts(2));
+    ArrayPtr base = make_ready(rt, 8, 0.0);
+    ArrayPtr even = slice(rt, base, 0, 2, 4); // base[0::2]
+    Buffer* before = base->buffer().get();
+    inplace_add(rt, even, make_ready(rt, 4, 1.0)); // base[0::2] += 1
+    check(base->buffer().get() == before, "view write without readers is in place");
+    check(!base->ready() || value(rt, base, 0) == 1.0,
+          "base is pending until the view write completes");
+    bool ok = true;
+    for (int i = 0; i < 8; ++i) {
+        ok = ok && value(rt, base, i) == (i % 2 == 0 ? 1.0 : 0.0);
+    }
+    check(ok, "write through view base[0::2] is visible in base");
+}
+
+void test_view_write_waits_for_base_producer() {
+    Runtime rt(opts(2));
+    // base is pending (slow producer); a view of it is written in place.
+    ArrayPtr base = issue1(rt, add_const(5.0, 30ms), {make_ready(rt, 8, 0.0)}, 8);
+    ArrayPtr odd = slice(rt, base, 1, 2, 4);
+    inplace_add(rt, odd, make_ready(rt, 4, 1.0)); // base[1::2] += 1
+    check(value(rt, base, 0) == 5.0 && value(rt, base, 1) == 6.0,
+          "view write orders after the pending producer of its base");
+}
+
+void test_view_copy_on_write() {
+    Runtime rt(opts(2));
+    ArrayPtr base = make_ready(rt, 8, 0.0);
+    ArrayPtr even = slice(rt, base, 0, 2, 4);
+    // Pending reader of the whole base.
+    ArrayPtr gate = issue1(rt, add_const(0.0, 50ms), {make_ready(rt, 8, 0.0)}, 8);
+    ArrayPtr reader = issue1(rt, add_all(), {gate, base}, 8);
+    Buffer* before = base->buffer().get();
+    inplace_add(rt, even, make_ready(rt, 4, 1.0)); // base[0::2] += 1
+    check(base->buffer().get() != before && base->buffer() == even->buffer(),
+          "view write with pending reader: base and view switch to a new buffer together");
+    check(even->layout().strides[0] == 16, "view keeps its layout (no consolidation with views)");
+    bool ok = true;
+    for (int i = 0; i < 8; ++i) {
+        ok = ok && value(rt, base, i) == (i % 2 == 0 ? 1.0 : 0.0) && value(rt, reader, i) == 0.0;
+    }
+    check(ok, "base sees the view write, the pending reader sees the old data");
+}
+
+void test_consolidated_copy_on_write_of_strided_array() {
+    Runtime rt(opts(2));
+    // A reversed array (stride -8) that alone covers its whole storage.
+    Layout rev = vec(4);
+    rev.strides[0] = -8;
+    rev.offset = 24;
+    auto b = std::make_shared<Buffer>(rev.nbytes());
+    b->ensure_allocated();
+    for (int i = 0; i < 4; ++i) {
+        reinterpret_cast<double*>(b->data())[i] = i; // logical a = [3, 2, 1, 0]
+    }
+    ArrayPtr a = rt.wrap(rev, b);
+    ArrayPtr gate = issue1(rt, add_const(0.0, 30ms), {make_ready(rt, 4, 0.0)}, 4);
+    ArrayPtr reader = issue1(rt, add_all(), {gate, a}, 4);
+    inplace_add(rt, a, make_ready(rt, 4, 10.0));
+    check(a->layout().strides[0] == 8 && a->layout().offset == 0 && a->buffer().get() != b.get(),
+          "consolidated copy-on-write: new contiguous buffer, decided at issue time");
+    bool ok = true;
+    for (int i = 0; i < 4; ++i) {
+        ok = ok && value(rt, a, i) == 13.0 - i && value(rt, reader, i) == 3.0 - i;
+    }
+    check(ok, "consolidated copy-on-write: logical values kept, reader sees old data");
+}
+
+void test_overlapping_inplace() {
+    Runtime rt(opts(2));
+    // a += a[::-1] must read all of `a` before writing (NumPy semantics).
+    Layout l = vec(6);
+    auto b = std::make_shared<Buffer>(l.nbytes());
+    b->ensure_allocated();
+    for (int i = 0; i < 6; ++i) {
+        reinterpret_cast<double*>(b->data())[i] = i;
+    }
+    ArrayPtr a = rt.wrap(l, b);
+    ArrayPtr rev = slice(rt, a, 5, -1, 6);
+    inplace_add(rt, a, rev);
+    bool ok = true;
+    for (int i = 0; i < 6; ++i) {
+        ok = ok && value(rt, a, i) == 5.0; // i + (5 - i)
+    }
+    check(ok, "a += a[::-1] reads the old data (overlap forces copy-on-write)");
+}
+
 void test_error_propagation() {
     Runtime rt(opts(2));
     auto fail = std::make_shared<FnKernel>([](auto, auto) {
@@ -312,6 +423,70 @@ void test_random_programs() {
     check(true, "20 random programs (2000 ops each, with in/out) match sequential reference");
 }
 
+void test_random_view_programs() {
+    // Random in-place writes through views (incl. overlapping and reversed
+    // ones) and new arrays, against a sequential reference with NumPy
+    // semantics (all inputs are read before the output is written).
+    std::mt19937 rng(2);
+    constexpr std::int64_t n = 6;
+    struct Slice {
+        std::int64_t start, step, len;
+    };
+    const Slice slices[] = {{0, 1, 6}, {0, 2, 3}, {1, 2, 3}, {5, -1, 6}, {4, -2, 3}, {2, 1, 3}};
+    for (int round = 0; round < 20; ++round) {
+        Runtime rt(opts(4));
+        std::vector<ArrayPtr> bases;
+        std::vector<std::vector<double>> ref;
+        for (int i = 0; i < 4; ++i) {
+            bases.push_back(make_ready(rt, n, i));
+            ref.push_back(std::vector<double>(n, i));
+        }
+        for (int step = 0; step < 1500; ++step) {
+            const std::size_t i = rng() % bases.size();
+            const std::size_t j = rng() % bases.size();
+            if (rng() % 4 == 0) { // new base = bases[i] + bases[j]
+                bases.push_back(issue1(rt, add_all(), {bases[i], bases[j]}, n));
+                std::vector<double> r(n);
+                for (std::int64_t k = 0; k < n; ++k) {
+                    r[k] = ref[i][k] + ref[j][k];
+                }
+                ref.push_back(r);
+                continue;
+            }
+            // bases[i][si] += bases[j][sj] with matching lengths.
+            const Slice& si = slices[rng() % std::size(slices)];
+            Slice sj = slices[rng() % std::size(slices)];
+            while (sj.len != si.len) {
+                sj = slices[rng() % std::size(slices)];
+            }
+            inplace_add(rt, slice(rt, bases[i], si.start, si.step, si.len),
+                        slice(rt, bases[j], sj.start, sj.step, sj.len));
+            std::vector<double> src(si.len);
+            for (std::int64_t k = 0; k < si.len; ++k) {
+                src[k] = ref[j][sj.start + k * sj.step];
+            }
+            for (std::int64_t k = 0; k < si.len; ++k) {
+                ref[i][si.start + k * si.step] += src[k];
+            }
+            if (bases.size() > 12) {
+                bases.resize(4);
+                ref.resize(4);
+            }
+        }
+        bool ok = true;
+        for (std::size_t b = 0; b < bases.size(); ++b) {
+            for (std::int64_t k = 0; k < n; ++k) {
+                ok = ok && value(rt, bases[b], k) == ref[b][k];
+            }
+        }
+        if (!ok) {
+            check(false, "random view program matches sequential reference");
+            return;
+        }
+    }
+    check(true, "20 random view programs (1500 ops each, overlapping views) match reference");
+}
+
 } // namespace
 
 int main() {
@@ -323,9 +498,15 @@ int main() {
     test_deep_chain_no_stack_growth();
     test_inout_in_place();
     test_copy_on_write();
+    test_view_write_visible_in_base();
+    test_view_write_waits_for_base_producer();
+    test_view_copy_on_write();
+    test_consolidated_copy_on_write_of_strided_array();
+    test_overlapping_inplace();
     test_error_propagation();
     test_active_limit();
     test_random_programs();
+    test_random_view_programs();
     std::printf("%d failure(s)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

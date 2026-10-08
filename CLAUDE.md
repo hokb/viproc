@@ -41,8 +41,14 @@ to plain sequential NumPy execution.
 - Arrays do **not** reference the tasks that consume them as inputs.
 - A pending array may have no element memory yet; the producer allocates
   it.
-- Each array has a dedicated atomic counter **`async_reads`**: the number
-  of issued, not yet completed tasks that read the array as an input.
+- **Views share a storage.** A base array and all its views refer to one
+  shared *storage*, which holds the current buffer (data version) and the
+  last task writing it. Readiness, the producer and `async_reads` belong
+  to the storage: a write through one view makes the base and all other
+  views `pending`, and copy-on-write switches all of them together.
+  (Conservative: two views of disjoint regions are still ordered.)
+- Each storage buffer has a dedicated atomic counter **`async_reads`**: the
+  number of issued, not yet completed tasks that read it as an input.
   - The main thread increments it when it issues a task reading the array.
   - The reading task decrements it when it has finished reading (at the
     latest on `completed`), on whatever thread it runs.
@@ -152,14 +158,30 @@ reported with that issue site, not with the worker's stack.
   `ready` array drops its producer reference.
 - **Write-after-read safety via `async_reads` (copy-on-write).** Only
   relevant for in/out argument semantics (an op that writes into an
-  existing array: in-place operators like `a += b`, `out=`). Arrays do not
-  know their pending readers, only how many there are. When the main
-  thread issues such a task, it checks the in/out array's `async_reads`:
-  - `0`: the task may write the existing buffer in place.
-  - `> 0`: pending readers still need the old data. The writing task must
-    not overwrite that buffer; it writes into a new buffer, and the array
-    switches to it. The old buffer stays alive through the readers'
-    references and is freed when the last one releases it.
+  existing array: in-place operators like `a += b`, `out=`). When the main
+  thread issues such a task, it checks the in/out array's storage:
+  - No pending readers (`async_reads == 0`) and no input of this op reads
+    the storage through a *different* view: write in place.
+  - Otherwise the old data is still needed (by pending readers, or by this
+    op's own overlapping inputs, e.g. `a += a[::-1]`, where NumPy requires
+    all inputs to be read before the output is written). The storage
+    switches to a new buffer; the op's inputs read the old one. The old
+    buffer stays alive through its readers' references.
+    - **Consolidated** (array is the only view of its storage and covers
+      all of it): no copy at all. The op reads the old buffer and writes
+      the new one, and the new buffer gets a **contiguous layout**.
+    - **With views or partial writes:** a copy task copies the whole old
+      buffer into the new one first; the op then writes its part. Views
+      keep their layouts (offsets and strides stay valid in the new
+      buffer).
+- **Consolidation is decided at issue time, on the main thread.** Layout
+  and size, once communicated (`size_completed`), never change. Tasks
+  already issued captured (buffer, layout) pairs and are unaffected; only
+  ops issued later see the new layout. A later change (e.g. at allocation
+  time) could only keep the strides as they are.
+- Known difference to NumPy: consolidation can change the observable
+  strides / flags of an array after an in-place op (`a.strides`,
+  `a.flags.c_contiguous`). Values are always identical.
 - Sync points that hand memory back to plain NumPy for *writing* also
   wait until `async_reads == 0`.
 
@@ -388,15 +410,18 @@ Rules:
 
 ## Implementation notes (current code)
 
-- `Array` objects are **main-thread only**. Workers see only `Task`s and the
-  `Buffer`s captured in their operands. An array's state is derived:
-  `pending` while its producer is set and not completed.
+- `Array` and `Storage` objects are **main-thread only**. Workers see only
+  `Task`s and the `Buffer`s captured in their operands. State is derived:
+  a storage is `pending` while its producer is set and not completed.
+- `Runtime::view(base, layout)` creates a view (metadata only, no task).
+  The bridge must map NumPy views of one base onto runtime views of one
+  storage; wrapping two NumPy views separately would lose the aliasing.
+- After copy-on-write the storage no longer uses the wrapped NumPy memory;
+  the bridge must treat the runtime array, not the original ndarray
+  memory, as the source of truth.
 - Operands capture the **buffer at issue time**, not the array, so a reader
   keeps the data version it was issued against when an in/out op switches
   the array to a new buffer (copy-on-write).
-- Copy-on-write is currently **consolidated with the op**: the in/out op
-  reads the old buffer and writes the new one, no separate copy. Correct
-  because the op writes the whole array (no views yet).
 - Tasks the **main thread** runs inline (`should_offload == false`) hand the
   consumers they unblock to the pool, so the main thread keeps issuing.
   Workers run one unblocked consumer as their continuation.
@@ -472,13 +497,4 @@ functions.
       `det`, `fft` and `argmax`; FP flags are visible on the worker
       (`tests/test_numpy_loops.cpp`, NumPy 2.5.3).
 - [ ] `should_offload` heuristic for tasks whose inputs are all completed.
-- [ ] Copy-on-write and consolidation: is the new buffer always made
-      contiguous (consolidated), and is the copy always merged into the op
-      itself where possible?
-- [ ] Views: base array and views share a buffer. An in-place write through
-      a view must stay visible in the base (NumPy semantics), so COW must
-      switch base and all views together (shared storage indirection) and,
-      for partial writes, copy the untouched part first. `async_reads` per
-      array vs. per shared buffer. Until decided, views fall back to eager
-      NumPy.
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.

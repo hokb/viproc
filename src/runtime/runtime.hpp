@@ -23,27 +23,32 @@ namespace viproc {
 // Look-ahead limit: maximum number of issued, not yet completed tasks.
 inline constexpr std::size_t kDefaultMaxActiveTasks = 1000;
 
-// An array as seen by the main thread. All fields are main-thread only:
-// workers never touch Array objects, only the Buffers and Tasks it refers to.
+// Shared storage of a base array and all of its views. Main-thread only.
+//
+// The storage, not the individual array, carries the data version (buffer)
+// and the last task writing it (producer): a write through one view makes the
+// base and all other views pending, and copy-on-write switches all of them to
+// the new buffer together.
 //
 // State: `pending` while `producer` is set and not completed, `ready`
 // otherwise. Only the main thread sets `producer` (ready -> pending); the
-// producer completing makes it ready. So a ready array stays ready until the
+// producer completing makes it ready. So a ready storage stays ready until the
 // main thread issues a new write to it.
-class Array {
+class Storage {
   public:
-    Array(Layout layout, std::shared_ptr<Buffer> buffer, std::shared_ptr<Task> producer)
-        : layout_(std::move(layout)), buffer_(std::move(buffer)), producer_(std::move(producer)) {}
+    explicit Storage(std::shared_ptr<Buffer> buffer, std::shared_ptr<Task> producer = nullptr)
+        : buffer_(std::move(buffer)), producer_(std::move(producer)) {}
 
-    const Layout& layout() const { return layout_; }
     const std::shared_ptr<Buffer>& buffer() const { return buffer_; }
-    // Last task that writes this array; null once known to be completed.
+    // Last task that writes this storage; null once known to be completed.
     const std::shared_ptr<Task>& producer() const { return producer_; }
+    // Error of the last completed producer, if it failed.
+    const std::optional<TaskError>& last_error() const { return last_error_; }
 
     bool ready() {
         if (producer_ && producer_->completed()) {
             last_error_ = producer_->error();
-            producer_.reset(); // break the array -> task reference early
+            producer_.reset(); // break the storage -> task reference early
         }
         return !producer_;
     }
@@ -51,10 +56,30 @@ class Array {
   private:
     friend class Runtime;
 
-    Layout layout_;
     std::shared_ptr<Buffer> buffer_;
     std::shared_ptr<Task> producer_;
-    std::optional<TaskError> last_error_; // error of the completed producer
+    std::optional<TaskError> last_error_;
+};
+
+// An array as seen by the main thread: a layout (view) onto a shared storage.
+// Main-thread only: workers never touch Array or Storage objects, only the
+// Buffers and Tasks they refer to.
+class Array {
+  public:
+    Array(Layout layout, std::shared_ptr<Storage> storage)
+        : layout_(std::move(layout)), storage_(std::move(storage)) {}
+
+    const Layout& layout() const { return layout_; }
+    const std::shared_ptr<Storage>& storage() const { return storage_; }
+    const std::shared_ptr<Buffer>& buffer() const { return storage_->buffer(); }
+    const std::shared_ptr<Task>& producer() const { return storage_->producer(); }
+    bool ready() { return storage_->ready(); }
+
+  private:
+    friend class Runtime;
+
+    Layout layout_;
+    std::shared_ptr<Storage> storage_;
 };
 
 using ArrayPtr = std::shared_ptr<Array>;
@@ -81,12 +106,16 @@ class Runtime {
 
     // A ready array over existing memory.
     ArrayPtr wrap(Layout layout, std::shared_ptr<Buffer> buffer);
+    // A view of `base`: same storage, different layout (shape, strides,
+    // offset into the storage's buffer). Metadata only, no task.
+    ArrayPtr view(const ArrayPtr& base, Layout layout);
 
     // Issues one array op and returns immediately.
     //  - `inputs` are read.
-    //  - `inouts` are read and written in place (in/out semantics). If pending
-    //    tasks still read an in/out array's buffer (async_reads > 0), the op
-    //    writes a new buffer instead (copy-on-write).
+    //  - `inouts` are read and written in place (in/out semantics). If the
+    //    old data is still needed (pending readers: async_reads > 0, or an
+    //    input of this op overlaps the in/out with a different layout), the
+    //    op writes a new buffer instead (copy-on-write, see CLAUDE.md).
     //  - `new_outputs` are layouts of arrays the op creates.
     // Kernel operands: inputs = [inputs..., inouts...],
     //                  outputs = [inouts..., new outputs...].
@@ -110,6 +139,13 @@ class Runtime {
     std::vector<std::shared_ptr<Task>> run(const std::shared_ptr<Task>& task);
     void enqueue(std::shared_ptr<Task> task);
     void trigger_from_main(const std::shared_ptr<Task>& task);
+    void acquire_slot();
+    // Registers `task` on its pending producers and triggers it if none.
+    void launch(const std::shared_ptr<Task>& task,
+                const std::vector<std::shared_ptr<Task>>& producers);
+    // Copy-on-write with views: switches `s` to a new buffer holding a copy of
+    // the old data (issued as its own task); views keep their layouts.
+    void issue_storage_copy(Storage& s);
 
     RuntimeOptions options_;
     std::atomic<std::size_t> active_{0};
