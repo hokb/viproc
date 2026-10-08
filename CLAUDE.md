@@ -81,6 +81,12 @@ to plain sequential NumPy execution.
    (see "Dispatch decision").
 5. Continue with the next op.
 
+**Look-ahead limit (back-pressure):** at most **1000 active tasks** (issued,
+not yet `completed`). When the limit is reached, the main thread blocks
+before creating the next task until an active task completes. Fixed
+constant for now; keep it in one place so it can become configurable or
+memory-based later.
+
 When a producer reaches `completed`, its callbacks run on the completing
 thread. The callback that reports the last pending input of a task
 triggers that task, and **the thread that completed the last input runs
@@ -92,6 +98,10 @@ back to its top-level task loop and runs the consumer from there
 (trampoline). Never call a consumer task from inside the producer's
 callback frame. Nested execution would build deep stacks along dependency
 chains and, on errors, hide where the failing op came from.
+
+If one completion unblocks several consumers, the completing thread runs
+one of them as its continuation; the others go to idle workers / the
+pool's queue.
 
 Each task records its **issue site** (Python file, line and function,
 captured by the main thread at issue time). Errors from a task are
@@ -140,10 +150,11 @@ reported with that issue site, not with the worker's stack.
 - Cycles (array → producer → callback → consumer → array) are broken on
   `completed`: the producer releases its callbacks and its inputs, and a
   `ready` array drops its producer reference.
-- **Write-after-read safety via `async_reads`.** Arrays do not know their
-  pending readers, only how many there are. When the main thread issues a
-  task that writes an array (in/out argument, `out=`), it checks
-  `async_reads`:
+- **Write-after-read safety via `async_reads` (copy-on-write).** Only
+  relevant for in/out argument semantics (an op that writes into an
+  existing array: in-place operators like `a += b`, `out=`). Arrays do not
+  know their pending readers, only how many there are. When the main
+  thread issues such a task, it checks the in/out array's `async_reads`:
   - `0`: the task may write the existing buffer in place.
   - `> 0`: pending readers still need the old data. The writing task must
     not overwrite that buffer; it writes into a new buffer, and the array
@@ -427,11 +438,4 @@ functions.
       `det`, `fft` and `argmax`; FP flags are visible on the worker
       (`tests/test_numpy_loops.cpp`, NumPy 2.5.3).
 - [ ] `should_offload` heuristic for tasks whose inputs are all completed.
-- [ ] Writer with `async_reads > 0`: new buffer (as described) or wait
-      for the readers? — confirm.
-- [ ] A completing producer may unblock several consumers at once: the
-      completing thread runs one as its continuation; the others go to
-      idle workers / the pool queue.
-- [ ] Back-pressure: how far may the main thread run ahead (number of
-      pending tasks, or memory of pending outputs) before it blocks?
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.
