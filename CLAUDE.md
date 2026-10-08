@@ -242,20 +242,25 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
   task.*               Task: stages, consumer callbacks, execute(); Kernel interface
   runtime.*            Array (main-thread view), Runtime: issue protocol,
                        worker pool, trampoline, look-ahead limit, wait
+  assign.*             element copy kernel (dst[...] = src)
 src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
   numpy_ufunc.*        UfuncLoop / LoopCache (resolved NumPy loops),
                        element-wise kernel, wrap_ndarray / to_ndarray
+src/capi/capi.cpp      Implementation of the C ABI (library `viproc_capi`)
+python/viproc/         Python package
+  _viproc.c            CPython extension: thin binding of viproc.h (C only)
+  _ndarray.py          viproc.ndarray, NumPy protocols, fallbacks, indexing
+  __init__.py          module API (asarray, zeros, …; other names from NumPy)
+python/tests/          pytest tests of the bridge (bit-identical to NumPy)
+python/benchmarks/     strong_scaling.py
 tests/
   test_numpy_loops.cpp    spike: NumPy loops on a worker without the GIL
   test_runtime.cpp        runtime core with C++ test kernels
   test_numpy_runtime.cpp  end-to-end with NumPy loops, bit-identical to NumPy
 ```
 
-Planned (not created yet):
-
-```
-python/              Python bridge derived from Bohrium npbackend
-```
+The build assembles the importable package in `build/python/viproc`
+(Python sources copied, extension module built there).
 
 Rules:
 - Bridges (Python, later .NET) only talk to the runtime through
@@ -270,7 +275,14 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug   # configure
 cmake --build build                                     # build
 ctest --test-dir build --output-on-failure              # run tests
 clang-format -i <files>                                 # format
+
+# Python bridge
+PYTHONPATH=build/python python3 -m pytest -q python/tests
+PYTHONPATH=build/python python3 python/benchmarks/strong_scaling.py   # use a Release build
 ```
+
+`ctest` also runs the pytest suite. Tests need `pytest`
+(`pip install pytest`).
 
 Build with `-DVIPROC_WARNINGS_AS_ERRORS=OFF` only for local experiments;
 the default build treats warnings as errors. Always build and run the tests
@@ -408,6 +420,39 @@ Rules:
 - The proven calling patterns are in `tests/test_numpy_loops.cpp`; keep
   that test green when changing how loops are called.
 
+## Python bridge
+
+- **Decision: a wrapper class using NumPy's array protocols, not an
+  `ndarray` subclass.** `viproc.ndarray` implements `__array_ufunc__`
+  (NEP 13) and `__array_function__` (NEP 18) plus the operators
+  (`NDArrayOperatorsMixin`). Bohrium's npbackend subclasses `ndarray` and
+  protects memory (mprotect + signal handler) to sync when NumPy C code
+  touches the data; with the protocols every NumPy entry point either is
+  intercepted or calls `__array__`, which is a clean sync point. No
+  Bohrium code is copied (license still open); only the design idea
+  (intercept, run elsewhere, fall back, sync on access) is reused.
+- **Supported asynchronously:** element-wise ufunc calls (`ufunc.signature
+  is None`, one output) with exact dtype signatures after NumPy's own
+  resolution (`ufunc.resolve_dtypes`, NEP 50 weak Python scalars), incl.
+  `out=` and in-place operators; basic indexing as views (no sync);
+  `__setitem__` with basic keys (assign kernel).
+- **Fallback (sync + eager NumPy, result wrapped again):** everything else:
+  reductions, gufuncs (`matmul`), casting, advanced indexing, other NumPy
+  functions. Functions that mutate an argument (`np.put`, …) raise,
+  except `np.copyto`, which maps to assignment.
+- **Sync points:** `np.asarray(x)`, `x.numpy()`, printing, `float(x)`,
+  `bool(x)`, scalar indexing, iteration, `x.wait()`, `viproc.wait_all()`.
+- `asarray` copies NumPy input (the runtime then owns the memory; the
+  user's array may be modified freely). Results of fallbacks are wrapped
+  without copy.
+- The issue site is the first stack frame outside viproc and NumPy.
+- One Python thread only: the thread that initialized the runtime.
+- Measured (4 CPUs, `strong_scaling.py`, 8 chains, Release build):
+  1e6 elements: 3.7x faster than NumPy with 4 workers; 1e5: 3.2x;
+  1e4: no gain; 1e3: 10x slower. The bridge costs ~35 µs per op (Python
+  code in `_issue_ufunc`: dtype resolution, scalar wrapping, issue site);
+  small arrays need a faster issue path and/or `should_offload`.
+
 ## Implementation notes (current code)
 
 - `Array` and `Storage` objects are **main-thread only**. Workers see only
@@ -433,9 +478,12 @@ Rules:
   Python objects.
 - `wrap_ndarray` borrows the NumPy memory; the bridge keeps the ndarray
   alive while tasks may read it.
+- Python objects whose memory a task still uses are released only on the
+  main thread with the GIL: a worker dropping the last reference parks
+  the object in a graveyard drained at the next C ABI call.
 - Not implemented yet: casting (exact dtype signatures only), reductions,
   gufuncs (linalg, fft, matmul), argmin/argmax, FP-flag reporting to
-  Python, the C ABI and the Python bridge.
+  Python (NumPy warnings / `np.errstate`), `python -m viproc`.
 
 ## Conventions
 
@@ -497,4 +545,6 @@ functions.
       `det`, `fft` and `argmax`; FP flags are visible on the worker
       (`tests/test_numpy_loops.cpp`, NumPy 2.5.3).
 - [ ] `should_offload` heuristic for tasks whose inputs are all completed.
+- [ ] Per-op overhead of the bridge (~35 µs): move `_issue_ufunc` to C,
+      cache dtype resolution per (ufunc, dtypes).
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.

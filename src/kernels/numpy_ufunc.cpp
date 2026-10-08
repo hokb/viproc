@@ -187,14 +187,13 @@ class ElementwiseKernel : public Kernel {
   public:
     explicit ElementwiseKernel(const UfuncLoop* loop) : loop_(loop) {}
 
+    // Only the first nin() inputs go to the loop; further inputs are in/out
+    // arrays the runtime lists as read (see Runtime::issue).
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Shape& shape = outputs[0].layout.shape;
-        const std::size_t nops = inputs.size() + outputs.size();
         std::vector<Layout> layouts;
         std::vector<char*> base;
-        layouts.reserve(nops);
-        base.reserve(nops);
-        for (const Operand& op : inputs) {
+        for (const Operand& op : inputs.first(static_cast<std::size_t>(loop_->nin()))) {
             layouts.push_back(broadcast_to(op.layout, shape));
             base.push_back(reinterpret_cast<char*>(op.first()));
         }
@@ -202,44 +201,11 @@ class ElementwiseKernel : public Kernel {
             layouts.push_back(op.layout);
             base.push_back(reinterpret_cast<char*>(op.first()));
         }
-
-        for (std::int64_t d : shape) {
-            if (d == 0) {
-                return {};
-            }
-        }
-        const std::size_t nd = shape.size();
-        // Innermost dimension per loop call; 0-d arrays are one element.
-        const std::intptr_t inner = nd == 0 ? 1 : static_cast<std::intptr_t>(shape[nd - 1]);
-        std::vector<std::intptr_t> inner_strides(nops);
-        for (std::size_t k = 0; k < nops; ++k) {
-            inner_strides[k] = nd == 0 ? 0 : static_cast<std::intptr_t>(layouts[k].strides[nd - 1]);
-        }
-
-        std::vector<std::int64_t> index(nd > 0 ? nd - 1 : 0, 0);
-        std::vector<char*> ptr = base;
-        for (;;) {
-            if (loop_->call(ptr.data(), &inner, inner_strides.data()) != 0) {
-                return {1, "NumPy loop failed", 0};
-            }
-            // Odometer over all but the innermost dimension.
-            std::size_t dim = index.size();
-            while (dim-- > 0) {
-                if (++index[dim] < shape[dim]) {
-                    for (std::size_t k = 0; k < nops; ++k) {
-                        ptr[k] += layouts[k].strides[dim];
-                    }
-                    break;
-                }
-                for (std::size_t k = 0; k < nops; ++k) {
-                    ptr[k] -= layouts[k].strides[dim] * (shape[dim] - 1);
-                }
-                index[dim] = 0;
-            }
-            if (dim == static_cast<std::size_t>(-1)) {
-                return {};
-            }
-        }
+        const bool ok = for_each_row(shape, layouts, std::move(base),
+                                     [this](char** ptrs, std::intptr_t n, const std::intptr_t* st) {
+                                         return loop_->call(ptrs, &n, st) == 0;
+                                     });
+        return ok ? KernelResult{} : KernelResult{1, "NumPy loop failed", 0};
     }
 
   private:
@@ -252,7 +218,16 @@ std::shared_ptr<Kernel> make_elementwise_kernel(const UfuncLoop* loop) {
     return std::make_shared<ElementwiseKernel>(loop);
 }
 
-ArrayPtr wrap_ndarray(Runtime& rt, PyObject* obj, std::string& error) {
+bool supported_ndarray(PyObject* obj) {
+    if (!PyArray_Check(obj)) {
+        return false;
+    }
+    auto* arr = reinterpret_cast<PyArrayObject*>(obj);
+    DType d;
+    return dtype_of(PyArray_TYPE(arr), d) && PyArray_ISALIGNED(arr) && PyArray_ISNOTSWAPPED(arr);
+}
+
+ArrayPtr wrap_ndarray(Runtime& rt, PyObject* obj, std::string& error, std::shared_ptr<void> owner) {
     if (!PyArray_Check(obj)) {
         error = "not a NumPy array";
         return nullptr;
@@ -276,7 +251,7 @@ ArrayPtr wrap_ndarray(Runtime& rt, PyObject* obj, std::string& error) {
     }
     l.offset = -lo;
     auto buffer = std::make_shared<Buffer>(PyArray_BYTES(arr) + lo,
-                                           static_cast<std::size_t>(hi - lo), nullptr);
+                                           static_cast<std::size_t>(hi - lo), std::move(owner));
     return rt.wrap(std::move(l), std::move(buffer));
 }
 

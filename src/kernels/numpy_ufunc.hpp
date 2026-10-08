@@ -66,8 +66,12 @@ class LoopCache {
 std::shared_ptr<Kernel> make_elementwise_kernel(const UfuncLoop* loop);
 
 // Wraps the memory of a NumPy array as a ready runtime array without copying.
-// The caller keeps `arr` alive until all tasks reading it have completed.
-ArrayPtr wrap_ndarray(Runtime& rt, PyObject* arr, std::string& error);
+// `owner` keeps the memory alive (e.g. holds a reference to `arr`); with a
+// null owner the caller keeps `arr` alive until no task reads it any more.
+ArrayPtr wrap_ndarray(Runtime& rt, PyObject* arr, std::string& error,
+                      std::shared_ptr<void> owner = nullptr);
+// Same checks as wrap_ndarray(), without wrapping.
+bool supported_ndarray(PyObject* arr);
 
 // New NumPy array with a copy of `a`'s data. `a` must be ready.
 PyObject* to_ndarray(const Array& a);

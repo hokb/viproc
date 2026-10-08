@@ -8,10 +8,24 @@ The goal is strong scaling of whole array programs; the actual computation is de
 NumPy's own inner loops.
 See [CLAUDE.md](CLAUDE.md) for architecture and build instructions.
 
+## Usage
+
+```python
+import numpy as np
+import viproc
+
+a = viproc.asarray(np.random.rand(1_000_000))   # or: import viproc as np
+b = viproc.asarray(np.random.rand(1_000_000))
+c = np.sin(a) * b + 1.0      # returns immediately, computed in the background
+d = np.cos(b) - a            # independent of c: runs in parallel
+print((c + d)[:5])           # sync point
+```
+
 ## Build
 
 ```bash
 cmake -S . -B build -G Ninja
 cmake --build build
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure     # needs: pip install pytest
+PYTHONPATH=build/python python3 python/benchmarks/strong_scaling.py
 ```

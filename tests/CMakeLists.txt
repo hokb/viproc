@@ -14,5 +14,9 @@ add_test(NAME runtime COMMAND test_runtime)
 
 # End-to-end: runtime + NumPy loops, bit-identical to eager NumPy.
 add_executable(test_numpy_runtime test_numpy_runtime.cpp)
-target_link_libraries(test_numpy_runtime PRIVATE viproc_numpy viproc_warnings)
+target_link_libraries(test_numpy_runtime PRIVATE viproc_numpy Python3::Python viproc_warnings)
 add_test(NAME numpy_runtime COMMAND test_numpy_runtime)
+
+# Python bridge (pytest), against the package assembled in the build tree.
+add_test(NAME python COMMAND ${Python3_EXECUTABLE} -m pytest -q ${CMAKE_SOURCE_DIR}/python/tests)
+set_tests_properties(python PROPERTIES ENVIRONMENT "PYTHONPATH=${VIPROC_PYTHON_DIR}")

@@ -35,4 +35,48 @@ bool broadcast_shapes(const Shape& a, const Shape& b, Shape& out);
 // Broadcast dimensions get stride 0.
 Layout broadcast_to(const Layout& in, const Shape& target);
 
+// Calls `row(ptrs, count, strides)` once per innermost row of `shape` for a
+// set of operands, all already broadcast to `shape` (`layouts[k]`, first
+// element at `base[k]`). A 0-d shape is one row of one element. Returns
+// false as soon as `row` returns false.
+template <class RowFn>
+bool for_each_row(const Shape& shape, const std::vector<Layout>& layouts, std::vector<char*> ptrs,
+                  RowFn&& row) {
+    for (std::int64_t d : shape) {
+        if (d == 0) {
+            return true;
+        }
+    }
+    const std::size_t nops = layouts.size();
+    const std::size_t nd = shape.size();
+    const std::intptr_t count = nd == 0 ? 1 : static_cast<std::intptr_t>(shape[nd - 1]);
+    std::vector<std::intptr_t> strides(nops);
+    for (std::size_t k = 0; k < nops; ++k) {
+        strides[k] = nd == 0 ? 0 : static_cast<std::intptr_t>(layouts[k].strides[nd - 1]);
+    }
+    std::vector<std::int64_t> index(nd > 0 ? nd - 1 : 0, 0);
+    for (;;) {
+        if (!row(ptrs.data(), count, strides.data())) {
+            return false;
+        }
+        // Odometer over all but the innermost dimension.
+        std::size_t dim = index.size();
+        while (dim-- > 0) {
+            if (++index[dim] < shape[dim]) {
+                for (std::size_t k = 0; k < nops; ++k) {
+                    ptrs[k] += layouts[k].strides[dim];
+                }
+                break;
+            }
+            for (std::size_t k = 0; k < nops; ++k) {
+                ptrs[k] -= layouts[k].strides[dim] * (shape[dim] - 1);
+            }
+            index[dim] = 0;
+        }
+        if (dim == static_cast<std::size_t>(-1)) {
+            return true;
+        }
+    }
+}
+
 } // namespace viproc
