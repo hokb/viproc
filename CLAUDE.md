@@ -4,18 +4,44 @@ Guidance for Claude Code when working in this repository.
 
 ## Project
 
-**viproc** is a virtual processor: it takes a *serial* stream of array
-instructions (`c = a + b`, `m = max(c)`, `s = sum(c, axis=0)`, …) and executes
-it autonomously and asynchronously on parallel, heterogeneous hardware. The
-program author writes ordinary sequential array code; viproc schedules and
-dispatches the work.
+**viproc** is a layer that adds **instruction-level parallelism for array
+instructions (array ILP)** to regular NumPy programs. The program is
+written sequentially (`c = a + b`, `m = max(c)`, `s = sum(c, axis=0)`, …);
+viproc executes its array instructions in parallel wherever the data
+dependencies allow it. The final computation of every instruction is
+delegated to NumPy's own inner loops, including their SIMD paths.
 
 The execution model follows the **ILNumerics Accelerator**: the caller's
-thread does not compute. It only *issues* array instructions, records their
-data dependencies, and returns immediately. Each instruction runs as soon as
-the instructions producing its inputs have finished. Independent instructions
-run concurrently; dependent ones keep only the local order needed for correct
-results. Results must always be identical to plain sequential execution.
+thread does not compute. It only *issues* array instructions and returns
+immediately. Each instruction runs as soon as its inputs are ready.
+Independent instructions run concurrently; dependent ones keep only the
+local order needed for correct results. Results must always be identical
+to plain sequential NumPy execution.
+
+### How parallelism is found
+
+- **At runtime, by local decisions only.** There is no dependency graph
+  (DAG) of the program, no look-ahead window and no ahead-of-time (AOT)
+  analysis. When an instruction is issued, viproc asks one local question
+  per operand: *is this input array ready, or still pending?* That answer,
+  plus the state of the output buffer, decides what happens (see
+  "Dispatch decision").
+- Each array carries its own readiness state (pending producer, pending
+  readers). This per-array state is the only dependency bookkeeping.
+  Do not introduce global analysis structures.
+
+### Goals and non-goals
+
+- **Goal:** strong scaling of whole array programs: a fixed program gets
+  faster with more cores, because independent array instructions overlap.
+- **Non-goal:** weak scaling, and data parallelism *inside* a single array
+  op (splitting one op across threads). One instruction runs on one
+  thread, as one NumPy loop call (or the same sequence of loop calls
+  NumPy itself would make).
+- **Not a goal yet:** any optimization besides array ILP: own SIMD code,
+  kernel fusion, JIT code generation, GPU offloading. SIMD comes from
+  NumPy's loops. Do not add these, but do not make design decisions that
+  rule them out (keep device and memory handling behind an interface).
 
 ### Phase 1 (current): MVP on CPUs
 
@@ -28,17 +54,15 @@ multicore CPUs.
   C API and calls them on viproc buffers. No kernels of our own.
 - **Async execution / glue layer (ours):** sits between the user ops
   (`add`, `sum`, `max`, …) and the NumPy ndarray layer. It owns the
-  instruction queue, dependency tracking, scheduling onto worker threads,
-  and synchronization when the caller needs a concrete value.
+  per-array readiness state, the queue of instructions handed to worker
+  threads, and synchronization when the caller needs a concrete value.
 - **Python integration: adopted from Bohrium's `npbackend`**
   (`bridge/npbackend` in https://github.com/bh107/bohrium): an `ndarray`
   subclass whose operations are intercepted and forwarded to the runtime
   instead of being executed eagerly; data is synced back to NumPy on access.
 
-Out of scope for phase 1: .NET/ILNumerics bindings, GPUs, distributed
-execution, kernel fusion and JIT code generation. Do not add them, but do
-not make design decisions that rule them out (keep device and memory
-handling behind an interface).
+Also out of scope for phase 1: .NET/ILNumerics bindings and distributed
+execution.
 
 ## Tech stack
 
@@ -96,8 +120,8 @@ Python user code  (import viproc as np / python -m viproc)
         │
 Python bridge     ndarray subclass, op interception      ← from Bohrium npbackend
         │  C ABI (viproc.h)
-Runtime           instruction queue · dependency tracking ·
-                  scheduler · worker threads · sync       ← ours
+Runtime           per-array readiness · local dispatch decision ·
+                  worker threads · sync                   ← ours
         │
 Kernel adapters   map an instruction onto a NumPy loop
         │  function pointers resolved once, called without the GIL
@@ -122,8 +146,10 @@ Core concepts:
   - Readiness also covers the output buffer: if pending instructions still
     read or write it (WAR/WAW), the instruction counts as pending.
 - **Dependencies:** read-after-write, write-after-read and write-after-write
-  on overlapping buffers. Start conservatively: any instruction touching the
-  same buffer is ordered.
+  on overlapping buffers, tracked locally on each buffer (no global graph).
+  Start conservatively: any instruction touching the same buffer is
+  ordered. When a pending instruction finishes, it marks its outputs
+  ready and releases the instructions waiting on exactly those buffers.
 - **Sync points:** reading data from the caller (printing, converting to a
   scalar, handing memory back to plain NumPy) waits only for the
   instructions that produce that data.
@@ -246,6 +272,8 @@ Rules:
   with NumPy executing the same ops eagerly.
 - Keep the MVP small: prefer the simplest correct scheduling over
   optimizations until there is a benchmark that shows the need.
+- Measure success as strong scaling: benchmark whole array programs
+  (fixed problem size) against plain NumPy at 1, 2, 4, … worker threads.
 
 ## Licensing
 
@@ -292,6 +320,4 @@ functions.
       `det`, `fft` and `argmax`; FP flags are visible on the worker
       (`tests/test_numpy_loops.cpp`, NumPy 2.5.3).
 - [ ] `should_offload` heuristic for instructions whose inputs are all ready.
-- [ ] Splitting one large instruction across several workers (later; must
-      not change results, see the note on reductions).
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.
