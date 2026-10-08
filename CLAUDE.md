@@ -21,14 +21,43 @@ to plain sequential NumPy execution.
 ### How parallelism is found
 
 - **At runtime, by local decisions only.** There is no dependency graph
-  (DAG) of the program, no look-ahead window and no ahead-of-time (AOT)
-  analysis. When an instruction is issued, viproc asks one local question
-  per operand: *is this input array ready, or still pending?* That answer,
-  plus the state of the output buffer, decides what happens (see
-  "Dispatch decision").
-- Each array carries its own readiness state (pending producer, pending
-  readers). This per-array state is the only dependency bookkeeping.
-  Do not introduce global analysis structures.
+  (DAG) of the program and no ahead-of-time (AOT) analysis. Each array
+  carries its own state (`pending` or `completed`); that per-array state
+  is the only dependency bookkeeping. Do not introduce global analysis
+  structures.
+- **The main thread runs ahead.** The Python main thread never waits for
+  results (except at sync points). It races (far) ahead of the
+  computation, and that implicit look-ahead is where the parallelism comes
+  from: by the time early results complete, many later instructions are
+  already issued and waiting on exactly their inputs.
+
+### Issuing an array op (main thread)
+
+For every array op, the main thread only does this, then continues with
+the next op:
+
+1. **Create a task** for the op and store its input arrays in it, for
+   later use when the task runs.
+2. **Allocate the output array** as metadata only (shape, strides, dtype);
+   no element memory yet. Mark it `pending` and reference it from the
+   task. The element memory is allocated when the task runs.
+3. **Register the task** with every input that is still `pending`. The task
+   is triggered when the last of them becomes `completed` (completed by
+   the preceding tasks that produce them).
+4. **If all inputs are already `completed`,** trigger the task right away
+   (see "Dispatch decision").
+
+When a task finishes, it marks its output `completed` and triggers the
+waiting tasks whose inputs are now all completed.
+
+Consequences:
+- The output's shape and dtype must be known at issue time without
+  looking at data (broadcasting, `resolve_dtypes`). Ops whose result shape
+  depends on data (boolean indexing, `nonzero`, `unique`, …) are sync
+  points and fall back to eager NumPy.
+- Registering a task on an input and that input completing can happen at
+  the same time on different threads; the check "still pending? then
+  register" must be atomic per array so no task is lost or triggered twice.
 
 ### Goals and non-goals
 
@@ -130,21 +159,22 @@ NumPy C kernels   ufunc inner loops, SIMD                ← installed NumPy
 
 Core concepts:
 - **Array handle:** opaque runtime handle with shape, byte strides,
-  element type and a reference to its buffer. Readers and writers of a
-  buffer are tracked per handle and buffer.
-- **Instruction:** an opcode plus input and output handles. Issuing one
-  never blocks (except for back-pressure when the queue is full).
-- **Dispatch decision (per instruction, at issue time):**
-  - If any input array is still *pending* (produced by an instruction that
-    has not finished), the instruction is queued for asynchronous
-    execution on a worker thread.
-  - If all inputs are *ready*, `should_offload(instruction)` decides: `true`
-    → queue it for a worker, `false` → execute it immediately on the
-    caller thread. `should_offload` is a heuristic still to be defined
+  element type, state (`pending` / `completed`) and a reference to its
+  buffer. A pending array has no element memory until its producing task
+  runs. Readers and writers of a buffer are tracked per handle and buffer.
+- **Task:** an op plus references to its input and output arrays and the
+  resolved NumPy loop. Issuing one never blocks (except for back-pressure
+  if the main thread gets too far ahead).
+- **Dispatch decision (per task, at issue time):**
+  - If any input array is still `pending`, the task waits on those inputs
+    and later runs on a worker thread.
+  - If all inputs are `completed`, `should_offload(task)` decides: `true`
+    → hand it to a worker, `false` → execute it immediately on the main
+    thread. `should_offload` is a heuristic still to be defined
     (candidates: element count, op cost class, current queue length).
     Keep it a single, swappable function.
   - Readiness also covers the output buffer: if pending instructions still
-    read or write it (WAR/WAW), the instruction counts as pending.
+    read or write it (WAR/WAW), the task counts as pending.
 - **Dependencies:** read-after-write, write-after-read and write-after-write
   on overlapping buffers, tracked locally on each buffer (no global graph).
   Start conservatively: any instruction touching the same buffer is
@@ -319,5 +349,7 @@ functions.
       element-wise ufuncs (incl. 0-d broadcast), `add.reduce`, linalg
       `det`, `fft` and `argmax`; FP flags are visible on the worker
       (`tests/test_numpy_loops.cpp`, NumPy 2.5.3).
-- [ ] `should_offload` heuristic for instructions whose inputs are all ready.
+- [ ] `should_offload` heuristic for tasks whose inputs are all completed.
+- [ ] Back-pressure: how far may the main thread run ahead (number of
+      pending tasks, or memory of pending outputs) before it blocks?
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.
