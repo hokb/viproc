@@ -213,17 +213,25 @@ execution.
 ## Repository layout
 
 ```
-include/viproc/   Public C ABI (viproc.h). The only interface bridges may use.
-src/runtime/      C++ async execution / glue layer
-tests/            CTest test executables
-                  test_numpy_loops.cpp: embeds CPython and proves that NumPy
-                  loops run bit-identically on a worker thread without the GIL
+include/viproc/        Public C ABI (viproc.h). The only interface bridges may use.
+src/runtime/           Runtime core, no Python dependency (library `viproc`)
+  layout.*             DType, Layout (shape, byte strides, offset), broadcasting
+  buffer.*             Buffer: element memory, lazily allocated; async_reads
+  task.*               Task: stages, consumer callbacks, execute(); Kernel interface
+  runtime.*            Array (main-thread view), Runtime: issue protocol,
+                       worker pool, trampoline, look-ahead limit, wait
+src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
+  numpy_ufunc.*        UfuncLoop / LoopCache (resolved NumPy loops),
+                       element-wise kernel, wrap_ndarray / to_ndarray
+tests/
+  test_numpy_loops.cpp    spike: NumPy loops on a worker without the GIL
+  test_runtime.cpp        runtime core with C++ test kernels
+  test_numpy_runtime.cpp  end-to-end with NumPy loops, bit-identical to NumPy
 ```
 
 Planned (not created yet):
 
 ```
-src/kernels/         Adapters that resolve and call NumPy's ufunc loops
 python/              Python bridge derived from Bohrium npbackend
 ```
 
@@ -378,6 +386,32 @@ Rules:
 - The proven calling patterns are in `tests/test_numpy_loops.cpp`; keep
   that test green when changing how loops are called.
 
+## Implementation notes (current code)
+
+- `Array` objects are **main-thread only**. Workers see only `Task`s and the
+  `Buffer`s captured in their operands. An array's state is derived:
+  `pending` while its producer is set and not completed.
+- Operands capture the **buffer at issue time**, not the array, so a reader
+  keeps the data version it was issued against when an in/out op switches
+  the array to a new buffer (copy-on-write).
+- Copy-on-write is currently **consolidated with the op**: the in/out op
+  reads the old buffer and writes the new one, no separate copy. Correct
+  because the op writes the whole array (no views yet).
+- Tasks the **main thread** runs inline (`should_offload == false`) hand the
+  consumers they unblock to the pool, so the main thread keeps issuing.
+  Workers run one unblocked consumer as their continuation.
+- Default `should_offload`: always offload.
+- **GIL:** the bridge must release the GIL while waiting on the runtime
+  (`Runtime::wait`, `wait_all`); workers never take it.
+- `UfuncLoop`s are owned by a `LoopCache` on the main thread; kernels hold
+  raw pointers. Destroy the cache only after `wait_all()`. Kernels never own
+  Python objects.
+- `wrap_ndarray` borrows the NumPy memory; the bridge keeps the ndarray
+  alive while tasks may read it.
+- Not implemented yet: casting (exact dtype signatures only), reductions,
+  gufuncs (linalg, fft, matmul), argmin/argmax, FP-flag reporting to
+  Python, the C ABI and the Python bridge.
+
 ## Conventions
 
 - Language for code, comments, docs and commit messages: **English**.
@@ -438,4 +472,13 @@ functions.
       `det`, `fft` and `argmax`; FP flags are visible on the worker
       (`tests/test_numpy_loops.cpp`, NumPy 2.5.3).
 - [ ] `should_offload` heuristic for tasks whose inputs are all completed.
+- [ ] Copy-on-write and consolidation: is the new buffer always made
+      contiguous (consolidated), and is the copy always merged into the op
+      itself where possible?
+- [ ] Views: base array and views share a buffer. An in-place write through
+      a view must stay visible in the base (NumPy semantics), so COW must
+      switch base and all views together (shared storage indirection) and,
+      for partial writes, copy the untouched part first. `async_reads` per
+      array vs. per shared buffer. Until decided, views fall back to eager
+      NumPy.
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.

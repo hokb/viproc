@@ -19,7 +19,12 @@ target_compile_options(viproc_warnings INTERFACE
     $<$<AND:$<BOOL:${VIPROC_WARNINGS_AS_ERRORS}>,$<CXX_COMPILER_ID:GNU,Clang>>:-Werror>)
 
 # Runtime: async execution / glue layer between user ops and the NumPy ndarray layer.
-add_library(viproc src/runtime/version.cpp)
+add_library(viproc
+    src/runtime/version.cpp
+    src/runtime/layout.cpp
+    src/runtime/buffer.cpp
+    src/runtime/task.cpp
+    src/runtime/runtime.cpp)
 target_include_directories(viproc PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
@@ -27,7 +32,13 @@ target_compile_definitions(viproc PRIVATE
     VIPROC_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
     VIPROC_VERSION_MINOR=${PROJECT_VERSION_MINOR}
     VIPROC_VERSION_PATCH=${PROJECT_VERSION_PATCH})
-target_link_libraries(viproc PRIVATE viproc_warnings)
+target_include_directories(viproc PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+find_package(Threads REQUIRED)
+target_link_libraries(viproc PUBLIC Threads::Threads PRIVATE viproc_warnings)
+
+# Kernel adapters that run tasks with NumPy's loops (needs CPython + NumPy).
+add_library(viproc_numpy src/kernels/numpy_ufunc.cpp)
+target_link_libraries(viproc_numpy PUBLIC viproc Python3::Python Python3::NumPy PRIVATE viproc_warnings)
 
 if(VIPROC_BUILD_TESTS)
     enable_testing()
