@@ -41,6 +41,14 @@ to plain sequential NumPy execution.
 - Arrays do **not** reference the tasks that consume them as inputs.
 - A pending array may have no element memory yet; the producer allocates
   it.
+- Each array has a dedicated atomic counter **`async_reads`**: the number
+  of issued, not yet completed tasks that read the array as an input.
+  - The main thread increments it when it issues a task reading the array.
+  - The reading task decrements it when it has finished reading (at the
+    latest on `completed`), on whatever thread it runs.
+  - Only the main thread increments, so **`async_reads == 0` seen by the
+    main thread stays 0** until the main thread itself issues a new reader
+    (same reasoning as `ready`, see "Thread rules").
 
 ### Tasks
 
@@ -75,7 +83,19 @@ to plain sequential NumPy execution.
 
 When a producer reaches `completed`, its callbacks run on the completing
 thread. The callback that reports the last pending input of a task
-triggers that task (hands it to a worker).
+triggers that task, and **the thread that completed the last input runs
+it** (no hand-off to the pool).
+
+It must run as a **continuation, not nested**: the callback only records
+the consumer as the thread's next task; the thread then unwinds its stack
+back to its top-level task loop and runs the consumer from there
+(trampoline). Never call a consumer task from inside the producer's
+callback frame. Nested execution would build deep stacks along dependency
+chains and, on errors, hide where the failing op came from.
+
+Each task records its **issue site** (Python file, line and function,
+captured by the main thread at issue time). Errors from a task are
+reported with that issue site, not with the worker's stack.
 
 ### Eventing
 
@@ -120,12 +140,17 @@ triggers that task (hands it to a worker).
 - Cycles (array → producer → callback → consumer → array) are broken on
   `completed`: the producer releases its callbacks and its inputs, and a
   `ready` array drops its producer reference.
-- Proposal (to confirm): **write-after-read safety via buffer reference
-  counts.** Since arrays do not know their pending readers, a task that
-  writes an array in place (in/out) while other tasks still hold the old
-  buffer as an input must not overwrite it. It allocates a new buffer
-  instead (copy-on-write, in its `allocated` stage) when the buffer's
-  reference count shows other holders.
+- **Write-after-read safety via `async_reads`.** Arrays do not know their
+  pending readers, only how many there are. When the main thread issues a
+  task that writes an array (in/out argument, `out=`), it checks
+  `async_reads`:
+  - `0`: the task may write the existing buffer in place.
+  - `> 0`: pending readers still need the old data. The writing task must
+    not overwrite that buffer; it writes into a new buffer, and the array
+    switches to it. The old buffer stays alive through the readers'
+    references and is freed when the last one releases it.
+- Sync points that hand memory back to plain NumPy for *writing* also
+  wait until `async_reads == 0`.
 
 ### Goals and non-goals
 
@@ -233,7 +258,8 @@ reference counting.
   worker, `false` → execute it immediately on the main thread.
   `should_offload` is a heuristic still to be defined (candidates: element
   count, op cost class, number of pending tasks). Keep it a single,
-  swappable function. Tasks triggered by a callback run on a worker thread.
+  swappable function. Tasks triggered by a callback run on the thread that
+  completed their last input, as a continuation (see "Issuing an op").
 - **Errors** from asynchronous execution are stored on the task and its
   outputs and raised at the next sync point that touches them.
 
@@ -401,11 +427,11 @@ functions.
       `det`, `fft` and `argmax`; FP flags are visible on the worker
       (`tests/test_numpy_loops.cpp`, NumPy 2.5.3).
 - [ ] `should_offload` heuristic for tasks whose inputs are all completed.
-- [ ] Copy-on-write for in-place writes to buffers still read by pending
-      tasks (see "Reference counting") — confirm.
-- [ ] Callbacks of a completing producer: run each consumer's trigger on
-      the completing thread (it may then run the consumer itself) or always
-      enqueue to the pool?
+- [ ] Writer with `async_reads > 0`: new buffer (as described) or wait
+      for the readers? — confirm.
+- [ ] A completing producer may unblock several consumers at once: the
+      completing thread runs one as its continuation; the others go to
+      idle workers / the pool queue.
 - [ ] Back-pressure: how far may the main thread run ahead (number of
       pending tasks, or memory of pending outputs) before it blocks?
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.
