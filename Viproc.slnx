@@ -1,9 +1,0 @@
-<Solution>
-  <Folder Name="/src/">
-    <Project Path="src/Viproc.Backends.Cpu/Viproc.Backends.Cpu.csproj" />
-    <Project Path="src/Viproc.Core/Viproc.Core.csproj" />
-  </Folder>
-  <Folder Name="/tests/">
-    <Project Path="tests/Viproc.Core.Tests/Viproc.Core.Tests.csproj" />
-  </Folder>
-</Solution>
