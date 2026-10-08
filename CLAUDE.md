@@ -211,10 +211,11 @@ multicore CPUs.
   (`add`, `sum`, `max`, …) and the NumPy ndarray layer. It owns the
   arrays and tasks, the completion events between tasks, the worker
   threads, and synchronization when the caller needs a concrete value.
-- **Python integration: adopted from Bohrium's `npbackend`**
-  (`bridge/npbackend` in https://github.com/bh107/bohrium): an `ndarray`
-  subclass whose operations are intercepted and forwarded to the runtime
-  instead of being executed eagerly; data is synced back to NumPy on access.
+- **Python integration: design adopted from Bohrium's `npbackend`**
+  (`bridge/npbackend` in https://github.com/bh107/bohrium): array operations
+  are intercepted and forwarded to the runtime instead of being executed
+  eagerly; data is synced back to NumPy on access. Implemented with NumPy's
+  array protocols instead of an `ndarray` subclass (see "Python bridge").
 
 Also out of scope for phase 1: .NET/ILNumerics bindings and distributed
 execution.
@@ -291,9 +292,9 @@ before committing.
 ## Architecture (phase 1)
 
 ```
-Python user code  (import viproc as np / python -m viproc)
+Python user code  (viproc.asarray(...) / import viproc as np)
         │
-Python bridge     ndarray subclass, op interception      ← from Bohrium npbackend
+Python bridge     viproc.ndarray, NumPy protocols        ← design from Bohrium npbackend
         │  C ABI (viproc.h)
 Runtime           arrays (ready/pending) · tasks · stage events ·
                   worker threads · sync                   ← ours
