@@ -125,31 +125,80 @@ Core concepts:
   (`ve/openmp`, …). We adopt the **bridge**, not the JIT backends. It
   targets NumPy 1.x and Python ≤ 3.7, so porting to current NumPy 2.x and
   Python 3.12+ is expected work.
-- **NumPy**: inner loops have the signature
-  `void loop(char **args, npy_intp const *dimensions, npy_intp const *steps, void *data)`.
-  That is the calling convention our kernel adapters target.
+- **NumPy** (checked against 2.5.3 installed, 2.6.0.dev0 main): every
+  op we need is a ufunc or gufunc, including `numpy.linalg`
+  (`numpy.linalg._umath_linalg`: `det`, `inv`, `solve`, `svd`, `eig`, `qr`,
+  `cholesky`, `lstsq`, …) and `numpy.fft` (`numpy.fft._pocketfft_umath`:
+  `fft`, `ifft`, `rfft_n_even`, `rfft_n_odd`, `irfft`). All of them go
+  through the same loop machinery.
+
+### How NumPy handles element types
+
+- **One inner loop per dtype signature.** Each ufunc has a list of loops,
+  one per type signature (`np.add.types`: `??->?`, `bb->b`, …, `ii->i`,
+  `ll->l`, `ff->f`, `dd->d`, `FF->F`, `DD->D`, …). `int32`, `int64`,
+  `float32`, `float64` etc. each have their own C function. They are
+  generated from templates (`*.c.src` / `*.dispatch.c.src` with
+  `/**begin repeat` blocks, C++ templates and Highway for newer loops in
+  `numpy/_core/src/umath/`), so the source exists once and the binary has
+  one instance per type.
+- **SIMD dispatch per CPU:** `*.dispatch.*` loops are compiled several
+  times for different instruction sets (SSE/AVX2/AVX512/NEON/…); the best
+  one is selected at import time.
+- **Mixed inputs are not separate loops.** `add(int32, float64)` is
+  resolved by type promotion to the `dd->d` loop; the `int32` operand is
+  cast first. Some combinations are explicit loops (`logical_and`:
+  `bb->?`, `fft`: `Dd->D`). `l` and `q` are both `int64` on Linux.
+- Linalg gufuncs only have `f`, `d`, `F`, `D` loops (integers are cast to
+  `float64`). FFT loops exist for `f`, `d`, `g` and their complex types.
 
 ### Calling NumPy kernels
 
-- **Resolve once, with the GIL:** at runtime init, look up the loop
-  function pointer and its `data` for every (op, dtype) pair in the MVP set
-  (e.g. via `np.add`'s loop for `dd->d`) and store them in a dispatch table.
-  Fail init if a required loop is missing.
-- **Call without the GIL:** worker threads call the stored function
-  pointers directly. They never touch Python objects, never call the
-  Python C API, and never acquire the GIL. Only the bridge (caller thread)
-  and runtime init/shutdown use the C API.
-- **Element-wise ops:** one loop call per contiguous block;
-  `dimensions[0]` is the element count, `steps` are the byte strides.
-- **Reductions** (`sum` = `add`, `max` = `maximum`): use NumPy's reduce
-  trick. Call the binary loop with `args = {acc, in, acc}` and
-  `steps = {0, in_stride, 0}`, after seeding `acc` with the first element.
-  `axis=None` first; `axis=k` later.
-- **Dtype semantics follow NumPy:** `divide` on `int64` is true division
-  and yields `float64` (`ll` inputs cast, loop `dd->d`). Casting rules,
-  overflow and NaN behavior must match eager NumPy exactly.
-- Keep NumPy objects (ufuncs, dtypes) alive for the whole runtime lifetime
-  so the resolved function pointers stay valid.
+Use NumPy's low-level loop access API (unstable, NumPy-version-specific
+capsule name `numpy_1.24_ufunc_call_info`, but works for ufuncs,
+reductions and gufuncs alike):
+
+1. `call_info = ufunc._resolve_dtypes_and_context(dtypes, reduction=...)`
+   resolves dtypes, applying NumPy's promotion rules.
+2. `ufunc._get_strided_loop(call_info, fixed_strides=...)` fills the capsule:
+   `strided_loop`, `context`, `auxdata`, `requires_pyapi`,
+   `no_floatingpoint_errors`.
+3. The loop has the new-style signature
+   `int loop(PyArrayMethod_Context *ctx, char *const data[], npy_intp const dims[], npy_intp const strides[], NpyAuxData *aux)`
+   and returns 0 on success, -1 on failure. For gufuncs, `dims` and
+   `strides` also carry the core dimensions.
+
+Rules:
+- **Resolve with the GIL, on the caller thread,** when an instruction is
+  issued (cache per ufunc and dtype signature). The capsule owns `auxdata`;
+  keep it alive until all instructions that use it have finished.
+- **Call without the GIL** from worker threads. Never run a loop with
+  `requires_pyapi` set (object dtype etc.) asynchronously; fall back to
+  eager NumPy instead.
+- **Casting:** when promotion casts an operand, the cast is its own
+  instruction (cast loops via the same ArrayMethod machinery) or done
+  eagerly before the op. Never call a loop on data of the wrong dtype.
+- **Floating-point errors:** loops report divide-by-zero, overflow and
+  invalid via the thread-local FP status flags (unless
+  `no_floatingpoint_errors`). Workers clear the flags before and read them
+  after each loop and store them on the instruction; the bridge applies
+  `np.errstate` semantics at the next sync point.
+- **Reductions** (`sum`, `prod`, `min`, `max`, `any`, `all`, …) use the
+  binary loop resolved with `reduction=True`, called with an output stride
+  of 0 (`args = {acc, in, acc}`), seeded with the identity or the first
+  element. `axis=None` first, `axis=k` and `keepdims` later.
+- **Linalg:** the Python wrappers (`np.linalg.inv`, …) do argument checks
+  and raise `LinAlgError` via an `errstate(invalid='call')` callback when
+  the gufunc sets the invalid flag. We replicate those checks in the
+  bridge and map the stored FP flags to `LinAlgError` at sync. Linalg
+  loops call BLAS/LAPACK, which may be multithreaded itself; limit BLAS
+  threads (e.g. 1 per worker) to avoid oversubscription.
+- **FFT:** the Python wrappers in `numpy/fft/_pocketfft.py` handle `n`
+  (padding/truncation), `axis`, `norm` (passed as the scalar `fct`
+  argument) and the choice between `rfft_n_even`/`rfft_n_odd`. We port that
+  logic into the bridge and issue the gufunc as an instruction.
+- **Dtype semantics follow NumPy exactly:** promotion, `divide` on integers
+  yielding `float64`, overflow wrap-around, NaN handling.
 
 ## Conventions
 
@@ -175,21 +224,40 @@ Core concepts:
 
 ## MVP scope (decided)
 
-- **Ops:** element-wise `add`, `subtract`, `multiply`, `divide`;
-  reductions `sum`, `max`.
-- **Dtypes:** `float64`, `int64`.
+All ops below run asynchronously; anything else falls back to eager NumPy
+in the bridge after a sync, the way Bohrium falls back for unsupported
+functions.
+
+- **Element-wise unary ufuncs:** all of them (`negative`, `absolute`,
+  `sqrt`, `exp`, `log`, `sin`, `cos`, `tanh`, `floor`, `rint`, …).
+- **Element-wise binary ufuncs:** all of them (`add`, `subtract`,
+  `multiply`, `divide`, `power`, `floor_divide`, `remainder`, `maximum`,
+  `minimum`, `arctan2`, `hypot`, bitwise ops, shifts, …), incl. `matmul`.
+- **Boolean functions:** comparisons (`less`, `equal`, …), `logical_and`,
+  `logical_or`, `logical_xor`, `logical_not`, `isnan`, `isinf`,
+  `isfinite`, `signbit`.
+- **Reductions:** `sum`, `prod`, `min`, `max`, `any`, `all` (ufunc
+  `.reduce`); `mean`, `var`, `std` as compositions of these; `argmin`,
+  `argmax` (not ufuncs, need their own kernel path).
+- **Linear algebra:** the `numpy.linalg` functions backed by
+  `_umath_linalg` gufuncs (`det`, `slogdet`, `inv`, `solve`, `cholesky`,
+  `qr`, `svd`, `eig`, `eigh`, `eigvals`, `eigvalsh`, `lstsq`), plus `matmul`/`dot`.
+- **FFT:** the `numpy.fft` interface (`fft`, `ifft`, `rfft`, `irfft` and
+  the `n`-dimensional variants built on them).
 - **Kernels:** from the installed NumPy at runtime (see "Calling NumPy
   kernels").
-
-Anything beyond this set falls back to plain NumPy in the bridge (after a
-sync), the way Bohrium falls back for unsupported functions.
 
 ## Open questions
 
 - [ ] Threading inside a single instruction (split large arrays across
       workers) or only between instructions in the MVP?
-- [ ] How exactly to obtain loop pointers in NumPy 2.x: legacy
-      `PyUFuncObject->functions`/`types`, or the `ArrayMethod`
-      `get_strided_loop` API? Verify with a spike before building on it.
+- [ ] Which dtypes in the MVP? Proposal: `bool`, `int32`, `int64`,
+      `float32`, `float64`, `complex64`, `complex128` (complex is needed
+      for FFT and `eig`). Exclude object, string, datetime, `float16`,
+      `longdouble`.
+- [ ] `argmin`/`argmax`: NumPy's per-dtype `argmax` functions
+      (`PyArray_ArrFuncs`) or our own kernel?
+- [ ] Spike: call a loop obtained via `_get_strided_loop` from a worker
+      thread without the GIL (ufunc, reduction, linalg gufunc, fft gufunc).
 - [ ] Broadcasting and scalar operands in the MVP, or same-shape arrays only?
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.
