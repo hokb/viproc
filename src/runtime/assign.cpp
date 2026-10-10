@@ -12,8 +12,8 @@ class AssignKernel : public Kernel {
         const Layout& dst = outputs[0].layout;
         const std::size_t item = itemsize(dst.dtype);
         std::vector<Layout> layouts{broadcast_to(inputs[0].layout, dst.shape), dst};
-        std::vector<char*> base{reinterpret_cast<char*>(inputs[0].first()),
-                                reinterpret_cast<char*>(outputs[0].first())};
+        OperandPointers base{reinterpret_cast<char*>(inputs[0].first()),
+                             reinterpret_cast<char*>(outputs[0].first())};
         for_each_row(dst.shape, layouts, std::move(base),
                      [item](char** p, std::intptr_t n, const std::intptr_t* st) {
                          if (st[0] == static_cast<std::intptr_t>(item) && st[1] == st[0]) {

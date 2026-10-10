@@ -239,6 +239,7 @@ execution.
 include/viproc/        Public C ABI (viproc.h). The only interface bridges may use.
 src/runtime/           Runtime core, no Python dependency (library `viproc`)
   layout.*             DType, Layout (shape, byte strides, offset), broadcasting
+  small_vector.hpp     inline-storage vector (shapes/strides without heap)
   buffer.*             Buffer: element memory, lazily allocated; async_reads
   task.*               Task: stages, consumer callbacks, execute(); Kernel interface
   runtime.*            Array (main-thread view), Runtime: issue protocol,
@@ -250,8 +251,12 @@ src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
 src/capi/capi.cpp      Implementation of the C ABI (library `viproc_capi`)
 src/viproc_python.h    the only way to include Python.h (MSVC debug fix)
 python/viproc/         Python package
-  _viproc.c            CPython extension: thin binding of viproc.h (C only)
-  _ndarray.py          viproc.ndarray, NumPy protocols, fallbacks, indexing
+  _viproc.c            CPython extension (C only, uses viproc.h): base class
+                       _Array with the per-op hot path (__array_ufunc__ for
+                       element-wise ufuncs, all operators, dtype-resolution
+                       cache, scalars, broadcasting, issue sites)
+  _ndarray.py          viproc.ndarray(_Array): fallbacks, __array_function__,
+                       indexing, sync points; registers hooks with setup()
   __init__.py          module API (asarray, zeros, …; other names from NumPy)
 python/tests/          pytest tests of the bridge (bit-identical to NumPy)
 python/benchmarks/     strong_scaling.py
@@ -459,8 +464,7 @@ Rules:
 
 - **Decision: a wrapper class using NumPy's array protocols, not an
   `ndarray` subclass.** `viproc.ndarray` implements `__array_ufunc__`
-  (NEP 13) and `__array_function__` (NEP 18) plus the operators
-  (`NDArrayOperatorsMixin`). Bohrium's npbackend subclasses `ndarray` and
+  (NEP 13) and `__array_function__` (NEP 18) plus the operators. Bohrium's npbackend subclasses `ndarray` and
   protects memory (mprotect + signal handler) to sync when NumPy C code
   touches the data; with the protocols every NumPy entry point either is
   intercepted or calls `__array__`, which is a clean sync point. No
@@ -480,13 +484,25 @@ Rules:
 - `asarray` copies NumPy input (the runtime then owns the memory; the
   user's array may be modified freely). Results of fallbacks are wrapped
   without copy.
-- The issue site is the first stack frame outside viproc and NumPy.
+- **Hot path in C** (`_viproc._Array`): everything that runs once per op —
+  `__array_ufunc__` for element-wise calls, all Python operators (number
+  protocol and rich comparisons, with NDArrayOperatorsMixin semantics,
+  incl. deferring to `__array_ufunc__ = None`), dtype resolution via
+  NumPy's `ufunc.resolve_dtypes` cached per (ufunc, input kinds; Python
+  scalars as weak NEP 50 kinds), scalar conversion (`vp_array_from_scalar`,
+  NumPy's conversion rules), broadcasting and the issue site. Whatever it
+  does not handle goes to the Python fallback, so NumPy semantics (errors
+  included) stay NumPy's.
+- The issue site is the first stack frame outside viproc and NumPy,
+  formatted once per (code object, line) and interned by the C ABI
+  (tasks keep a `const char*`).
 - One Python thread only: the thread that initialized the runtime.
-- Measured (4 CPUs, `strong_scaling.py`, 8 chains, Release build):
-  1e6 elements: 3.7x faster than NumPy with 4 workers; 1e5: 3.2x;
-  1e4: no gain; 1e3: 10x slower. The bridge costs ~35 µs per op (Python
-  code in `_issue_ufunc`: dtype resolution, scalar wrapping, issue site);
-  small arrays need a faster issue path and/or `should_offload`.
+- Per-op cost on the main thread (8-element arrays, Release): ~2.5–7 µs
+  (NumPy itself: ~0.7 µs), down from 31–41 µs with the Python hot path.
+- Measured (4 CPUs, `strong_scaling.py`, 8 chains, Release build, speedup
+  vs. NumPy with 4 workers): 1e6 elements 3.5x; 1e5 3.0x; 1e4 2.4x;
+  1e3 0.8–1.0x. Tiny ops are now dominated by handing tasks to workers;
+  `should_offload` (run tiny ready tasks inline) is the next lever.
 
 ## Implementation notes (current code)
 
@@ -506,6 +522,12 @@ Rules:
   consumers they unblock to the pool, so the main thread keeps issuing.
   Workers run one unblocked consumer as their continuation.
 - Default `should_offload`: always offload.
+- Worker pool: at most one idle worker spins (50 µs, `pause`) before
+  sleeping; `enqueue()` wakes a sleeper only if nobody spins. This avoids a
+  wake-up syscall per small task without taking cores from busy threads.
+- Per-op allocations are kept low: shapes/strides inline (`SmallVector`),
+  one operand vector per task, one shared kernel object per resolved loop,
+  interned issue sites.
 - **GIL:** the bridge must release the GIL while waiting on the runtime
   (`Runtime::wait`, `wait_all`); workers never take it.
 - `UfuncLoop`s are owned by a `LoopCache` on the main thread; kernels hold
@@ -580,8 +602,7 @@ functions.
       `det`, `fft` and `argmax`; FP flags are visible on the worker
       (`tests/test_numpy_loops.cpp`, NumPy 2.5.3).
 - [ ] `should_offload` heuristic for tasks whose inputs are all completed.
-- [ ] Per-op overhead of the bridge (~35 µs): move `_issue_ufunc` to C,
-      cache dtype resolution per (ufunc, dtypes).
+- [x] Per-op overhead of the bridge: hot path moved to C (~35 µs → ~3–7 µs).
 - [ ] Evaluate a generic path under free-threaded CPython: workers call the
       regular NumPy entry (no reimplementation of NumPy semantics).
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.

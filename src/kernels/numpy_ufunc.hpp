@@ -38,6 +38,8 @@ class UfuncLoop {
     int call(char* const* data, const std::intptr_t* dims, const std::intptr_t* strides) const;
 
     int nin() const { return nin_; }
+    // Element-wise kernel for this loop, shared by all tasks using it.
+    const std::shared_ptr<Kernel>& elementwise_kernel() const { return kernel_; }
     int nout() const { return nout_; }
     bool requires_pyapi() const;
 
@@ -47,6 +49,7 @@ class UfuncLoop {
     void* info_ = nullptr; // UfuncCallInfoPrefix inside the capsule
     int nin_ = 0;
     int nout_ = 0;
+    std::shared_ptr<Kernel> kernel_;
 };
 
 // Caches resolved loops per (ufunc, dtype signature). Main thread with the GIL.
@@ -71,6 +74,10 @@ ArrayPtr wrap_ndarray(Runtime& rt, PyObject* arr, std::string& error,
                       std::shared_ptr<void> owner = nullptr);
 // Same checks as wrap_ndarray(), without wrapping.
 bool supported_ndarray(PyObject* arr);
+
+// A ready 0-d array holding `value` converted to `dtype` by NumPy (nullptr
+// with a Python exception set on failure).
+ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype);
 
 // New NumPy array with a copy of `a`'s data. `a` must be ready.
 PyObject* to_ndarray(const Array& a);

@@ -4,13 +4,15 @@ viproc arrays intercept NumPy through the array protocols (NEP 13
 ``__array_ufunc__``, NEP 18 ``__array_function__``). Supported ops are issued
 asynchronously to the runtime; everything else syncs, runs eagerly in NumPy and
 wraps the result again (fallback).
+
+The per-op hot path (``__array_ufunc__`` for element-wise ufuncs and all
+operators) is implemented in C by the base class ``_viproc._Array``; this
+module adds everything else and the fallbacks the C code calls.
 """
 
 import os
-import sys
 
 import numpy as np
-from numpy.lib.mixins import NDArrayOperatorsMixin
 from numpy.lib.stride_tricks import as_strided
 
 from . import _viproc
@@ -31,18 +33,6 @@ _DTYPES = {code: dt for dt, code in _CODES.items()}
 
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 _NUMPY_DIR = os.path.dirname(os.path.abspath(np.__file__))
-_PY_SCALARS = (bool, int, float, complex)
-
-
-def _site():
-    """Source location of the user code issuing the current op."""
-    f = sys._getframe(1)
-    while f is not None:
-        fn = f.f_code.co_filename
-        if not (fn.startswith(_PKG_DIR) or fn.startswith(_NUMPY_DIR)):
-            return f"{fn}:{f.f_lineno} in {f.f_code.co_name}"
-        f = f.f_back
-    return "<unknown>"
 
 
 def _ensure_runtime():
@@ -56,7 +46,7 @@ def _wrap_numpy(arr):
     _ensure_runtime()
     if arr.dtype not in _CODES or not arr.flags.aligned or not arr.dtype.isnative:
         return None
-    return ndarray._from_handle(_viproc.from_ndarray(arr))
+    return _viproc.from_ndarray(arr)
 
 
 def asarray(obj, dtype=None):
@@ -113,45 +103,22 @@ def _is_basic_index(key):
 _MUTATING = {np.copyto, np.put, np.place, np.putmask, np.fill_diagonal}
 
 
-class ndarray(NDArrayOperatorsMixin):
+class ndarray(_viproc._Array):
     """Array whose ops run asynchronously in the viproc runtime.
 
     Supported ops return immediately with a pending result; reading data
     (printing, ``np.asarray``, ``float()``, unsupported functions) is a sync
-    point.
+    point. ``shape``, ``strides``, ``dtype`` and ``ndim`` come from the C base
+    class and never sync.
     """
 
-    __slots__ = ("_h", "_meta")
+    __slots__ = ()
     __array_priority__ = 100
-
-    @classmethod
-    def _from_handle(cls, h):
-        self = object.__new__(cls)
-        self._h = h
-        shape, strides, code = _viproc.info(h)
-        self._meta = (shape, strides, _DTYPES[code])
-        return self
 
     # --- metadata (no sync) -------------------------------------------------
     @property
-    def shape(self):
-        return self._meta[0]
-
-    @property
-    def strides(self):
-        return self._meta[1]
-
-    @property
-    def dtype(self):
-        return self._meta[2]
-
-    @property
-    def ndim(self):
-        return len(self._meta[0])
-
-    @property
     def size(self):
-        return int(np.prod(self._meta[0], dtype=np.int64))
+        return int(np.prod(self.shape, dtype=np.int64))
 
     @property
     def itemsize(self):
@@ -169,7 +136,7 @@ class ndarray(NDArrayOperatorsMixin):
     # --- sync points ----------------------------------------------------------
     def numpy(self):
         """Sync point: a NumPy copy of the data."""
-        return _viproc.to_ndarray(self._h)
+        return _viproc.to_ndarray(self)
 
     def __array__(self, dtype=None, copy=None):
         if copy is False:
@@ -179,11 +146,11 @@ class ndarray(NDArrayOperatorsMixin):
 
     def wait(self):
         """Sync point: wait until the data is computed (raises AsyncError)."""
-        _viproc.wait(self._h)
+        _viproc.wait(self)
         return self
 
     def ready(self):
-        return _viproc.ready(self._h)
+        return _viproc.ready(self)
 
     def __repr__(self):
         return "viproc." + repr(self.numpy())
@@ -225,7 +192,7 @@ class ndarray(NDArrayOperatorsMixin):
             keys = keys + (Ellipsis,)  # always a view, never a NumPy scalar
         v = fake[keys]
         offset = v.__array_interface__["data"][0] - dummy.__array_interface__["data"][0]
-        return ndarray._from_handle(_viproc.view(self._h, v.shape, v.strides, offset))
+        return _viproc.view(self, v.shape, v.strides, offset)
 
     def __getitem__(self, key):
         if _is_basic_index(key):
@@ -246,17 +213,9 @@ class ndarray(NDArrayOperatorsMixin):
         src = value if isinstance(value, ndarray) else None
         if src is None or src.dtype != self.dtype:
             src = asarray(np.asarray(_to_numpy(value)).astype(self.dtype, copy=False))
-        _viproc.assign(target._h, src._h, _site())
+        _viproc.assign(target, src)
 
     # --- NumPy protocols -------------------------------------------------------
-    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
-        if (method == "__call__" and ufunc.nout == 1 and ufunc.signature is None
-                and set(kwargs) <= {"out"}):
-            result = _issue_ufunc(ufunc, inputs, kwargs.get("out"))
-            if result is not NotImplemented:
-                return result
-        return _fallback_ufunc(ufunc, method, inputs, kwargs)
-
     def __array_function__(self, func, types, args, kwargs):
         if func is np.copyto and len(args) >= 2 and isinstance(args[0], ndarray) and not kwargs:
             args[0][...] = args[1]
@@ -275,7 +234,7 @@ class ndarray(NDArrayOperatorsMixin):
 
     def copy(self):
         out = _wrap_numpy(np.empty(self.shape, self.dtype))
-        _viproc.assign(out._h, self._h, _site())
+        _viproc.assign(out, self)
         return out
 
     def reshape(self, *shape, **kwargs):
@@ -319,59 +278,6 @@ class ndarray(NDArrayOperatorsMixin):
         return np.argmax(self, *a, **k)
 
 
-def _issue_ufunc(ufunc, inputs, out):
-    """Issues ufunc(*inputs, out=out) asynchronously, or NotImplemented."""
-    if out is not None:
-        if len(out) != 1 or not isinstance(out[0], ndarray):
-            return NotImplemented
-        out = out[0]
-    spec = []
-    for x in inputs:
-        if isinstance(x, ndarray):
-            spec.append(x.dtype)
-        elif isinstance(x, _PY_SCALARS):
-            spec.append(type(x))  # weak Python scalar (NEP 50)
-        elif isinstance(x, (np.ndarray, np.generic)):
-            spec.append(x.dtype)
-        else:
-            return NotImplemented
-    try:
-        dtypes = ufunc.resolve_dtypes(tuple(spec) + (None,))
-    except (TypeError, ValueError, np.exceptions.DTypePromotionError):
-        return NotImplemented
-    in_dtypes, out_dtype = dtypes[: ufunc.nin], dtypes[ufunc.nin]
-    if out_dtype not in _CODES:
-        return NotImplemented
-
-    handles = []
-    shapes = []
-    for x, dt in zip(inputs, in_dtypes):
-        if isinstance(x, ndarray):
-            if x.dtype != dt:
-                return NotImplemented  # needs casting
-            v = x
-        elif isinstance(x, _PY_SCALARS):
-            v = asarray(np.asarray(x, dtype=dt))  # may raise like NumPy (overflow)
-        else:
-            if x.dtype != dt or dt not in _CODES:
-                return NotImplemented
-            v = asarray(x)
-        handles.append(v._h)
-        shapes.append(v.shape)
-    try:
-        shape = np.broadcast_shapes(*shapes)
-    except ValueError:
-        return NotImplemented  # the fallback raises NumPy's own error
-    if out is not None and (out.shape != shape or out.dtype != out_dtype):
-        return NotImplemented
-    try:
-        h = _viproc.ufunc(ufunc, tuple(handles), _CODES[out_dtype], shape,
-                          None if out is None else out._h, _site())
-    except NotImplementedError:
-        return NotImplemented
-    return out if out is not None else ndarray._from_handle(h)
-
-
 def _fallback_ufunc(ufunc, method, inputs, kwargs):
     """Sync, run eagerly in NumPy, wrap the result."""
     out = kwargs.pop("out", None)
@@ -386,6 +292,28 @@ def _fallback_ufunc(ufunc, method, inputs, kwargs):
         if isinstance(o, ndarray):
             o[...] = r
     return out[0] if len(out) == 1 else out
+
+
+# Hooks for the C fast path (see _viproc.c).
+_OPS = {
+    name: getattr(np, name)
+    for name in (
+        "add", "subtract", "multiply", "true_divide", "floor_divide", "remainder", "divmod",
+        "power", "left_shift", "right_shift", "bitwise_and", "bitwise_or", "bitwise_xor",
+        "matmul", "negative", "positive", "absolute", "invert", "less", "less_equal",
+        "equal", "not_equal", "greater", "greater_equal",
+    )
+}
+_viproc.setup(
+    ndarray,
+    tuple(_DTYPES[c] for c in range(7)),
+    _fallback_ufunc,
+    asarray,
+    (_PKG_DIR, _NUMPY_DIR),
+    _OPS,
+    np.ndarray,
+    np.generic,
+)
 
 
 def wait_all():

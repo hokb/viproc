@@ -40,6 +40,7 @@ enum {
     VP_ERROR = -1,       /* failure of an asynchronous task (raised at sync) */
     VP_UNSUPPORTED = -2, /* op/dtype/layout not supported: fall back to NumPy */
     VP_INVALID = -3,     /* invalid arguments */
+    VP_PYERR = -4,       /* a Python exception is set */
 };
 
 /* Returns the runtime version as "MAJOR.MINOR.PATCH". Any thread. */
@@ -66,6 +67,10 @@ size_t vp_active_tasks(const vp_runtime* rt);
  * not modify the ndarray's memory afterwards. */
 int vp_array_from_ndarray(vp_runtime* rt, PyObject* ndarray, vp_array** out, char* err,
                           size_t errlen);
+/* [GIL] A ready 0-d array holding `value` (a Python or NumPy scalar)
+ * converted to `dtype` with NumPy's rules (e.g. OverflowError for a Python
+ * int out of range). Returns VP_PYERR with the Python exception set. */
+int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array** out);
 /* [GIL] A view of `base` sharing its storage. `offset` is in bytes, relative
  * to base's first element; strides are in bytes. Metadata only. */
 vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, int ndim, const int64_t* shape,

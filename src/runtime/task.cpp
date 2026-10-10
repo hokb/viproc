@@ -6,8 +6,8 @@
 
 namespace viproc {
 
-Task::Task(std::shared_ptr<Kernel> kernel, std::string issue_site)
-    : kernel_(std::move(kernel)), issue_site_(std::move(issue_site)) {}
+Task::Task(std::shared_ptr<Kernel> kernel, const char* issue_site)
+    : kernel_(std::move(kernel)), issue_site_(issue_site) {}
 
 void Task::wait_completed() const {
     TaskState s = state();
@@ -17,9 +17,9 @@ void Task::wait_completed() const {
     }
 }
 
-void Task::set_operands(std::vector<Operand> inputs, std::vector<Operand> outputs) {
-    inputs_ = std::move(inputs);
-    outputs_ = std::move(outputs);
+void Task::set_operands(std::vector<Operand> operands, std::size_t ninputs) {
+    operands_ = std::move(operands);
+    ninputs_ = ninputs;
 }
 
 void Task::advance(TaskState next) {
@@ -62,14 +62,16 @@ std::vector<std::shared_ptr<Task>> Task::execute() {
         }
     }
     if (!error_) {
-        for (Operand& out : outputs_) {
+        const std::span<const Operand> inputs(operands_.data(), ninputs_);
+        const std::span<Operand> outputs(operands_.data() + ninputs_, operands_.size() - ninputs_);
+        for (Operand& out : outputs) {
             out.buffer->ensure_allocated();
         }
         advance(TaskState::Allocated);
         std::feclearexcept(FE_ALL_EXCEPT);
         KernelResult r;
         try {
-            r = kernel_->run(inputs_, outputs_);
+            r = kernel_->run(inputs, outputs);
         } catch (const std::exception& e) {
             r = KernelResult{1, e.what(), 0};
         } catch (...) {
@@ -82,11 +84,11 @@ std::vector<std::shared_ptr<Task>> Task::execute() {
     }
 
     // Done reading: release the inputs (and the async_reads they hold).
-    for (Operand& in : inputs_) {
+    for (std::size_t i = 0; i < ninputs_; ++i) {
+        Operand& in = operands_[i];
         in.buffer->async_reads.fetch_sub(1, std::memory_order_release);
     }
-    inputs_.clear();
-    outputs_.clear();
+    operands_.clear();
     kernel_.reset();
 
     std::vector<std::shared_ptr<Task>> consumers;

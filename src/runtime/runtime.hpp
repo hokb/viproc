@@ -117,11 +117,13 @@ class Runtime {
     //    input of this op overlaps the in/out with a different layout), the
     //    op writes a new buffer instead (copy-on-write, see CLAUDE.md).
     //  - `new_outputs` are layouts of arrays the op creates.
+    //  - `issue_site` must outlive the task: a string literal or an interned
+    //    string (the C ABI interns the sites it receives).
     // Kernel operands: inputs = [inputs..., inouts...],
     //                  outputs = [inouts..., new outputs...].
     std::vector<ArrayPtr> issue(std::shared_ptr<Kernel> kernel, std::span<const ArrayPtr> inputs,
                                 std::span<const ArrayPtr> inouts,
-                                std::span<const Layout> new_outputs, std::string issue_site);
+                                std::span<const Layout> new_outputs, const char* issue_site);
 
     // Sync point: waits until `a` is ready. Returns the error of the task that
     // produced it, if any.
@@ -150,10 +152,18 @@ class Runtime {
     RuntimeOptions options_;
     std::atomic<std::size_t> active_{0};
 
+    // Pool queue. Idle workers spin for a short while (checking `queued_`
+    // without the lock) before they sleep on `queue_cv_`; enqueue() wakes a
+    // sleeper only if no worker is spinning, so a stream of small tasks does
+    // not cost a wake-up syscall per task.
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Task>> queue_;
+    std::atomic<std::size_t> queued_{0};
+    std::atomic<int> spinning_{0};
+    std::atomic<int> sleeping_{0};
     bool stopping_ = false;
+    std::shared_ptr<Task> try_pop();
     std::vector<std::thread> workers_;
 };
 

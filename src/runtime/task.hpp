@@ -58,7 +58,9 @@ struct TaskError {
 
 class Task {
   public:
-    Task(std::shared_ptr<Kernel> kernel, std::string issue_site);
+    // `issue_site` must stay valid for the task's lifetime (a string literal
+    // or an interned string, see Runtime::issue()).
+    Task(std::shared_ptr<Kernel> kernel, const char* issue_site);
 
     Task(const Task&) = delete;
     Task& operator=(const Task&) = delete;
@@ -68,13 +70,14 @@ class Task {
     // Blocks until the task is completed.
     void wait_completed() const;
 
-    const std::string& issue_site() const { return issue_site_; }
+    const char* issue_site() const { return issue_site_; }
     // Valid once completed (acquire through state()).
     const std::optional<TaskError>& error() const { return error_; }
     int fp_flags() const { return fp_flags_; }
 
     // --- Main thread, while issuing -------------------------------------
-    void set_operands(std::vector<Operand> inputs, std::vector<Operand> outputs);
+    // `operands` holds the inputs followed by the outputs (one allocation).
+    void set_operands(std::vector<Operand> operands, std::size_t ninputs);
     void advance(TaskState next);
     // Announces one more pending producer before registering on it.
     void add_pending_input() { pending_.fetch_add(1, std::memory_order_relaxed); }
@@ -107,9 +110,9 @@ class Task {
     std::atomic<int> pending_{1};
 
     std::shared_ptr<Kernel> kernel_;
-    std::vector<Operand> inputs_;
-    std::vector<Operand> outputs_;
-    std::string issue_site_;
+    std::vector<Operand> operands_; // inputs, then outputs
+    std::size_t ninputs_ = 0;
+    const char* issue_site_;
 
     std::mutex mutex_; // guards consumers_, upstream_error_ and the switch to Completed
     std::vector<std::shared_ptr<Task>> consumers_;

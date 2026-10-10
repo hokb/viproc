@@ -1,9 +1,35 @@
 #include "runtime.hpp"
 
 #include <algorithm>
+#include <chrono>
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#include <immintrin.h>
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+#include <intrin.h>
+#endif
 #include <cstring>
 
 namespace viproc {
+
+namespace {
+
+// Tells the CPU we are spin-waiting (cheaper than a yield syscall).
+inline void cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    _mm_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#if defined(_MSC_VER)
+    __yield();
+#else
+    asm volatile("yield");
+#endif
+#else
+    std::this_thread::yield();
+#endif
+}
+
+} // namespace
 
 Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)) {
     std::size_t n = options_.workers;
@@ -98,7 +124,7 @@ void Runtime::issue_storage_copy(Storage& s) {
     acquire_slot();
     auto task = std::make_shared<Task>(std::make_shared<CopyKernel>(), "copy-on-write");
     old->async_reads.fetch_add(1, std::memory_order_relaxed);
-    task->set_operands({{old, bytes_of(*old)}}, {{fresh, bytes_of(*fresh)}});
+    task->set_operands({{old, bytes_of(*old)}, {fresh, bytes_of(*fresh)}}, 1);
     if (failed) {
         task->add_upstream_error(*failed);
     }
@@ -111,14 +137,15 @@ void Runtime::issue_storage_copy(Storage& s) {
 std::vector<ArrayPtr> Runtime::issue(std::shared_ptr<Kernel> kernel,
                                      std::span<const ArrayPtr> inputs,
                                      std::span<const ArrayPtr> inouts,
-                                     std::span<const Layout> new_outputs, std::string issue_site) {
+                                     std::span<const Layout> new_outputs, const char* issue_site) {
     // 1. Snapshot everything this op reads (inputs, then in/outs): buffer,
     //    layout and pending producer, before any copy-on-write switch. Reads
     //    always see the data as it was before this op.
     std::vector<Operand> in_ops;
     std::vector<std::shared_ptr<Task>> producers;
     std::optional<TaskError> failed_input;
-    in_ops.reserve(inputs.size() + inouts.size());
+    // One vector for all operands: inputs, then outputs (see Task).
+    in_ops.reserve(inputs.size() + 2 * inouts.size() + new_outputs.size());
     auto snapshot = [&](Array& a) {
         Storage& s = *a.storage_;
         if (!s.ready()) {
@@ -174,14 +201,13 @@ std::vector<ArrayPtr> Runtime::issue(std::shared_ptr<Kernel> kernel,
 
     // 3. The task itself.
     acquire_slot();
-    auto task = std::make_shared<Task>(std::move(kernel), std::move(issue_site));
+    auto task = std::make_shared<Task>(std::move(kernel), issue_site);
     for (Operand& op : in_ops) {
         op.buffer->async_reads.fetch_add(1, std::memory_order_relaxed);
     }
 
-    std::vector<Operand> out_ops;
+    const std::size_t ninputs = in_ops.size();
     std::vector<ArrayPtr> results;
-    out_ops.reserve(inouts.size() + new_outputs.size());
     results.reserve(new_outputs.size());
     for (const ArrayPtr& ap : inouts) {
         Storage& s = *ap->storage_;
@@ -191,17 +217,17 @@ std::vector<ArrayPtr> Runtime::issue(std::shared_ptr<Kernel> kernel,
             producers.push_back(s.producer_);
         }
         s.producer_ = task;
-        out_ops.push_back({s.buffer_, ap->layout_});
+        in_ops.push_back({s.buffer_, ap->layout_});
     }
     for (const Layout& l : new_outputs) {
         Layout contiguous = Layout::contiguous(l.dtype, l.shape);
         auto buffer = std::make_shared<Buffer>(contiguous.nbytes());
-        out_ops.push_back({buffer, contiguous});
-        results.push_back(
-            std::make_shared<Array>(contiguous, std::make_shared<Storage>(buffer, task)));
+        in_ops.push_back({buffer, contiguous});
+        results.push_back(std::make_shared<Array>(std::move(contiguous),
+                                                  std::make_shared<Storage>(buffer, task)));
     }
 
-    task->set_operands(std::move(in_ops), std::move(out_ops));
+    task->set_operands(std::move(in_ops), ninputs);
     if (failed_input) {
         task->add_upstream_error(*failed_input);
     }
@@ -251,21 +277,68 @@ void Runtime::enqueue(std::shared_ptr<Task> task) {
     {
         std::lock_guard lock(queue_mutex_);
         queue_.push_back(std::move(task));
+        queued_.fetch_add(1, std::memory_order_seq_cst);
     }
-    queue_cv_.notify_one();
+    // A spinning worker will pick the task up. The seq_cst order between this
+    // load and the worker's decrement of spinning_ before it sleeps (followed
+    // by its locked re-check of the queue) rules out a lost wake-up.
+    if (spinning_.load(std::memory_order_seq_cst) == 0 &&
+        sleeping_.load(std::memory_order_seq_cst) > 0) {
+        queue_cv_.notify_one();
+    }
+}
+
+std::shared_ptr<Task> Runtime::try_pop() {
+    std::lock_guard lock(queue_mutex_);
+    if (queue_.empty()) {
+        return nullptr;
+    }
+    std::shared_ptr<Task> t = std::move(queue_.front());
+    queue_.pop_front();
+    queued_.fetch_sub(1, std::memory_order_relaxed);
+    return t;
 }
 
 void Runtime::worker_loop() {
+    using clock = std::chrono::steady_clock;
+    constexpr auto kSpin = std::chrono::microseconds(50);
     std::shared_ptr<Task> next;
     for (;;) {
         if (!next) {
+            next = try_pop();
+        }
+        if (!next) {
+            // At most one worker spins (the others sleep), so spinning never
+            // takes a core away from the main thread or a working worker.
+            int expected = 0;
+            if (spinning_.compare_exchange_strong(expected, 1, std::memory_order_seq_cst)) {
+                const auto until = clock::now() + kSpin;
+                while (!next && clock::now() < until) {
+                    if (queued_.load(std::memory_order_relaxed) > 0) {
+                        next = try_pop();
+                    } else {
+                        cpu_relax();
+                    }
+                }
+                spinning_.store(0, std::memory_order_seq_cst);
+                // Work found while others sleep: let the next worker spin.
+                if (next && queued_.load(std::memory_order_seq_cst) > 0 &&
+                    sleeping_.load(std::memory_order_seq_cst) > 0) {
+                    queue_cv_.notify_one();
+                }
+            }
+        }
+        if (!next) {
             std::unique_lock lock(queue_mutex_);
+            sleeping_.fetch_add(1, std::memory_order_seq_cst);
             queue_cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+            sleeping_.fetch_sub(1, std::memory_order_seq_cst);
             if (queue_.empty()) {
                 return; // stopping
             }
             next = std::move(queue_.front());
             queue_.pop_front();
+            queued_.fetch_sub(1, std::memory_order_relaxed);
         }
         // Trampoline: run() returns instead of calling consumers, so the stack
         // is unwound before the continuation starts.

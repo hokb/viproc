@@ -1,6 +1,8 @@
 // Element types and array layouts (shape, byte strides, offset).
 #pragma once
 
+#include "small_vector.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -11,13 +13,16 @@ enum class DType : std::uint8_t { Bool, Int32, Int64, Float32, Float64, Complex6
 
 std::size_t itemsize(DType dtype);
 
-using Shape = std::vector<std::int64_t>;
+// Shapes and strides live inline up to this rank (no heap allocation).
+inline constexpr std::size_t kInlineRank = 4;
+using Shape = SmallVector<std::int64_t, kInlineRank>;
+using Strides = SmallVector<std::int64_t, kInlineRank>;
 
 // Logical view onto a buffer. Strides are in bytes, like NumPy's.
 struct Layout {
     DType dtype = DType::Float64;
     Shape shape;
-    std::vector<std::int64_t> strides;
+    Strides strides;
     std::int64_t offset = 0; // byte offset of the first element in the buffer
 
     // C-contiguous layout of `shape`; a 0-d shape is a scalar with one element.
@@ -39,8 +44,10 @@ Layout broadcast_to(const Layout& in, const Shape& target);
 // set of operands, all already broadcast to `shape` (`layouts[k]`, first
 // element at `base[k]`). A 0-d shape is one row of one element. Returns
 // false as soon as `row` returns false.
+using OperandPointers = SmallVector<char*, 8>;
+
 template <class RowFn>
-bool for_each_row(const Shape& shape, const std::vector<Layout>& layouts, std::vector<char*> ptrs,
+bool for_each_row(const Shape& shape, const std::vector<Layout>& layouts, OperandPointers ptrs,
                   RowFn&& row) {
     for (std::int64_t d : shape) {
         if (d == 0) {
@@ -50,11 +57,11 @@ bool for_each_row(const Shape& shape, const std::vector<Layout>& layouts, std::v
     const std::size_t nops = layouts.size();
     const std::size_t nd = shape.size();
     const std::intptr_t count = nd == 0 ? 1 : static_cast<std::intptr_t>(shape[nd - 1]);
-    std::vector<std::intptr_t> strides(nops);
+    SmallVector<std::intptr_t, 8> strides(nops);
     for (std::size_t k = 0; k < nops; ++k) {
         strides[k] = nd == 0 ? 0 : static_cast<std::intptr_t>(layouts[k].strides[nd - 1]);
     }
-    std::vector<std::int64_t> index(nd > 0 ? nd - 1 : 0, 0);
+    SmallVector<std::int64_t, kInlineRank> index(nd > 0 ? nd - 1 : 0, 0);
     for (;;) {
         if (!row(ptrs.data(), count, strides.data())) {
             return false;

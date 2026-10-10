@@ -154,3 +154,99 @@ def test_import_viproc_as_np():
     assert isinstance(b, viproc.ndarray)
     assert same(b, np.sin(np.arange(10.0)) + 1)
     assert vnp.float64 is np.float64
+
+
+# --- operators and the C fast path ------------------------------------------
+
+OPS = [
+    lambda a, b: a + b, lambda a, b: a - b, lambda a, b: a * b, lambda a, b: a / b,
+    lambda a, b: a // b, lambda a, b: a % b, lambda a, b: a ** b,
+    lambda a, b: a < b, lambda a, b: a <= b, lambda a, b: a == b, lambda a, b: a != b,
+    lambda a, b: a > b, lambda a, b: a >= b,
+]
+
+
+@pytest.mark.parametrize("op", OPS)
+@pytest.mark.parametrize("dtype", [np.int64, np.float64, np.float32])
+def test_binary_operators_match_numpy(op, dtype):
+    a = (rng.standard_normal(20) * 5 + 10).astype(dtype)
+    b = (rng.standard_normal(20) * 2 + 3).astype(dtype)
+    va, vb = viproc.asarray(a), viproc.asarray(b)
+    with np.errstate(all="ignore"):
+        expected = op(a, b)
+        assert same(op(va, vb), expected)  # both viproc
+        assert same(op(va, b), expected)  # NumPy array on the right
+        assert same(op(a, vb), expected)  # NumPy array on the left (reflected)
+        assert same(op(va, 2), op(a, 2))  # Python scalar
+        assert same(op(3.5, va), op(3.5, a))  # reflected Python scalar
+        assert same(op(va, dtype(2)), op(a, dtype(2)))  # NumPy scalar
+
+
+def test_bitwise_and_unary_operators():
+    a = np.arange(-8, 8, dtype=np.int32)
+    va = viproc.asarray(a)
+    assert same(va & 3, a & 3) and same(va | 4, a | 4) and same(va ^ 5, a ^ 5)
+    assert same(va << 2, a << 2) and same(va >> 1, a >> 1)
+    assert same(-va, -a) and same(+va, +a) and same(abs(va), abs(a)) and same(~va, ~a)
+
+
+def test_divmod_matmul_and_pow_with_mod_fall_back():
+    a = np.arange(1.0, 10.0)
+    va = viproc.asarray(a)
+    q, r = divmod(va, 4.0)
+    assert same(q, a // 4.0) and same(r, a % 4.0)
+    m = rng.standard_normal((4, 4))
+    assert same(viproc.asarray(m) @ viproc.asarray(m), m @ m)
+    with pytest.raises(TypeError):
+        pow(viproc.asarray(np.arange(3)), 2, 5)
+
+
+def test_inplace_operators_all_kinds():
+    a = np.arange(1, 13, dtype=np.int64)
+    va = viproc.asarray(a)
+    for op in ("__iadd__", "__isub__", "__imul__", "__ifloordiv__", "__imod__",
+               "__ilshift__", "__irshift__", "__iand__", "__ior__", "__ixor__"):
+        getattr(va, op)(3)
+        getattr(a, op)(3)
+    assert same(va, a)
+
+
+def test_inplace_cast_error_like_numpy():
+    va = viproc.asarray(np.arange(4))
+    with pytest.raises(TypeError):  # UFuncTypeError: float64 result into int64
+        va /= 2
+    with pytest.raises(TypeError):
+        np.true_divide(np.arange(4), 2, out=np.arange(4))
+
+
+def test_python_int_overflow_like_numpy():
+    v = viproc.asarray(np.arange(3, dtype=np.int32))
+    with pytest.raises(OverflowError):
+        v + 2**40
+    with pytest.raises(OverflowError):
+        np.arange(3, dtype=np.int32) + 2**40
+
+
+def test_comparison_with_non_array_operands():
+    va = viproc.asarray(np.arange(3.0))
+    assert same(va == None, np.arange(3.0) == None)  # noqa: E711
+
+
+def test_classes_opting_out_of_numpy_get_their_reflected_operator():
+    class OptOut:
+        __array_ufunc__ = None
+
+        def __radd__(self, other):
+            return "OptOut.__radd__"
+
+    assert viproc.asarray(np.arange(3.0)) + OptOut() == "OptOut.__radd__"
+
+
+def test_operator_results_are_pending_until_computed():
+    x = viproc.asarray(rng.standard_normal(2_000_000))
+    y = x
+    for _ in range(5):
+        y = np.sqrt(y * y + 1.0)  # issued here; result pending
+    assert not y.ready()
+    y.wait()
+    assert y.ready()

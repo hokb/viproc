@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace viproc;
@@ -55,6 +56,10 @@ vp_dtype to_vp(DType d) { return static_cast<vp_dtype>(d); }
 
 struct vp_runtime {
     std::unique_ptr<Runtime> rt;
+    // Issue sites, interned: tasks keep a `const char*` to them. Grows with
+    // the number of distinct source locations only.
+    std::unordered_set<std::string> sites;
+    const char* intern(const char* site) { return sites.emplace(site).first->c_str(); }
     std::unique_ptr<numpy::LoopCache> loops;
     std::shared_ptr<Graveyard> graveyard = std::make_shared<Graveyard>();
 };
@@ -124,6 +129,15 @@ int vp_array_from_ndarray(vp_runtime* rt, PyObject* ndarray, vp_array** out, cha
     return VP_OK;
 }
 
+int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array** out) {
+    ArrayPtr a = numpy::scalar_array(*rt->rt, value, to_dtype(dtype));
+    if (!a) {
+        return VP_PYERR;
+    }
+    *out = new vp_array{std::move(a)};
+    return VP_OK;
+}
+
 vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, int ndim, const int64_t* shape,
                         const int64_t* strides, int64_t offset) {
     Layout l;
@@ -179,7 +193,8 @@ int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, 
         return VP_UNSUPPORTED;
     }
     Shape shape(out_shape, out_shape + out_ndim);
-    auto kernel = numpy::make_elementwise_kernel(loop);
+    const std::shared_ptr<Kernel>& kernel = loop->elementwise_kernel();
+    const char* interned = rt->intern(site);
     if (out != nullptr) {
         const Layout& ol = out->array->layout();
         if (ol.shape != shape || ol.dtype != to_dtype(out_dtype)) {
@@ -187,12 +202,12 @@ int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, 
             return VP_INVALID;
         }
         std::vector<ArrayPtr> io{out->array};
-        rt->rt->issue(std::move(kernel), ins, io, {}, site);
+        rt->rt->issue(kernel, ins, io, {}, interned);
         *result = nullptr;
         return VP_OK;
     }
     Layout l = Layout::contiguous(to_dtype(out_dtype), std::move(shape));
-    std::vector<ArrayPtr> res = rt->rt->issue(std::move(kernel), ins, {}, std::span(&l, 1), site);
+    std::vector<ArrayPtr> res = rt->rt->issue(kernel, ins, {}, std::span(&l, 1), interned);
     *result = new vp_array{std::move(res[0])};
     return VP_OK;
 }
@@ -209,7 +224,8 @@ int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, ch
     }
     std::vector<ArrayPtr> ins{src->array};
     std::vector<ArrayPtr> io{dst->array};
-    rt->rt->issue(make_assign_kernel(), ins, io, {}, site);
+    static const std::shared_ptr<Kernel> assign = make_assign_kernel();
+    rt->rt->issue(assign, ins, io, {}, rt->intern(site));
     return VP_OK;
 }
 

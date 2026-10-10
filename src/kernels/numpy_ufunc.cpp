@@ -7,6 +7,8 @@
 #include <numpy/dtype_api.h>
 #include <numpy/ufuncobject.h>
 
+#include <cstring>
+
 namespace viproc::numpy {
 
 namespace {
@@ -153,6 +155,7 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve(PyObject* ufunc, std::span<const D
         error = "loop requires the Python API; cannot run asynchronously";
         return nullptr;
     }
+    loop->kernel_ = make_elementwise_kernel(loop.get());
     return loop;
 }
 
@@ -191,9 +194,11 @@ class ElementwiseKernel : public Kernel {
     // arrays the runtime lists as read (see Runtime::issue).
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Shape& shape = outputs[0].layout.shape;
+        const auto nin = static_cast<std::size_t>(loop_->nin());
         std::vector<Layout> layouts;
-        std::vector<char*> base;
-        for (const Operand& op : inputs.first(static_cast<std::size_t>(loop_->nin()))) {
+        layouts.reserve(nin + outputs.size());
+        OperandPointers base;
+        for (const Operand& op : inputs.first(nin)) {
             layouts.push_back(broadcast_to(op.layout, shape));
             base.push_back(reinterpret_cast<char*>(op.first()));
         }
@@ -252,6 +257,20 @@ ArrayPtr wrap_ndarray(Runtime& rt, PyObject* obj, std::string& error, std::share
     l.offset = -lo;
     auto buffer = std::make_shared<Buffer>(PyArray_BYTES(arr) + lo,
                                            static_cast<std::size_t>(hi - lo), std::move(owner));
+    return rt.wrap(std::move(l), std::move(buffer));
+}
+
+ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype) {
+    PyArray_Descr* descr = PyArray_DescrFromType(type_num(dtype));
+    PyObject* arr = PyArray_FromAny(value, descr, 0, 0, 0, nullptr); // steals descr
+    if (arr == nullptr) {
+        return nullptr;
+    }
+    Layout l = Layout::contiguous(dtype, {});
+    auto buffer = std::make_shared<Buffer>(l.nbytes());
+    buffer->ensure_allocated();
+    std::memcpy(buffer->data(), PyArray_DATA(reinterpret_cast<PyArrayObject*>(arr)), l.nbytes());
+    Py_DECREF(arr);
     return rt.wrap(std::move(l), std::move(buffer));
 }
 
