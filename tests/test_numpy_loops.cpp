@@ -13,6 +13,7 @@
 #include <numpy/arrayobject.h>
 #include <numpy/dtype_api.h>
 
+#include <algorithm>
 #include <cfenv>
 #include <cstdio>
 #include <functional>
@@ -52,7 +53,10 @@ struct ResolvedLoop {
 };
 
 // Caller thread, GIL held. `dtypes` is a tuple of dtype objects or None.
-ResolvedLoop resolve_loop(PyObject* ufunc, PyObject* dtypes, bool reduction) {
+// `fixed_strides` (a tuple, or nullptr) is passed to _get_strided_loop like
+// NumPy does when it knows the strides; it may select a specialized loop.
+ResolvedLoop resolve_loop(PyObject* ufunc, PyObject* dtypes, bool reduction,
+                          PyObject* fixed_strides = nullptr) {
     ResolvedLoop r;
     PyObject* meth = PyObject_GetAttrString(ufunc, "_resolve_dtypes_and_context");
     PyObject* args = PyTuple_Pack(1, dtypes);
@@ -69,7 +73,16 @@ ResolvedLoop resolve_loop(PyObject* ufunc, PyObject* dtypes, bool reduction) {
     Py_INCREF(r.capsule);
     Py_DECREF(res);
 
-    PyObject* filled = PyObject_CallMethod(ufunc, "_get_strided_loop", "O", r.capsule);
+    PyObject* get = PyObject_GetAttrString(ufunc, "_get_strided_loop");
+    PyObject* get_args = PyTuple_Pack(1, r.capsule);
+    PyObject* get_kwargs = PyDict_New();
+    if (fixed_strides != nullptr) {
+        PyDict_SetItemString(get_kwargs, "fixed_strides", fixed_strides);
+    }
+    PyObject* filled = PyObject_Call(get, get_args, get_kwargs);
+    Py_DECREF(get);
+    Py_DECREF(get_args);
+    Py_DECREF(get_kwargs);
     if (filled == nullptr) {
         PyErr_Print();
         Py_CLEAR(r.capsule);
@@ -170,32 +183,85 @@ void test_binary_broadcast(PyObject* np, PyObject* g) {
     Py_DECREF(s);
 }
 
+// Sums `a` with NumPy's add loop on a worker thread, the way a reduction
+// calls it: args = {acc, in, acc}, acc stride 0, acc starting at 0 (add's
+// identity). The input is passed in calls of at most `chunk` elements.
+PyObject* worker_sum(PyObject* np, PyObject* g, PyObject* a, PyObject* fixed_strides,
+                     npy_intp chunk) {
+    PyObject* acc = eval("np.zeros((), dtype='f8')", g);
+    PyObject* add = np_attr(np, "add");
+    PyObject* dtypes = eval("(None, np.dtype('f8'), None)", g);
+    ResolvedLoop loop = resolve_loop(add, dtypes, true, fixed_strides);
+    Py_DECREF(dtypes);
+    Py_DECREF(add);
+    if (loop.info == nullptr) {
+        Py_DECREF(acc);
+        return nullptr;
+    }
+    const npy_intp n = PyArray_SIZE((PyArrayObject*)a);
+    char* in = data_of(a);
+    int rc = 0;
+    run_on_worker_without_gil([&] {
+        for (npy_intp start = 0; start < n && rc == 0; start += chunk) {
+            char* data[3] = {data_of(acc), in + start * sizeof(double), data_of(acc)};
+            npy_intp dims[1] = {std::min(chunk, n - start)};
+            npy_intp strides[3] = {0, sizeof(double), 0};
+            rc = loop.info->strided_loop(loop.info->context, data, dims, strides,
+                                         loop.info->auxdata);
+        }
+    });
+    Py_XDECREF(loop.capsule);
+    if (rc != 0) {
+        Py_DECREF(acc);
+        return nullptr;
+    }
+    return acc;
+}
+
 void test_sum_reduction(PyObject* np, PyObject* g) {
     PyObject* a = eval("rng.standard_normal(100003)", g);
     PyDict_SetItemString(g, "_a", a);
     PyObject* expected = eval("np.sum(_a)", g);
-    PyObject* acc = eval("np.zeros((), dtype='f8')", g);
+    PyObject* fixed = eval("(0, 8, 0)", g);
+    const npy_intp n = PyArray_SIZE((PyArrayObject*)a);
 
-    PyObject* add = np_attr(np, "add");
-    PyObject* dtypes = eval("(None, np.dtype('f8'), None)", g);
-    ResolvedLoop loop = resolve_loop(add, dtypes, true);
-    check(loop.info != nullptr, "add.reduce f8: loop resolved");
+    // Variants of calling the loop; NumPy must match the first one. The others
+    // are printed to find out how NumPy calls it where it does not.
+    struct Variant {
+        const char* name;
+        PyObject* fixed_strides;
+        npy_intp chunk;
+    };
+    const Variant variants[] = {
+        {"one call, fixed strides", fixed, n},
+        {"one call, generic strides", nullptr, n},
+        {"chunks of 8192, fixed strides", fixed, 8192},
+        {"chunks of 8192, generic strides", nullptr, 8192},
+    };
+    bool canonical = false;
+    std::string matching;
+    for (const Variant& v : variants) {
+        PyObject* got = worker_sum(np, g, a, v.fixed_strides, v.chunk);
+        const bool eq = got != nullptr && array_equal(np, got, expected);
+        if (eq) {
+            matching += std::string(matching.empty() ? "" : ", ") + v.name;
+        }
+        canonical = canonical || (eq && &v == &variants[0]);
+        Py_XDECREF(got);
+    }
+    check(canonical, "sum f8: bit-identical to np.sum (one loop call, fixed strides)");
+    if (!canonical) {
+        PyObject* info =
+            eval("f'numpy {np.__version__}, np.sum = {float(np.sum(_a)).hex()}, '"
+                 "f'dispatch {getattr(np._core._multiarray_umath, \"__cpu_dispatch__\", \"?\")}'",
+                 g);
+        std::printf("     info: %s\n", info != nullptr ? PyUnicode_AsUTF8(info) : "?");
+        std::printf("     variants matching np.sum: %s\n",
+                    matching.empty() ? "none" : matching.c_str());
+        Py_XDECREF(info);
+    }
 
-    // NumPy reduce pattern: args = {acc, in, acc}, acc stride 0.
-    npy_intp n = PyArray_SIZE((PyArrayObject*)a);
-    char* data[3] = {data_of(acc), data_of(a), data_of(acc)};
-    npy_intp dims[1] = {n};
-    npy_intp strides[3] = {0, sizeof(double), 0};
-    int rc = -1;
-    run_on_worker_without_gil([&] {
-        rc = loop.info->strided_loop(loop.info->context, data, dims, strides, loop.info->auxdata);
-    });
-    check(rc == 0 && array_equal(np, acc, expected), "sum f8: bit-identical to np.sum");
-
-    Py_XDECREF(loop.capsule);
-    Py_DECREF(dtypes);
-    Py_DECREF(add);
-    Py_DECREF(acc);
+    Py_DECREF(fixed);
     Py_DECREF(expected);
     Py_DECREF(a);
 }

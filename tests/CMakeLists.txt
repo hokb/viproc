@@ -19,8 +19,16 @@ target_link_libraries(test_numpy_runtime PRIVATE viproc_numpy Python3::Python vi
 add_test(NAME numpy_runtime COMMAND test_numpy_runtime)
 
 # Python bridge (pytest), against the package assembled in the build tree.
-add_test(NAME python COMMAND ${Python3_EXECUTABLE} -m pytest -q ${CMAKE_SOURCE_DIR}/python/tests)
-set_tests_properties(python PROPERTIES ENVIRONMENT "PYTHONPATH=${VIPROC_PYTHON_DIR}")
+execute_process(COMMAND ${Python3_EXECUTABLE} -c "import pytest"
+                RESULT_VARIABLE VIPROC_NO_PYTEST OUTPUT_QUIET ERROR_QUIET)
+if(VIPROC_NO_PYTEST)
+    message(WARNING "pytest is not installed for ${Python3_EXECUTABLE}: the Python bridge "
+                    "tests are not registered. Install it with: \"${Python3_EXECUTABLE}\" "
+                    "-m pip install pytest (then re-run CMake).")
+else()
+    add_test(NAME python COMMAND ${Python3_EXECUTABLE} -m pytest -q ${CMAKE_SOURCE_DIR}/python/tests)
+    set_tests_properties(python PROPERTIES ENVIRONMENT "PYTHONPATH=${VIPROC_PYTHON_DIR}")
+endif()
 
 # Test executables that embed Python start it as the interpreter CMake found
 # (see embed_python.h). On Windows they also need the Python DLL on PATH.
