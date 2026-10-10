@@ -39,8 +39,8 @@ constexpr const char* kCallInfoCapsule = "numpy_1.24_ufunc_call_info";
 
 int g_failures = 0;
 
-void check(bool ok, const char* what) {
-    std::printf("%s %s\n", ok ? "PASS" : "FAIL", what);
+void check(bool ok, const std::string& what) {
+    std::printf("%s %s\n", ok ? "PASS" : "FAIL", what.c_str());
     if (!ok) {
         ++g_failures;
     }
@@ -225,14 +225,26 @@ void test_sum_reduction(PyObject* np, PyObject* g) {
     PyObject* fixed = eval("(0, 8, 0)", g);
     const npy_intp n = PyArray_SIZE((PyArrayObject*)a);
 
-    // Variants of calling the loop; NumPy must match the first one. The others
-    // are printed to find out how NumPy calls it where it does not.
+    // How NumPy calls the loop for np.sum depends on its version: up to 2.2 in
+    // chunks of the buffer size (np.getbufsize(), default 8192), from 2.3 on in
+    // one call. The first variant is the expected one; the others are printed
+    // on a mismatch to find out what NumPy does instead.
+    PyObject* old_obj = eval("np.lib.NumpyVersion(np.__version__) < '2.3.0'", g);
+    PyObject* bufsize_obj = eval("np.getbufsize()", g);
+    const bool chunked = old_obj == Py_True;
+    const npy_intp bufsize = PyLong_AsSsize_t(bufsize_obj);
+    Py_XDECREF(old_obj);
+    Py_XDECREF(bufsize_obj);
+    const std::string expected_name =
+        chunked ? "chunks of np.getbufsize() (NumPy < 2.3)" : "one call (NumPy >= 2.3)";
+
     struct Variant {
         const char* name;
         PyObject* fixed_strides;
         npy_intp chunk;
     };
     const Variant variants[] = {
+        {expected_name.c_str(), fixed, chunked ? bufsize : n},
         {"one call, fixed strides", fixed, n},
         {"one call, generic strides", nullptr, n},
         {"chunks of 8192, fixed strides", fixed, 8192},
@@ -249,7 +261,7 @@ void test_sum_reduction(PyObject* np, PyObject* g) {
         canonical = canonical || (eq && &v == &variants[0]);
         Py_XDECREF(got);
     }
-    check(canonical, "sum f8: bit-identical to np.sum (one loop call, fixed strides)");
+    check(canonical, "sum f8: bit-identical to np.sum, loop called as " + expected_name);
     if (!canonical) {
         PyObject* info =
             eval("f'numpy {np.__version__}, np.sum = {float(np.sum(_a)).hex()}, '"

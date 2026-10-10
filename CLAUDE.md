@@ -409,10 +409,14 @@ Rules:
   reduction into chunks changes rounding; call the loop with the same
   blocks NumPy would to stay bit-identical. Pass `fixed_strides` to
   `_get_strided_loop` when the strides are known, as NumPy does; it may
-  select a specialized loop. Observed: `np.sum` of 100003 float64 is
-  bit-identical to one loop call on Linux (NumPy 2.5.3), but not on a
-  Windows machine; `test_numpy_loops` prints which calling variant
-  matches there (open question).
+  select a specialized loop.
+- **NumPy's reduction chunking depends on its version** (measured for a
+  contiguous 1-d float64 `np.sum`, 100003 elements, NumPy 2.1–2.5):
+  **up to 2.2** the loop is called in chunks of `np.getbufsize()` (default
+  8192; users can change it, so read it at issue time); **from 2.3 on** in
+  one call, independent of the buffer size. `test_numpy_loops` checks the
+  rule for the installed version. Axis reductions and strided inputs are
+  not measured yet; check them the same way before relying on them.
 - **`argmin`/`argmax`** come from NumPy too: the per-dtype functions in
   `PyDataType_GetArrFuncs(descr)->argmax` / `->argmin`
   (`int f(void *data, npy_intp n, npy_intp *index, void *arr)`).
@@ -562,6 +566,4 @@ functions.
 - [ ] `should_offload` heuristic for tasks whose inputs are all completed.
 - [ ] Per-op overhead of the bridge (~35 µs): move `_issue_ufunc` to C,
       cache dtype resolution per (ufunc, dtypes).
-- [ ] Reductions on Windows: which loop / chunking does `np.sum` use there
-      (see `test_numpy_loops` output)? Needed before async reductions.
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.
