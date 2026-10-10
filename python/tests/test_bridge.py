@@ -250,3 +250,19 @@ def test_operator_results_are_pending_until_computed():
     assert not y.ready()
     y.wait()
     assert y.ready()
+
+
+def test_issue_site_names_the_user_code_line():
+    from viproc import _viproc
+
+    def caller():
+        return _viproc._issue_site()  # the line below must be reported
+
+    site = caller()
+    assert site.endswith("in test_issue_site_names_the_user_code_line.<locals>.caller")
+    assert "test_bridge.py:" in site
+    line = int(site.split("test_bridge.py:")[1].split(" ")[0])
+    import inspect
+    assert line == inspect.getsourcelines(caller)[1] + 1
+    sites = {caller() for _ in range(3)}  # cached: same interned site
+    assert sites == {site}

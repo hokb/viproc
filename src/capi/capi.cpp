@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -54,6 +55,11 @@ vp_dtype to_vp(DType d) { return static_cast<vp_dtype>(d); }
 
 } // namespace
 
+struct vp_loop {
+    const numpy::UfuncLoop* loop; // owned by vp_runtime::loops
+    std::vector<DType> dtypes;    // inputs, then the output
+};
+
 struct vp_runtime {
     std::unique_ptr<Runtime> rt;
     // Issue sites, interned: tasks keep a `const char*` to them. Grows with
@@ -61,6 +67,8 @@ struct vp_runtime {
     std::unordered_set<std::string> sites;
     const char* intern(const char* site) { return sites.emplace(site).first->c_str(); }
     std::unique_ptr<numpy::LoopCache> loops;
+    // One handle per resolved loop (node-based: stable addresses).
+    std::unordered_map<const numpy::UfuncLoop*, vp_loop> handles;
     std::shared_ptr<Graveyard> graveyard = std::make_shared<Graveyard>();
 };
 
@@ -129,6 +137,8 @@ int vp_array_from_ndarray(vp_runtime* rt, PyObject* ndarray, vp_array** out, cha
     return VP_OK;
 }
 
+const char* vp_intern(vp_runtime* rt, const char* site) { return rt->intern(site); }
+
 int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array** out) {
     ArrayPtr a = numpy::scalar_array(*rt->rt, value, to_dtype(dtype));
     if (!a) {
@@ -170,19 +180,14 @@ int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
 
 PyObject* vp_array_to_ndarray(const vp_array* a) { return numpy::to_ndarray(*a->array); }
 
-int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, vp_dtype out_dtype,
-             int out_ndim, const int64_t* out_shape, vp_array* out, vp_array** result,
-             const char* site, char* err, size_t errlen) {
-    rt->graveyard->drain();
-    std::vector<DType> dtypes;
-    std::vector<ArrayPtr> ins;
-    for (int i = 0; i < nin; ++i) {
-        dtypes.push_back(inputs[i]->array->layout().dtype);
-        ins.push_back(inputs[i]->array);
+int vp_ufunc_loop(vp_runtime* rt, PyObject* ufunc, int nin, const vp_dtype* dtypes,
+                  const vp_loop** out, char* err, size_t errlen) {
+    std::vector<DType> d;
+    for (int i = 0; i <= nin; ++i) {
+        d.push_back(to_dtype(dtypes[i]));
     }
-    dtypes.push_back(to_dtype(out_dtype));
     std::string e;
-    const numpy::UfuncLoop* loop = rt->loops->get(ufunc, dtypes, e);
+    const numpy::UfuncLoop* loop = rt->loops->get(ufunc, d, e);
     if (loop == nullptr) {
         PyErr_Clear();
         set_error(err, errlen, e);
@@ -192,24 +197,57 @@ int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, 
         set_error(err, errlen, "only ufuncs with one output are supported");
         return VP_UNSUPPORTED;
     }
+    *out = &rt->handles.try_emplace(loop, vp_loop{loop, std::move(d)}).first->second;
+    return VP_OK;
+}
+
+int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs, int out_ndim,
+                   const int64_t* out_shape, vp_array* out, vp_array** result, const char* site,
+                   char* err, size_t errlen) {
+    rt->graveyard->drain();
+    const int nin = loop->loop->nin();
+    ArrayPtr ins[3];
+    if (nin > 3) {
+        set_error(err, errlen, "too many inputs");
+        return VP_UNSUPPORTED;
+    }
+    for (int i = 0; i < nin; ++i) {
+        ins[i] = inputs[i]->array;
+    }
+    const DType out_dtype = loop->dtypes[static_cast<std::size_t>(nin)];
     Shape shape(out_shape, out_shape + out_ndim);
-    const std::shared_ptr<Kernel>& kernel = loop->elementwise_kernel();
-    const char* interned = rt->intern(site);
+    const std::shared_ptr<Kernel>& kernel = loop->loop->elementwise_kernel();
+    const std::span<const ArrayPtr> in_span(ins, static_cast<std::size_t>(nin));
     if (out != nullptr) {
         const Layout& ol = out->array->layout();
-        if (ol.shape != shape || ol.dtype != to_dtype(out_dtype)) {
+        if (ol.shape != shape || ol.dtype != out_dtype) {
             set_error(err, errlen, "out= array has the wrong shape or dtype");
             return VP_INVALID;
         }
-        std::vector<ArrayPtr> io{out->array};
-        rt->rt->issue(kernel, ins, io, {}, interned);
+        rt->rt->issue(kernel, in_span, std::span(&out->array, 1), {}, site);
         *result = nullptr;
         return VP_OK;
     }
-    Layout l = Layout::contiguous(to_dtype(out_dtype), std::move(shape));
-    std::vector<ArrayPtr> res = rt->rt->issue(kernel, ins, {}, std::span(&l, 1), interned);
+    Layout l = Layout::contiguous(out_dtype, std::move(shape));
+    std::vector<ArrayPtr> res = rt->rt->issue(kernel, in_span, {}, std::span(&l, 1), site);
     *result = new vp_array{std::move(res[0])};
     return VP_OK;
+}
+
+int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, vp_dtype out_dtype,
+             int out_ndim, const int64_t* out_shape, vp_array* out, vp_array** result,
+             const char* site, char* err, size_t errlen) {
+    std::vector<vp_dtype> dtypes;
+    for (int i = 0; i < nin; ++i) {
+        dtypes.push_back(to_vp(inputs[i]->array->layout().dtype));
+    }
+    dtypes.push_back(out_dtype);
+    const vp_loop* loop = nullptr;
+    const int st = vp_ufunc_loop(rt, ufunc, nin, dtypes.data(), &loop, err, errlen);
+    if (st != VP_OK) {
+        return st;
+    }
+    return vp_ufunc_issue(rt, loop, inputs, out_ndim, out_shape, out, result, site, err, errlen);
 }
 
 int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, char* err,
@@ -225,7 +263,7 @@ int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, ch
     std::vector<ArrayPtr> ins{src->array};
     std::vector<ArrayPtr> io{dst->array};
     static const std::shared_ptr<Kernel> assign = make_assign_kernel();
-    rt->rt->issue(assign, ins, io, {}, rt->intern(site));
+    rt->rt->issue(assign, ins, io, {}, site);
     return VP_OK;
 }
 

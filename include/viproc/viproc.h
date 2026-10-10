@@ -23,6 +23,7 @@ typedef struct _object PyObject;
 
 typedef struct vp_runtime vp_runtime;
 typedef struct vp_array vp_array;
+typedef struct vp_loop vp_loop;
 
 typedef enum vp_dtype {
     VP_BOOL,
@@ -96,6 +97,12 @@ PyObject* vp_array_to_ndarray(const vp_array* a);
 
 /* --- Ops (all [GIL], all asynchronous) ------------------------------------ */
 
+/* [GIL] Interns an issue-site description ("file:line in function") and
+ * returns a copy that stays valid until the runtime is destroyed. Ops take
+ * their `site` argument only from here: tasks keep the pointer, so passing
+ * it costs nothing per op. Callers should cache the result per site. */
+const char* vp_intern(vp_runtime* rt, const char* site);
+
 /* Issues `ufunc(inputs...)` with one output, using NumPy's loop for exactly
  * the dtypes (inputs..., out_dtype); no casting. Inputs broadcast to
  * out_shape.
@@ -103,13 +110,26 @@ PyObject* vp_array_to_ndarray(const vp_array* a);
  *  - out != NULL: writes into `out` (in/out semantics, `out=` / `a += b`);
  *    *result is set to NULL.
  * Returns VP_UNSUPPORTED if no matching loop exists or it needs the Python
- * API; the caller then falls back to NumPy. `site` names the issuing source
- * location; it is reported with errors. */
+ * API; the caller then falls back to NumPy. `site` (from vp_intern) names
+ * the issuing source location; it is reported with errors. */
 int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, vp_dtype out_dtype,
              int out_ndim, const int64_t* out_shape, vp_array* out, vp_array** result,
              const char* site, char* err, size_t errlen);
 
-/* Issues dst[...] = src (src broadcasts to dst's shape, same dtype). */
+/* Resolves NumPy's loop for `ufunc` with exactly `dtypes` (nin inputs, then
+ * the output) once; the handle stays valid until the runtime is destroyed.
+ * vp_ufunc_issue() then issues ops without any lookup. Returns
+ * VP_UNSUPPORTED (and a reason in `err`) like vp_ufunc(). */
+int vp_ufunc_loop(vp_runtime* rt, PyObject* ufunc, int nin, const vp_dtype* dtypes,
+                  const vp_loop** loop, char* err, size_t errlen);
+/* Like vp_ufunc(), with a loop from vp_ufunc_loop(). The inputs must have the
+ * loop's input dtypes. */
+int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs, int out_ndim,
+                   const int64_t* out_shape, vp_array* out, vp_array** result, const char* site,
+                   char* err, size_t errlen);
+
+/* Issues dst[...] = src (src broadcasts to dst's shape, same dtype). `site`
+ * comes from vp_intern. */
 int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, char* err,
               size_t errlen);
 

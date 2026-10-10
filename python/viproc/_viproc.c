@@ -34,9 +34,12 @@ static PyObject* g_np_generic = NULL;    /* numpy.generic */
 static PyObject* g_ops = NULL;           /* dict: operator name -> ufunc */
 
 /* Caches (main thread only). */
-static PyObject* g_ufunc_info = NULL;    /* ufunc -> (nin, nout, is_gufunc, {sigkey: resolved}) */
-static PyObject* g_code_internal = NULL; /* code object -> bool */
-static PyObject* g_sites = NULL;         /* (code, lineno) -> bytes */
+static PyObject* g_ufunc_info = NULL; /* ufunc -> (nin, nout, is_gufunc, {sigkey: resolved}) */
+/* Code objects are keyed by address: hashing a code object hashes its whole
+ * bytecode and constants. Each g_code_internal entry also holds the code
+ * object, so its address cannot be reused while it is cached. */
+static PyObject* g_code_internal = NULL; /* id(code) -> (code, is_internal) */
+static PyObject* g_sites = NULL;         /* (id(code), lasti) -> interned site (per runtime) */
 
 static PyObject* s_call = NULL; /* "__call__" */
 static PyObject* s_out = NULL;  /* "out" */
@@ -176,19 +179,19 @@ static int read_dims(PyObject* seq, int64_t* out) {
 }
 
 /* Issue site: "file:line in function" of the first frame outside viproc and
- * NumPy. Returns a borrowed, cached bytes object (never NULL: falls back to
- * "<unknown>"). */
+ * NumPy, interned in the runtime (vp_intern) and cached per (code object,
+ * bytecode offset). The offset, unlike the line number, is free to read: the
+ * line is computed only on a cache miss. Never NULL. */
 static const char* issue_site(void) {
-    static const char unknown[] = "<unknown>";
     PyFrameObject* f = PyEval_GetFrame(); /* borrowed */
     Py_XINCREF(f);
     while (f != NULL) {
         PyCodeObject* code = PyFrame_GetCode(f); /* new ref */
-        PyObject* internal = PyDict_GetItemWithError(g_code_internal, (PyObject*)code);
-        if (internal == NULL) {
-            if (PyErr_Occurred()) {
-                PyErr_Clear();
-            }
+        PyObject* id = PyLong_FromVoidPtr(code);
+        PyObject* entry = id != NULL ? PyDict_GetItemWithError(g_code_internal, id) : NULL;
+        PyObject* internal = entry != NULL ? PyTuple_GET_ITEM(entry, 1) : NULL;
+        if (internal == NULL && id != NULL) {
+            PyErr_Clear();
             PyObject* fn = PyObject_GetAttrString((PyObject*)code, "co_filename");
             int is_internal = 0;
             if (fn != NULL && g_internal_dirs != NULL) {
@@ -201,39 +204,50 @@ static const char* issue_site(void) {
             Py_XDECREF(fn);
             PyErr_Clear();
             internal = is_internal ? Py_True : Py_False;
-            PyDict_SetItem(g_code_internal, (PyObject*)code, internal);
+            PyObject* e = PyTuple_Pack(2, (PyObject*)code, internal);
+            if (e != NULL) {
+                PyDict_SetItem(g_code_internal, id, e);
+                Py_DECREF(e);
+            }
         }
         if (internal == Py_False) {
-            const int line = PyFrame_GetLineNumber(f);
-            PyObject* key = Py_BuildValue("(Oi)", (PyObject*)code, line);
-            PyObject* site = key != NULL ? PyDict_GetItemWithError(g_sites, key) : NULL;
-            if (site == NULL && key != NULL && !PyErr_Occurred()) {
+            const char* site = NULL;
+            PyObject* key = Py_BuildValue("(Oi)", id, PyFrame_GetLasti(f));
+            PyObject* hit = key != NULL ? PyDict_GetItemWithError(g_sites, key) : NULL;
+            if (hit != NULL) {
+                site = (const char*)PyLong_AsVoidPtr(hit);
+            } else if (key != NULL && !PyErr_Occurred()) {
                 PyObject* name = PyObject_GetAttrString((PyObject*)code, "co_qualname");
                 PyObject* fn = PyObject_GetAttrString((PyObject*)code, "co_filename");
-                site = PyBytes_FromFormat("%s:%d in %s", fn ? PyUnicode_AsUTF8(fn) : "?", line,
-                                          name ? PyUnicode_AsUTF8(name) : "?");
+                PyObject* text = PyBytes_FromFormat("%s:%d in %s", fn ? PyUnicode_AsUTF8(fn) : "?",
+                                                    PyFrame_GetLineNumber(f),
+                                                    name ? PyUnicode_AsUTF8(name) : "?");
                 Py_XDECREF(name);
                 Py_XDECREF(fn);
-                if (site != NULL) {
-                    PyDict_SetItem(g_sites, key, site);
-                    Py_DECREF(site); /* now owned by the cache */
+                if (text != NULL) {
+                    site = vp_intern(g_rt, PyBytes_AS_STRING(text));
+                    Py_DECREF(text);
+                    PyObject* v = PyLong_FromVoidPtr((void*)site);
+                    if (v != NULL) {
+                        PyDict_SetItem(g_sites, key, v);
+                        Py_DECREF(v);
+                    }
                 }
             }
             Py_XDECREF(key);
+            Py_XDECREF(id);
             Py_DECREF(code);
             Py_DECREF(f);
-            if (site == NULL) {
-                PyErr_Clear();
-                return unknown;
-            }
-            return PyBytes_AS_STRING(site);
+            PyErr_Clear();
+            return site != NULL ? site : vp_intern(g_rt, "<unknown>");
         }
+        Py_XDECREF(id);
         Py_DECREF(code);
         PyFrameObject* back = PyFrame_GetBack(f); /* new ref */
         Py_DECREF(f);
         f = back;
     }
-    return unknown;
+    return vp_intern(g_rt, "<unknown>");
 }
 
 /* --- the ufunc fast path -------------------------------------------------- */
@@ -334,8 +348,10 @@ static PyObject* ufunc_info(PyObject* ufunc) {
 }
 
 /* Resolved dtype codes for (ufunc, kinds): out[0..nin) inputs, out[nin] the
- * output. Returns 1 if supported, 0 if not, -1 on error. Cached. */
-static int resolve(PyObject* ufunc, PyObject* sigcache, int nin, const int* kinds, int* out) {
+ * output, plus NumPy's loop for them. Returns 1 if supported, 0 if not, -1 on
+ * error. Cached per runtime (the loop handles belong to it). */
+static int resolve(PyObject* ufunc, PyObject* sigcache, int nin, const int* kinds, int* out,
+                   const vp_loop** loop) {
     unsigned long long key = 0;
     for (int i = 0; i < nin; ++i) {
         key |= (unsigned long long)kinds[i] << (8 * i);
@@ -346,8 +362,10 @@ static int resolve(PyObject* ufunc, PyObject* sigcache, int nin, const int* kind
     }
     PyObject* hit = PyDict_GetItemWithError(sigcache, k);
     long long packed;
+    *loop = NULL;
     if (hit != NULL) {
-        packed = PyLong_AsLongLong(hit);
+        packed = PyLong_AsLongLong(PyTuple_GET_ITEM(hit, 0));
+        *loop = (const vp_loop*)PyLong_AsVoidPtr(PyTuple_GET_ITEM(hit, 1));
     } else if (PyErr_Occurred()) {
         Py_DECREF(k);
         return -1;
@@ -376,7 +394,18 @@ static int resolve(PyObject* ufunc, PyObject* sigcache, int nin, const int* kind
             Py_DECREF(res);
             packed = ok ? p : -1;
         }
-        PyObject* v = PyLong_FromLongLong(packed);
+        if (packed >= 0) {
+            vp_dtype dts[MAXIN + 1];
+            for (int i = 0; i <= nin; ++i) {
+                dts[i] = (vp_dtype)((packed >> (8 * i)) & 0xff);
+            }
+            char err[ERRLEN];
+            if (vp_ufunc_loop(g_rt, ufunc, nin, dts, loop, err, sizeof err) != VP_OK) {
+                packed = -1; /* no exact NumPy loop (or it needs the Python API) */
+                *loop = NULL;
+            }
+        }
+        PyObject* v = Py_BuildValue("(LN)", packed, PyLong_FromVoidPtr((void*)*loop));
         if (v == NULL || PyDict_SetItem(sigcache, k, v) < 0) {
             Py_XDECREF(v);
             Py_DECREF(k);
@@ -441,7 +470,8 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
         }
     }
     int codes[MAXIN + 1];
-    int r = resolve(ufunc, PyTuple_GET_ITEM(info, 3), (int)n, kinds, codes);
+    const vp_loop* loop = NULL;
+    int r = resolve(ufunc, PyTuple_GET_ITEM(info, 3), (int)n, kinds, codes, &loop);
     if (r <= 0) {
         return r;
     }
@@ -490,9 +520,9 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
     if (status == 0) {
         char err[ERRLEN] = "";
         vp_array* res = NULL;
-        int st = vp_ufunc(g_rt, ufunc, (int)n, ins, (vp_dtype)codes[n], ndim, shape,
-                          out != NULL ? ((ArrayObject*)out)->a : NULL, &res, issue_site(), err,
-                          sizeof err);
+        int st = vp_ufunc_issue(g_rt, loop, ins, ndim, shape,
+                                out != NULL ? ((ArrayObject*)out)->a : NULL, &res, issue_site(),
+                                err, sizeof err);
         if (st == VP_OK) {
             *result = out != NULL ? Py_NewRef(out) : wrap_array(res);
             handled = *result != NULL ? 1 : -1;
@@ -800,6 +830,8 @@ static PyObject* m_shutdown(PyObject* self, PyObject* noargs) {
     if (g_rt != NULL) {
         vp_runtime* rt = g_rt;
         g_rt = NULL;
+        PyDict_Clear(g_sites);      /* interned in the runtime being destroyed */
+        PyDict_Clear(g_ufunc_info); /* holds its loop handles */
         vp_runtime_destroy(rt);
     }
     Py_RETURN_NONE;
@@ -933,7 +965,17 @@ static PyObject* m_assign(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+static PyObject* m_issue_site(PyObject* self, PyObject* noargs) {
+    (void)self;
+    (void)noargs;
+    if (check_runtime() < 0) {
+        return NULL;
+    }
+    return PyUnicode_FromString(issue_site());
+}
+
 static PyMethodDef methods[] = {
+    {"_issue_site", m_issue_site, METH_NOARGS, "The issue site an op issued here would get."},
     {"setup", m_setup, METH_VARARGS,
      "setup(cls, dtypes, fallback, asarray, internal_dirs, ops, ndarray, generic)"},
     {"init", m_init, METH_VARARGS, "init(workers=0, max_active_tasks=0)"},

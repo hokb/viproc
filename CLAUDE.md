@@ -493,15 +493,25 @@ Rules:
   NumPy's conversion rules), broadcasting and the issue site. Whatever it
   does not handle goes to the Python fallback, so NumPy semantics (errors
   included) stay NumPy's.
-- The issue site is the first stack frame outside viproc and NumPy,
-  formatted once per (code object, line) and interned by the C ABI
-  (tasks keep a `const char*`).
+- The issue site is the first stack frame outside viproc and NumPy. It is
+  cached per (code object address, bytecode offset), formatted only on a
+  miss and interned once with `vp_intern`; tasks keep that pointer. Never
+  key dicts by code object: hashing one hashes its whole bytecode
+  (~3000 instructions per lookup; it was 20% of the per-op cost).
+- Loops are resolved once per (ufunc, input kinds) into a `vp_loop`
+  handle (`vp_ufunc_loop`) kept in the dtype-resolution cache; ops are
+  issued with `vp_ufunc_issue` without any lookup. Both caches are
+  cleared when the runtime shuts down (handles and interned sites belong
+  to it).
+- Evaluated and rejected: caching/reusing `viproc.ndarray` objects. Their
+  allocation and deallocation is ~1% of the per-op instructions.
 - One Python thread only: the thread that initialized the runtime.
-- Per-op cost on the main thread (8-element arrays, Release): ~2.5–7 µs
-  (NumPy itself: ~0.7 µs), down from 31–41 µs with the Python hot path.
+- Per-op cost on the main thread (`x * y`, 8 elements, Release): ~7,000
+  instructions (callgrind), ~1.3 µs with one worker (NumPy itself:
+  ~0.5 µs); it was 31–41 µs with the Python hot path.
 - Measured (4 CPUs, `strong_scaling.py`, 8 chains, Release build, speedup
-  vs. NumPy with 4 workers): 1e6 elements 3.5x; 1e5 3.0x; 1e4 2.4x;
-  1e3 0.8–1.0x. Tiny ops are now dominated by handing tasks to workers;
+  vs. NumPy with 4 workers): 1e6 elements 3.5x; 1e5 3.0x; 1e4 ~3x;
+  1e3 ~1x (noisy). Tiny ops are now dominated by handing tasks to workers;
   `should_offload` (run tiny ready tasks inline) is the next lever.
 
 ## Implementation notes (current code)
