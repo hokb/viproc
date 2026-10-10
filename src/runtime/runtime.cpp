@@ -1,0 +1,449 @@
+#include "runtime.hpp"
+
+#include "pool.hpp"
+
+#include <algorithm>
+#include <chrono>
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#include <immintrin.h>
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+#include <intrin.h>
+#endif
+#include <cstring>
+
+namespace viproc {
+
+namespace {
+
+// Tells the CPU we are spin-waiting (cheaper than a yield syscall).
+inline void cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    _mm_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#if defined(_MSC_VER)
+    __yield();
+#else
+    asm volatile("yield");
+#endif
+#else
+    std::this_thread::yield();
+#endif
+}
+
+} // namespace
+
+Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_(options_.offload) {
+    std::size_t n = options_.workers;
+    if (n == 0) {
+        n = std::max(1u, std::thread::hardware_concurrency());
+    }
+    if (options_.max_active_tasks == 0) {
+        options_.max_active_tasks = 1;
+    }
+    workers_.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        workers_.emplace_back([this] { worker_loop(); });
+    }
+}
+
+Runtime::~Runtime() {
+    wait_all();
+    {
+        std::lock_guard lock(queue_mutex_);
+        stopping_ = true;
+    }
+    queue_cv_.notify_all();
+    for (std::thread& t : workers_) {
+        t.join();
+    }
+}
+
+namespace {
+
+// Copies a whole buffer (copy-on-write with views).
+class CopyKernel : public Kernel {
+  public:
+    KernelResult run(std::span<const Operand> in, std::span<const Operand> out) override {
+        std::memcpy(out[0].first(), in[0].first(), in[0].layout.nbytes());
+        return {};
+    }
+};
+
+bool same_view(const Layout& x, const Layout& y) {
+    return x.dtype == y.dtype && x.shape == y.shape && x.strides == y.strides &&
+           x.offset == y.offset;
+}
+
+Layout bytes_of(const Buffer& b) {
+    return Layout::contiguous(DType::Bool, {static_cast<std::int64_t>(b.nbytes())});
+}
+
+} // namespace
+
+namespace {
+
+using BlockPool = FixedPool<sizeof(ArrayBlock), alignof(ArrayBlock)>;
+
+ArrayBlock* new_block(int alive) {
+    auto* b = ::new (BlockPool::allocate()) ArrayBlock();
+    b->alive = alive;
+    return b;
+}
+
+void free_block(ArrayBlock* b) {
+    b->~ArrayBlock();
+    BlockPool::deallocate(b);
+}
+
+} // namespace
+
+void Storage::last_ref_dropped(Storage* s) {
+    ArrayBlock* b = s->block_;
+    b->storage.reset();
+    if (--b->alive == 0) {
+        free_block(b);
+    }
+}
+
+void Array::last_ref_dropped(Array* a) {
+    ArrayBlock* b = a->block_;
+    b->array.reset(); // may drop the storage of the same block first
+    if (--b->alive == 0) {
+        free_block(b);
+    }
+}
+
+namespace {
+
+// A base array with a new storage, both in one block.
+ArrayPtr new_array(Layout layout, std::shared_ptr<Buffer> buffer, std::shared_ptr<Task> producer) {
+    ArrayBlock* block = new_block(2); // owned by the references from here on
+    Storage& s = block->storage.emplace(std::move(buffer), std::move(producer), block);
+    Array& a = block->array.emplace(std::move(layout), Ref<Storage>(&s), block);
+    return ArrayPtr(&a);
+}
+
+} // namespace
+
+ArrayPtr Runtime::wrap(Layout layout, std::shared_ptr<Buffer> buffer) {
+    return new_array(std::move(layout), std::move(buffer), nullptr);
+}
+
+ArrayPtr Runtime::view(const ArrayPtr& base, Layout layout) {
+    ArrayBlock* block = new_block(1);
+    Array& a = block->array.emplace(std::move(layout), base->storage_, block);
+    return ArrayPtr(&a);
+}
+
+void Runtime::wait_active_below(std::size_t limit) {
+    if (active_.load(std::memory_order_acquire) < limit) {
+        return;
+    }
+    // seq_cst pairs with run(): it decrements active_, then reads the waiter
+    // count. Either it sees this waiter and notifies, or the load below sees
+    // its decrement.
+    active_waiters_.fetch_add(1, std::memory_order_seq_cst);
+    for (std::size_t n = active_.load(std::memory_order_seq_cst); n >= limit;
+         n = active_.load(std::memory_order_seq_cst)) {
+        active_.wait(n, std::memory_order_acquire);
+    }
+    active_waiters_.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void Runtime::acquire_slot() {
+    // Back-pressure: limit how far the main thread runs ahead. Only the main
+    // thread increments active_, so check-then-increment is race free.
+    wait_active_below(options_.max_active_tasks);
+    active_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void Runtime::launch(const std::shared_ptr<Task>& task,
+                     const std::vector<std::shared_ptr<Task>>& producers, std::int64_t elements) {
+    ++seq_;
+    // While pending, the task's work is attributed to the decision that
+    // started the work it waits for.
+    for (const std::shared_ptr<Task>& p : producers) {
+        if (p->blame() != nullptr) {
+            task->set_blame(p->blame(), p->blame_seq());
+            break;
+        }
+    }
+    for (const std::shared_ptr<Task>& p : producers) {
+        task->add_pending_input();
+        if (!p->add_consumer(task)) {
+            task->producer_already_done(*p); // cannot reach 0: issue guard held
+        }
+    }
+    if (task->release_issue_guard()) {
+        trigger_from_main(task, elements);
+    }
+}
+
+void Runtime::issue_storage_copy(Storage& s) {
+    std::shared_ptr<Buffer> old = s.buffer_;
+    auto fresh = make_pooled<Buffer>(old->nbytes());
+    std::vector<std::shared_ptr<Task>> producers;
+    std::optional<TaskError> failed;
+    if (!s.ready()) {
+        producers.push_back(s.producer_);
+    } else {
+        failed = s.last_error_;
+    }
+
+    // Counted, but not held back: the op that needs the copy holds a slot
+    // already, and waiting here while holding it could deadlock.
+    active_.fetch_add(1, std::memory_order_acq_rel);
+    auto task = make_pooled<Task>(std::make_shared<CopyKernel>(), "copy-on-write");
+    old->async_reads.fetch_add(1, std::memory_order_relaxed);
+    task->operands_for_issue().push_back({old, bytes_of(*old)});
+    task->operands_for_issue().push_back({fresh, bytes_of(*fresh)});
+    task->set_ninputs(1);
+    if (failed) {
+        task->add_upstream_error(*failed);
+    }
+    task->advance(TaskState::SizeCompleted);
+    s.buffer_ = fresh;
+    s.producer_ = task;
+    launch(task, producers, static_cast<std::int64_t>(old->nbytes()));
+}
+
+std::vector<ArrayPtr> Runtime::issue(const std::shared_ptr<Kernel>& kernel,
+                                     std::span<const ArrayPtr> inputs,
+                                     std::span<const ArrayPtr> inouts,
+                                     std::span<const Layout> new_outputs, const char* issue_site) {
+    std::vector<ArrayPtr> results(new_outputs.size());
+    issue(kernel, inputs, inouts, new_outputs, issue_site, results);
+    return results;
+}
+
+void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
+                    std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
+                    const char* issue_site, std::span<ArrayPtr> results) {
+    // The task first (back-pressure: wait for a slot before creating it), so
+    // the operands are built in place.
+    acquire_slot();
+    auto task = make_pooled<Task>(kernel, issue_site);
+    Operands& in_ops = task->operands_for_issue(); // inputs, then outputs
+
+    // 1. Snapshot everything this op reads (inputs, then in/outs): buffer,
+    //    layout and pending producer, before any copy-on-write switch. Reads
+    //    always see the data as it was before this op.
+    std::vector<std::shared_ptr<Task>> producers;
+    std::optional<TaskError> failed_input;
+    auto snapshot = [&](Array& a) {
+        Storage& s = *a.storage_;
+        if (!s.ready()) {
+            producers.push_back(s.producer_);
+        } else if (s.last_error_ && !failed_input) {
+            failed_input = s.last_error_;
+        }
+        in_ops.push_back({s.buffer_, a.layout_});
+    };
+    for (const ArrayPtr& a : inputs) {
+        snapshot(*a);
+    }
+    for (const ArrayPtr& a : inouts) {
+        snapshot(*a);
+    }
+
+    // 2. Copy-on-write decisions, before this op counts its own reads. All
+    //    layout changes happen here, at issue time: what later tasks learn
+    //    (layout, size) never changes afterwards.
+    std::vector<Storage*> switched;
+    for (const ArrayPtr& ap : inouts) {
+        Array& a = *ap;
+        Storage& s = *a.storage_;
+        if (std::find(switched.begin(), switched.end(), &s) != switched.end()) {
+            continue; // same storage written twice by this op: switched already
+        }
+        const bool pending_readers = s.buffer_->async_reads.load(std::memory_order_acquire) > 0;
+        // An input reading the same storage through a different view would see
+        // partly updated data if the op wrote in place; NumPy semantics are
+        // "all inputs read before any output is written".
+        bool overlapping_input = false;
+        for (const ArrayPtr& in : inputs) {
+            overlapping_input = overlapping_input ||
+                                (in->storage_ == a.storage_ && !same_view(in->layout_, a.layout_));
+        }
+        if (!pending_readers && !overlapping_input) {
+            continue; // write in place
+        }
+        switched.push_back(&s);
+        const bool only_view = a.storage_.use_count() == 1;
+        const bool covers_buffer = a.layout_.nbytes() == s.buffer_->nbytes();
+        if (only_view && covers_buffer) {
+            // Consolidated: no copy task. The op reads the old buffer (step 1)
+            // and writes a new, contiguous one.
+            a.layout_ = Layout::contiguous(a.layout_.dtype, a.layout_.shape);
+            s.buffer_ = make_pooled<Buffer>(a.layout_.nbytes());
+        } else {
+            // Views share the storage (or the op writes only part of it):
+            // copy the whole buffer first, views keep their layouts.
+            issue_storage_copy(s);
+        }
+    }
+
+    // 3. Outputs.
+    for (Operand& op : in_ops) {
+        op.buffer->async_reads.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const std::size_t ninputs = in_ops.size();
+    for (const ArrayPtr& ap : inouts) {
+        Storage& s = *ap->storage_;
+        // A storage copy issued in step 2 must finish before this op writes.
+        if (s.producer_ && s.producer_ != task &&
+            std::find(producers.begin(), producers.end(), s.producer_) == producers.end()) {
+            producers.push_back(s.producer_);
+        }
+        s.producer_ = task;
+        in_ops.push_back({s.buffer_, ap->layout_});
+    }
+    for (std::size_t i = 0; i < new_outputs.size(); ++i) {
+        const Layout& l = new_outputs[i];
+        Layout contiguous = l.c_contiguous() ? l : Layout::contiguous(l.dtype, l.shape);
+        auto buffer = make_pooled<Buffer>(contiguous.nbytes());
+        in_ops.push_back({buffer, contiguous});
+        results[i] = new_array(std::move(contiguous), std::move(buffer), task);
+    }
+
+    task->set_ninputs(ninputs);
+    if (failed_input) {
+        task->add_upstream_error(*failed_input);
+    }
+    // Phase 1: shapes are known at issue time.
+    task->advance(TaskState::SizeCompleted);
+    const std::int64_t elements = !new_outputs.empty() ? new_outputs[0].size()
+                                  : !inouts.empty()    ? inouts[0]->layout_.size()
+                                                       : 0;
+    launch(task, producers, elements);
+}
+
+void Runtime::trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t elements) {
+    bool offload;
+    if (options_.should_offload) {
+        offload = options_.should_offload(*task);
+    } else {
+        const OffloadPolicy::Decision d = policy_.decide(task->issue_site(), elements);
+        offload = d.offload;
+        task->set_blame(d.stats, seq_);
+    }
+    if (offload) {
+        enqueue(task);
+        return;
+    }
+    // Run inline; consumers it unblocks go to the workers so the main thread
+    // can keep issuing.
+    for (std::shared_ptr<Task>& next : run(task)) {
+        enqueue(std::move(next));
+    }
+}
+
+std::optional<TaskError> Runtime::wait(Array& a) {
+    Storage& s = *a.storage_;
+    if (s.producer_) {
+        Task& p = *s.producer_;
+        // Any access right after issuing counts, finished or not: async had
+        // nothing to overlap with in between.
+        if (p.mark_blocked()) {
+            policy_.on_blocked(p.blame(), seq_ - p.blame_seq());
+        }
+        p.wait_completed();
+    }
+    s.ready();
+    return s.last_error_;
+}
+
+void Runtime::wait_all() { wait_active_below(1); }
+
+std::vector<std::shared_ptr<Task>> Runtime::run(const std::shared_ptr<Task>& task) {
+    std::vector<std::shared_ptr<Task>> runnable = task->execute();
+    active_.fetch_sub(1, std::memory_order_seq_cst);
+    if (active_waiters_.load(std::memory_order_seq_cst) > 0) {
+        active_.notify_all();
+    }
+    return runnable;
+}
+
+void Runtime::enqueue(std::shared_ptr<Task> task) {
+    {
+        std::lock_guard lock(queue_mutex_);
+        queue_.push_back(std::move(task));
+        queued_.fetch_add(1, std::memory_order_seq_cst);
+    }
+    // A spinning worker will pick the task up. The seq_cst order between this
+    // load and the worker's decrement of spinning_ before it sleeps (followed
+    // by its locked re-check of the queue) rules out a lost wake-up.
+    if (spinning_.load(std::memory_order_seq_cst) == 0 &&
+        sleeping_.load(std::memory_order_seq_cst) > 0) {
+        queue_cv_.notify_one();
+    }
+}
+
+std::shared_ptr<Task> Runtime::try_pop() {
+    std::lock_guard lock(queue_mutex_);
+    if (queue_.empty()) {
+        return nullptr;
+    }
+    std::shared_ptr<Task> t = std::move(queue_.front());
+    queue_.pop_front();
+    queued_.fetch_sub(1, std::memory_order_relaxed);
+    return t;
+}
+
+void Runtime::worker_loop() {
+    using clock = std::chrono::steady_clock;
+    constexpr auto kSpin = std::chrono::microseconds(50);
+    std::shared_ptr<Task> next;
+    for (;;) {
+        if (!next) {
+            next = try_pop();
+        }
+        if (!next) {
+            // At most one worker spins (the others sleep), so spinning never
+            // takes a core away from the main thread or a working worker.
+            int expected = 0;
+            if (spinning_.compare_exchange_strong(expected, 1, std::memory_order_seq_cst)) {
+                const auto until = clock::now() + kSpin;
+                while (!next && clock::now() < until) {
+                    if (queued_.load(std::memory_order_relaxed) > 0) {
+                        next = try_pop();
+                    } else {
+                        cpu_relax();
+                    }
+                }
+                spinning_.store(0, std::memory_order_seq_cst);
+                // Work found while others sleep: let the next worker spin.
+                if (next && queued_.load(std::memory_order_seq_cst) > 0 &&
+                    sleeping_.load(std::memory_order_seq_cst) > 0) {
+                    queue_cv_.notify_one();
+                }
+            }
+        }
+        if (!next) {
+            std::unique_lock lock(queue_mutex_);
+            sleeping_.fetch_add(1, std::memory_order_seq_cst);
+            queue_cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+            sleeping_.fetch_sub(1, std::memory_order_seq_cst);
+            if (queue_.empty()) {
+                return; // stopping
+            }
+            next = std::move(queue_.front());
+            queue_.pop_front();
+            queued_.fetch_sub(1, std::memory_order_relaxed);
+        }
+        // Trampoline: run() returns instead of calling consumers, so the stack
+        // is unwound before the continuation starts.
+        std::vector<std::shared_ptr<Task>> runnable = run(next);
+        next.reset();
+        if (!runnable.empty()) {
+            next = std::move(runnable.front());
+            for (std::size_t i = 1; i < runnable.size(); ++i) {
+                enqueue(std::move(runnable[i]));
+            }
+        }
+    }
+}
+
+} // namespace viproc
