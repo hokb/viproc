@@ -1,5 +1,6 @@
 #include "offload.hpp"
 
+#include <algorithm>
 #include <bit>
 
 namespace viproc {
@@ -29,7 +30,7 @@ OffloadPolicy::Decision OffloadPolicy::decide(const char* site, std::int64_t ele
     bool offload = true;
     if (s.inline_mode) {
         // Re-test now and then whether the site has overlap after all.
-        offload = options_.explore_every > 0 && ++s.calls % options_.explore_every == 0;
+        offload = s.period > 0 && ++s.calls % s.period == 0;
     }
     if (!offload) {
         ++inline_count_;
@@ -56,8 +57,12 @@ void OffloadPolicy::maybe_switch(SiteStats& s) {
     if (!s.inline_mode && 4 * s.blocked >= 3 * s.observed) {
         s.inline_mode = true;
         s.calls = 0;
+        s.period = options_.explore_every;
     } else if (s.inline_mode && 4 * s.blocked <= s.observed) {
         s.inline_mode = false;
+    } else if (s.inline_mode) {
+        // Confirmed: explore less often.
+        s.period = std::min(2 * s.period, options_.explore_max);
     }
     s.observed = 0;
     s.blocked = 0;

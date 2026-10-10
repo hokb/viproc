@@ -273,7 +273,9 @@ std::optional<TaskError> Runtime::wait(Array& a) {
     Storage& s = *a.storage_;
     if (s.producer_) {
         Task& p = *s.producer_;
-        if (!p.completed() && p.mark_blocked()) {
+        // Any access right after issuing counts, finished or not: async had
+        // nothing to overlap with in between.
+        if (p.mark_blocked()) {
             policy_.on_blocked(p.blame(), seq_ - p.blame_seq());
         }
         p.wait_completed();

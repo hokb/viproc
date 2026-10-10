@@ -25,14 +25,16 @@ struct OffloadOptions {
     std::int64_t sync_below = 2048;
     // Per-site adaptive decision above `sync_below`; off = always offload.
     bool adaptive = true;
-    // A wait counts as "blocked right after issuing" if at most this many ops
-    // were issued in between (measured from the main-thread decision that
-    // started the work).
-    std::uint64_t window = 8;
+    // A sync point counts as "result needed right after issuing" if at most
+    // this many ops were issued in between (measured from the main-thread
+    // decision that started the work), whether the task had finished or not.
+    std::uint64_t window = 2;
     // Async observations per decision, and the exploration period in inline
-    // mode.
+    // mode: it starts at explore_every and doubles (up to explore_max) each
+    // time the exploration confirms inline mode.
     int sample = 8;
     int explore_every = 16;
+    int explore_max = 1024;
 };
 
 // Statistics of one (issue site, size class). Main thread only.
@@ -40,7 +42,8 @@ struct SiteStats {
     int observed = 0; // async issues since the last decision
     int blocked = 0;  // ... of which the main thread waited on right away
     bool inline_mode = false;
-    int calls = 0; // calls in inline mode (for exploration)
+    int calls = 0;  // calls in inline mode (for exploration)
+    int period = 0; // current exploration period (0: explore_every)
 };
 
 class OffloadPolicy {

@@ -337,18 +337,28 @@ reference counting.
      with `strong_scaling.py` (4 CPUs, sin/cos chains): inline wins up to
      ~1000 elements, async from ~3000.
   2. **Adaptive above N_min, per (issue site, log2 size class):** count
-     async issues and how many of them the main thread blocked on "right
-     away" (a wait within `window` = 8 issued ops of the decision that
-     started the work; consumers issued while it was pending inherit that
-     attribution). After `sample` = 8 issues: ≥ 3/4 blocked → the site runs
-     inline; in inline mode every 16th call still goes async to re-test,
-     and ≤ 1/4 blocked switches back. Reversible, unlike the Accelerator.
+     async issues and how many of their results the main thread accessed
+     "right away" — a sync point within `window` = 2 issued ops of the
+     decision that started the work, **whether the task had finished or
+     not** (counting only unfinished ones made fast sites oscillate between
+     modes). Consumers issued while it was pending inherit the attribution.
+     After `sample` = 8 issues: ≥ 3/4 accessed right away → the site runs
+     inline; in inline mode an exploration call still goes async, first
+     every 16th call, doubling up to every 1024th while explorations confirm
+     inline; ≤ 1/4 switches back. Reversible, unlike the Accelerator.
   3. **Deterministic mode:** `adaptive = false` (`viproc.init(adaptive=False)`
      or `VIPROC_DETERMINISTIC=1`) keeps only rule 1. Results are identical
      in every mode; only where ops run changes.
   Not done yet: per-op cost classes (N_min is in elements, calibrated on
-  sin/cos; cheap ops like `add` would warrant a higher N_min), and letting
-  a waiting main thread run a queued, not yet started task itself.
+  sin/cos; cheap ops like `add` would warrant a higher N_min).
+  **Decided against:** letting a waiting main thread run a queued, not yet
+  started task itself. Ready work rarely sits in the queue: a task whose
+  inputs complete runs at once as the continuation of the thread that
+  completed the last input. Measured (`strong_scaling.py`, 1e4 and 1e6):
+  1278 continuations vs. 336 queue pops (chain starts, fan-out), and no
+  sync point found its task runnable but queued. In `sync_latency.py` that
+  happened only for the async exploration calls, which the policy keeps
+  rare.
   `python/benchmarks/sync_latency.py` measures the targeted pattern.
 - **Errors** from asynchronous execution are stored on the task and its
   outputs and raised at the next sync point that touches them.
@@ -535,8 +545,11 @@ Rules:
   vs. NumPy with 4 workers): 1e6 elements 3.5x; 1e5 3.0x; 1e4 ~3x;
   1e3 ~0.75x, 3e3 ~2x (noisy).
 - "Issue an op, read the result right away" (`sync_latency.py`): 8 elements
-  8.1 → 1.6–2.3 µs (NumPy 0.4–0.9), 1e3 5.1 → 1.9–2.6 µs (NumPy 0.8–1.5),
-  1e5 ~equal to NumPy, thanks to the dispatch policy.
+  8.1 → 1.4–2.4 µs (NumPy 0.5–0.9), 1e3 5.1 → 1.6–2.7 µs (NumPy 0.8–1.6),
+  1e4 ~NumPy (4.3–6.9 vs. 6.1–6.9 µs), 1e5 faster than NumPy, thanks to
+  the dispatch policy. What remains at small sizes (~1 µs per op) is the
+  issue path itself (task, arrays, bridge), paid even when the op runs
+  inline; the hand-off to a worker is no longer part of it.
 
 ## Implementation notes (current code)
 
