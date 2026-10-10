@@ -11,7 +11,22 @@ namespace viproc {
 
 enum class DType : std::uint8_t { Bool, Int32, Int64, Float32, Float64, Complex64, Complex128 };
 
-std::size_t itemsize(DType dtype);
+constexpr std::size_t itemsize(DType dtype) {
+    switch (dtype) {
+    case DType::Bool:
+        return 1;
+    case DType::Int32:
+    case DType::Float32:
+        return 4;
+    case DType::Int64:
+    case DType::Float64:
+    case DType::Complex64:
+        return 8;
+    case DType::Complex128:
+        return 16;
+    }
+    return 0;
+}
 
 // Shapes and strides live inline up to this rank (no heap allocation).
 inline constexpr std::size_t kInlineRank = 4;

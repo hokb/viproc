@@ -1,5 +1,7 @@
 #include "runtime.hpp"
 
+#include "pool.hpp"
+
 #include <algorithm>
 #include <chrono>
 
@@ -79,21 +81,80 @@ Layout bytes_of(const Buffer& b) {
 
 } // namespace
 
+namespace {
+
+using BlockPool = FixedPool<sizeof(ArrayBlock), alignof(ArrayBlock)>;
+
+ArrayBlock* new_block(int alive) {
+    auto* b = ::new (BlockPool::allocate()) ArrayBlock();
+    b->alive = alive;
+    return b;
+}
+
+void free_block(ArrayBlock* b) {
+    b->~ArrayBlock();
+    BlockPool::deallocate(b);
+}
+
+} // namespace
+
+void Storage::last_ref_dropped(Storage* s) {
+    ArrayBlock* b = s->block_;
+    b->storage.reset();
+    if (--b->alive == 0) {
+        free_block(b);
+    }
+}
+
+void Array::last_ref_dropped(Array* a) {
+    ArrayBlock* b = a->block_;
+    b->array.reset(); // may drop the storage of the same block first
+    if (--b->alive == 0) {
+        free_block(b);
+    }
+}
+
+namespace {
+
+// A base array with a new storage, both in one block.
+ArrayPtr new_array(Layout layout, std::shared_ptr<Buffer> buffer, std::shared_ptr<Task> producer) {
+    ArrayBlock* block = new_block(2); // owned by the references from here on
+    Storage& s = block->storage.emplace(std::move(buffer), std::move(producer), block);
+    Array& a = block->array.emplace(std::move(layout), Ref<Storage>(&s), block);
+    return ArrayPtr(&a);
+}
+
+} // namespace
+
 ArrayPtr Runtime::wrap(Layout layout, std::shared_ptr<Buffer> buffer) {
-    return std::make_shared<Array>(std::move(layout), std::make_shared<Storage>(std::move(buffer)));
+    return new_array(std::move(layout), std::move(buffer), nullptr);
 }
 
 ArrayPtr Runtime::view(const ArrayPtr& base, Layout layout) {
-    return std::make_shared<Array>(std::move(layout), base->storage_);
+    ArrayBlock* block = new_block(1);
+    Array& a = block->array.emplace(std::move(layout), base->storage_, block);
+    return ArrayPtr(&a);
+}
+
+void Runtime::wait_active_below(std::size_t limit) {
+    if (active_.load(std::memory_order_acquire) < limit) {
+        return;
+    }
+    // seq_cst pairs with run(): it decrements active_, then reads the waiter
+    // count. Either it sees this waiter and notifies, or the load below sees
+    // its decrement.
+    active_waiters_.fetch_add(1, std::memory_order_seq_cst);
+    for (std::size_t n = active_.load(std::memory_order_seq_cst); n >= limit;
+         n = active_.load(std::memory_order_seq_cst)) {
+        active_.wait(n, std::memory_order_acquire);
+    }
+    active_waiters_.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void Runtime::acquire_slot() {
     // Back-pressure: limit how far the main thread runs ahead. Only the main
     // thread increments active_, so check-then-increment is race free.
-    for (std::size_t n = active_.load(std::memory_order_acquire); n >= options_.max_active_tasks;
-         n = active_.load(std::memory_order_acquire)) {
-        active_.wait(n, std::memory_order_acquire);
-    }
+    wait_active_below(options_.max_active_tasks);
     active_.fetch_add(1, std::memory_order_acq_rel);
 }
 
@@ -121,7 +182,7 @@ void Runtime::launch(const std::shared_ptr<Task>& task,
 
 void Runtime::issue_storage_copy(Storage& s) {
     std::shared_ptr<Buffer> old = s.buffer_;
-    auto fresh = std::make_shared<Buffer>(old->nbytes());
+    auto fresh = make_pooled<Buffer>(old->nbytes());
     std::vector<std::shared_ptr<Task>> producers;
     std::optional<TaskError> failed;
     if (!s.ready()) {
@@ -130,10 +191,14 @@ void Runtime::issue_storage_copy(Storage& s) {
         failed = s.last_error_;
     }
 
-    acquire_slot();
-    auto task = std::make_shared<Task>(std::make_shared<CopyKernel>(), "copy-on-write");
+    // Counted, but not held back: the op that needs the copy holds a slot
+    // already, and waiting here while holding it could deadlock.
+    active_.fetch_add(1, std::memory_order_acq_rel);
+    auto task = make_pooled<Task>(std::make_shared<CopyKernel>(), "copy-on-write");
     old->async_reads.fetch_add(1, std::memory_order_relaxed);
-    task->set_operands({{old, bytes_of(*old)}, {fresh, bytes_of(*fresh)}}, 1);
+    task->operands_for_issue().push_back({old, bytes_of(*old)});
+    task->operands_for_issue().push_back({fresh, bytes_of(*fresh)});
+    task->set_ninputs(1);
     if (failed) {
         task->add_upstream_error(*failed);
     }
@@ -143,18 +208,29 @@ void Runtime::issue_storage_copy(Storage& s) {
     launch(task, producers, static_cast<std::int64_t>(old->nbytes()));
 }
 
-std::vector<ArrayPtr> Runtime::issue(std::shared_ptr<Kernel> kernel,
+std::vector<ArrayPtr> Runtime::issue(const std::shared_ptr<Kernel>& kernel,
                                      std::span<const ArrayPtr> inputs,
                                      std::span<const ArrayPtr> inouts,
                                      std::span<const Layout> new_outputs, const char* issue_site) {
+    std::vector<ArrayPtr> results(new_outputs.size());
+    issue(kernel, inputs, inouts, new_outputs, issue_site, results);
+    return results;
+}
+
+void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
+                    std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
+                    const char* issue_site, std::span<ArrayPtr> results) {
+    // The task first (back-pressure: wait for a slot before creating it), so
+    // the operands are built in place.
+    acquire_slot();
+    auto task = make_pooled<Task>(kernel, issue_site);
+    Operands& in_ops = task->operands_for_issue(); // inputs, then outputs
+
     // 1. Snapshot everything this op reads (inputs, then in/outs): buffer,
     //    layout and pending producer, before any copy-on-write switch. Reads
     //    always see the data as it was before this op.
-    std::vector<Operand> in_ops;
     std::vector<std::shared_ptr<Task>> producers;
     std::optional<TaskError> failed_input;
-    // One vector for all operands: inputs, then outputs (see Task).
-    in_ops.reserve(inputs.size() + 2 * inouts.size() + new_outputs.size());
     auto snapshot = [&](Array& a) {
         Storage& s = *a.storage_;
         if (!s.ready()) {
@@ -200,7 +276,7 @@ std::vector<ArrayPtr> Runtime::issue(std::shared_ptr<Kernel> kernel,
             // Consolidated: no copy task. The op reads the old buffer (step 1)
             // and writes a new, contiguous one.
             a.layout_ = Layout::contiguous(a.layout_.dtype, a.layout_.shape);
-            s.buffer_ = std::make_shared<Buffer>(a.layout_.nbytes());
+            s.buffer_ = make_pooled<Buffer>(a.layout_.nbytes());
         } else {
             // Views share the storage (or the op writes only part of it):
             // copy the whole buffer first, views keep their layouts.
@@ -208,16 +284,12 @@ std::vector<ArrayPtr> Runtime::issue(std::shared_ptr<Kernel> kernel,
         }
     }
 
-    // 3. The task itself.
-    acquire_slot();
-    auto task = std::make_shared<Task>(std::move(kernel), issue_site);
+    // 3. Outputs.
     for (Operand& op : in_ops) {
         op.buffer->async_reads.fetch_add(1, std::memory_order_relaxed);
     }
 
     const std::size_t ninputs = in_ops.size();
-    std::vector<ArrayPtr> results;
-    results.reserve(new_outputs.size());
     for (const ArrayPtr& ap : inouts) {
         Storage& s = *ap->storage_;
         // A storage copy issued in step 2 must finish before this op writes.
@@ -228,15 +300,15 @@ std::vector<ArrayPtr> Runtime::issue(std::shared_ptr<Kernel> kernel,
         s.producer_ = task;
         in_ops.push_back({s.buffer_, ap->layout_});
     }
-    for (const Layout& l : new_outputs) {
-        Layout contiguous = Layout::contiguous(l.dtype, l.shape);
-        auto buffer = std::make_shared<Buffer>(contiguous.nbytes());
+    for (std::size_t i = 0; i < new_outputs.size(); ++i) {
+        const Layout& l = new_outputs[i];
+        Layout contiguous = l.c_contiguous() ? l : Layout::contiguous(l.dtype, l.shape);
+        auto buffer = make_pooled<Buffer>(contiguous.nbytes());
         in_ops.push_back({buffer, contiguous});
-        results.push_back(std::make_shared<Array>(std::move(contiguous),
-                                                  std::make_shared<Storage>(buffer, task)));
+        results[i] = new_array(std::move(contiguous), std::move(buffer), task);
     }
 
-    task->set_operands(std::move(in_ops), ninputs);
+    task->set_ninputs(ninputs);
     if (failed_input) {
         task->add_upstream_error(*failed_input);
     }
@@ -246,7 +318,6 @@ std::vector<ArrayPtr> Runtime::issue(std::shared_ptr<Kernel> kernel,
                                   : !inouts.empty()    ? inouts[0]->layout_.size()
                                                        : 0;
     launch(task, producers, elements);
-    return results;
 }
 
 void Runtime::trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t elements) {
@@ -284,17 +355,14 @@ std::optional<TaskError> Runtime::wait(Array& a) {
     return s.last_error_;
 }
 
-void Runtime::wait_all() {
-    for (std::size_t n = active_.load(std::memory_order_acquire); n != 0;
-         n = active_.load(std::memory_order_acquire)) {
-        active_.wait(n, std::memory_order_acquire);
-    }
-}
+void Runtime::wait_all() { wait_active_below(1); }
 
 std::vector<std::shared_ptr<Task>> Runtime::run(const std::shared_ptr<Task>& task) {
     std::vector<std::shared_ptr<Task>> runnable = task->execute();
-    active_.fetch_sub(1, std::memory_order_acq_rel);
-    active_.notify_all();
+    active_.fetch_sub(1, std::memory_order_seq_cst);
+    if (active_waiters_.load(std::memory_order_seq_cst) > 0) {
+        active_.notify_all();
+    }
     return runnable;
 }
 

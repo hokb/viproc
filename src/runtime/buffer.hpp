@@ -35,7 +35,12 @@ class Buffer {
     // reading task when it completes. See "Reference counting" in CLAUDE.md.
     std::atomic<int> async_reads{0};
 
+    // Up to this many bytes live inside the Buffer object itself: one
+    // allocation for small arrays instead of two.
+    static constexpr std::size_t kInlineBytes = 128;
+
   private:
+    alignas(64) std::byte inline_[kInlineBytes];
     std::byte* data_ = nullptr;
     std::size_t nbytes_;
     bool owns_ = false;

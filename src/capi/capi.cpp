@@ -72,9 +72,12 @@ struct vp_runtime {
     std::shared_ptr<Graveyard> graveyard = std::make_shared<Graveyard>();
 };
 
-struct vp_array {
-    ArrayPtr array;
-};
+// A vp_array* is an Array* holding one reference (no wrapper allocation).
+namespace {
+Array& arr(const vp_array* a) { return *reinterpret_cast<Array*>(const_cast<vp_array*>(a)); }
+ArrayPtr ref(const vp_array* a) { return ArrayPtr(&arr(a)); } // a new reference
+vp_array* hand_out(ArrayPtr a) { return reinterpret_cast<vp_array*>(a.release()); }
+} // namespace
 
 extern "C" {
 
@@ -145,7 +148,7 @@ int vp_array_from_ndarray(vp_runtime* rt, PyObject* ndarray, vp_array** out, cha
         set_error(err, errlen, e);
         return VP_UNSUPPORTED;
     }
-    *out = new vp_array{std::move(a)};
+    *out = hand_out(std::move(a));
     return VP_OK;
 }
 
@@ -156,33 +159,33 @@ int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_arr
     if (!a) {
         return VP_PYERR;
     }
-    *out = new vp_array{std::move(a)};
+    *out = hand_out(std::move(a));
     return VP_OK;
 }
 
 vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, int ndim, const int64_t* shape,
                         const int64_t* strides, int64_t offset) {
     Layout l;
-    l.dtype = base->array->layout().dtype;
+    l.dtype = arr(base).layout().dtype;
     l.shape.assign(shape, shape + ndim);
     l.strides.assign(strides, strides + ndim);
-    l.offset = base->array->layout().offset + offset;
-    return new vp_array{rt->rt->view(base->array, std::move(l))};
+    l.offset = arr(base).layout().offset + offset;
+    return hand_out(rt->rt->view(ref(base), std::move(l)));
 }
 
-void vp_array_release(vp_array* a) { delete a; }
+void vp_array_release(vp_array* a) { ArrayPtr::adopt(&arr(a)).reset(); }
 
-int vp_array_ndim(const vp_array* a) { return static_cast<int>(a->array->layout().shape.size()); }
-const int64_t* vp_array_shape(const vp_array* a) { return a->array->layout().shape.data(); }
-const int64_t* vp_array_strides(const vp_array* a) { return a->array->layout().strides.data(); }
-vp_dtype vp_array_dtype(const vp_array* a) { return to_vp(a->array->layout().dtype); }
-int vp_array_ready(vp_array* a) { return a->array->ready() ? 1 : 0; }
+int vp_array_ndim(const vp_array* a) { return static_cast<int>(arr(a).layout().shape.size()); }
+const int64_t* vp_array_shape(const vp_array* a) { return arr(a).layout().shape.data(); }
+const int64_t* vp_array_strides(const vp_array* a) { return arr(a).layout().strides.data(); }
+vp_dtype vp_array_dtype(const vp_array* a) { return to_vp(arr(a).layout().dtype); }
+int vp_array_ready(vp_array* a) { return arr(a).ready() ? 1 : 0; }
 int vp_array_same_storage(const vp_array* a, const vp_array* b) {
-    return a->array->storage() == b->array->storage() ? 1 : 0;
+    return arr(a).storage() == arr(b).storage() ? 1 : 0;
 }
 
 int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
-    std::optional<TaskError> e = rt->rt->wait(*a->array);
+    std::optional<TaskError> e = rt->rt->wait(arr(a));
     if (e) {
         set_error(err, errlen, e->message + " (in op issued at " + e->issue_site + ")");
         return VP_ERROR;
@@ -190,7 +193,7 @@ int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
     return VP_OK;
 }
 
-PyObject* vp_array_to_ndarray(const vp_array* a) { return numpy::to_ndarray(*a->array); }
+PyObject* vp_array_to_ndarray(const vp_array* a) { return numpy::to_ndarray(arr(a)); }
 
 int vp_ufunc_loop(vp_runtime* rt, PyObject* ufunc, int nin, const vp_dtype* dtypes,
                   const vp_loop** out, char* err, size_t errlen) {
@@ -224,25 +227,27 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
         return VP_UNSUPPORTED;
     }
     for (int i = 0; i < nin; ++i) {
-        ins[i] = inputs[i]->array;
+        ins[i] = ref(inputs[i]);
     }
     const DType out_dtype = loop->dtypes[static_cast<std::size_t>(nin)];
     Shape shape(out_shape, out_shape + out_ndim);
     const std::shared_ptr<Kernel>& kernel = loop->loop->elementwise_kernel();
     const std::span<const ArrayPtr> in_span(ins, static_cast<std::size_t>(nin));
     if (out != nullptr) {
-        const Layout& ol = out->array->layout();
+        const Layout& ol = arr(out).layout();
         if (ol.shape != shape || ol.dtype != out_dtype) {
             set_error(err, errlen, "out= array has the wrong shape or dtype");
             return VP_INVALID;
         }
-        rt->rt->issue(kernel, in_span, std::span(&out->array, 1), {}, site);
+        const ArrayPtr o = ref(out);
+        rt->rt->issue(kernel, in_span, std::span(&o, 1), {}, site);
         *result = nullptr;
         return VP_OK;
     }
     Layout l = Layout::contiguous(out_dtype, std::move(shape));
-    std::vector<ArrayPtr> res = rt->rt->issue(kernel, in_span, {}, std::span(&l, 1), site);
-    *result = new vp_array{std::move(res[0])};
+    ArrayPtr res;
+    rt->rt->issue(kernel, in_span, {}, std::span(&l, 1), site, std::span(&res, 1));
+    *result = hand_out(std::move(res));
     return VP_OK;
 }
 
@@ -251,7 +256,7 @@ int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, 
              const char* site, char* err, size_t errlen) {
     std::vector<vp_dtype> dtypes;
     for (int i = 0; i < nin; ++i) {
-        dtypes.push_back(to_vp(inputs[i]->array->layout().dtype));
+        dtypes.push_back(to_vp(arr(inputs[i]).layout().dtype));
     }
     dtypes.push_back(out_dtype);
     const vp_loop* loop = nullptr;
@@ -265,15 +270,15 @@ int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, 
 int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, char* err,
               size_t errlen) {
     rt->graveyard->drain();
-    const Layout& d = dst->array->layout();
-    const Layout& s = src->array->layout();
+    const Layout& d = arr(dst).layout();
+    const Layout& s = arr(src).layout();
     Shape b;
     if (d.dtype != s.dtype || !broadcast_shapes(d.shape, s.shape, b) || b != d.shape) {
         set_error(err, errlen, "assign: dtype mismatch or shapes do not broadcast");
         return VP_INVALID;
     }
-    std::vector<ArrayPtr> ins{src->array};
-    std::vector<ArrayPtr> io{dst->array};
+    const ArrayPtr ins[] = {ref(src)};
+    const ArrayPtr io[] = {ref(dst)};
     static const std::shared_ptr<Kernel> assign = make_assign_kernel();
     rt->rt->issue(assign, ins, io, {}, site);
     return VP_OK;

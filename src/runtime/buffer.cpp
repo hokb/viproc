@@ -23,8 +23,12 @@ void Buffer::ensure_allocated() {
     if (data_ != nullptr) {
         return;
     }
-    // At least one byte so that an allocated buffer never has a null pointer.
-    data_ = static_cast<std::byte*>(::operator new[](nbytes_ > 0 ? nbytes_ : 1, kAlignment));
+    // Inline also for 0 bytes: an allocated buffer never has a null pointer.
+    if (nbytes_ <= kInlineBytes) {
+        data_ = inline_;
+        return;
+    }
+    data_ = static_cast<std::byte*>(::operator new[](nbytes_, kAlignment));
     owns_ = true;
 }
 

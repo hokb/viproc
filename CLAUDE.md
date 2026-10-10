@@ -69,7 +69,8 @@ to plain sequential NumPy execution.
   may skip states, never go back.
 - The task holds references to its input arrays, its output arrays and the
   resolved NumPy loop.
-- TODO: performance, caching / pooling of task objects.
+- Tasks, buffers and array blocks come from per-thread memory pools
+  (`src/runtime/pool.hpp`), not malloc/free per op.
 
 ### Issuing an op (main thread)
 
@@ -148,8 +149,10 @@ reported with that issue site, not with the worker's stack.
 
 ### Reference counting
 
-- Tasks, arrays and array memory (buffers) are **reference counted**,
-  with atomic counts (they are shared across threads).
+- Tasks, arrays and array memory (buffers) are **reference counted**.
+  Tasks and buffers are shared across threads (`std::shared_ptr`, atomic
+  counts); arrays and storages are main-thread only (`Ref<T>`, plain int
+  counts, see "Implementation notes").
 - References: Python object → array; array → producer task (while
   `pending`); task → its input and output arrays; producer task →
   registered callbacks → consumer tasks.
@@ -239,7 +242,9 @@ execution.
 include/viproc/        Public C ABI (viproc.h). The only interface bridges may use.
 src/runtime/           Runtime core, no Python dependency (library `viproc`)
   layout.*             DType, Layout (shape, byte strides, offset), broadcasting
-  small_vector.hpp     inline-storage vector (shapes/strides without heap)
+  small_vector.hpp     inline-storage vectors (shapes/strides, task operands)
+  ref.hpp              Ref<T>: non-atomic intrusive refcount (Array, Storage)
+  pool.hpp             FixedPool / make_pooled: per-thread pools (Task, Buffer, …)
   offload.*            OffloadPolicy: inline vs. worker for ready tasks
   buffer.*             Buffer: element memory, lazily allocated; async_reads
   task.*               Task: stages, consumer callbacks, execute(); Kernel interface
@@ -541,22 +546,28 @@ Rules:
 - Evaluated and rejected: caching/reusing `viproc.ndarray` objects. Their
   allocation and deallocation is ~1% of the per-op instructions.
 - One Python thread only: the thread that initialized the runtime.
-- Per-op cost (`x * y`, 8 elements, Release, callgrind, op run inline):
-  viproc ~7,100 instructions, ~0.8 µs; NumPy ~4,300, ~0.4 µs. Breakdown:
-  bridge front end (kinds, cached resolution, issue site, result object)
-  ~900, which is *less* than NumPy's own dispatch and dtype resolution
-  (~2,500); the difference is the runtime's bookkeeping: `Runtime::issue`
-  ~2,300 (Task, Array, Storage, Buffer, operand vectors: 9 heap
-  allocations per op vs. NumPy's 2, plus shared_ptr atomics), `execute`
-  ~1,100 besides the NumPy loop itself (~110), release ~900 (NumPy's
-  dealloc ~350). Next levers: fewer allocations per op (one block for
-  Array/Storage/Buffer, small element memory inline, pooled tasks).
+- Per-op cost (`x * y`, 8 elements, Release, callgrind, op run inline,
+  `OPENBLAS_NUM_THREADS=1` so idle BLAS threads do not blur the counts):
+  viproc ~5,400 instructions, ~0.65 µs; NumPy ~4,650, ~0.4 µs. History:
+  ~10,500 → ~7,100 (C lookup tables instead of dicts, flat loop calls)
+  → ~6,600 (array and storage in one block, intrusive non-atomic refs,
+  `vp_array*` is the `Array*`, small element memory inline in the Buffer)
+  → ~5,800 (operands built in place in the task, no lock to read the
+  upstream error, inline `itemsize`) → ~5,400 (pooled Task/Buffer/block
+  memory). The bridge front end (~900) is cheaper than NumPy's own dispatch
+  and dtype resolution (~2,500); what remains on top is the task protocol
+  itself (task object, operand capture, async_reads, slot accounting,
+  completion under the task mutex) and the result's release.
+- `std::atomic::notify_all` is not free without waiters: libstdc++ bumps a
+  process-wide counter (a shared cache line) for atomics that are not
+  4-byte futex words. Task completion and `run()` therefore notify only
+  when a waiter registered (`Task::waiters_`, `active_waiters_`).
 - Element-wise kernels call the loop once over all elements when every
   operand is C-contiguous with the output shape or a single element
   (stride 0); otherwise once per innermost row.
 - Measured (4 CPUs, `strong_scaling.py`, 8 chains, Release build, speedup
   vs. NumPy with 4 workers): 1e6 elements 3.5x; 1e5 3.0x; 1e4 ~3x;
-  1e3 ~0.75x, 3e3 ~2x (noisy).
+  3e3 ~2.5x, 1e3 ~0.9x (noisy).
 - "Issue an op, read the result right away" (`sync_latency.py`): 8 elements
   8.1 → 1.4–2.4 µs (NumPy 0.5–0.9), 1e3 5.1 → 1.6–2.7 µs (NumPy 0.8–1.6),
   1e4 ~NumPy (4.3–6.9 vs. 6.1–6.9 µs), 1e5 faster than NumPy, thanks to
@@ -584,9 +595,23 @@ Rules:
 - Worker pool: at most one idle worker spins (50 µs, `pause`) before
   sleeping; `enqueue()` wakes a sleeper only if nobody spins. This avoids a
   wake-up syscall per small task without taking cores from busy threads.
-- Per-op allocations are kept low: shapes/strides inline (`SmallVector`),
-  one operand vector per task, one shared kernel object per resolved loop,
+- Per-op allocations: one pooled Task (operands inline up to 4), one
+  pooled Buffer (element memory inline up to 128 bytes), one pooled
+  `ArrayBlock` (Array and its Storage), the Python object. Shapes/strides
+  inline (`SmallVector`), one shared kernel object per resolved loop,
   interned issue sites.
+- `Array`/`Storage` use `Ref<T>` (`src/runtime/ref.hpp`): plain int counts,
+  legal because only the main thread creates, copies and releases them. An
+  `ArrayBlock` holds a base array and its storage; each object is destroyed
+  with its last reference, the block when both are gone (views get a block
+  of their own). The C ABI hands out `Array*` as `vp_array*`, one reference
+  each.
+- Pools (`FixedPool`): per-thread free lists without atomics for the
+  allocating thread; other threads return blocks through a lock-free stack
+  that an allocating thread takes over whole (exchange, so no ABA). Pools
+  only grow, to the peak number of live objects.
+- Copy-on-write copy tasks are counted as active but do not wait on the
+  look-ahead limit: the op needing the copy already holds its slot.
 - **GIL:** the bridge must release the GIL while waiting on the runtime
   (`Runtime::wait`, `wait_all`); workers never take it.
 - `UfuncLoop`s are owned by a `LoopCache` on the main thread; kernels hold

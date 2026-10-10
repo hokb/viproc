@@ -38,6 +38,9 @@ struct Operand {
     std::byte* first() const { return buffer->data() + layout.offset; }
 };
 
+// Operands of one task, inline up to a ternary op with one output.
+using Operands = InlineVector<Operand, 4>;
+
 struct KernelResult {
     int status = 0; // 0 = success
     std::string message;
@@ -78,8 +81,10 @@ class Task {
     int fp_flags() const { return fp_flags_; }
 
     // --- Main thread, while issuing -------------------------------------
-    // `operands` holds the inputs followed by the outputs (one allocation).
-    void set_operands(std::vector<Operand> operands, std::size_t ninputs);
+    // The operands, filled in place by the issuing code: the inputs followed
+    // by the outputs, the first `ninputs` being inputs.
+    Operands& operands_for_issue() { return operands_; }
+    void set_ninputs(std::size_t ninputs) { ninputs_ = ninputs; }
     void advance(TaskState next);
     // Announces one more pending producer before registering on it.
     void add_pending_input() { pending_.fetch_add(1, std::memory_order_relaxed); }
@@ -124,11 +129,16 @@ class Task {
     std::atomic<int> pending_{1};
 
     std::shared_ptr<Kernel> kernel_;
-    std::vector<Operand> operands_; // inputs, then outputs
+    Operands operands_; // inputs, then outputs
     std::size_t ninputs_ = 0;
     const char* issue_site_;
 
-    std::mutex mutex_; // guards consumers_, upstream_error_ and the switch to Completed
+    // Guards consumers_, upstream_error_, waiters_ and the switch to Completed.
+    mutable std::mutex mutex_;
+    // Someone waits (or is about to) in wait_completed(): only then does
+    // completion notify. std::atomic::notify_all is not free even without
+    // waiters (libstdc++ bumps a process-wide counter for 1-byte atomics).
+    mutable bool waiters_ = false;
     std::vector<std::shared_ptr<Task>> consumers_;
     std::optional<TaskError> upstream_error_;
 

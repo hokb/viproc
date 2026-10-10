@@ -10,16 +10,20 @@ Task::Task(std::shared_ptr<Kernel> kernel, const char* issue_site)
     : kernel_(std::move(kernel)), issue_site_(issue_site) {}
 
 void Task::wait_completed() const {
+    if (completed()) {
+        return;
+    }
+    {
+        // Under the lock: either execute() sees the flag and notifies, or it
+        // completed before and the loop below does not block.
+        std::lock_guard lock(mutex_);
+        waiters_ = true;
+    }
     TaskState s = state();
     while (s != TaskState::Completed) {
         state_.wait(s, std::memory_order_acquire);
         s = state();
     }
-}
-
-void Task::set_operands(std::vector<Operand> operands, std::size_t ninputs) {
-    operands_ = std::move(operands);
-    ninputs_ = ninputs;
 }
 
 void Task::advance(TaskState next) {
@@ -55,11 +59,11 @@ bool Task::input_done(const Task* producer) {
 }
 
 std::vector<std::shared_ptr<Task>> Task::execute() {
-    {
-        std::lock_guard lock(mutex_);
-        if (upstream_error_) {
-            error_ = upstream_error_;
-        }
+    // No lock: every write of upstream_error_ happens before the release
+    // decrement of pending_ by its writer, and this thread observed the final
+    // decrement (or got the task from the thread that did).
+    if (upstream_error_) {
+        error_ = upstream_error_;
     }
     if (!error_) {
         const std::span<const Operand> inputs(operands_.data(), ninputs_);
@@ -92,12 +96,16 @@ std::vector<std::shared_ptr<Task>> Task::execute() {
     kernel_.reset();
 
     std::vector<std::shared_ptr<Task>> consumers;
+    bool notify;
     {
         std::lock_guard lock(mutex_);
         state_.store(TaskState::Completed, std::memory_order_release);
         consumers.swap(consumers_);
+        notify = waiters_;
     }
-    state_.notify_all();
+    if (notify) {
+        state_.notify_all();
+    }
 
     std::vector<std::shared_ptr<Task>> runnable;
     for (auto& c : consumers) {

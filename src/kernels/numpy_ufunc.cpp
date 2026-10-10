@@ -1,5 +1,7 @@
 #include "kernels/numpy_ufunc.hpp"
 
+#include "runtime/pool.hpp"
+
 #define NPY_NO_DEPRECATED_API NPY_2_0_API_VERSION
 #define PY_ARRAY_UNIQUE_SYMBOL viproc_ARRAY_API
 #define PY_UFUNC_UNIQUE_SYMBOL viproc_UFUNC_API
@@ -304,7 +306,7 @@ ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype) {
         return nullptr;
     }
     Layout l = Layout::contiguous(dtype, {});
-    auto buffer = std::make_shared<Buffer>(l.nbytes());
+    auto buffer = make_pooled<Buffer>(l.nbytes());
     buffer->ensure_allocated();
     std::memcpy(buffer->data(), PyArray_DATA(reinterpret_cast<PyArrayObject*>(arr)), l.nbytes());
     Py_DECREF(arr);
