@@ -59,6 +59,15 @@ void vp_wait_all(vp_runtime* rt);
  * afterwards must only be released. */
 void vp_runtime_destroy(vp_runtime* rt);
 size_t vp_worker_count(const vp_runtime* rt);
+
+/* Dispatch policy for ops whose inputs are all ready (call before issuing):
+ * ops with fewer than `sync_below` output elements run inline on the calling
+ * thread; above that, `adaptive` != 0 lets each issue site switch to inline
+ * execution while its results are usually waited on right after issuing.
+ * adaptive == 0 gives a deterministic schedule. */
+void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive);
+/* Number of ops the policy ran inline / handed to workers so far. */
+void vp_offload_counts(const vp_runtime* rt, uint64_t* inline_ops, uint64_t* offloaded_ops);
 size_t vp_active_tasks(const vp_runtime* rt);
 
 /* --- Arrays -------------------------------------------------------------- */

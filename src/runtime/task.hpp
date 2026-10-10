@@ -3,6 +3,7 @@
 
 #include "buffer.hpp"
 #include "layout.hpp"
+#include "offload.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace viproc {
@@ -93,6 +95,18 @@ class Task {
     // this task was issued). The task then skips its kernel and fails too.
     void add_upstream_error(const TaskError& error);
 
+    // Dispatch statistics this task's work is attributed to: the site whose
+    // main-thread decision started it (inherited by consumers issued while it
+    // was pending), and the op count at that decision. Main thread only.
+    void set_blame(SiteStats* stats, std::uint64_t seq) {
+        blame_ = stats;
+        blame_seq_ = seq;
+    }
+    SiteStats* blame() const { return blame_; }
+    std::uint64_t blame_seq() const { return blame_seq_; }
+    // True the first time only (count one block per task).
+    bool mark_blocked() { return !std::exchange(blocked_, true); }
+
     // --- Any thread ---------------------------------------------------------
     // Runs the kernel (or skips it if an input failed), completes the task and
     // returns the consumers that became runnable. Never runs consumers itself:
@@ -120,6 +134,11 @@ class Task {
 
     std::optional<TaskError> error_;
     int fp_flags_ = 0;
+
+    // Main thread only (see set_blame).
+    SiteStats* blame_ = nullptr;
+    std::uint64_t blame_seq_ = 0;
+    bool blocked_ = false;
 };
 
 } // namespace viproc

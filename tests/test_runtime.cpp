@@ -43,10 +43,13 @@ class FnKernel : public Kernel {
     Fn fn_;
 };
 
+// Plain asynchronous dispatch (no inline execution) for the scheduling tests.
 RuntimeOptions opts(std::size_t workers, std::size_t max_active = kDefaultMaxActiveTasks) {
     RuntimeOptions o;
     o.workers = workers;
     o.max_active_tasks = max_active;
+    o.offload.sync_below = 0;
+    o.offload.adaptive = false;
     return o;
 }
 
@@ -488,6 +491,92 @@ void test_random_view_programs() {
     check(true, "20 random view programs (1500 ops each, overlapping views) match reference");
 }
 
+std::atomic<bool> on_main_thread_last{false};
+
+// out = in0 + 1, recording whether it ran on the calling (main) thread.
+std::shared_ptr<Kernel> add_one_where(std::thread::id main) {
+    return std::make_shared<FnKernel>([main](auto in, auto out) {
+        on_main_thread_last = std::this_thread::get_id() == main;
+        const std::int64_t n = out[0].layout.size();
+        for (std::int64_t i = 0; i < n; ++i) {
+            at(out[0], i) = at(in[0], i) + 1;
+        }
+        return KernelResult{};
+    });
+}
+
+void test_offload_small_ops_run_inline() {
+    RuntimeOptions o = opts(2);
+    o.offload.sync_below = 1024;
+    Runtime rt(o);
+    const auto main = std::this_thread::get_id();
+    ArrayPtr small = issue1(rt, add_one_where(main), {make_ready(rt, 100, 1.0)}, 100);
+    check(small->ready() && on_main_thread_last,
+          "op below sync_below with ready inputs runs inline");
+    ArrayPtr big = issue1(rt, add_one_where(main), {make_ready(rt, 4096, 1.0)}, 4096);
+    rt.wait(*big);
+    check(!on_main_thread_last, "op above sync_below goes to a worker");
+    // Pending input: always asynchronous, whatever the size.
+    ArrayPtr gate = issue1(rt, add_const(0.0, 20ms), {make_ready(rt, 4096, 0.0)}, 4096);
+    ArrayPtr dep = issue1(rt, add_one_where(main), {gate}, 4096);
+    check(!dep->ready(), "op with a pending input is issued asynchronously");
+    rt.wait(*dep);
+    check(rt.offload_policy().inline_count() == 1, "only the small ready op ran inline");
+}
+
+void test_offload_adaptive_per_site() {
+    RuntimeOptions o = opts(2);
+    o.offload.sync_below = 0;
+    o.offload.adaptive = true;
+    Runtime rt(o);
+    const auto main = std::this_thread::get_id();
+    ArrayPtr x = make_ready(rt, 2048, 1.0);
+    // Site A: issue, then immediately wait (nothing to overlap).
+    int inline_runs = 0;
+    for (int i = 0; i < 64; ++i) {
+        ArrayPtr r = issue1(rt, add_one_where(main), {x}, 2048, "prog.py:1 a");
+        rt.wait(*r);
+        inline_runs += on_main_thread_last ? 1 : 0;
+    }
+    check(inline_runs > 40,
+          "a site whose result is always waited on right away switches to inline");
+    // Site B: results are not waited on right away.
+    const std::uint64_t before = rt.offload_policy().inline_count();
+    std::vector<ArrayPtr> keep;
+    for (int i = 0; i < 64; ++i) {
+        keep.push_back(issue1(rt, add_const(1.0), {x}, 2048, "prog.py:2 b"));
+        for (int j = 0; j < 10; ++j) { // other work in between
+            keep.push_back(issue1(rt, add_const(1.0), {x}, 2048, "prog.py:3 c"));
+        }
+    }
+    rt.wait_all();
+    check(rt.offload_policy().inline_count() == before,
+          "sites whose results are not waited on right away stay asynchronous");
+    // Site A again, but now with overlap: it switches back (exploration).
+    for (int i = 0; i < 400; ++i) {
+        keep.push_back(issue1(rt, add_one_where(main), {x}, 2048, "prog.py:1 a"));
+        for (int j = 0; j < 10; ++j) {
+            keep.push_back(issue1(rt, add_const(1.0), {x}, 2048, "prog.py:3 c"));
+        }
+        if (keep.size() > 200) {
+            rt.wait_all();
+            keep.clear();
+        }
+    }
+    rt.wait_all();
+    int async_now = 0;
+    for (int i = 0; i < 20; ++i) {
+        ArrayPtr r = issue1(rt, add_one_where(main), {x}, 2048, "prog.py:1 a");
+        for (int j = 0; j < 10; ++j) {
+            keep.push_back(issue1(rt, add_const(1.0), {x}, 2048, "prog.py:3 c"));
+        }
+        rt.wait(*r);
+        async_now += on_main_thread_last ? 0 : 1;
+    }
+    rt.wait_all();
+    check(async_now > 10, "a site switched to inline goes back to async once its results overlap");
+}
+
 } // namespace
 
 int main() {
@@ -507,6 +596,8 @@ int main() {
     test_error_propagation();
     test_active_limit();
     test_random_programs();
+    test_offload_small_ops_run_inline();
+    test_offload_adaptive_per_site();
     test_random_view_programs();
     std::printf("%d failure(s)\n", g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -266,3 +266,33 @@ def test_issue_site_names_the_user_code_line():
     assert line == inspect.getsourcelines(caller)[1] + 1
     sites = {caller() for _ in range(3)}  # cached: same interned site
     assert sites == {site}
+
+
+def test_offload_policy_small_ops_inline_and_deterministic_mode():
+    try:
+        viproc.init(workers=2, sync_below=1024)
+        small = viproc.asarray(np.arange(10.0))
+        before = viproc.offload_stats()
+        r = small * 2
+        assert r.ready()  # ran inline: nothing to wait for
+        assert viproc.offload_stats()["inline"] == before["inline"] + 1
+        assert same(r, np.arange(10.0) * 2)
+
+        viproc.init(workers=2, sync_below=0, adaptive=False)  # deterministic: always async
+        big = viproc.asarray(rng.standard_normal(1_000_000))
+        for _ in range(50):
+            (np.sin(big) + 1).wait()  # always waited on right away
+        assert viproc.offload_stats()["inline"] == 0
+    finally:
+        viproc.init()
+
+
+def test_adaptive_policy_switches_site_waited_on_right_away():
+    try:
+        viproc.init(workers=2, sync_below=0, adaptive=True)
+        x = viproc.asarray(rng.standard_normal(4096))
+        for _ in range(64):
+            (x * 2).wait()  # same issue site, result needed immediately
+        assert viproc.offload_stats()["inline"] > 30
+    finally:
+        viproc.init()

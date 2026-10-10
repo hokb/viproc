@@ -807,7 +807,9 @@ static PyObject* m_setup(PyObject* self, PyObject* args) {
 static PyObject* m_init(PyObject* self, PyObject* args) {
     (void)self;
     Py_ssize_t workers = 0, max_active = 0;
-    if (!PyArg_ParseTuple(args, "|nn", &workers, &max_active)) {
+    long long sync_below = -1; /* -1: runtime default */
+    int adaptive = 1;
+    if (!PyArg_ParseTuple(args, "|nnLp", &workers, &max_active, &sync_below, &adaptive)) {
         return NULL;
     }
     if (g_rt != NULL) {
@@ -821,7 +823,22 @@ static PyObject* m_init(PyObject* self, PyObject* args) {
         return NULL;
     }
     g_main_thread = PyThread_get_thread_ident();
+    if (sync_below >= 0 || !adaptive) {
+        vp_set_offload_policy(g_rt, sync_below >= 0 ? sync_below : 2048, adaptive);
+    }
     Py_RETURN_NONE;
+}
+
+static PyObject* m_offload_counts(PyObject* self, PyObject* noargs) {
+    (void)self;
+    (void)noargs;
+    if (check_runtime() < 0) {
+        return NULL;
+    }
+    uint64_t inl = 0, off = 0;
+    vp_offload_counts(g_rt, &inl, &off);
+    return Py_BuildValue("{s:K,s:K}", "inline", (unsigned long long)inl, "offloaded",
+                         (unsigned long long)off);
 }
 
 static PyObject* m_shutdown(PyObject* self, PyObject* noargs) {
@@ -978,9 +995,12 @@ static PyMethodDef methods[] = {
     {"_issue_site", m_issue_site, METH_NOARGS, "The issue site an op issued here would get."},
     {"setup", m_setup, METH_VARARGS,
      "setup(cls, dtypes, fallback, asarray, internal_dirs, ops, ndarray, generic)"},
-    {"init", m_init, METH_VARARGS, "init(workers=0, max_active_tasks=0)"},
+    {"init", m_init, METH_VARARGS,
+     "init(workers=0, max_active_tasks=0, sync_below=-1, adaptive=True)"},
     {"shutdown", m_shutdown, METH_NOARGS, "Wait for all tasks and destroy the runtime."},
     {"initialized", m_initialized, METH_NOARGS, NULL},
+    {"offload_counts", m_offload_counts, METH_NOARGS,
+     "{'inline': n, 'offloaded': m}: ops run inline / handed to workers"},
     {"workers", m_workers, METH_NOARGS, NULL},
     {"active_tasks", m_active_tasks, METH_NOARGS, NULL},
     {"wait_all", m_wait_all, METH_NOARGS, NULL},

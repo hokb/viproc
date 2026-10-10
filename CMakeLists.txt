@@ -27,7 +27,8 @@ add_library(viproc
     src/runtime/buffer.cpp
     src/runtime/task.cpp
     src/runtime/runtime.cpp
-    src/runtime/assign.cpp)
+    src/runtime/assign.cpp
+    src/runtime/offload.cpp)
 target_include_directories(viproc PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)

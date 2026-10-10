@@ -35,10 +35,16 @@ _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 _NUMPY_DIR = os.path.dirname(os.path.abspath(np.__file__))
 
 
+def _env_policy():
+    sync_below = int(os.environ.get("VIPROC_SYNC_BELOW", "-1"))
+    adaptive = os.environ.get("VIPROC_DETERMINISTIC", "0") in ("", "0")
+    return sync_below, adaptive
+
+
 def _ensure_runtime():
     if not _viproc.initialized():
         workers = int(os.environ.get("VIPROC_WORKERS", "0"))
-        _viproc.init(workers)
+        _viproc.init(workers, 0, *_env_policy())
 
 
 def _wrap_numpy(arr):
@@ -322,10 +328,28 @@ def wait_all():
         _viproc.wait_all()
 
 
-def init(workers=0, max_active_tasks=0):
-    """(Re)starts the runtime with `workers` threads (0: one per CPU)."""
+def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
+    """(Re)starts the runtime.
+
+    workers: worker threads (0: one per CPU).
+    sync_below: ops whose inputs are ready and that produce fewer elements run
+        inline on the calling thread (default 2048, env VIPROC_SYNC_BELOW).
+    adaptive: let each issue site switch to inline execution while its results
+        are usually needed right after issuing (default True; False, or env
+        VIPROC_DETERMINISTIC=1, gives a deterministic schedule). Results are
+        identical either way; only where ops run changes.
+    """
+    env_sync, env_adaptive = _env_policy()
     shutdown()
-    _viproc.init(workers, max_active_tasks)
+    _viproc.init(workers, max_active_tasks,
+                 env_sync if sync_below is None else sync_below,
+                 env_adaptive if adaptive is None else adaptive)
+
+
+def offload_stats():
+    """{'inline': n, 'offloaded': m}: ready ops run inline / handed to workers."""
+    _ensure_runtime()
+    return _viproc.offload_counts()
 
 
 def shutdown():

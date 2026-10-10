@@ -31,7 +31,7 @@ inline void cpu_relax() {
 
 } // namespace
 
-Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)) {
+Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_(options_.offload) {
     std::size_t n = options_.workers;
     if (n == 0) {
         n = std::max(1u, std::thread::hardware_concurrency());
@@ -98,7 +98,16 @@ void Runtime::acquire_slot() {
 }
 
 void Runtime::launch(const std::shared_ptr<Task>& task,
-                     const std::vector<std::shared_ptr<Task>>& producers) {
+                     const std::vector<std::shared_ptr<Task>>& producers, std::int64_t elements) {
+    ++seq_;
+    // While pending, the task's work is attributed to the decision that
+    // started the work it waits for.
+    for (const std::shared_ptr<Task>& p : producers) {
+        if (p->blame() != nullptr) {
+            task->set_blame(p->blame(), p->blame_seq());
+            break;
+        }
+    }
     for (const std::shared_ptr<Task>& p : producers) {
         task->add_pending_input();
         if (!p->add_consumer(task)) {
@@ -106,7 +115,7 @@ void Runtime::launch(const std::shared_ptr<Task>& task,
         }
     }
     if (task->release_issue_guard()) {
-        trigger_from_main(task);
+        trigger_from_main(task, elements);
     }
 }
 
@@ -131,7 +140,7 @@ void Runtime::issue_storage_copy(Storage& s) {
     task->advance(TaskState::SizeCompleted);
     s.buffer_ = fresh;
     s.producer_ = task;
-    launch(task, producers);
+    launch(task, producers, static_cast<std::int64_t>(old->nbytes()));
 }
 
 std::vector<ArrayPtr> Runtime::issue(std::shared_ptr<Kernel> kernel,
@@ -233,12 +242,22 @@ std::vector<ArrayPtr> Runtime::issue(std::shared_ptr<Kernel> kernel,
     }
     // Phase 1: shapes are known at issue time.
     task->advance(TaskState::SizeCompleted);
-    launch(task, producers);
+    const std::int64_t elements = !new_outputs.empty() ? new_outputs[0].size()
+                                  : !inouts.empty()    ? inouts[0]->layout_.size()
+                                                       : 0;
+    launch(task, producers, elements);
     return results;
 }
 
-void Runtime::trigger_from_main(const std::shared_ptr<Task>& task) {
-    const bool offload = !options_.should_offload || options_.should_offload(*task);
+void Runtime::trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t elements) {
+    bool offload;
+    if (options_.should_offload) {
+        offload = options_.should_offload(*task);
+    } else {
+        const OffloadPolicy::Decision d = policy_.decide(task->issue_site(), elements);
+        offload = d.offload;
+        task->set_blame(d.stats, seq_);
+    }
     if (offload) {
         enqueue(task);
         return;
@@ -253,7 +272,11 @@ void Runtime::trigger_from_main(const std::shared_ptr<Task>& task) {
 std::optional<TaskError> Runtime::wait(Array& a) {
     Storage& s = *a.storage_;
     if (s.producer_) {
-        s.producer_->wait_completed();
+        Task& p = *s.producer_;
+        if (!p.completed() && p.mark_blocked()) {
+            policy_.on_blocked(p.blame(), seq_ - p.blame_seq());
+        }
+        p.wait_completed();
     }
     s.ready();
     return s.last_error_;

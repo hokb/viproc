@@ -109,6 +109,18 @@ void vp_runtime_destroy(vp_runtime* rt) {
 size_t vp_worker_count(const vp_runtime* rt) { return rt->rt->worker_count(); }
 size_t vp_active_tasks(const vp_runtime* rt) { return rt->rt->active_tasks(); }
 
+void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive) {
+    OffloadOptions o = rt->rt->offload_policy().options();
+    o.sync_below = sync_below;
+    o.adaptive = adaptive != 0;
+    rt->rt->set_offload_options(o);
+}
+
+void vp_offload_counts(const vp_runtime* rt, uint64_t* inline_ops, uint64_t* offloaded_ops) {
+    *inline_ops = rt->rt->offload_policy().inline_count();
+    *offloaded_ops = rt->rt->offload_policy().offload_count();
+}
+
 int vp_array_from_ndarray(vp_runtime* rt, PyObject* ndarray, vp_array** out, char* err,
                           size_t errlen) {
     rt->graveyard->drain();

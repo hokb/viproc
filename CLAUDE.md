@@ -240,6 +240,7 @@ include/viproc/        Public C ABI (viproc.h). The only interface bridges may u
 src/runtime/           Runtime core, no Python dependency (library `viproc`)
   layout.*             DType, Layout (shape, byte strides, offset), broadcasting
   small_vector.hpp     inline-storage vector (shapes/strides without heap)
+  offload.*            OffloadPolicy: inline vs. worker for ready tasks
   buffer.*             Buffer: element memory, lazily allocated; async_reads
   task.*               Task: stages, consumer callbacks, execute(); Kernel interface
   runtime.*            Array (main-thread view), Runtime: issue protocol,
@@ -259,7 +260,7 @@ python/viproc/         Python package
                        indexing, sync points; registers hooks with setup()
   __init__.py          module API (asarray, zeros, …; other names from NumPy)
 python/tests/          pytest tests of the bridge (bit-identical to NumPy)
-python/benchmarks/     strong_scaling.py
+python/benchmarks/     strong_scaling.py, sync_latency.py
 tests/
   test_numpy_loops.cpp    spike: NumPy loops on a worker without the GIL
   test_runtime.cpp        runtime core with C++ test kernels
@@ -322,12 +323,33 @@ See "Execution model" for arrays, tasks, eventing, thread rules and
 reference counting.
 
 - **Dispatch decision (when the main thread triggers a task whose inputs
-  are all `ready`):** `should_offload(task)` decides: `true` → hand it to a
-  worker, `false` → execute it immediately on the main thread.
-  `should_offload` is a heuristic still to be defined (candidates: element
-  count, op cost class, number of pending tasks). Keep it a single,
-  swappable function. Tasks triggered by a callback run on the thread that
+  are all `ready`):** hand it to a worker, or execute it immediately on the
+  main thread. Tasks triggered by a callback run on the thread that
   completed their last input, as a continuation (see "Issuing an op").
+  The decision is one swappable component, `OffloadPolicy`
+  (`src/runtime/offload.*`); `RuntimeOptions::should_offload` overrides it.
+  The case to catch: the main thread needs the result right after issuing
+  (`if (x*y).any():`, `print(c)`), so there is nothing to overlap and the
+  hand-off is pure latency. Hybrid policy, after the ILNumerics
+  Accelerator's "scalar shortcut" and "adaptive fork suppression":
+  1. **`sync_below` (N_min, default 2048 output elements):** smaller ready
+     tasks always run inline. Deterministic, one comparison. Calibrated
+     with `strong_scaling.py` (4 CPUs, sin/cos chains): inline wins up to
+     ~1000 elements, async from ~3000.
+  2. **Adaptive above N_min, per (issue site, log2 size class):** count
+     async issues and how many of them the main thread blocked on "right
+     away" (a wait within `window` = 8 issued ops of the decision that
+     started the work; consumers issued while it was pending inherit that
+     attribution). After `sample` = 8 issues: ≥ 3/4 blocked → the site runs
+     inline; in inline mode every 16th call still goes async to re-test,
+     and ≤ 1/4 blocked switches back. Reversible, unlike the Accelerator.
+  3. **Deterministic mode:** `adaptive = false` (`viproc.init(adaptive=False)`
+     or `VIPROC_DETERMINISTIC=1`) keeps only rule 1. Results are identical
+     in every mode; only where ops run changes.
+  Not done yet: per-op cost classes (N_min is in elements, calibrated on
+  sin/cos; cheap ops like `add` would warrant a higher N_min), and letting
+  a waiting main thread run a queued, not yet started task itself.
+  `python/benchmarks/sync_latency.py` measures the targeted pattern.
 - **Errors** from asynchronous execution are stored on the task and its
   outputs and raised at the next sync point that touches them.
 
@@ -511,8 +533,10 @@ Rules:
   ~0.5 µs); it was 31–41 µs with the Python hot path.
 - Measured (4 CPUs, `strong_scaling.py`, 8 chains, Release build, speedup
   vs. NumPy with 4 workers): 1e6 elements 3.5x; 1e5 3.0x; 1e4 ~3x;
-  1e3 ~1x (noisy). Tiny ops are now dominated by handing tasks to workers;
-  `should_offload` (run tiny ready tasks inline) is the next lever.
+  1e3 ~0.75x, 3e3 ~2x (noisy).
+- "Issue an op, read the result right away" (`sync_latency.py`): 8 elements
+  8.1 → 1.6–2.3 µs (NumPy 0.4–0.9), 1e3 5.1 → 1.9–2.6 µs (NumPy 0.8–1.5),
+  1e5 ~equal to NumPy, thanks to the dispatch policy.
 
 ## Implementation notes (current code)
 
@@ -531,7 +555,6 @@ Rules:
 - Tasks the **main thread** runs inline (`should_offload == false`) hand the
   consumers they unblock to the pool, so the main thread keeps issuing.
   Workers run one unblocked consumer as their continuation.
-- Default `should_offload`: always offload.
 - Worker pool: at most one idle worker spins (50 µs, `pause`) before
   sleeping; `enqueue()` wakes a sleeper only if nobody spins. This avoids a
   wake-up syscall per small task without taking cores from busy threads.
@@ -611,7 +634,10 @@ functions.
       element-wise ufuncs (incl. 0-d broadcast), `add.reduce`, linalg
       `det`, `fft` and `argmax`; FP flags are visible on the worker
       (`tests/test_numpy_loops.cpp`, NumPy 2.5.3).
-- [ ] `should_offload` heuristic for tasks whose inputs are all completed.
+- [x] `should_offload`: hybrid N_min + adaptive per-site policy (see
+      "Dispatch decision").
+- [ ] Dispatch: op cost classes for N_min; main thread runs a queued, not
+      yet started task itself when it has to wait for it.
 - [x] Per-op overhead of the bridge: hot path moved to C (~35 µs → ~3–7 µs).
 - [ ] Evaluate a generic path under free-threaded CPython: workers call the
       regular NumPy entry (no reimplementation of NumPy semantics).

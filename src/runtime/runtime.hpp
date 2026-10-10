@@ -3,6 +3,7 @@
 
 #include "buffer.hpp"
 #include "layout.hpp"
+#include "offload.hpp"
 #include "task.hpp"
 
 #include <atomic>
@@ -89,8 +90,10 @@ using ShouldOffload = std::function<bool(const Task&)>;
 struct RuntimeOptions {
     std::size_t workers = 0; // 0: std::thread::hardware_concurrency()
     std::size_t max_active_tasks = kDefaultMaxActiveTasks;
-    // Decides for a task whose inputs are all ready: true -> worker,
-    // false -> run immediately on the main thread. Default: always offload.
+    // Dispatch policy for tasks whose inputs are all ready (see offload.hpp).
+    OffloadOptions offload;
+    // Overrides the policy if set: true -> worker, false -> run immediately on
+    // the main thread.
     ShouldOffload should_offload;
 };
 
@@ -133,6 +136,10 @@ class Runtime {
 
     // --- Any thread ---------------------------------------------------------
     std::size_t active_tasks() const { return active_.load(std::memory_order_acquire); }
+    // Main thread: the dispatch policy and its counters.
+    const OffloadPolicy& offload_policy() const { return policy_; }
+    // Main thread, before issuing ops: replaces the dispatch policy.
+    void set_offload_options(const OffloadOptions& o) { policy_ = OffloadPolicy(o); }
     std::size_t worker_count() const { return workers_.size(); }
 
   private:
@@ -140,16 +147,18 @@ class Runtime {
     // Executes `task` on the current thread and returns its runnable consumers.
     std::vector<std::shared_ptr<Task>> run(const std::shared_ptr<Task>& task);
     void enqueue(std::shared_ptr<Task> task);
-    void trigger_from_main(const std::shared_ptr<Task>& task);
+    void trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t elements);
     void acquire_slot();
     // Registers `task` on its pending producers and triggers it if none.
     void launch(const std::shared_ptr<Task>& task,
-                const std::vector<std::shared_ptr<Task>>& producers);
+                const std::vector<std::shared_ptr<Task>>& producers, std::int64_t elements);
     // Copy-on-write with views: switches `s` to a new buffer holding a copy of
     // the old data (issued as its own task); views keep their layouts.
     void issue_storage_copy(Storage& s);
 
     RuntimeOptions options_;
+    OffloadPolicy policy_;  // main thread only
+    std::uint64_t seq_ = 0; // ops issued so far (main thread only)
     std::atomic<std::size_t> active_{0};
 
     // Pool queue. Idle workers spin for a short while (checking `queued_`

@@ -20,6 +20,7 @@ from ._ndarray import (
     asarray,
     init,
     ndarray,
+    offload_stats,
     shutdown,
     wait_all,
     workers,
