@@ -29,6 +29,9 @@ struct Layout {
     static Layout contiguous(DType dtype, Shape shape);
 
     std::int64_t size() const;
+    // True if the elements lie C-contiguously (dimensions of extent 1 may
+    // have any stride).
+    bool c_contiguous() const;
     // Bytes a buffer needs to hold this layout when it is contiguous.
     std::size_t nbytes() const;
 };

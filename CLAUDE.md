@@ -531,16 +531,29 @@ Rules:
   key dicts by code object: hashing one hashes its whole bytecode
   (~3000 instructions per lookup; it was 20% of the per-op cost).
 - Loops are resolved once per (ufunc, input kinds) into a `vp_loop`
-  handle (`vp_ufunc_loop`) kept in the dtype-resolution cache; ops are
-  issued with `vp_ufunc_issue` without any lookup. Both caches are
-  cleared when the runtime shuts down (handles and interned sites belong
-  to it).
+  handle (`vp_ufunc_loop`); ops are issued with `vp_ufunc_issue` without
+  any lookup. Per-op caches (issue sites, code flags, signatures) are small
+  open-addressing C tables keyed by (pointer, int), not dicts: building key
+  tuples/ints and two dict lookups cost ~1,700 instructions per op, the
+  tables ~100. Each entry holds a reference to its key object. Sites and
+  signatures are cleared when the runtime shuts down (handles and interned
+  sites belong to it).
 - Evaluated and rejected: caching/reusing `viproc.ndarray` objects. Their
   allocation and deallocation is ~1% of the per-op instructions.
 - One Python thread only: the thread that initialized the runtime.
-- Per-op cost on the main thread (`x * y`, 8 elements, Release): ~7,000
-  instructions (callgrind), ~1.3 µs with one worker (NumPy itself:
-  ~0.5 µs); it was 31–41 µs with the Python hot path.
+- Per-op cost (`x * y`, 8 elements, Release, callgrind, op run inline):
+  viproc ~7,100 instructions, ~0.8 µs; NumPy ~4,300, ~0.4 µs. Breakdown:
+  bridge front end (kinds, cached resolution, issue site, result object)
+  ~900, which is *less* than NumPy's own dispatch and dtype resolution
+  (~2,500); the difference is the runtime's bookkeeping: `Runtime::issue`
+  ~2,300 (Task, Array, Storage, Buffer, operand vectors: 9 heap
+  allocations per op vs. NumPy's 2, plus shared_ptr atomics), `execute`
+  ~1,100 besides the NumPy loop itself (~110), release ~900 (NumPy's
+  dealloc ~350). Next levers: fewer allocations per op (one block for
+  Array/Storage/Buffer, small element memory inline, pooled tasks).
+- Element-wise kernels call the loop once over all elements when every
+  operand is C-contiguous with the output shape or a single element
+  (stride 0); otherwise once per innermost row.
 - Measured (4 CPUs, `strong_scaling.py`, 8 chains, Release build, speedup
   vs. NumPy with 4 workers): 1e6 elements 3.5x; 1e5 3.0x; 1e4 ~3x;
   1e3 ~0.75x, 3e3 ~2x (noisy).

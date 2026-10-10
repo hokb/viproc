@@ -35,6 +35,17 @@ Layout Layout::contiguous(DType dtype, Shape shape) {
     return l;
 }
 
+bool Layout::c_contiguous() const {
+    std::int64_t stride = static_cast<std::int64_t>(itemsize(dtype));
+    for (std::size_t i = shape.size(); i-- > 0;) {
+        if (shape[i] != 1 && strides[i] != stride) {
+            return false;
+        }
+        stride *= shape[i];
+    }
+    return true;
+}
+
 std::int64_t Layout::size() const {
     std::int64_t n = 1;
     for (std::int64_t d : shape) {

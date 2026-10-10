@@ -195,6 +195,42 @@ class ElementwiseKernel : public Kernel {
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Shape& shape = outputs[0].layout.shape;
         const auto nin = static_cast<std::size_t>(loop_->nin());
+        if (nin + outputs.size() <= kMaxFlat) {
+            // Fast path: every operand covers `shape` C-contiguously or is a
+            // single element (stride 0). Then one loop call covers all
+            // elements, as in NumPy (element-wise results do not depend on
+            // how the elements are split into calls).
+            const std::int64_t n = outputs[0].layout.size();
+            char* ptrs[kMaxFlat];
+            std::intptr_t strides[kMaxFlat];
+            std::size_t k = 0;
+            auto flat = [&](const Operand& op) {
+                const Layout& l = op.layout;
+                ptrs[k] = reinterpret_cast<char*>(op.first());
+                if (l.shape == shape && l.c_contiguous()) {
+                    strides[k++] = static_cast<std::intptr_t>(itemsize(l.dtype));
+                    return true;
+                }
+                strides[k++] = 0;
+                return l.size() == 1;
+            };
+            bool ok = true;
+            for (const Operand& op : inputs.first(nin)) {
+                ok = ok && flat(op);
+            }
+            for (const Operand& op : outputs) {
+                ok = ok && flat(op) && strides[k - 1] != 0; // a broadcast output is not flat
+            }
+            if (ok) {
+                if (n == 0) {
+                    return {};
+                }
+                const auto count = static_cast<std::intptr_t>(n);
+                return loop_->call(ptrs, &count, strides) == 0
+                           ? KernelResult{}
+                           : KernelResult{1, "NumPy loop failed", 0};
+            }
+        }
         std::vector<Layout> layouts;
         layouts.reserve(nin + outputs.size());
         OperandPointers base;
@@ -214,6 +250,7 @@ class ElementwiseKernel : public Kernel {
     }
 
   private:
+    static constexpr std::size_t kMaxFlat = 8;
     const UfuncLoop* loop_;
 };
 

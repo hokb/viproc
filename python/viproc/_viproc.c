@@ -34,12 +34,92 @@ static PyObject* g_np_generic = NULL;    /* numpy.generic */
 static PyObject* g_ops = NULL;           /* dict: operator name -> ufunc */
 
 /* Caches (main thread only). */
-static PyObject* g_ufunc_info = NULL; /* ufunc -> (nin, nout, is_gufunc, {sigkey: resolved}) */
-/* Code objects are keyed by address: hashing a code object hashes its whole
- * bytecode and constants. Each g_code_internal entry also holds the code
- * object, so its address cannot be reused while it is cached. */
-static PyObject* g_code_internal = NULL; /* id(code) -> (code, is_internal) */
-static PyObject* g_sites = NULL;         /* (id(code), lasti) -> interned site (per runtime) */
+
+/* Per-op lookups use small open-addressing tables keyed by (pointer, int)
+ * instead of dicts: no key objects to build, no Python hashing. Code objects
+ * in particular are keyed by address (hashing one hashes its bytecode). Each
+ * entry holds a strong reference to the object its key points to, so the
+ * address cannot be reused while it is cached. */
+typedef struct {
+    const void* a; /* NULL: empty slot */
+    long long b;
+    long long v;
+    const void* p;
+    PyObject* keep;
+} Entry;
+
+typedef struct {
+    Entry* e;
+    size_t cap; /* power of two, or 0 */
+    size_t n;
+} Table;
+
+static Table g_code_flags; /* (code, 0) -> v: frame is inside viproc/NumPy */
+static Table g_sites;      /* (code, lasti) -> p: interned site (per runtime) */
+static Table g_sigs;       /* (ufunc, nin|kinds) -> v: packed dtype codes or -1, p: vp_loop */
+
+static size_t t_slot(const Table* t, const void* a, long long b) {
+    unsigned long long h = (unsigned long long)(uintptr_t)a * 0x9E3779B97F4A7C15ull ^
+                           (unsigned long long)b * 0xC2B2AE3D27D4EB4Full;
+    return (size_t)(h ^ (h >> 31)) & (t->cap - 1);
+}
+
+static Entry* t_find(const Table* t, const void* a, long long b) {
+    if (t->cap == 0) {
+        return NULL;
+    }
+    for (size_t i = t_slot(t, a, b);; i = (i + 1) & (t->cap - 1)) {
+        Entry* e = &t->e[i];
+        if (e->a == a && e->b == b) {
+            return e;
+        }
+        if (e->a == NULL) {
+            return NULL;
+        }
+    }
+}
+
+/* Inserts a key that is not in the table. Returns 0, or -1 (MemoryError). */
+static int t_put(Table* t, const void* a, long long b, long long v, const void* p, PyObject* keep) {
+    if (2 * (t->n + 1) > t->cap) {
+        const size_t cap = t->cap != 0 ? 2 * t->cap : 64;
+        Entry* e = PyMem_Calloc(cap, sizeof(Entry));
+        if (e == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        Table grown = {e, cap, 0};
+        for (size_t i = 0; i < t->cap; ++i) {
+            if (t->e[i].a != NULL) {
+                size_t j = t_slot(&grown, t->e[i].a, t->e[i].b);
+                while (e[j].a != NULL) {
+                    j = (j + 1) & (cap - 1);
+                }
+                e[j] = t->e[i];
+            }
+        }
+        grown.n = t->n;
+        PyMem_Free(t->e);
+        *t = grown;
+    }
+    size_t i = t_slot(t, a, b);
+    while (t->e[i].a != NULL) {
+        i = (i + 1) & (t->cap - 1);
+    }
+    t->e[i] = (Entry){a, b, v, p, Py_XNewRef(keep)};
+    ++t->n;
+    return 0;
+}
+
+static void t_clear(Table* t) {
+    Entry* e = t->e;
+    const size_t cap = t->cap;
+    *t = (Table){NULL, 0, 0};
+    for (size_t i = 0; i < cap; ++i) {
+        Py_XDECREF(e[i].keep);
+    }
+    PyMem_Free(e);
+}
 
 static PyObject* s_call = NULL; /* "__call__" */
 static PyObject* s_out = NULL;  /* "out" */
@@ -187,13 +267,13 @@ static const char* issue_site(void) {
     Py_XINCREF(f);
     while (f != NULL) {
         PyCodeObject* code = PyFrame_GetCode(f); /* new ref */
-        PyObject* id = PyLong_FromVoidPtr(code);
-        PyObject* entry = id != NULL ? PyDict_GetItemWithError(g_code_internal, id) : NULL;
-        PyObject* internal = entry != NULL ? PyTuple_GET_ITEM(entry, 1) : NULL;
-        if (internal == NULL && id != NULL) {
-            PyErr_Clear();
+        const Entry* flag = t_find(&g_code_flags, code, 0);
+        int is_internal;
+        if (flag != NULL) {
+            is_internal = (int)flag->v;
+        } else {
             PyObject* fn = PyObject_GetAttrString((PyObject*)code, "co_filename");
-            int is_internal = 0;
+            is_internal = 0;
             if (fn != NULL && g_internal_dirs != NULL) {
                 PyObject* name = PyUnicode_InternFromString("startswith");
                 PyObject* r = PyObject_CallMethodOneArg(fn, name, g_internal_dirs);
@@ -203,20 +283,15 @@ static const char* issue_site(void) {
             }
             Py_XDECREF(fn);
             PyErr_Clear();
-            internal = is_internal ? Py_True : Py_False;
-            PyObject* e = PyTuple_Pack(2, (PyObject*)code, internal);
-            if (e != NULL) {
-                PyDict_SetItem(g_code_internal, id, e);
-                Py_DECREF(e);
+            if (t_put(&g_code_flags, code, 0, is_internal, NULL, (PyObject*)code) < 0) {
+                PyErr_Clear(); /* not cached: computed again next time */
             }
         }
-        if (internal == Py_False) {
-            const char* site = NULL;
-            PyObject* key = Py_BuildValue("(Oi)", id, PyFrame_GetLasti(f));
-            PyObject* hit = key != NULL ? PyDict_GetItemWithError(g_sites, key) : NULL;
-            if (hit != NULL) {
-                site = (const char*)PyLong_AsVoidPtr(hit);
-            } else if (key != NULL && !PyErr_Occurred()) {
+        if (!is_internal) {
+            const int lasti = PyFrame_GetLasti(f);
+            const Entry* hit = t_find(&g_sites, code, lasti);
+            const char* site = hit != NULL ? (const char*)hit->p : NULL;
+            if (site == NULL) {
                 PyObject* name = PyObject_GetAttrString((PyObject*)code, "co_qualname");
                 PyObject* fn = PyObject_GetAttrString((PyObject*)code, "co_filename");
                 PyObject* text = PyBytes_FromFormat("%s:%d in %s", fn ? PyUnicode_AsUTF8(fn) : "?",
@@ -227,21 +302,16 @@ static const char* issue_site(void) {
                 if (text != NULL) {
                     site = vp_intern(g_rt, PyBytes_AS_STRING(text));
                     Py_DECREF(text);
-                    PyObject* v = PyLong_FromVoidPtr((void*)site);
-                    if (v != NULL) {
-                        PyDict_SetItem(g_sites, key, v);
-                        Py_DECREF(v);
+                    if (t_put(&g_sites, code, lasti, 0, site, (PyObject*)code) < 0) {
+                        PyErr_Clear();
                     }
                 }
+                PyErr_Clear();
             }
-            Py_XDECREF(key);
-            Py_XDECREF(id);
             Py_DECREF(code);
             Py_DECREF(f);
-            PyErr_Clear();
             return site != NULL ? site : vp_intern(g_rt, "<unknown>");
         }
-        Py_XDECREF(id);
         Py_DECREF(code);
         PyFrameObject* back = PyFrame_GetBack(f); /* new ref */
         Py_DECREF(f);
@@ -322,105 +392,64 @@ static PyObject* kind_spec(int kind) {
     }
 }
 
-/* Per-ufunc info: nin, nout, is gufunc, signature cache. Borrowed tuple. */
-static PyObject* ufunc_info(PyObject* ufunc) {
-    PyObject* info = PyDict_GetItemWithError(g_ufunc_info, ufunc);
-    if (info != NULL || PyErr_Occurred()) {
-        return info;
-    }
-    PyObject* nin = PyObject_GetAttrString(ufunc, "nin");
-    PyObject* nout = PyObject_GetAttrString(ufunc, "nout");
-    PyObject* sig = PyObject_GetAttrString(ufunc, "signature");
-    if (nin == NULL || nout == NULL || sig == NULL) {
-        Py_XDECREF(nin);
-        Py_XDECREF(nout);
-        Py_XDECREF(sig);
-        return NULL;
-    }
-    info = Py_BuildValue("(NNON)", nin, nout, sig != Py_None ? Py_True : Py_False, PyDict_New());
-    Py_DECREF(sig);
-    if (info == NULL || PyDict_SetItem(g_ufunc_info, ufunc, info) < 0) {
-        Py_XDECREF(info);
-        return NULL;
-    }
-    Py_DECREF(info); /* owned by the cache */
-    return info;
-}
-
-/* Resolved dtype codes for (ufunc, kinds): out[0..nin) inputs, out[nin] the
- * output, plus NumPy's loop for them. Returns 1 if supported, 0 if not, -1 on
- * error. Cached per runtime (the loop handles belong to it). */
-static int resolve(PyObject* ufunc, PyObject* sigcache, int nin, const int* kinds, int* out,
-                   const vp_loop** loop) {
-    unsigned long long key = 0;
-    for (int i = 0; i < nin; ++i) {
-        key |= (unsigned long long)kinds[i] << (8 * i);
-    }
-    PyObject* k = PyLong_FromUnsignedLongLong(key);
-    if (k == NULL) {
-        return -1;
-    }
-    PyObject* hit = PyDict_GetItemWithError(sigcache, k);
-    long long packed;
+/* Resolves (ufunc, kinds) on a g_sigs miss: *packed gets the dtype codes
+ * (inputs, then the output; 8 bits each) or -1 if the fast path does not
+ * handle the call, *loop NumPy's loop for them. Returns 0, or -1 on error. */
+static int resolve_slow(PyObject* ufunc, int nin, const int* kinds, long long* packed,
+                        const vp_loop** loop) {
+    *packed = -1;
     *loop = NULL;
-    if (hit != NULL) {
-        packed = PyLong_AsLongLong(PyTuple_GET_ITEM(hit, 0));
-        *loop = (const vp_loop*)PyLong_AsVoidPtr(PyTuple_GET_ITEM(hit, 1));
-    } else if (PyErr_Occurred()) {
-        Py_DECREF(k);
-        return -1;
-    } else {
-        packed = -1;
-        PyObject* spec = PyTuple_New(nin + 1);
-        for (int i = 0; i < nin; ++i) {
-            PyTuple_SET_ITEM(spec, i, Py_NewRef(kind_spec(kinds[i])));
-        }
-        PyTuple_SET_ITEM(spec, nin, Py_NewRef(Py_None));
-        PyObject* name = PyUnicode_InternFromString("resolve_dtypes");
-        PyObject* res = PyObject_CallMethodOneArg(ufunc, name, spec);
-        Py_DECREF(name);
-        Py_DECREF(spec);
-        if (res == NULL) {
-            PyErr_Clear(); /* no loop / promotion error: NumPy raises it in the fallback */
-        } else {
-            long long p = 0;
-            int ok = 1;
-            for (int i = 0; i <= nin && ok; ++i) {
-                int c = dtype_code(PyTuple_GET_ITEM(res, i));
-                /* Typed inputs must keep their dtype: anything else is a cast. */
-                ok = c >= 0 && (i == nin || kinds[i] >= K_PYBOOL || kinds[i] == c);
-                p |= (long long)c << (8 * i);
-            }
-            Py_DECREF(res);
-            packed = ok ? p : -1;
-        }
-        if (packed >= 0) {
-            vp_dtype dts[MAXIN + 1];
-            for (int i = 0; i <= nin; ++i) {
-                dts[i] = (vp_dtype)((packed >> (8 * i)) & 0xff);
-            }
-            char err[ERRLEN];
-            if (vp_ufunc_loop(g_rt, ufunc, nin, dts, loop, err, sizeof err) != VP_OK) {
-                packed = -1; /* no exact NumPy loop (or it needs the Python API) */
-                *loop = NULL;
-            }
-        }
-        PyObject* v = Py_BuildValue("(LN)", packed, PyLong_FromVoidPtr((void*)*loop));
-        if (v == NULL || PyDict_SetItem(sigcache, k, v) < 0) {
-            Py_XDECREF(v);
-            Py_DECREF(k);
-            return -1;
-        }
-        Py_DECREF(v);
+    PyObject* a_nin = PyObject_GetAttrString(ufunc, "nin");
+    PyObject* a_nout = PyObject_GetAttrString(ufunc, "nout");
+    PyObject* a_sig = PyObject_GetAttrString(ufunc, "signature");
+    const int simple = a_nin != NULL && a_nout != NULL && a_sig == Py_None &&
+                       PyLong_AsLong(a_nin) == nin && PyLong_AsLong(a_nout) == 1;
+    Py_XDECREF(a_nin);
+    Py_XDECREF(a_nout);
+    Py_XDECREF(a_sig);
+    PyErr_Clear();
+    if (!simple) {
+        return 0; /* gufunc, several outputs, or wrong argument count: fallback */
     }
-    Py_DECREF(k);
-    if (packed < 0) {
+    PyObject* spec = PyTuple_New(nin + 1);
+    if (spec == NULL) {
+        return -1;
+    }
+    for (int i = 0; i < nin; ++i) {
+        PyTuple_SET_ITEM(spec, i, Py_NewRef(kind_spec(kinds[i])));
+    }
+    PyTuple_SET_ITEM(spec, nin, Py_NewRef(Py_None));
+    PyObject* name = PyUnicode_InternFromString("resolve_dtypes");
+    PyObject* res = name != NULL ? PyObject_CallMethodOneArg(ufunc, name, spec) : NULL;
+    Py_XDECREF(name);
+    Py_DECREF(spec);
+    if (res == NULL) {
+        PyErr_Clear(); /* no loop / promotion error: NumPy raises it in the fallback */
         return 0;
     }
-    for (int i = 0; i <= nin; ++i) {
-        out[i] = (int)((packed >> (8 * i)) & 0xff);
+    long long p = 0;
+    int ok = 1;
+    for (int i = 0; i <= nin && ok; ++i) {
+        int c = dtype_code(PyTuple_GET_ITEM(res, i));
+        /* Typed inputs must keep their dtype: anything else is a cast. */
+        ok = c >= 0 && (i == nin || kinds[i] >= K_PYBOOL || kinds[i] == c);
+        p |= (long long)c << (8 * i);
     }
-    return 1;
+    Py_DECREF(res);
+    if (!ok) {
+        return 0;
+    }
+    vp_dtype dts[MAXIN + 1];
+    for (int i = 0; i <= nin; ++i) {
+        dts[i] = (vp_dtype)((p >> (8 * i)) & 0xff);
+    }
+    char err[ERRLEN];
+    if (vp_ufunc_loop(g_rt, ufunc, nin, dts, loop, err, sizeof err) != VP_OK) {
+        *loop = NULL; /* no exact NumPy loop (or it needs the Python API) */
+        return 0;
+    }
+    *packed = p;
+    return 0;
 }
 
 /* NumPy broadcasting of `shape` with (nd, d). Returns 0, or -1 if they do
@@ -453,27 +482,32 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
         PyThread_get_thread_ident() != g_main_thread) {
         return 0;
     }
-    PyObject* info = ufunc_info(ufunc);
-    if (info == NULL) {
-        PyErr_Clear();
-        return 0;
-    }
-    const long nin = PyLong_AsLong(PyTuple_GET_ITEM(info, 0));
-    const long nout = PyLong_AsLong(PyTuple_GET_ITEM(info, 1));
-    if (nin != n || nout != 1 || PyTuple_GET_ITEM(info, 2) == Py_True) {
-        return 0;
-    }
     int kinds[MAXIN];
+    long long key = (long long)n << 24;
     for (Py_ssize_t i = 0; i < n; ++i) {
         if ((kinds[i] = input_kind(inputs[i])) < 0) {
             return 0;
         }
+        key |= (long long)kinds[i] << (8 * i);
+    }
+    long long packed;
+    const vp_loop* loop = NULL;
+    const Entry* hit = t_find(&g_sigs, ufunc, key);
+    if (hit != NULL) {
+        packed = hit->v;
+        loop = (const vp_loop*)hit->p;
+    } else {
+        int r = resolve_slow(ufunc, (int)n, kinds, &packed, &loop);
+        if (r < 0 || t_put(&g_sigs, ufunc, key, packed, loop, ufunc) < 0) {
+            return -1;
+        }
+    }
+    if (packed < 0) {
+        return 0;
     }
     int codes[MAXIN + 1];
-    const vp_loop* loop = NULL;
-    int r = resolve(ufunc, PyTuple_GET_ITEM(info, 3), (int)n, kinds, codes, &loop);
-    if (r <= 0) {
-        return r;
+    for (Py_ssize_t i = 0; i <= n; ++i) {
+        codes[i] = (int)((packed >> (8 * i)) & 0xff);
     }
 
     /* Inputs as runtime arrays; scalars and NumPy arrays are converted. */
@@ -847,8 +881,8 @@ static PyObject* m_shutdown(PyObject* self, PyObject* noargs) {
     if (g_rt != NULL) {
         vp_runtime* rt = g_rt;
         g_rt = NULL;
-        PyDict_Clear(g_sites);      /* interned in the runtime being destroyed */
-        PyDict_Clear(g_ufunc_info); /* holds its loop handles */
+        t_clear(&g_sites); /* interned in the runtime being destroyed */
+        t_clear(&g_sigs);  /* holds its loop handles */
         vp_runtime_destroy(rt);
     }
     Py_RETURN_NONE;
@@ -1034,9 +1068,6 @@ PyMODINIT_FUNC PyInit__viproc(void) {
     if (m == NULL) {
         return NULL;
     }
-    g_ufunc_info = PyDict_New();
-    g_code_internal = PyDict_New();
-    g_sites = PyDict_New();
     s_call = PyUnicode_InternFromString("__call__");
     s_out = PyUnicode_InternFromString("out");
     AsyncError = PyErr_NewExceptionWithDoc(
@@ -1044,8 +1075,7 @@ PyMODINIT_FUNC PyInit__viproc(void) {
         "An array op that ran asynchronously failed. Raised at the next sync "
         "point touching its result; the message names where the op was issued.",
         PyExc_RuntimeError, NULL);
-    if (g_ufunc_info == NULL || g_code_internal == NULL || g_sites == NULL || s_call == NULL ||
-        s_out == NULL || AsyncError == NULL ||
+    if (s_call == NULL || s_out == NULL || AsyncError == NULL ||
         PyModule_AddObjectRef(m, "AsyncError", AsyncError) < 0 ||
         PyModule_AddObjectRef(m, "_Array", (PyObject*)&ArrayType) < 0 ||
         PyModule_AddStringConstant(m, "version", vp_version()) < 0) {
