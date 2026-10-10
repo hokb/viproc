@@ -381,6 +381,22 @@ reductions and gufuncs alike):
    `strides = {in_outer, out_outer, in_row, in_col}`; `fft` `(n),()->(m)`:
    `dims = {N, n, m}`, `strides = {in_outer, fct_outer, out_outer, in_n, out_m}`.
 
+**Why not call the regular NumPy entry (`np.sum`, …) on a worker?** It is
+Python C API (argument parsing, ndarray objects, dtype resolution,
+`errstate`, warnings) and needs the GIL; NumPy releases the GIL only
+inside the inner loop (from ~500 elements). The main thread holds the GIL
+while it runs the program ahead, so a worker gets it only at the switch
+interval (5 ms). Measured (4 worker threads calling `np.sum`): 1e6
+elements: 62 ms serial, 16 ms with an idle main thread, but 148 ms with a
+busy main thread; 1e3 elements: 34 ms serial vs. 6858 ms. Hence workers
+call the loops directly, without the GIL, and viproc reproduces NumPy's
+calling pattern where results depend on it: only floating-point `add`
+reductions (pairwise summation; `sum`, `mean`, `var`, `std`). Element-wise
+ops, `min`/`max`/`any`/`all`/`prod`, linalg and fft give the same result
+however the work is split into loop calls. With free-threaded CPython
+(3.13t+, supported by NumPy ≥ 2.1) calling the regular entry on workers
+becomes viable as a generic path.
+
 Mirror only the leading fields of the capsule struct (`strided_loop`,
 `context`, `auxdata`, `requires_pyapi`, `no_floatingpoint_errors`). The
 embedded `PyArrayMethod_Context` behind them changes size between NumPy
@@ -566,4 +582,6 @@ functions.
 - [ ] `should_offload` heuristic for tasks whose inputs are all completed.
 - [ ] Per-op overhead of the bridge (~35 µs): move `_issue_ufunc` to C,
       cache dtype resolution per (ufunc, dtypes).
+- [ ] Evaluate a generic path under free-threaded CPython: workers call the
+      regular NumPy entry (no reimplementation of NumPy semantics).
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.
