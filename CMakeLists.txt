@@ -57,9 +57,12 @@ target_link_libraries(_viproc PRIVATE viproc_capi)
 target_compile_options(_viproc PRIVATE
     $<$<C_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic>
     $<$<AND:$<BOOL:${VIPROC_WARNINGS_AS_ERRORS}>,$<C_COMPILER_ID:GNU,Clang>>:-Werror>)
+# The generator expression keeps multi-config generators (Visual Studio) from
+# appending a per-configuration subdirectory, where Python would not find it.
 set_target_properties(_viproc PROPERTIES
     LINKER_LANGUAGE CXX
-    LIBRARY_OUTPUT_DIRECTORY ${VIPROC_PYTHON_DIR}/viproc)
+    LIBRARY_OUTPUT_DIRECTORY $<1:${VIPROC_PYTHON_DIR}/viproc>
+    RUNTIME_OUTPUT_DIRECTORY $<1:${VIPROC_PYTHON_DIR}/viproc>)
 file(GLOB VIPROC_PY_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/python/viproc/*.py)
 add_custom_target(viproc_python ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory ${VIPROC_PYTHON_DIR}/viproc

@@ -15,8 +15,11 @@
 extern "C" {
 #endif
 
-/* Same type as Python.h's PyObject. */
+/* Same type as Python.h's PyObject (declared here only if Python.h is not
+ * included yet; include Python.h first, if at all). */
+#ifndef Py_PYTHON_H
 typedef struct _object PyObject;
+#endif
 
 typedef struct vp_runtime vp_runtime;
 typedef struct vp_array vp_array;

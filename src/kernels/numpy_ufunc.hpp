@@ -1,8 +1,7 @@
 // Kernel adapter: runs element-wise array ops with NumPy's own ufunc loops.
 #pragma once
 
-#define PY_SSIZE_T_CLEAN
-#include <Python.h>
+#include "viproc_python.h"
 
 #include "runtime/runtime.hpp"
 

@@ -2,8 +2,7 @@
  * include/viproc/viproc.h. All policy (dtype resolution, fallbacks, indexing)
  * lives in the Python package; this module only moves handles across. */
 
-#define PY_SSIZE_T_CLEAN
-#include <Python.h>
+#include "viproc_python.h"
 
 #include "viproc/viproc.h"
 

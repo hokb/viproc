@@ -7,8 +7,7 @@
 // linalg gufunc (det), fft gufunc, argmax via PyArray_ArrFuncs, and
 // floating-point error flags raised on the worker thread.
 
-#define PY_SSIZE_T_CLEAN
-#include <Python.h>
+#include "embed_python.h"
 
 #define NPY_NO_DEPRECATED_API NPY_2_0_API_VERSION
 #include <numpy/arrayobject.h>
@@ -324,7 +323,9 @@ int init_numpy() {
 } // namespace
 
 int main() {
-    Py_Initialize();
+    if (!init_embedded_python()) {
+        return 1;
+    }
     if (init_numpy() != 0) {
         PyErr_Print();
         return 1;

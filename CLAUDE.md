@@ -248,6 +248,7 @@ src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
   numpy_ufunc.*        UfuncLoop / LoopCache (resolved NumPy loops),
                        element-wise kernel, wrap_ndarray / to_ndarray
 src/capi/capi.cpp      Implementation of the C ABI (library `viproc_capi`)
+src/viproc_python.h    the only way to include Python.h (MSVC debug fix)
 python/viproc/         Python package
   _viproc.c            CPython extension: thin binding of viproc.h (C only)
   _ndarray.py          viproc.ndarray, NumPy protocols, fallbacks, indexing
@@ -266,6 +267,10 @@ The build assembles the importable package in `build/python/viproc`
 Rules:
 - Bridges (Python, later .NET) only talk to the runtime through
   `include/viproc/viproc.h`. No C++ types cross the ABI.
+- Include Python via `src/viproc_python.h`, never `<Python.h>` directly:
+  it hides MSVC's `_DEBUG`, which would otherwise make Debug builds link
+  `python3XX_d.lib` and use the debug ABI. Test executables that embed
+  Python start it through `tests/embed_python.h`.
 - Never edit vendored third-party code in place. Wrap it, and if a patch is
   unavoidable, keep it as a separate patch file and document why.
 
@@ -284,6 +289,10 @@ PYTHONPATH=build/python python3 python/benchmarks/strong_scaling.py   # use a Re
 
 `ctest` also runs the pytest suite. Tests need `pytest`
 (`pip install pytest`).
+
+Windows / Visual Studio: Debug builds work with a regular (release)
+Python installation; the extension module is written to
+`build/python/viproc` for every configuration (`ctest -C Debug`).
 
 Build with `-DVIPROC_WARNINGS_AS_ERRORS=OFF` only for local experiments;
 the default build treats warnings as errors. Always build and run the tests

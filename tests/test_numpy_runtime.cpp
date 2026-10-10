@@ -3,6 +3,8 @@
 
 #include "kernels/numpy_ufunc.hpp"
 
+#include "embed_python.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -237,7 +239,9 @@ void test_long_program(Runtime& rt) {
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    Py_Initialize();
+    if (!init_embedded_python()) {
+        return 1;
+    }
     if (!vnp::init()) {
         PyErr_Print();
         return 1;
