@@ -88,7 +88,7 @@ class Program {
         Py_BEGIN_ALLOW_THREADS;
         rt_.wait(*a);
         Py_END_ALLOW_THREADS;
-        return vnp::export_ndarray(*a);
+        return vnp::export_ndarray(*a, false);
     }
 
     ~Program() {

@@ -87,7 +87,7 @@ std::vector<std::shared_ptr<Task>> Task::execute() {
     for (std::size_t i = 0; i < ninputs_; ++i) {
         Operand& in = operands_[i];
         if (in.counted_read) {
-            in.buffer->async_reads.fetch_sub(1, std::memory_order_release);
+            in.buffer->release_read();
         }
     }
     operands_.clear();

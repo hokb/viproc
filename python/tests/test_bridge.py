@@ -451,3 +451,127 @@ def test_fallback_out_argument_is_written_back():
     o = viproc.zeros(6)
     np.add(i, 0.5, out=o)  # ufunc fallback (casting) with out=
     assert same(o, np.arange(6) + 0.5)
+
+
+def _results(r):
+    return list(r) if isinstance(r, (list, tuple)) else [r]
+
+
+def _check_numpy_semantics(f, *arrays):
+    """f on NumPy arrays and on viproc arrays: same values, same identity,
+    same writability, same aliasing (a write through a result shows in the
+    arguments exactly when it does in NumPy)."""
+    import warnings
+
+    np_args = [a.copy() for a in arrays]
+    vp_args = [viproc.asarray(a) for a in arrays]
+    np_res, vp_res = _results(f(*np_args)), _results(f(*vp_args))
+    assert len(np_res) == len(vp_res)
+    for rn, rv in zip(np_res, vp_res):
+        assert same(rv, rn)
+        for an, av in zip(np_args, vp_args):
+            assert (rn is an) == (rv is av)
+        idx = (0,) * np.ndim(rn)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # broadcast_arrays warns on write
+            try:
+                rn[idx] = 42
+                np_ok = True
+            except ValueError:
+                np_ok = False
+            try:
+                rv[idx] = 42
+                vp_ok = True
+            except ValueError:
+                vp_ok = False
+        assert np_ok == vp_ok
+        for an, av in zip(np_args, vp_args):
+            assert same(av, an)  # the write reached the argument iff in NumPy
+
+
+@pytest.mark.parametrize(
+    "f",
+    [
+        np.atleast_1d,
+        np.atleast_2d,
+        lambda a: np.reshape(a, (4, 6)),
+        lambda a: a.reshape(2, 12),
+        np.transpose,
+        lambda a: a.T,
+        np.ravel,
+        lambda a: np.squeeze(a[None]),
+        lambda a: np.swapaxes(a, 0, 1),
+        lambda a: np.moveaxis(a, 0, -1),
+        np.flip,
+        np.diagonal,
+        lambda a: np.broadcast_to(a, (2, 4, 6)),
+        lambda a: np.split(a, 2),
+        lambda a: np.expand_dims(a, 0),
+        lambda a: np.lib.stride_tricks.sliding_window_view(a, (2, 2)),
+        lambda a: a[[0, 2]],  # advanced indexing: a copy in NumPy
+        lambda a: np.concatenate([a, a]),
+        lambda a: np.where(a > 0, a, 0.0),
+    ],
+)
+def test_fallbacks_have_numpy_view_semantics(f):
+    _check_numpy_semantics(f, rng.standard_normal((4, 6)))
+
+
+def test_fallback_dtype_views_and_plain_arguments():
+    _check_numpy_semantics(np.real, rng.standard_normal(6) + 1j)
+    _check_numpy_semantics(np.imag, rng.standard_normal(6) + 1j)
+    plain = np.zeros((2, 1))
+    x = viproc.asarray(rng.standard_normal((1, 3)))
+    bx, bp = np.broadcast_arrays(x, plain)
+    assert bp.base is plain or np.shares_memory(bp, plain)  # NumPy's own view of plain
+    assert not isinstance(bp, viproc.ndarray)
+    r = np.atleast_1d(x, plain)
+    assert r[0] is x and r[1] is plain
+
+
+@pytest.mark.parametrize(
+    "f",
+    [
+        lambda a: np.put(a, [0, 5], [-1.0, -2.0]),
+        lambda a: np.place(a, a > 0, [7.0]),
+        lambda a: np.putmask(a, a < 0, 0.0),
+        lambda a: np.fill_diagonal(a, 3.0),
+        lambda a: np.copyto(a, 1.5, where=a > 0),
+        lambda a: np.add.at(a, ([0, 0, 1], [1, 1, 2]), 1.0),
+        lambda a: np.negative(a, out=a),
+        lambda a: np.cumsum(a, axis=0, out=a),
+        lambda a: a.__setitem__((a > 0), 0.0),  # boolean index assignment
+        lambda a: a.__setitem__(([0, 1], [2, 3]), a[([1, 0], [3, 2])]),  # overlapping
+    ],
+)
+def test_mutating_functions_work_in_place_like_numpy(f):
+    an = rng.standard_normal((4, 6))
+    av = viproc.asarray(an)
+    rn, rv = f(an), f(av)
+    assert same(av, an)
+    if isinstance(rn, np.ndarray):
+        assert rv is av if rn is an else same(rv, rn)
+
+
+def test_fallback_writes_respect_exports_and_pending_readers():
+    x = viproc.asarray(np.arange(100_000, dtype=np.float64))
+    keep = np.asarray(x)  # read-only export alive
+    pending = np.sin(x)  # an issued reader (may still run)
+    np.put(x, [0], [-1.0])  # NumPy writes x: copy-on-write away from `keep`
+    assert keep[0] == 0.0 and same(pending, np.sin(np.arange(100_000.0)))
+    assert np.asarray(x)[0] == -1.0
+
+
+def test_read_only_viproc_views_raise_like_numpy():
+    x = viproc.asarray(rng.standard_normal(6))
+    b = np.broadcast_to(x, (3, 6))
+    with pytest.raises(ValueError, match="read-only"):
+        b[0, 0] = 1.0
+    with pytest.raises(ValueError, match="read-only"):
+        b += 1.0
+    with pytest.raises(ValueError, match="read-only"):
+        np.add(b, 1.0, out=b)
+    with pytest.raises(ValueError, match="read-only"):
+        b[0][0] = 1.0  # views of a read-only array are read-only
+    x[0] = 5.0  # the base stays writable, and the view sees the write
+    assert np.asarray(b)[2, 0] == 5.0

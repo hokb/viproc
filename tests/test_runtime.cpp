@@ -235,6 +235,25 @@ void test_inout_chain_stays_in_place() {
     check(a->buffer().get() == before, "in/out chain stays in place (no copy-on-write)");
 }
 
+void test_prepare_host_write() {
+    Runtime rt(opts(2));
+    // Live NumPy views (host_views): the storage moves to a copy first.
+    ArrayPtr a = make_ready(rt, 8, 3.0);
+    Buffer* before = a->buffer().get();
+    ++a->buffer()->host_views; // as a read-only export would
+    rt.prepare_host_write(*a);
+    check(a->buffer().get() != before && value(rt, a, 7) == 3.0,
+          "prepare_host_write: copy-on-write while NumPy views are alive");
+    --before->host_views;
+    // Issued readers: waits until they are done, keeps the buffer.
+    ArrayPtr b = make_ready(rt, 8, 1.0);
+    ArrayPtr reader = issue1(rt, add_const(1.0, 30ms), {b}, 8);
+    Buffer* kept = b->buffer().get();
+    rt.prepare_host_write(*b);
+    check(b->buffer().get() == kept && b->buffer()->async_reads.load() == 0 && reader->ready(),
+          "prepare_host_write: waits for issued readers, writes in place");
+}
+
 void test_copy_on_write() {
     Runtime rt(opts(2));
     ArrayPtr a = make_ready(rt, 8, 1.0);
@@ -663,6 +682,7 @@ int main() {
     test_deep_chain_no_stack_growth();
     test_inout_in_place();
     test_inout_chain_stays_in_place();
+    test_prepare_host_write();
     test_copy_on_write();
     test_view_write_visible_in_base();
     test_view_write_waits_for_base_producer();

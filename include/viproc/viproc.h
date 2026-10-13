@@ -99,8 +99,8 @@ int vp_array_from_ndarray(vp_runtime* rt, PyObject* ndarray, vp_array** out, cha
 int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array** out);
 /* [GIL] A view of `base` sharing its storage. `offset` is in bytes, relative
  * to base's first element; strides are in bytes. Metadata only. */
-vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, int ndim, const int64_t* shape,
-                        const int64_t* strides, int64_t offset);
+vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, vp_dtype dtype, int ndim,
+                        const int64_t* shape, const int64_t* strides, int64_t offset);
 /* [GIL] Releases the handle. Pending work continues. */
 void vp_array_release(vp_array* a);
 
@@ -125,11 +125,17 @@ size_t vp_array_reusable_bytes(const vp_array* a);
 /* [no GIL] Sync point: waits until `a` is ready. Returns VP_ERROR with the
  * failing op's message and issue site if a task computing it failed. */
 int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen);
-/* [GIL, main thread] Copy-free export: a read-only NumPy view of the data.
- * `a` must be ready. The view counts as a pending reader of the buffer
+/* [GIL, main thread] Copy-free export: a NumPy view of the data. `a` must be
+ * ready. Read-only (writable == 0): the view counts as a reader of the buffer
  * while it lives, so later in-place writes to `a` copy-on-write and the view
- * keeps its data (copy semantics; docs/design/memory-management.md, D7). */
-PyObject* vp_array_export(const vp_array* a);
+ * keeps its data (copy semantics). Writable: only after
+ * vp_array_prepare_write(), for NumPy code run synchronously on the main
+ * thread (docs/design/memory-management.md, D7). */
+PyObject* vp_array_export(const vp_array* a, int writable);
+/* [no GIL, main thread] Sync point before NumPy code writes `a`'s buffer
+ * directly: waits for its producer, copies-on-write if NumPy views of the
+ * buffer are alive, waits until no task reads it. */
+int vp_array_prepare_write(vp_runtime* rt, vp_array* a, char* err, size_t errlen);
 
 /* --- Ops (all [GIL], all asynchronous) ------------------------------------ */
 

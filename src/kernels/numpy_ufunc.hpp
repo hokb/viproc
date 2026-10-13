@@ -79,12 +79,16 @@ bool supported_ndarray(PyObject* arr);
 // with a Python exception set on failure).
 ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype);
 
-// Copy-free export (docs/design/memory-management.md, D7): a read-only NumPy
-// view of `a`'s buffer, with `a`'s shape and strides. `a` must be ready. While
-// the view (or any NumPy view of it) lives, it counts as a pending reader of
-// the buffer (async_reads), so a later in-place write to `a` switches `a` to a
-// new buffer (copy-on-write) and the NumPy view keeps the data it showed:
-// copy semantics without a copy. Main thread, with the GIL.
-PyObject* export_ndarray(const Array& a);
+// Copy-free export (docs/design/memory-management.md, D7): a NumPy view of
+// `a`'s buffer, with `a`'s shape and strides. `a` must be ready.
+// - Read-only (writable == false): while the view (or any NumPy view of it)
+//   lives, it counts as a reader of the buffer (Buffer::host_views), so a later
+//   in-place write to `a` switches `a` to a new buffer (copy-on-write) and the
+//   NumPy view keeps the data it showed: copy semantics without a copy.
+// - Writable: only after Runtime::prepare_host_write(a), for NumPy code the
+//   bridge runs synchronously on the main thread (eager fallbacks); writes go
+//   straight into `a`, exactly as NumPy on an ndarray.
+// Main thread, with the GIL.
+PyObject* export_ndarray(const Array& a, bool writable);
 
 } // namespace viproc::numpy

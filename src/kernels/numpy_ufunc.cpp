@@ -314,39 +314,44 @@ ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype) {
 
 namespace {
 
-// Base object of exported NumPy views: keeps the buffer alive and holds one
-// async_reads count on it until the last NumPy view is gone.
+// Base object of exported NumPy views: keeps the buffer alive and, for a
+// read-only export, holds one host_views count on it until the last NumPy view
+// is gone. Created and released with the GIL (main thread).
 constexpr const char* kExportCapsule = "viproc.export";
 
 struct ExportHold {
     std::shared_ptr<Buffer> buffer;
+    bool counted; // holds a host_views count
 };
 
 void release_export(PyObject* capsule) {
     std::unique_ptr<ExportHold> hold(
         static_cast<ExportHold*>(PyCapsule_GetPointer(capsule, kExportCapsule)));
-    if (hold) {
-        hold->buffer->async_reads.fetch_sub(1, std::memory_order_release);
+    if (hold && hold->counted) {
+        --hold->buffer->host_views;
     }
 }
 
 } // namespace
 
-PyObject* export_ndarray(const Array& a) {
+PyObject* export_ndarray(const Array& a, bool writable) {
     const Layout& l = a.layout();
     std::vector<npy_intp> shape(l.shape.begin(), l.shape.end());
     std::vector<npy_intp> strides(l.strides.begin(), l.strides.end());
-    auto hold = std::make_unique<ExportHold>(ExportHold{a.buffer()});
+    auto hold = std::make_unique<ExportHold>(ExportHold{a.buffer(), !writable});
     PyObject* capsule = PyCapsule_New(hold.get(), kExportCapsule, release_export);
     if (capsule == nullptr) {
         return nullptr;
     }
-    hold->buffer->async_reads.fetch_add(1, std::memory_order_relaxed);
+    if (hold->counted) {
+        ++hold->buffer->host_views;
+    }
     hold.release(); // owned by the capsule now
-    // Read-only: NumPy code must not write behind viproc's back.
+    // Read-only unless the caller prepared the buffer for writing (see header).
+    const int flags = writable ? NPY_ARRAY_ALIGNED | NPY_ARRAY_WRITEABLE : NPY_ARRAY_ALIGNED;
     PyObject* view =
         PyArray_New(&PyArray_Type, static_cast<int>(shape.size()), shape.data(), type_num(l.dtype),
-                    strides.data(), a.buffer()->data() + l.offset, 0, NPY_ARRAY_ALIGNED, nullptr);
+                    strides.data(), a.buffer()->data() + l.offset, 0, flags, nullptr);
     if (view == nullptr ||
         PyArray_SetBaseObject(reinterpret_cast<PyArrayObject*>(view), capsule) < 0) {
         Py_XDECREF(view);

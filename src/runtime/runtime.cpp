@@ -258,7 +258,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         if (std::find(switched.begin(), switched.end(), &s) != switched.end()) {
             continue; // same storage written twice by this op: switched already
         }
-        const bool pending_readers = s.buffer_->async_reads.load(std::memory_order_acquire) > 0;
+        const bool pending_readers = s.buffer_->has_readers();
         // An input reading the same storage through a different view would see
         // partly updated data if the op wrote in place; NumPy semantics are
         // "all inputs read before any output is written".
@@ -362,6 +362,17 @@ std::optional<TaskError> Runtime::wait(Array& a) {
     }
     s.ready();
     return s.last_error_;
+}
+
+std::optional<TaskError> Runtime::prepare_host_write(Array& a) {
+    std::optional<TaskError> e = wait(a);
+    Storage& s = *a.storage_;
+    if (s.buffer_->host_views > 0) {
+        issue_storage_copy(s);
+        e = wait(a);
+    }
+    s.buffer_->wait_task_readers();
+    return e;
 }
 
 void Runtime::wait_all() { wait_active_below(1); }

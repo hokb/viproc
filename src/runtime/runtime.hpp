@@ -154,6 +154,13 @@ class Runtime {
     // Sync point: waits until `a` is ready. Returns the error of the task that
     // produced it, if any.
     std::optional<TaskError> wait(Array& a);
+    // Sync point before NumPy code on the main thread writes `a`'s buffer
+    // directly (design doc D7): waits for `a`'s producer; if NumPy views of
+    // the buffer are alive (host_views), switches the storage to a copy first
+    // (copy-on-write, so those views keep their data); then waits until no
+    // issued task reads the buffer. Afterwards nothing but the caller touches
+    // the buffer until the main thread issues the next op.
+    std::optional<TaskError> prepare_host_write(Array& a);
     // Waits until no task is active.
     void wait_all();
 

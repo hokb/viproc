@@ -38,11 +38,45 @@ class Buffer {
     // reading task when it completes. See "Reference counting" in CLAUDE.md.
     std::atomic<int> async_reads{0};
 
+    // Read-only NumPy views of this buffer handed out by an export (design
+    // doc D7) that are still alive. Main thread only (exports are created and
+    // released with the GIL). Like async_reads, a later in-place write must
+    // not touch the buffer while it is > 0 (copy-on-write).
+    int host_views = 0;
+
+    // Any reader a writer must not disturb: issued tasks or NumPy views.
+    bool has_readers() const {
+        return host_views > 0 || async_reads.load(std::memory_order_acquire) > 0;
+    }
+
+    // A reading task is done with the buffer (any thread).
+    void release_read() {
+        if (async_reads.fetch_sub(1, std::memory_order_seq_cst) == 1 &&
+            read_waiters_.load(std::memory_order_seq_cst) > 0) {
+            async_reads.notify_all();
+        }
+    }
+    // Main thread: blocks until no issued task reads the buffer any more.
+    void wait_task_readers() {
+        if (async_reads.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        // seq_cst pairs with release_read(): either it sees the waiter and
+        // notifies, or the load below sees its decrement.
+        read_waiters_.fetch_add(1, std::memory_order_seq_cst);
+        for (int n = async_reads.load(std::memory_order_seq_cst); n != 0;
+             n = async_reads.load(std::memory_order_seq_cst)) {
+            async_reads.wait(n, std::memory_order_acquire);
+        }
+        read_waiters_.fetch_sub(1, std::memory_order_relaxed);
+    }
+
     // Up to this many bytes live inside the Buffer object itself: one
     // allocation for small arrays instead of two.
     static constexpr std::size_t kInlineBytes = 128;
 
   private:
+    std::atomic<int> read_waiters_{0};
     alignas(64) std::byte inline_[kInlineBytes];
     std::byte* data_ = nullptr;
     std::size_t nbytes_;

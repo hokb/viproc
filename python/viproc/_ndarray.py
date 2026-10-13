@@ -12,6 +12,8 @@ module adds everything else and the fallbacks the C code calls.
 
 import os
 
+import warnings
+
 import numpy as np
 from numpy.lib.stride_tricks import as_strided
 
@@ -47,10 +49,6 @@ def _ensure_runtime():
         _viproc.init(workers, 0, *_env_policy())
 
 
-def _flat(x):
-    return list(x) if isinstance(x, (list, tuple)) else [x]
-
-
 def _wrap_numpy(arr):
     """viproc array over a NumPy array's memory. The caller gives up `arr`."""
     _ensure_runtime()
@@ -78,40 +76,98 @@ def _to_numpy(x):
     return np.asarray(x) if isinstance(x, ndarray) else x
 
 
-def _writable_copy(x):
-    """NumPy array NumPy code may write into (assigned back by the caller)."""
-    return np.array(x) if isinstance(x, ndarray) else x
+def _rebuild(x, items):
+    """Container of the same type as `x` (list, tuple, named tuple)."""
+    if hasattr(x, "_fields"):  # named tuple
+        return type(x)(*items)
+    return type(x)(items)
 
 
 def _tree(x, fn):
     if isinstance(x, (list, tuple)):
-        return type(x)(_tree(i, fn) for i in x)
+        return _rebuild(x, [_tree(i, fn) for i in x])
     if isinstance(x, dict):
         return {k: _tree(v, fn) for k, v in x.items()}
     return fn(x)
 
 
-def _fresh(x, args):
-    """True if `x` (returned by a NumPy function called with `args`) is memory
-    nobody else holds: it owns its data and is not one of the arguments."""
-    if not (x.flags.owndata and x.base is None and x.flags.writeable):
-        return False
-    found = []
-    _tree(args, lambda a: found.append(a is x))
-    return not any(found)
+def _adopt(arr):
+    """viproc array over fresh NumPy memory (no copy); unsupported: as is."""
+    w = _wrap_numpy(arr)
+    return w if w is not None else arr
 
 
-def _wrap_result(x, args=()):
-    """Fallback results: NumPy arrays become viproc arrays again, adopted
-    without a copy when they are fresh memory (D7), copied otherwise."""
-    if isinstance(x, np.ndarray) and not isinstance(x, ndarray):
-        if x.ndim == 0:
-            return x[()]
-        w = _wrap_numpy(x if _fresh(x, args) else x.copy())
-        return w if w is not None else x
-    if isinstance(x, (list, tuple)):
-        return type(x)(_wrap_result(i, args) for i in x)
-    return x
+class _Host:
+    """Runs NumPy code eagerly on viproc arrays with NumPy's semantics
+    (design doc D7, "Eager fallbacks").
+
+    Each viproc argument becomes a *writable* NumPy view of its buffer, made
+    exclusive first (export(a, True): waits for pending writers and readers,
+    copies-on-write if read-only exports of it are alive). NumPy code then
+    reads and writes viproc memory as it would an ndarray's: in-place
+    functions, ``out=`` and overlap handling are NumPy's own. Results are
+    mapped back: an argument returned as is -> that viproc array; a view of
+    an argument -> a viproc view of the same storage (writable as NumPy made
+    it); a view of a NumPy argument -> returned unchanged; fresh memory ->
+    adopted; anything else -> copied.
+    """
+
+    def __init__(self):
+        self.exports = {}  # id(export) -> (export, viproc array)
+        self.plain = {}  # id(x) -> NumPy arguments
+
+    def numpy(self, tree):
+        return _tree(tree, self._convert)
+
+    def _convert(self, x):
+        if isinstance(x, ndarray):
+            e = _viproc.export(x, True)  # read-only for read-only viproc arrays
+            self.exports[id(e)] = (e, x)
+            return e
+        if isinstance(x, np.ndarray):
+            self.plain[id(x)] = x
+        return x
+
+    def done(self, result):
+        r = self._map(result)
+        for e, _ in self.exports.values():
+            e.flags.writeable = False  # in case NumPy code kept a reference
+        return r
+
+    def _map(self, r):
+        if isinstance(r, (list, tuple)):
+            return _rebuild(r, [self._map(i) for i in r])
+        if not isinstance(r, np.ndarray) or isinstance(r, ndarray):
+            return r
+        for e, v in self.exports.values():
+            if r is e:
+                return v  # identity, as NumPy (np.atleast_1d(x) is x)
+        # Views are recognized by memory, not by the base chain: NumPy code
+        # may build them through other objects (as_strided, DummyArray).
+        for e, v in self.exports.values():
+            if np.may_share_memory(r, e):
+                code = _CODES.get(r.dtype)
+                if code is None or not r.flags.aligned or not r.dtype.isnative:
+                    return _adopt(r.copy())  # a view viproc cannot express
+                offset = r.__array_interface__["data"][0] - e.__array_interface__["data"][0]
+                w = _viproc.view(v, r.shape, r.strides, offset, code)
+                with warnings.catch_warnings():  # broadcast_arrays warns on reading it
+                    warnings.simplefilter("ignore", FutureWarning)
+                    w._readonly = not r.flags.writeable
+                return w
+        for p in self.plain.values():
+            if r is p or np.may_share_memory(r, p):
+                return r  # aliases a NumPy argument: unchanged, as NumPy returns it
+        if r.flags.owndata and r.base is None:
+            return _adopt(r)  # fresh memory nobody else holds
+        return _adopt(r.copy())
+
+
+def _host_call(fn, args, kwargs):
+    host = _Host()
+    np_args = host.numpy(args)
+    np_kwargs = host.numpy(kwargs)
+    return host.done(fn(*np_args, **np_kwargs))
 
 
 def _is_basic_index(key):
@@ -123,10 +179,6 @@ def _is_basic_index(key):
             continue
         return False
     return True
-
-
-# Functions that modify an argument in place: the fallback would modify a copy.
-_MUTATING = {np.copyto, np.put, np.place, np.putmask, np.fill_diagonal}
 
 
 class ndarray(_viproc._Array):
@@ -206,7 +258,9 @@ class ndarray(_viproc._Array):
         return self.numpy().__index__()
 
     def __iter__(self):
-        return iter(_wrap_result(self.numpy()) if self.ndim > 1 else self.numpy())
+        if self.ndim > 1:
+            return (self[i] for i in range(self.shape[0]))  # row views, as NumPy
+        return iter(self.numpy())
 
     def item(self, *args):
         return self.numpy().item(*args)
@@ -233,15 +287,19 @@ class ndarray(_viproc._Array):
             if v.ndim == 0 and not any(k is Ellipsis for k in keys):
                 return v.numpy()[()]  # NumPy returns a scalar here: sync point
             return v
-        return _wrap_result(self.numpy()[_tree(key, _to_numpy)], (key,))
+        return _host_call(lambda a, k: a[k], (self, key), {})
 
     def __setitem__(self, key, value):
-        if _is_basic_index(key):
-            target = self._view(key)
-        else:
-            arr = np.array(self)  # writable copy, assigned back below
-            arr[_tree(key, _to_numpy)] = _to_numpy(value)
-            target, value = self._view(Ellipsis), arr
+        if not _is_basic_index(key):  # NumPy assigns in place, overlap included
+
+            def assign(a, k, v):
+                a[k] = v
+
+            _host_call(assign, (self, key, value), {})
+            return
+        if self._readonly:
+            raise ValueError("assignment destination is read-only")
+        target = self._view(key)
         src = value if isinstance(value, ndarray) else None
         if src is None or src.dtype != self.dtype:
             src = asarray(np.asarray(_to_numpy(value)).astype(self.dtype, copy=False))
@@ -252,27 +310,14 @@ class ndarray(_viproc._Array):
         if func is np.copyto and len(args) >= 2 and isinstance(args[0], ndarray) and not kwargs:
             args[0][...] = args[1]
             return None
-        if func in _MUTATING:
-            raise NotImplementedError(f"viproc: in-place function {func.__name__} is not supported")
-        out = kwargs.get("out")
-        np_args = _tree(args, _to_numpy)
-        np_kwargs = _tree(kwargs, _to_numpy)
-        if out is not None:  # NumPy writes into copies; assigned back below
-            np_kwargs["out"] = _tree(out, _writable_copy)
-        result = func(*np_args, **np_kwargs)
-        if out is not None:
-            for o, r in zip(*(_flat(out), _flat(np_kwargs["out"]))):
-                if isinstance(o, ndarray):
-                    o[...] = r
-            return out
-        return _wrap_result(result, (np_args, np_kwargs))
+        return _host_call(func, args, kwargs)
 
     # --- common methods (NumPy semantics via the protocols) -------------------
     def astype(self, dtype, copy=True):
         dtype = np.dtype(dtype)
         if dtype == self.dtype and not copy:
             return self
-        return asarray(self.numpy().astype(dtype))
+        return _adopt(self.numpy().astype(dtype))  # fresh copy
 
     def copy(self):
         out = _wrap_numpy(np.empty(self.shape, self.dtype))
@@ -321,19 +366,8 @@ class ndarray(_viproc._Array):
 
 
 def _fallback_ufunc(ufunc, method, inputs, kwargs):
-    """Sync, run eagerly in NumPy, wrap the result."""
-    out = kwargs.pop("out", None)
-    args = _tree(inputs, _to_numpy)
-    kwargs = _tree(kwargs, _to_numpy)
-    if out is None:
-        return _wrap_result(getattr(ufunc, method)(*args, **kwargs), (args, kwargs))
-    out = out if isinstance(out, tuple) else (out,)
-    np_out = tuple(_writable_copy(o) for o in out)
-    getattr(ufunc, method)(*args, out=np_out if len(np_out) > 1 else np_out[0], **kwargs)
-    for o, r in zip(out, np_out):
-        if isinstance(o, ndarray):
-            o[...] = r
-    return out[0] if len(out) == 1 else out
+    """Sync, run eagerly in NumPy (in place for out= and ufunc.at)."""
+    return _host_call(getattr(ufunc, method), inputs, kwargs)
 
 
 # Hooks for the C fast path (see _viproc.c).

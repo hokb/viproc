@@ -144,6 +144,7 @@ static PyObject* s_out = NULL;  /* "out" */
 
 typedef struct {
     PyObject_HEAD vp_array* a;
+    int readonly; /* NumPy's WRITEABLE == False (e.g. views NumPy made read-only) */
 } ArrayObject;
 
 static PyTypeObject ArrayType; /* forward */
@@ -210,7 +211,24 @@ static PyObject* Array_get_dtype(ArrayObject* self, void* c) {
     return Py_NewRef(d);
 }
 
+static PyObject* Array_get_readonly(ArrayObject* self, void* c) {
+    (void)c;
+    return PyBool_FromLong(self->readonly);
+}
+
+static int Array_set_readonly(ArrayObject* self, PyObject* v, void* c) {
+    (void)c;
+    const int t = v != NULL ? PyObject_IsTrue(v) : 0;
+    if (t < 0) {
+        return -1;
+    }
+    self->readonly = t;
+    return 0;
+}
+
 static PyGetSetDef Array_getset[] = {
+    {"_readonly", (getter)Array_get_readonly, (setter)Array_set_readonly,
+     "True if writes raise, as for a NumPy array with WRITEABLE == False.", NULL},
     {"shape", (getter)Array_get_shape, NULL, "Shape (no sync).", NULL},
     {"strides", (getter)Array_get_strides, NULL, "Byte strides (no sync).", NULL},
     {"ndim", (getter)Array_get_ndim, NULL, "Number of dimensions (no sync).", NULL},
@@ -547,8 +565,8 @@ static int is_temporary(PyObject* obj, size_t nbytes) {
 static PyObject* elision_candidate(PyObject* const* inputs, vp_array* const* ins, Py_ssize_t n,
                                    int out_code, int ndim, const int64_t* shape) {
     for (Py_ssize_t i = 0; i < n; ++i) {
-        if (!is_array(inputs[i]) || (int)vp_array_dtype(ins[i]) != out_code ||
-            vp_array_ndim(ins[i]) != ndim ||
+        if (!is_array(inputs[i]) || ((ArrayObject*)inputs[i])->readonly ||
+            (int)vp_array_dtype(ins[i]) != out_code || vp_array_ndim(ins[i]) != ndim ||
             memcmp(vp_array_shape(ins[i]), shape, (size_t)ndim * sizeof(int64_t)) != 0) {
             continue;
         }
@@ -786,8 +804,8 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
         vp_array* o = ((ArrayObject*)out)->a;
         int same = vp_array_ndim(o) == ndim && (int)vp_array_dtype(o) == codes[n] &&
                    memcmp(vp_array_shape(o), shape, (size_t)ndim * sizeof(int64_t)) == 0;
-        if (!same) {
-            status = 1; /* casting or broadcasting into out=: fallback */
+        if (!same || ((ArrayObject*)out)->readonly) {
+            status = 1; /* casting/broadcasting into out=, or read-only: NumPy decides */
         }
     }
     if (status == 0 && elide && out == NULL) {
@@ -1234,9 +1252,14 @@ static PyObject* m_view(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *base, *shape_o, *strides_o;
     long long offset;
-    if (!PyArg_ParseTuple(args, "O!OOL", &ArrayType, &base, &shape_o, &strides_o, &offset) ||
+    int code = -1; /* dtype of the view; default: the base's */
+    if (!PyArg_ParseTuple(args, "O!OOL|i", &ArrayType, &base, &shape_o, &strides_o, &offset,
+                          &code) ||
         check_runtime() < 0) {
         return NULL;
+    }
+    if (code < 0) {
+        code = (int)vp_array_dtype(array_of(base));
     }
     int64_t shape[MAXDIMS], strides[MAXDIMS];
     int nd = read_dims(shape_o, shape);
@@ -1246,7 +1269,12 @@ static PyObject* m_view(PyObject* self, PyObject* args) {
         }
         return NULL;
     }
-    return wrap_array(vp_array_view(g_rt, array_of(base), nd, shape, strides, offset));
+    PyObject* v =
+        wrap_array(vp_array_view(g_rt, array_of(base), (vp_dtype)code, nd, shape, strides, offset));
+    if (v != NULL) {
+        ((ArrayObject*)v)->readonly = ((ArrayObject*)base)->readonly; /* as NumPy views */
+    }
+    return v;
 }
 
 static PyObject* m_ready(PyObject* self, PyObject* o) {
@@ -1285,13 +1313,31 @@ static PyObject* m_wait(PyObject* self, PyObject* o) {
     Py_RETURN_NONE;
 }
 
-static PyObject* m_export(PyObject* self, PyObject* o) {
+/* export(a, writable=False): NumPy view of a's data, no copy (D7). A writable
+ * export first makes the buffer exclusive (vp_array_prepare_write); it is for
+ * NumPy code the bridge runs synchronously, never handed to user code. */
+static PyObject* m_export(PyObject* self, PyObject* args) {
     (void)self;
-    vp_array* a = array_of(o);
-    if (a == NULL || check_runtime() < 0 || wait_array(a) < 0) {
+    PyObject* o;
+    int writable = 0;
+    if (!PyArg_ParseTuple(args, "O!|p", &ArrayType, &o, &writable) || check_runtime() < 0) {
         return NULL;
     }
-    return vp_array_export(a);
+    vp_array* a = array_of(o);
+    writable = writable && !((ArrayObject*)o)->readonly;
+    if (writable) {
+        char err[ERRLEN] = "";
+        int status;
+        Py_BEGIN_ALLOW_THREADS;
+        status = vp_array_prepare_write(g_rt, a, err, sizeof err);
+        Py_END_ALLOW_THREADS;
+        if (raise_status(status, err) < 0) {
+            return NULL;
+        }
+    } else if (wait_array(a) < 0) {
+        return NULL;
+    }
+    return vp_array_export(a, writable);
 }
 
 static PyObject* m_assign(PyObject* self, PyObject* args) {
@@ -1299,6 +1345,10 @@ static PyObject* m_assign(PyObject* self, PyObject* args) {
     PyObject *dst, *src;
     if (!PyArg_ParseTuple(args, "O!O!", &ArrayType, &dst, &ArrayType, &src) ||
         check_runtime() < 0) {
+        return NULL;
+    }
+    if (((ArrayObject*)dst)->readonly) {
+        PyErr_SetString(PyExc_ValueError, "assignment destination is read-only");
         return NULL;
     }
     char err[ERRLEN] = "";
@@ -1342,7 +1392,8 @@ static PyMethodDef methods[] = {
     {"ready", m_ready, METH_O, NULL},
     {"same_storage", m_same_storage, METH_VARARGS, NULL},
     {"wait", m_wait, METH_O, "Sync point: wait for a, raise AsyncError on failure."},
-    {"export", m_export, METH_O, "Sync point: read-only NumPy view of a (no copy)."},
+    {"export", m_export, METH_VARARGS,
+     "export(a, writable=False): sync point, NumPy view of a without a copy."},
     {"assign", m_assign, METH_VARARGS, "assign(dst, src): dst[...] = src"},
     {NULL, NULL, 0, NULL},
 };

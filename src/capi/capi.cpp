@@ -176,10 +176,10 @@ int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_arr
     return VP_OK;
 }
 
-vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, int ndim, const int64_t* shape,
-                        const int64_t* strides, int64_t offset) {
+vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, vp_dtype dtype, int ndim,
+                        const int64_t* shape, const int64_t* strides, int64_t offset) {
     Layout l;
-    l.dtype = arr(base).layout().dtype;
+    l.dtype = to_dtype(dtype);
     l.shape.assign(shape, shape + ndim);
     l.strides.assign(strides, strides + ndim);
     l.offset = arr(base).layout().offset + offset;
@@ -202,8 +202,8 @@ size_t vp_array_reusable_bytes(const vp_array* a) {
     const Buffer& b = *x.buffer();
     const Layout& l = x.layout();
     const bool ok = x.ref_count() == 1 && x.storage().use_count() == 1 && b.capacity() != 0 &&
-                    b.async_reads.load(std::memory_order_acquire) == 0 && l.offset == 0 &&
-                    l.c_contiguous() && l.nbytes() == b.nbytes();
+                    !b.has_readers() && l.offset == 0 && l.c_contiguous() &&
+                    l.nbytes() == b.nbytes();
     return ok ? b.nbytes() : 0;
 }
 
@@ -216,7 +216,18 @@ int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
     return VP_OK;
 }
 
-PyObject* vp_array_export(const vp_array* a) { return numpy::export_ndarray(arr(a)); }
+PyObject* vp_array_export(const vp_array* a, int writable) {
+    return numpy::export_ndarray(arr(a), writable != 0);
+}
+
+int vp_array_prepare_write(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
+    std::optional<TaskError> e = rt->rt->prepare_host_write(arr(a));
+    if (e) {
+        set_error(err, errlen, e->message + " (in op issued at " + e->issue_site + ")");
+        return VP_ERROR;
+    }
+    return VP_OK;
+}
 
 int vp_ufunc_loop(vp_runtime* rt, PyObject* ufunc, int nin, const vp_dtype* dtypes,
                   const vp_loop** out, char* err, size_t errlen) {
