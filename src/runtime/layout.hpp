@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace viproc {
@@ -42,6 +43,12 @@ struct Layout {
 
     // C-contiguous layout of `shape`; a 0-d shape is a scalar with one element.
     static Layout contiguous(DType dtype, Shape shape);
+    // The layout NumPy gives a new ufunc result (order='K'): dense, axes in
+    // the order NumPy's iterator picks from the inputs' strides (inputs as
+    // broadcast to `shape`): C order unless the inputs agree on another one
+    // (F-order inputs give an F-order result). Reductions over the result
+    // then visit elements in NumPy's order (bit-identical sums).
+    static Layout keep_order(DType dtype, Shape shape, std::span<const Layout> inputs);
 
     std::int64_t size() const;
     // True if the elements lie C-contiguously (dimensions of extent 1 may
@@ -49,6 +56,9 @@ struct Layout {
     bool c_contiguous() const;
     // Bytes a buffer needs to hold this layout when it is contiguous.
     std::size_t nbytes() const;
+    // True if the elements fill nbytes() bytes from offset 0, in some axis
+    // order, with positive strides (extent-1 dimensions may have any stride).
+    bool dense() const;
 };
 
 // NumPy broadcasting of two shapes. Returns false if they are incompatible.

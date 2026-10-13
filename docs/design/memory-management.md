@@ -461,13 +461,15 @@ writing an array in place (in-place operators, `out=`, `__setitem__`)
 writes the current buffer only if nobody still reads it and no input of the
 op overlaps it through another view; otherwise the storage switches to a
 new buffer and the old one lives on through its readers' references.
-Single-view storages are *consolidated* (the op writes a fresh contiguous
-buffer, no copy); storages with views get a copy task first. An op's reads
+Single-view storages are *consolidated* (the op writes a fresh buffer with
+the array's layout, no copy); storages with views get a copy task first. An op's reads
 of the buffer it writes in place are not counted (D5): later writers wait
 for it as the producer anyway. Decided at
 issue time on the main thread, so layouts never change after they were
-communicated. Known difference to NumPy: strides/flags of an array may
-change after an in-place op (values never do).
+communicated. Arrays keep their strides, as in NumPy: until reductions ran
+asynchronously, consolidation switched to a C-contiguous layout, which made
+later sums of F-order arrays round differently from NumPy (the element
+order of a pairwise sum follows the layout).
 
 ## D9 — A wrapper, not a subclass of `numpy.ndarray`
 

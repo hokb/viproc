@@ -144,9 +144,12 @@ class Runtime {
     // Kernel operands: inputs = [inputs..., inouts...],
     //                  outputs = [inouts..., new outputs...].
     // `results` receives one array per new output.
+    // `work_elements` sizes the op for the dispatch policy; by default the
+    // elements of the first output (a reduction passes its input's size).
     void issue(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
                std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
-               const char* issue_site, std::span<ArrayPtr> results);
+               const char* issue_site, std::span<ArrayPtr> results,
+               std::int64_t work_elements = -1);
     std::vector<ArrayPtr> issue(const std::shared_ptr<Kernel>& kernel,
                                 std::span<const ArrayPtr> inputs, std::span<const ArrayPtr> inouts,
                                 std::span<const Layout> new_outputs, const char* issue_site);

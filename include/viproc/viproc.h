@@ -170,6 +170,21 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
                    const int64_t* out_shape, vp_array* out, vp_array** result, const char* site,
                    char* err, size_t errlen);
 
+/* Issues a reduction of `in` with the binary `ufunc` (add, multiply, minimum,
+ * maximum, logical_and, ...) over the dimensions flagged in `axes` (one entry
+ * per dimension of `in`; nonzero = reduced). viproc calls NumPy's own
+ * reduction loop, in the blocks NumPy's reduction passes to it, so results
+ * are bit-identical (NumPy >= 2.3; the caller checks the version). The
+ * result has the input's dtype; reduced dimensions stay with extent 1 if
+ * `keepdims`. `identity` is the value the accumulator starts at (the
+ * ufunc's identity), or Py_None to start at the first element along the
+ * reduced axes (minimum, maximum). Returns VP_UNSUPPORTED (reason in `err`)
+ * if the input is empty, the reduction would cast, or the loop needs the
+ * Python API; the caller then falls back to NumPy. */
+int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
+              int keepdims, PyObject* identity, vp_array** result, const char* site, char* err,
+              size_t errlen);
+
 /* Issues dst[...] = src (src broadcasts to dst's shape, same dtype). `site`
  * comes from vp_intern. */
 int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, char* err,

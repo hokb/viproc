@@ -182,7 +182,8 @@ ownership, release or reuse of memory.
     buffer stays alive through its readers' references.
     - **Consolidated** (array is the only view of its storage and covers
       all of it): no copy at all. The op reads the old buffer and writes
-      the new one, and the new buffer gets a **contiguous layout**.
+      the new one, with the **same layout** (as in NumPy, the array keeps
+      its strides).
     - **With views or partial writes:** a copy task copies the whole old
       buffer into the new one first; the op then writes its part. Views
       keep their layouts (offsets and strides stay valid in the new
@@ -190,11 +191,14 @@ ownership, release or reuse of memory.
 - **Consolidation is decided at issue time, on the main thread.** Layout
   and size, once communicated (`size_completed`), never change. Tasks
   already issued captured (buffer, layout) pairs and are unaffected; only
-  ops issued later see the new layout. A later change (e.g. at allocation
-  time) could only keep the strides as they are.
-- Known difference to NumPy: consolidation can change the observable
-  strides / flags of an array after an in-place op (`a.strides`,
-  `a.flags.c_contiguous`). Values are always identical.
+  ops issued later see the new buffer.
+- **Layouts follow NumPy's**, because the order in which a reduction visits
+  elements depends on them (pairwise `add`): a new ufunc result gets the
+  layout NumPy would allocate (`Layout::keep_order`: order='K', dense, axes
+  ordered by the inputs' strides as NumPy's iterator orders them; F-order
+  inputs give an F-order result), and copy-on-write keeps the array's
+  layout. Importing a non-contiguous NumPy array (`asarray`) copies it
+  densely, in its axis order.
 - Memory is handed to plain NumPy for *writing* only inside an eager
   fallback, after the buffer was made exclusive (no pending writer, no
   task reader, no live export); exports to the user are read-only and
@@ -270,6 +274,8 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
 src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
   numpy_ufunc.*        UfuncLoop / LoopCache (resolved NumPy loops),
                        element-wise kernel, wrap_ndarray / to_ndarray
+  numpy_reduce.*       reduction kernel: NumPy's reduction loop, called in
+                       NumPy's blocks (ReducePlan)
 src/capi/capi.cpp      Implementation of the C ABI (library `viproc_capi`)
 src/viproc_python.h    the only way to include Python.h (MSVC debug fix)
 python/viproc/         Python package
@@ -503,15 +509,27 @@ Rules:
   `no_floatingpoint_errors`). Workers clear the flags before and read them
   after each loop and store them on the instruction; the bridge applies
   `np.errstate` semantics at the next sync point.
-- **Reductions** (`sum`, `prod`, `min`, `max`, `any`, `all`, …) use the
-  binary loop resolved with `reduction=True`, called with an output stride
-  of 0 (`args = {acc, in, acc}`), seeded with the identity or the first
-  element. `axis=None` first, `axis=k` and `keepdims` later. NumPy's float
-  `add` loop does pairwise summation inside one call, so splitting a
-  reduction into chunks changes rounding; call the loop with the same
-  blocks NumPy would to stay bit-identical. Pass `fixed_strides` to
-  `_get_strided_loop` when the strides are known, as NumPy does; it may
-  select a specialized loop.
+- **Reductions** (`sum`, `prod`, `min`, `max`, `any`, `all`, …;
+  `src/kernels/numpy_reduce.*`) use the binary loop resolved with
+  `reduction=True` and `fixed_strides` = the inner strides, called with
+  `args = {acc, in, acc}` (acc stride 0 along reduced axes). NumPy's float
+  `add` loop sums each call pairwise, so the blocks decide the rounding;
+  viproc calls the loop in exactly NumPy's blocks (`ReducePlan`, built at
+  issue time):
+  - axes ordered by the input's |stride| (nditer's insertion sort over C
+    order; zero strides and extent-1 axes never decide), negative strides
+    kept (DONT_NEGATE_STRIDES);
+  - adjacent reduced axes coalesced when the input is contiguous across
+    them; kept axes not (element-wise accumulation: blocks do not matter);
+  - one loop call per outer position over the whole innermost axis;
+  - accumulator starts at `ufunc.identity` (add: +0.0, so `sum([-0.0])` is
+    0.0, as NumPy); without identity (min/max) at the first element along
+    the reduced axes, which the loop then skips (NumPy's first-visit skip).
+  **Not covered, left to NumPy:** reduced axes that do not coalesce into
+  one (full reduction of a non-contiguous array): there NumPy ≥ 2.3 buffers
+  the input and sums buffer-sized blocks. Fuzzed against NumPy over shapes,
+  axes, layouts and dtypes (`python/tests/test_reductions.py`, incl. signs
+  of zeros and NaNs): bit-identical.
 - **NumPy's reduction chunking depends on its version** (measured for a
   contiguous 1-d float64 `np.sum`, 100003 elements, NumPy 2.1–2.5):
   **up to 2.2** the loop is called in chunks of `np.getbufsize()` (default
@@ -555,9 +573,20 @@ Rules:
   is None`, one output) with exact dtype signatures after NumPy's own
   resolution (`ufunc.resolve_dtypes`, NEP 50 weak Python scalars), incl.
   `out=` and in-place operators; basic indexing as views (no sync);
-  `__setitem__` with basic keys (assign kernel).
+  `__setitem__` with basic keys (assign kernel); **reductions** (NumPy ≥
+  2.3): `ufunc.reduce` of reorderable ufuncs (add, multiply, minimum,
+  maximum, fmin, fmax, logical and/or/xor, bitwise and/or/xor) and
+  `np.sum/prod/min/max/amin/amax/any/all` (also as methods) without
+  `out=`, `initial=`, `where=` and without a cast (int32 `sum` accumulates
+  in int64: NumPy); `any`/`all` of non-bool data as `a != 0` first;
+  `mean`, `var`, `std` of float64 composed exactly as NumPy's
+  `_methods.py` (sum, divide by the count, squared deviations). Results
+  are viproc arrays (0-d for full reductions), not NumPy scalars;
+  `float()`, `bool()`, `format()`, `round()` sync. Per-call preparation is
+  cached per (ufunc, dtype, ndim, axis, keepdims) (`_reduce_plans`).
 - **Fallback (sync + eager NumPy on viproc memory, `_Host`):** everything
-  else: reductions, gufuncs (`matmul`), casting, advanced indexing,
+  else: other reductions (casts, argmin/argmax, float32 mean), gufuncs
+  (`matmul`), casting, advanced indexing,
   `ufunc.at`, other NumPy functions. NumPy's semantics exactly (design doc
   D7, "Eager fallbacks"): each viproc argument becomes a writable NumPy
   view after `vp_array_prepare_write` (wait for producer and task readers,
@@ -639,6 +668,11 @@ Rules:
   vs. NumPy with 4 workers): 1e7 elements ~7.5x (pool + temporary elision;
   NumPy pays page faults for its temporaries); 1e6 ~4.5x; 1e5 3.0x; 1e4 ~3x;
   3e3 ~2.5x, 1e3 ~0.9x (noisy).
+- Async reductions (benchmark suite, 4 CPUs, full run): score 44.7 → 52.2,
+  category `reductions` 31 → 75; `reduce_full` medium 1.0x → 5.3x,
+  `softmax_rows` medium 1.0x → 3.7x vs NumPy. A small `np.sum` (1,000
+  elements) costs ~2.8 µs vs NumPy's ~1.5–2 µs (NumPy's own
+  `__array_function__` dispatch is most of the difference).
 - "Issue an op, read the result right away" (`sync_latency.py`): 8 elements
   8.1 → 1.4–2.4 µs (NumPy 0.5–0.9), 1e3 5.1 → 1.6–2.7 µs (NumPy 0.8–1.6),
   1e4 ~NumPy (4.3–6.9 vs. 6.1–6.9 µs), 1e5 faster than NumPy, thanks to
@@ -694,8 +728,9 @@ Rules:
 - Python objects whose memory a task still uses are released only on the
   main thread with the GIL: a worker dropping the last reference parks
   the object in a graveyard drained at the next C ABI call.
-- Not implemented yet: casting (exact dtype signatures only), reductions,
-  gufuncs (linalg, fft, matmul), argmin/argmax, FP-flag reporting to
+- Not implemented yet: casting (exact dtype signatures only), reductions
+  with casts or over non-coalescing axes, gufuncs (linalg, fft, matmul),
+  argmin/argmax, FP-flag reporting to
   Python (NumPy warnings / `np.errstate`), `python -m viproc`.
 
 ## Conventions

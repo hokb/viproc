@@ -1435,6 +1435,52 @@ static PyObject* m_assign(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+/* reduce(ufunc, a, axes, keepdims, identity): async reduction with NumPy's
+ * reduction loop (vp_reduce). `axes`: a sequence of bools, one per
+ * dimension of `a`. Returns the (pending) result, or None if viproc cannot
+ * run it (the caller falls back to NumPy). */
+static PyObject* m_reduce(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *ufunc, *a, *axes, *identity;
+    int keepdims;
+    if (!PyArg_ParseTuple(args, "OO!OpO", &ufunc, &ArrayType, &a, &axes, &keepdims, &identity) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    vp_array* in = array_of(a);
+    const int nd = vp_array_ndim(in);
+    PyObject* fast = PySequence_Fast(axes, "axes must be a sequence");
+    if (fast == NULL) {
+        return NULL;
+    }
+    if (PySequence_Fast_GET_SIZE(fast) != nd || nd > MAXDIMS) {
+        Py_DECREF(fast);
+        PyErr_SetString(PyExc_ValueError, "reduce: one axis flag per dimension expected");
+        return NULL;
+    }
+    unsigned char flags[MAXDIMS];
+    for (int i = 0; i < nd; ++i) {
+        const int t = PyObject_IsTrue(PySequence_Fast_GET_ITEM(fast, i));
+        if (t < 0) {
+            Py_DECREF(fast);
+            return NULL;
+        }
+        flags[i] = (unsigned char)t;
+    }
+    Py_DECREF(fast);
+    vp_array* res = NULL;
+    char err[ERRLEN] = "";
+    const int status =
+        vp_reduce(g_rt, ufunc, in, flags, keepdims, identity, &res, issue_site(), err, sizeof err);
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    return wrap_array(res);
+}
+
 static PyObject* m_issue_site(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
@@ -1475,6 +1521,8 @@ static PyMethodDef methods[] = {
     {"export", m_export, METH_VARARGS,
      "export(a, writable=False): sync point, NumPy view of a without a copy."},
     {"assign", m_assign, METH_VARARGS, "assign(dst, src): dst[...] = src"},
+    {"reduce", m_reduce, METH_VARARGS,
+     "reduce(ufunc, a, axes, keepdims, identity): async reduction, or None if unsupported"},
     {NULL, NULL, 0, NULL},
 };
 

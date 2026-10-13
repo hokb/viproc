@@ -2,6 +2,7 @@
 
 #include "viproc/viproc.h"
 
+#include "kernels/numpy_reduce.hpp"
 #include "kernels/numpy_ufunc.hpp"
 #include "runtime/assign.hpp"
 #include "runtime/element_pool.hpp"
@@ -278,7 +279,23 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
         *result = nullptr;
         return VP_OK;
     }
-    Layout l = Layout::contiguous(out_dtype, std::move(shape));
+    // NumPy's result layout (order='K'); C order unless an input is not.
+    bool all_c = true;
+    for (int i = 0; i < nin; ++i) {
+        const Layout& il = ins[i]->layout();
+        all_c = all_c && (il.c_contiguous() || il.size() <= 1);
+    }
+    Layout l;
+    if (all_c) {
+        l = Layout::contiguous(out_dtype, std::move(shape));
+    } else {
+        Layout in_layouts[3];
+        for (int i = 0; i < nin; ++i) {
+            in_layouts[i] = ins[i]->layout();
+        }
+        l = Layout::keep_order(out_dtype, std::move(shape),
+                               std::span<const Layout>(in_layouts, static_cast<std::size_t>(nin)));
+    }
     ArrayPtr res;
     rt->rt->issue(kernel, in_span, {}, std::span(&l, 1), site, std::span(&res, 1));
     *result = hand_out(std::move(res));
@@ -299,6 +316,54 @@ int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, 
         return st;
     }
     return vp_ufunc_issue(rt, loop, inputs, out_ndim, out_shape, out, result, site, err, errlen);
+}
+
+int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
+              int keepdims, PyObject* identity, vp_array** result, const char* site, char* err,
+              size_t errlen) {
+    rt->graveyard->drain();
+    const Layout& l = arr(in).layout();
+    if (l.size() == 0) {
+        set_error(err, errlen, "empty reduction"); // NumPy's identity / error handling
+        return VP_UNSUPPORTED;
+    }
+    const std::size_t nd = l.shape.size();
+    std::vector<char> flags(nd); // std::vector<bool> has no data()
+    Shape out_shape;
+    for (std::size_t i = 0; i < nd; ++i) {
+        flags[i] = axes[i] != 0;
+        if (!flags[i]) {
+            out_shape.push_back(l.shape[i]);
+        } else if (keepdims) {
+            out_shape.push_back(1);
+        }
+    }
+    Layout out_layout = Layout::contiguous(l.dtype, std::move(out_shape));
+    const std::span<const bool> reduced(reinterpret_cast<const bool*>(flags.data()), nd);
+    numpy::ReducePlan plan = numpy::plan_reduction(l, reduced, out_layout);
+    if (!plan.supported()) {
+        set_error(err, errlen, "reduced axes do not coalesce (NumPy buffers them)");
+        return VP_UNSUPPORTED;
+    }
+    std::string e;
+    const numpy::UfuncLoop* loop =
+        rt->loops->get_reduction(ufunc, l.dtype, plan.inner_strides(), e);
+    if (loop == nullptr) {
+        PyErr_Clear();
+        set_error(err, errlen, e);
+        return VP_UNSUPPORTED;
+    }
+    std::vector<std::byte> init;
+    if (identity != nullptr && identity != Py_None &&
+        !numpy::scalar_bytes(identity, l.dtype, init)) {
+        return VP_PYERR;
+    }
+    const ArrayPtr ins[] = {ref(in)};
+    ArrayPtr res;
+    rt->rt->issue(numpy::make_reduce_kernel(loop, std::move(plan), std::move(init)), ins, {},
+                  std::span(&out_layout, 1), site, std::span(&res, 1), l.size());
+    *result = hand_out(std::move(res));
+    return VP_OK;
 }
 
 int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, char* err,

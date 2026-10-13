@@ -5,10 +5,12 @@
 
 #include "runtime/runtime.hpp"
 
+#include <array>
 #include <map>
 #include <memory>
 #include <span>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -34,6 +36,13 @@ class UfuncLoop {
     // resolve a different signature (casting is not supported yet).
     static std::unique_ptr<UfuncLoop> resolve(PyObject* ufunc, std::span<const DType> dtypes,
                                               std::string& error);
+    // The loop NumPy uses to reduce `dtype` with the binary `ufunc` (resolved
+    // with reduction=True), for the inner strides `fixed_strides` (acc, in,
+    // acc), as NumPy's reduction passes them to get_strided_loop. Fails if
+    // the reduction would cast (the accumulator dtype differs from `dtype`).
+    static std::unique_ptr<UfuncLoop> resolve_reduction(PyObject* ufunc, DType dtype,
+                                                        const std::array<std::intptr_t, 3>& fixed,
+                                                        std::string& error);
 
     int call(char* const* data, const std::intptr_t* dims, const std::intptr_t* strides) const;
 
@@ -58,9 +67,15 @@ class UfuncLoop {
 class LoopCache {
   public:
     const UfuncLoop* get(PyObject* ufunc, std::span<const DType> dtypes, std::string& error);
+    // Reduction loop (UfuncLoop::resolve_reduction), cached per ufunc, dtype
+    // and inner strides.
+    const UfuncLoop* get_reduction(PyObject* ufunc, DType dtype,
+                                   const std::array<std::intptr_t, 3>& fixed, std::string& error);
 
   private:
     std::map<std::pair<PyObject*, std::vector<DType>>, std::unique_ptr<UfuncLoop>> loops_;
+    std::map<std::tuple<PyObject*, DType, std::array<std::intptr_t, 3>>, std::unique_ptr<UfuncLoop>>
+        reduction_loops_;
 };
 
 // Element-wise kernel: broadcasts the inputs to the shape of output 0 and calls
@@ -78,6 +93,10 @@ bool supported_ndarray(PyObject* arr);
 // A ready 0-d array holding `value` converted to `dtype` by NumPy (nullptr
 // with a Python exception set on failure).
 ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype);
+
+// The bytes of `value` converted to `dtype` by NumPy (false with a Python
+// exception set on failure). GIL held.
+bool scalar_bytes(PyObject* value, DType dtype, std::vector<std::byte>& out);
 
 // Copy-free export (docs/design/memory-management.md, D7): a NumPy view of
 // `a`'s buffer, with `a`'s shape and strides. `a` must be ready.

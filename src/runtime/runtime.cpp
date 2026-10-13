@@ -220,7 +220,8 @@ std::vector<ArrayPtr> Runtime::issue(const std::shared_ptr<Kernel>& kernel,
 
 void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
                     std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
-                    const char* issue_site, std::span<ArrayPtr> results) {
+                    const char* issue_site, std::span<ArrayPtr> results,
+                    std::int64_t work_elements) {
     // The task first (back-pressure: wait for a slot before creating it), so
     // the operands are built in place.
     acquire_slot();
@@ -275,9 +276,9 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         const bool covers_buffer = a.layout_.nbytes() == s.buffer_->nbytes();
         if (only_view && covers_buffer) {
             // Consolidated: no copy task. The op reads the old buffer (step 1)
-            // and writes a new, contiguous one.
-            a.layout_ = Layout::contiguous(a.layout_.dtype, a.layout_.shape);
-            s.buffer_ = make_pooled<Buffer>(a.layout_.nbytes());
+            // and writes a new one with the same layout (as NumPy, the array
+            // keeps its strides; later reductions see NumPy's element order).
+            s.buffer_ = make_pooled<Buffer>(s.buffer_->nbytes());
         } else {
             // Views share the storage (or the op writes only part of it):
             // copy the whole buffer first, views keep their layouts.
@@ -309,7 +310,9 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     }
     for (std::size_t i = 0; i < new_outputs.size(); ++i) {
         const Layout& l = new_outputs[i];
-        Layout contiguous = l.c_contiguous() ? l : Layout::contiguous(l.dtype, l.shape);
+        // Dense layouts (C, F, any axis order) are kept: ufunc results follow
+        // NumPy's order (Layout::keep_order).
+        Layout contiguous = l.dense() ? l : Layout::contiguous(l.dtype, l.shape);
         auto buffer = make_pooled<Buffer>(contiguous.nbytes());
         in_ops.push_back({buffer, contiguous});
         results[i] = new_array(std::move(contiguous), std::move(buffer), task);
@@ -323,9 +326,10 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     // output memory from the pool right here (memory-management.md, D10).
     task->advance(TaskState::SizeCompleted);
     task->advance(TaskState::Allocated);
-    const std::int64_t elements = !new_outputs.empty() ? new_outputs[0].size()
-                                  : !inouts.empty()    ? inouts[0]->layout_.size()
-                                                       : 0;
+    const std::int64_t elements = work_elements >= 0     ? work_elements
+                                  : !new_outputs.empty() ? new_outputs[0].size()
+                                  : !inouts.empty()      ? inouts[0]->layout_.size()
+                                                         : 0;
     launch(task, producers, elements);
 }
 

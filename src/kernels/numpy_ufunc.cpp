@@ -161,6 +161,80 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve(PyObject* ufunc, std::span<const D
     return loop;
 }
 
+std::unique_ptr<UfuncLoop> UfuncLoop::resolve_reduction(PyObject* ufunc, DType dtype,
+                                                        const std::array<std::intptr_t, 3>& fixed,
+                                                        std::string& error) {
+    auto* uf = reinterpret_cast<PyUFuncObject*>(ufunc);
+    if (!PyObject_TypeCheck(ufunc, &PyUFunc_Type) || uf->nin != 2 || uf->nout != 1) {
+        error = "not a binary ufunc";
+        return nullptr;
+    }
+    // As NumPy's reduction: (None, operand dtype, None), reduction=True.
+    PyObject* descr = reinterpret_cast<PyObject*>(PyArray_DescrFromType(type_num(dtype)));
+    PyObject* requested = PyTuple_Pack(3, Py_None, descr, Py_None);
+    Py_DECREF(descr);
+    PyObject* meth = PyObject_GetAttrString(ufunc, "_resolve_dtypes_and_context");
+    PyObject* args = PyTuple_Pack(1, requested);
+    PyObject* kwargs = Py_BuildValue("{s:O}", "reduction", Py_True);
+    PyObject* res = meth != nullptr && args != nullptr && kwargs != nullptr
+                        ? PyObject_Call(meth, args, kwargs)
+                        : nullptr;
+    Py_XDECREF(meth);
+    Py_XDECREF(args);
+    Py_XDECREF(kwargs);
+    Py_DECREF(requested);
+    if (res == nullptr) {
+        error = fetch_python_error();
+        return nullptr;
+    }
+    PyObject* resolved = PyTuple_GetItem(res, 0);
+    bool exact = true;
+    for (Py_ssize_t i = 0; i < 3; ++i) {
+        auto* d = reinterpret_cast<PyArray_Descr*>(PyTuple_GetItem(resolved, i));
+        exact = exact && d->type_num == type_num(dtype);
+    }
+    if (!exact) {
+        Py_DECREF(res);
+        error = "the reduction casts (casting not supported yet)";
+        return nullptr;
+    }
+    std::unique_ptr<UfuncLoop> loop(new UfuncLoop());
+    loop->capsule_ = PyTuple_GetItem(res, 1);
+    Py_INCREF(loop->capsule_);
+    Py_DECREF(res);
+
+    PyObject* get = PyObject_GetAttrString(ufunc, "_get_strided_loop");
+    PyObject* get_args = PyTuple_Pack(1, loop->capsule_);
+    PyObject* strides =
+        Py_BuildValue("(nnn)", static_cast<Py_ssize_t>(fixed[0]), static_cast<Py_ssize_t>(fixed[1]),
+                      static_cast<Py_ssize_t>(fixed[2]));
+    PyObject* get_kwargs = Py_BuildValue("{s:O}", "fixed_strides", strides);
+    PyObject* filled = get != nullptr && get_args != nullptr && get_kwargs != nullptr
+                           ? PyObject_Call(get, get_args, get_kwargs)
+                           : nullptr;
+    Py_XDECREF(get);
+    Py_XDECREF(get_args);
+    Py_XDECREF(strides);
+    Py_XDECREF(get_kwargs);
+    if (filled == nullptr) {
+        error = fetch_python_error();
+        return nullptr;
+    }
+    Py_DECREF(filled);
+    loop->info_ = PyCapsule_GetPointer(loop->capsule_, kCallInfoCapsule);
+    if (loop->info_ == nullptr) {
+        error = fetch_python_error();
+        return nullptr;
+    }
+    loop->nin_ = 2;
+    loop->nout_ = 1;
+    if (loop->requires_pyapi()) {
+        error = "loop requires the Python API; cannot run asynchronously";
+        return nullptr;
+    }
+    return loop;
+}
+
 bool UfuncLoop::requires_pyapi() const {
     return static_cast<const UfuncCallInfoPrefix*>(info_)->requires_pyapi != 0;
 }
@@ -186,7 +260,44 @@ const UfuncLoop* LoopCache::get(PyObject* ufunc, std::span<const DType> dtypes,
     return loops_.emplace(std::move(key), std::move(loop)).first->second.get();
 }
 
+const UfuncLoop* LoopCache::get_reduction(PyObject* ufunc, DType dtype,
+                                          const std::array<std::intptr_t, 3>& fixed,
+                                          std::string& error) {
+    auto key = std::make_tuple(ufunc, dtype, fixed);
+    auto it = reduction_loops_.find(key);
+    if (it != reduction_loops_.end()) {
+        return it->second.get();
+    }
+    std::unique_ptr<UfuncLoop> loop = UfuncLoop::resolve_reduction(ufunc, dtype, fixed, error);
+    if (!loop) {
+        return nullptr;
+    }
+    Py_INCREF(ufunc); // as in get()
+    return reduction_loops_.emplace(std::move(key), std::move(loop)).first->second.get();
+}
+
 namespace {
+
+// Dense with positive strides: the elements fill a block starting at the
+// first element (Layout::dense() without the offset condition).
+bool dense_from_first(const Layout& l) {
+    Layout at0 = l;
+    at0.offset = 0;
+    return at0.dense();
+}
+
+// Same shape and the same strides along every axis of extent > 1.
+bool same_order(const Layout& a, const Layout& b) {
+    if (a.shape != b.shape) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.shape.size(); ++i) {
+        if (a.shape[i] != 1 && a.strides[i] != b.strides[i]) {
+            return false;
+        }
+    }
+    return true;
+}
 
 class ElementwiseKernel : public Kernel {
   public:
@@ -198,18 +309,21 @@ class ElementwiseKernel : public Kernel {
         const Shape& shape = outputs[0].layout.shape;
         const auto nin = static_cast<std::size_t>(loop_->nin());
         if (nin + outputs.size() <= kMaxFlat) {
-            // Fast path: every operand covers `shape` C-contiguously or is a
-            // single element (stride 0). Then one loop call covers all
-            // elements, as in NumPy (element-wise results do not depend on
-            // how the elements are split into calls).
+            // Fast path: every operand covers `shape` densely with the
+            // output's strides (C, F or any axis order), or is a single
+            // element (stride 0). Then one loop call covers all elements in
+            // memory order, as in NumPy (element-wise results do not depend
+            // on how the elements are split into calls).
             const std::int64_t n = outputs[0].layout.size();
+            const Layout& out_layout = outputs[0].layout;
+            const bool out_dense = out_layout.c_contiguous() || dense_from_first(out_layout);
             char* ptrs[kMaxFlat];
             std::intptr_t strides[kMaxFlat];
             std::size_t k = 0;
             auto flat = [&](const Operand& op) {
                 const Layout& l = op.layout;
                 ptrs[k] = reinterpret_cast<char*>(op.first());
-                if (l.shape == shape && l.c_contiguous()) {
+                if (out_dense && same_order(l, out_layout)) {
                     strides[k++] = static_cast<std::intptr_t>(itemsize(l.dtype));
                     return true;
                 }
@@ -310,6 +424,19 @@ ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype) {
     std::memcpy(buffer->data(), PyArray_DATA(reinterpret_cast<PyArrayObject*>(arr)), l.nbytes());
     Py_DECREF(arr);
     return rt.wrap(std::move(l), std::move(buffer));
+}
+
+bool scalar_bytes(PyObject* value, DType dtype, std::vector<std::byte>& out) {
+    PyArray_Descr* descr = PyArray_DescrFromType(type_num(dtype));
+    PyObject* arr = PyArray_FromAny(value, descr, 0, 0, 0, nullptr); // steals descr
+    if (arr == nullptr) {
+        return false;
+    }
+    const auto* p =
+        static_cast<const std::byte*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(arr)));
+    out.assign(p, p + itemsize(dtype));
+    Py_DECREF(arr);
+    return true;
 }
 
 namespace {

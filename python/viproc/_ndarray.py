@@ -15,6 +15,7 @@ import os
 import warnings
 
 import numpy as np
+from numpy.lib.array_utils import normalize_axis_tuple
 from numpy.lib.stride_tricks import as_strided
 
 from . import _viproc
@@ -176,6 +177,175 @@ def _host_call(fn, args, kwargs):
     return host.done(fn(*np_args, **np_kwargs))
 
 
+# --- reductions -----------------------------------------------------------------
+# Asynchronous with NumPy's own reduction loops (vp_reduce): viproc calls the
+# loop in the blocks NumPy's reduction would, so results are bit-identical.
+# That calling pattern is the one of NumPy >= 2.3 (earlier versions split
+# loops at the buffer size); older NumPy keeps reductions eager.
+_REDUCE_ASYNC = np.lib.NumpyVersion(np.__version__) >= "2.3.0"
+
+# Reorderable binary ufuncs; reduce() starts at ufunc.identity, or at the
+# first element where it is None (minimum, maximum, fmin, fmax).
+_REDUCE_UFUNCS = frozenset((
+    np.add, np.multiply, np.minimum, np.maximum, np.fmin, np.fmax, np.logical_and,
+    np.logical_or, np.logical_xor, np.bitwise_and, np.bitwise_or, np.bitwise_xor,
+))
+_MISS = object()
+# (ufunc, dtype, ndim, axis, keepdims, requested dtype) -> (axis flags,
+# keepdims, identity), or None if viproc cannot run that reduction. Per-call
+# work is then one lookup (normalizing axes and probing NumPy's result dtype
+# cost more than the reduction of 1,000 elements).
+_reduce_plans = {}
+
+
+def _plan_reduce(ufunc, dtype, ndim, axis, keepdims, requested):
+    if requested is not None:
+        if np.dtype(requested) != dtype:
+            return None  # a cast
+    else:
+        try:  # e.g. sum of int32 accumulates in int64: a cast
+            if ufunc.reduce(np.zeros(1, dtype)).dtype != dtype:
+                return None
+        except (TypeError, ValueError):
+            return None
+    if axis is None:
+        flags = (True,) * ndim
+    else:
+        try:
+            axes = normalize_axis_tuple(axis, ndim)
+        except (TypeError, ValueError, np.exceptions.AxisError):
+            return None  # NumPy raises the error
+        flags = tuple(i in axes for i in range(ndim))
+    return flags, bool(keepdims), ufunc.identity
+
+
+def _reduce(ufunc, a, axis=None, keepdims=False, dtype=None):
+    """ufunc.reduce(a, axis, keepdims=..., dtype=...) issued asynchronously,
+    or None if viproc cannot run it (the caller falls back to NumPy; empty
+    inputs too, vp_reduce refuses them)."""
+    if not _REDUCE_ASYNC or type(a) is not ndarray or ufunc not in _REDUCE_UFUNCS:
+        return None
+    try:
+        key = (ufunc, a.dtype, a.ndim, axis, keepdims, dtype)
+        plan = _reduce_plans.get(key, _MISS)
+    except TypeError:  # unhashable axis (a list): plan without the cache
+        key, plan = None, _MISS
+    if plan is _MISS:
+        plan = _plan_reduce(ufunc, a.dtype, a.ndim, axis, keepdims, dtype)
+        if key is not None:
+            if len(_reduce_plans) > 4096:
+                _reduce_plans.clear()
+            _reduce_plans[key] = plan
+    if plan is None:
+        return None
+    return _viproc.reduce(ufunc, a, *plan)
+
+
+def _reduced_count(a, axis):
+    """Elements per result element (NumPy's _count_reduce_items)."""
+    if axis is None:
+        return a.size
+    n = 1
+    for ax in normalize_axis_tuple(axis, a.ndim):
+        n *= a.shape[ax]
+    return n
+
+
+_NOPE = object()  # handler result: not supported here, fall back
+_NV = np._NoValue
+
+
+def _sum_or_numpy(x, axis, keepdims):
+    r = _reduce(np.add, x, axis, keepdims)
+    return r if r is not None else np.add.reduce(x, axis=axis, keepdims=keepdims)
+
+
+def _r_sum(ufunc):
+    def handler(a, axis=None, dtype=None, out=None, keepdims=_NV, initial=_NV, where=_NV):
+        if out is not None or initial is not _NV or where is not _NV:
+            return _NOPE
+        r = _reduce(ufunc, a, axis, keepdims is True, dtype)
+        return _NOPE if r is None else r
+
+    return handler
+
+
+def _r_minmax(ufunc):
+    def handler(a, axis=None, out=None, keepdims=_NV, initial=_NV, where=_NV):
+        if out is not None or initial is not _NV or where is not _NV:
+            return _NOPE
+        r = _reduce(ufunc, a, axis, keepdims is True)
+        return _NOPE if r is None else r
+
+    return handler
+
+
+def _r_anyall(ufunc):
+    # np.any / np.all reduce with dtype=bool: each element as truth value,
+    # which is `a != 0` (NaN counts as true, complex if either part is set).
+    def handler(a, axis=None, out=None, keepdims=_NV, *, where=_NV):
+        if out is not None or where is not _NV or not isinstance(a, ndarray):
+            return _NOPE
+        b = a if a.dtype == np.bool_ else (a != 0)
+        if not isinstance(b, ndarray):
+            return _NOPE
+        r = _reduce(ufunc, b, axis, keepdims is True)
+        return _NOPE if r is None else r
+
+    return handler
+
+
+def _r_mean(a, axis=None, dtype=None, out=None, keepdims=_NV, *, where=_NV):
+    # As NumPy's _methods._mean for float64: sum, then divide by the count
+    # (NumPy divides by an intp; float64 / float64(count) is the same).
+    if (out is not None or where is not _NV or not isinstance(a, ndarray)
+            or a.dtype != np.float64 or (dtype is not None and np.dtype(dtype) != a.dtype)):
+        return _NOPE
+    s = _reduce(np.add, a, axis, keepdims is True)
+    if s is None:
+        return _NOPE
+    return s / float(_reduced_count(a, axis))
+
+
+def _r_var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=_NV, *, where=_NV,
+           mean=_NV, correction=_NV, sqrt=False):
+    # As NumPy's _methods._var (and _std) for float64.
+    if (out is not None or where is not _NV or mean is not _NV or correction is not _NV
+            or not isinstance(a, ndarray) or a.dtype != np.float64
+            or (dtype is not None and np.dtype(dtype) != a.dtype)):
+        return _NOPE
+    count = _reduced_count(a, axis) if a.size else 0
+    if count - ddof <= 0:
+        return _NOPE  # NumPy warns and returns inf/nan
+    m = _reduce(np.add, a, axis, True)
+    if m is None:
+        return _NOPE
+    m = m / float(count)
+    x = a - m
+    x = x * x
+    v = _sum_or_numpy(x, axis, keepdims is True) / float(count - ddof)
+    return np.sqrt(v) if sqrt else v
+
+
+def _r_std(*args, **kwargs):
+    return _r_var(*args, sqrt=True, **kwargs)
+
+
+_REDUCTIONS = {
+    np.sum: _r_sum(np.add),
+    np.prod: _r_sum(np.multiply),
+    np.max: _r_minmax(np.maximum),
+    np.min: _r_minmax(np.minimum),
+    np.amax: _r_minmax(np.maximum),
+    np.amin: _r_minmax(np.minimum),
+    np.any: _r_anyall(np.logical_or),
+    np.all: _r_anyall(np.logical_and),
+    np.mean: _r_mean,
+    np.var: _r_var,
+    np.std: _r_std,
+}
+
+
 def _is_basic_index(key):
     key = key if isinstance(key, tuple) else (key,)
     for k in key:
@@ -260,6 +430,13 @@ class ndarray(_viproc._Array):
     def __complex__(self):
         return complex(self.numpy())
 
+    def __format__(self, spec):  # sync point; 0-d results format like NumPy scalars
+        return format(self.numpy()[()] if self.ndim == 0 else self.numpy(), spec)
+
+    def __round__(self, ndigits=None):  # sync point
+        v = self.numpy()[()] if self.ndim == 0 else self.numpy()
+        return round(v) if ndigits is None else round(v, ndigits)
+
     def __index__(self):
         return self.numpy().__index__()
 
@@ -316,6 +493,14 @@ class ndarray(_viproc._Array):
         if func is np.copyto and len(args) >= 2 and isinstance(args[0], ndarray) and not kwargs:
             args[0][...] = args[1]
             return None
+        handler = _REDUCTIONS.get(func)
+        if handler is not None:
+            try:
+                r = handler(*args, **kwargs)
+            except TypeError:  # unexpected arguments: NumPy reports them
+                r = _NOPE
+            if r is not _NOPE:
+                return r
         return _host_call(func, args, kwargs)
 
     # --- common methods (NumPy semantics via the protocols) -------------------
@@ -371,8 +556,23 @@ class ndarray(_viproc._Array):
         return np.argmax(self, *a, **k)
 
 
+def _ufunc_reduce(ufunc, a, axis=0, dtype=None, out=None, keepdims=False, initial=_NV,
+                  where=True):
+    if out is not None or initial is not _NV or where is not True:
+        return None
+    return _reduce(ufunc, a, axis, keepdims, dtype)
+
+
 def _fallback_ufunc(ufunc, method, inputs, kwargs):
-    """Sync, run eagerly in NumPy (in place for out= and ufunc.at)."""
+    """ufunc.reduce asynchronously where possible; anything else syncs and
+    runs eagerly in NumPy (in place for out= and ufunc.at)."""
+    if method == "reduce" and len(inputs) == 1:
+        try:
+            r = _ufunc_reduce(ufunc, *inputs, **kwargs)
+        except TypeError:
+            r = None
+        if r is not None:
+            return r
     return _host_call(getattr(ufunc, method), inputs, kwargs)
 
 

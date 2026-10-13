@@ -331,8 +331,8 @@ void test_consolidated_copy_on_write_of_strided_array() {
     ArrayPtr gate = issue1(rt, add_const(0.0, 30ms), {make_ready(rt, 4, 0.0)}, 4);
     ArrayPtr reader = issue1(rt, add_all(), {gate, a}, 4);
     inplace_add(rt, a, make_ready(rt, 4, 10.0));
-    check(a->layout().strides[0] == 8 && a->layout().offset == 0 && a->buffer().get() != b.get(),
-          "consolidated copy-on-write: new contiguous buffer, decided at issue time");
+    check(a->layout().strides[0] == -8 && a->layout().offset == 24 && a->buffer().get() != b.get(),
+          "consolidated copy-on-write: new buffer, the array keeps its layout (as in NumPy)");
     bool ok = true;
     for (int i = 0; i < 4; ++i) {
         ok = ok && value(rt, a, i) == 13.0 - i && value(rt, reader, i) == 3.0 - i;
