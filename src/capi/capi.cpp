@@ -532,6 +532,29 @@ int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array
     return VP_OK;
 }
 
+int vp_arg_reduce(vp_runtime* rt, int argmax, vp_array* in, int out_ndim, const int64_t* out_shape,
+                  vp_array** result, const char* site, char* err, size_t errlen) {
+    rt->graveyard->drain();
+    const Layout& l = arr(in).layout();
+    Layout out = Layout::contiguous(DType::Int64, Shape(out_shape, out_shape + out_ndim));
+    if (l.shape.empty() || !l.c_contiguous() || l.shape.back() == 0 ||
+        out.size() * l.shape.back() != l.size() || sizeof(void*) != 8) {
+        set_error(err, errlen, "argmin/argmax: unsupported input");
+        return VP_UNSUPPORTED;
+    }
+    std::string e;
+    std::shared_ptr<Kernel> k = numpy::make_arg_reduce_kernel(l.dtype, argmax != 0, e);
+    if (!k) {
+        set_error(err, errlen, e);
+        return VP_UNSUPPORTED;
+    }
+    const ArrayPtr ins[] = {ref(in)};
+    ArrayPtr res;
+    rt->rt->issue(k, ins, {}, std::span(&out, 1), site, std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
 int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
               int keepdims, PyObject* dtype, PyObject* identity, vp_array** result,
               const char* site, char* err, size_t errlen) {

@@ -94,4 +94,12 @@ bool make_iter_reduction(PyObject* ufunc, const Layout& in, std::shared_ptr<Buff
                          PyObject* initial, long buffersize, DeferRelease defer, IterReduction& out,
                          std::string& error);
 
+// argmin / argmax with NumPy's per-dtype functions
+// (PyDataType_GetArrFuncs(descr)->argmin/argmax), called as PyArray_ArgMax
+// calls them: once per row of a C-contiguous input whose last axis is the
+// reduced one (the bridge moves the axis last and copies, as NumPy does).
+// Operands: inputs = {in}, outputs = {intp result, one per row}. Main thread
+// with the GIL; nullptr if NumPy has no such function for `dtype`.
+std::shared_ptr<Kernel> make_arg_reduce_kernel(DType dtype, bool argmax, std::string& error);
+
 } // namespace viproc::numpy

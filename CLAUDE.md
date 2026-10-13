@@ -594,13 +594,17 @@ Rules:
   maximum, fmin, fmax, logical and/or/xor, bitwise and/or/xor) and
   `np.sum/prod/min/max/amin/amax/any/all` (also as methods) without
   `out=` and `where=`, with casts and `initial=`; `any`/`all` of non-bool data as `a != 0` first;
-  `mean`, `var`, `std` of float64 composed exactly as NumPy's
-  `_methods.py` (sum, divide by the count, squared deviations). Results
+  `mean`, `var`, `std` of every viproc dtype composed exactly as NumPy's
+  `_methods.py` (sum, in float64 for bool and integers; divide by the
+  count in the promoted dtype and cast back; squared deviations, for
+  complex data through NumPy's float view of the deviations);
+  `argmin`/`argmax` (NumPy's per-dtype functions, one call per row of a
+  C-contiguous copy with the axis last, as `PyArray_ArgMax`). Results
   are viproc arrays (0-d for full reductions), not NumPy scalars;
   `float()`, `bool()`, `format()`, `round()` sync. Per-call preparation is
   cached per (ufunc, dtype, ndim, axis, keepdims) (`_reduce_plans`).
 - **Fallback (sync + eager NumPy on viproc memory, `_Host`):** everything
-  else: other reductions (argmin/argmax, float32 mean), gufuncs
+  else: other reductions (`out=`, `where=`), gufuncs
   (`matmul`), advanced indexing,
   `ufunc.at`, other NumPy functions. NumPy's semantics exactly (design doc
   D7, "Eager fallbacks"): each viproc argument becomes a writable NumPy
@@ -754,8 +758,7 @@ Rules:
   main thread with the GIL: a worker dropping the last reference parks
   the object in a graveyard drained at the next C ABI call.
 - Not implemented yet: casting into `out=` of another dtype, gufuncs
-  (linalg, fft, matmul),
-  argmin/argmax, FP-flag reporting to
+  (linalg, fft, matmul), FP-flag reporting to
   Python (NumPy warnings / `np.errstate`), `python -m viproc`.
 
 ## Conventions

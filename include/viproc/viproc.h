@@ -191,6 +191,14 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
 int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array** result,
               const char* site, char* err, size_t errlen);
 
+/* Issues argmax (`argmax` != 0) or argmin of `in` along its last axis with
+ * NumPy's per-dtype functions, one call per row, as PyArray_ArgMax calls
+ * them. `in` must be C-contiguous with at least one dimension (the bridge
+ * moves the axis last and copies as NumPy does); the result is an intp
+ * (int64) array of shape `out_shape` with one element per row. */
+int vp_arg_reduce(vp_runtime* rt, int argmax, vp_array* in, int out_ndim, const int64_t* out_shape,
+                  vp_array** result, const char* site, char* err, size_t errlen);
+
 /* Issues a reduction of `in` with the binary `ufunc` (add, multiply, minimum,
  * maximum, logical_and, ...) over the dimensions flagged in `axes` (one entry
  * per dimension of `in`; nonzero = reduced). viproc calls NumPy's own

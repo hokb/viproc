@@ -249,3 +249,39 @@ def test_casting_reductions_run_asynchronously_on_numpys_iterator(seed):
             assert same(np.sum(v, axis=axis, initial=3), expected)
     assert checked > 60
     assert fallbacks() == f0
+
+
+@pytest.mark.parametrize("dtype", ["f8", "f4", "c8", "c16", "i4", "i8", "b1"])
+def test_mean_var_std_of_every_dtype_run_asynchronously(dtype):
+    rng = np.random.default_rng(20)
+    f0 = fallbacks()
+    with np.errstate(all="ignore"):
+        for shape in [(37,), (13, 29), (5, 7, 9)]:
+            x = sensitive(rng, shape, dtype)
+            for base in (x, np.asfortranarray(x)):
+                v = viproc.asarray(base)
+                for fn in (np.mean, np.var, np.std):
+                    axes = [{"axis": (0, len(shape) - 1)}] if len(shape) > 1 else []
+                    for kw in [{}, {"axis": 0}, {"axis": -1, "keepdims": True},
+                               {"dtype": np.float32}] + axes:
+                        if fn is not np.mean:
+                            kw = dict(kw, ddof=1)
+                        assert same(fn(v, **kw), fn(base, **kw)), (fn.__name__, shape, kw)
+    assert fallbacks() == f0
+
+
+@pytest.mark.parametrize("dtype", ["f8", "f4", "c16", "i4", "i8", "b1"])
+def test_argmin_argmax_run_asynchronously(dtype):
+    rng = np.random.default_rng(21)
+    f0 = fallbacks()
+    for shape in [(), (17,), (6, 9), (4, 5, 6)]:
+        x = sensitive(rng, shape, dtype)
+        if dtype[0] in "fc" and x.size > 1:
+            x.flat[int(rng.integers(x.size))] = np.nan  # NumPy: the first NaN wins
+        for a, v in [(x, viproc.asarray(x)), (x.T, viproc.asarray(x).T)]:
+            for fn in (np.argmax, np.argmin):
+                for kw in [{}, {"keepdims": True}] + [{"axis": i} for i in range(-a.ndim, a.ndim)]:
+                    got = fn(v, **kw)
+                    assert isinstance(got, viproc.ndarray)
+                    assert same(got, fn(a, **kw)), (fn.__name__, shape, kw)
+    assert fallbacks() == f0

@@ -527,4 +527,44 @@ bool make_iter_reduction(PyObject* ufunc, const Layout& in, std::shared_ptr<Buff
     return true;
 }
 
+namespace {
+
+class ArgReduceKernel : public Kernel {
+  public:
+    explicit ArgReduceKernel(PyArray_ArgFunc* fn) : fn_(fn) {}
+
+    KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
+        const Layout& l = inputs[0].layout;
+        const npy_intp m = l.shape.empty() ? 1 : static_cast<npy_intp>(l.shape.back());
+        const npy_intp rows = m == 0 ? 0 : static_cast<npy_intp>(l.size()) / m;
+        const auto step = static_cast<npy_intp>(itemsize(l.dtype)) * m;
+        char* in = reinterpret_cast<char*>(inputs[0].first());
+        auto* out = reinterpret_cast<npy_intp*>(outputs[0].first());
+        for (npy_intp r = 0; r < rows; ++r) {
+            // The last argument (the array) is unused for builtin dtypes.
+            if (fn_(in + r * step, m, out + r, nullptr) < 0) {
+                return {1, "NumPy argmin/argmax failed", 0};
+            }
+        }
+        return {};
+    }
+
+  private:
+    PyArray_ArgFunc* fn_;
+};
+
+} // namespace
+
+std::shared_ptr<Kernel> make_arg_reduce_kernel(DType dtype, bool argmax, std::string& error) {
+    PyArray_Descr* descr = PyArray_DescrFromType(type_num(dtype));
+    PyArray_ArgFunc* fn =
+        argmax ? PyDataType_GetArrFuncs(descr)->argmax : PyDataType_GetArrFuncs(descr)->argmin;
+    Py_DECREF(descr);
+    if (fn == nullptr) {
+        error = "no argmin/argmax function for this dtype";
+        return nullptr;
+    }
+    return std::make_shared<ArgReduceKernel>(fn);
+}
+
 } // namespace viproc::numpy

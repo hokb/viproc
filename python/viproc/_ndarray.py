@@ -295,36 +295,106 @@ def _r_anyall(ufunc):
     return handler
 
 
+_INTP = np.intp
+
+
+def _divide_by_count(r, n):
+    """NumPy's true_divide(r, intp(n), out=r, casting='unsafe') (and, for
+    0-d results, r.dtype.type(r / n)): divided in the promoted dtype of r
+    and intp (float64, complex128), cast back to r's dtype."""
+    q = np.true_divide(r, _INTP(n))
+    return q if q.dtype == r.dtype else q.astype(r.dtype)
+
+
+def _moment_dtype(a, dtype):
+    if dtype is None and a.dtype.kind in "biu":
+        return np.dtype(np.float64)  # NumPy: bool and integers in float64
+    return dtype
+
+
 def _r_mean(a, axis=None, dtype=None, out=None, keepdims=_NV, *, where=_NV):
-    # As NumPy's _methods._mean for float64: sum, then divide by the count
-    # (NumPy divides by an intp; float64 / float64(count) is the same).
-    if (out is not None or where is not _NV or not isinstance(a, ndarray)
-            or a.dtype != np.float64 or (dtype is not None and np.dtype(dtype) != a.dtype)):
+    # NumPy's _methods._mean: sum (in float64 for bool and integers), then
+    # divide by the count.
+    if out is not None or where is not _NV or type(a) is not ndarray or not a.size:
         return _NOPE
-    s = _reduce(np.add, a, axis, keepdims is True)
-    if s is None:
+    s = _reduce(np.add, a, axis, keepdims is True, _moment_dtype(a, dtype))
+    if s is None or s.dtype.kind not in "fcbiu":
         return _NOPE
-    return s / float(_reduced_count(a, axis))
+    return _divide_by_count(s, _reduced_count(a, axis))
+
+
+_COMPLEX_TO_FLOAT = {np.dtype(np.complex64): np.dtype(np.float32),
+                     np.dtype(np.complex128): np.dtype(np.float64)}
 
 
 def _r_var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=_NV, *, where=_NV,
            mean=_NV, correction=_NV, sqrt=False):
-    # As NumPy's _methods._var (and _std) for float64.
+    # NumPy's _methods._var (and _std), step by step.
     if (out is not None or where is not _NV or mean is not _NV or correction is not _NV
-            or not isinstance(a, ndarray) or a.dtype != np.float64
-            or (dtype is not None and np.dtype(dtype) != a.dtype)):
+            or type(a) is not ndarray or not a.size or a.dtype.kind not in "fcbiu"):
         return _NOPE
-    count = _reduced_count(a, axis) if a.size else 0
+    count = _reduced_count(a, axis)
     if count - ddof <= 0:
         return _NOPE  # NumPy warns and returns inf/nan
-    m = _reduce(np.add, a, axis, True)
+    dtype = _moment_dtype(a, dtype)
+    m = _reduce(np.add, a, axis, True, dtype)
     if m is None:
         return _NOPE
-    m = m / float(count)
-    x = a - m
-    x = x * x
-    v = _sum_or_numpy(x, axis, keepdims is True) / float(count - ddof)
-    return np.sqrt(v) if sqrt else v
+    m = _divide_by_count(m, count)
+    x = np.subtract(a, m)
+    if a.dtype.kind in "fiu":
+        x = np.square(x, out=x)
+    elif x.dtype in _COMPLEX_TO_FLOAT:
+        xv = x.view((_COMPLEX_TO_FLOAT[x.dtype], (2,)))
+        np.square(xv, out=xv)
+        x = np.add(xv[..., 0], xv[..., 1], out=x.real)
+    else:
+        x = np.multiply(x, np.conjugate(x), out=x).real
+    v = _reduce(np.add, x, axis, keepdims is True, dtype)
+    if v is None:
+        v = np.add.reduce(x, axis=axis, dtype=dtype, keepdims=keepdims is True)
+    v = _divide_by_count(v, max(count - ddof, 0))
+    return np.sqrt(v, out=v) if sqrt else v
+
+
+def _c_contiguous(a):
+    step = a.itemsize
+    for n, st in zip(reversed(a.shape), reversed(a.strides)):
+        if n != 1:
+            if st != step:
+                return False
+            step *= n
+    return True
+
+
+def _r_arg(argmax):
+    # PyArray_ArgMax / ArgMin: the axis moved last (axis=None: raveled), a
+    # C-contiguous copy if needed, NumPy's argmax function once per row.
+    def handler(a, axis=None, out=None, *, keepdims=_NV):
+        if out is not None or type(a) is not ndarray or not a.size:
+            return _NOPE
+        keep = keepdims is True
+        if axis is None:
+            src = a.reshape(-1)
+            shape = (1,) * a.ndim if keep else ()
+        else:
+            try:
+                ax = normalize_axis_tuple(axis, a.ndim)
+            except (TypeError, ValueError, np.exceptions.AxisError):
+                return _NOPE  # NumPy raises
+            if len(ax) != 1 or not isinstance(axis, (int, np.integer)):
+                return _NOPE
+            ax = ax[0]
+            src = np.moveaxis(a, ax, -1)
+            shape = src.shape[:-1]
+            if keep:
+                shape = shape[:ax] + (1,) + shape[ax:]
+        if not _c_contiguous(src):
+            src = src.astype(src.dtype, order="C")
+        r = _viproc.arg_reduce(argmax, src, shape)
+        return _NOPE if r is None else r
+
+    return handler
 
 
 def _r_std(*args, **kwargs):
@@ -340,6 +410,8 @@ _REDUCTIONS = {
     np.amin: _r_minmax(np.minimum),
     np.any: _r_anyall(np.logical_or),
     np.all: _r_anyall(np.logical_and),
+    np.argmax: _r_arg(True),
+    np.argmin: _r_arg(False),
     np.mean: _r_mean,
     np.var: _r_var,
     np.std: _r_std,

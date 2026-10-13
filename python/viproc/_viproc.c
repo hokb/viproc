@@ -1564,6 +1564,31 @@ static PyObject* m_astype(PyObject* self, PyObject* args) {
     return wrap_array(res);
 }
 
+static PyObject* m_arg_reduce(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *a, *shape_o;
+    int argmax;
+    if (!PyArg_ParseTuple(args, "pO!O", &argmax, &ArrayType, &a, &shape_o) || check_runtime() < 0) {
+        return NULL;
+    }
+    int64_t shape[MAXDIMS];
+    const int nd = read_dims(shape_o, shape);
+    if (nd < 0) {
+        return NULL;
+    }
+    vp_array* res = NULL;
+    char err[ERRLEN] = "";
+    const int status =
+        vp_arg_reduce(g_rt, argmax, array_of(a), nd, shape, &res, issue_site(), err, sizeof err);
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    return wrap_array(res);
+}
+
 static PyObject* m_issue_site(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
@@ -1608,6 +1633,8 @@ static PyMethodDef methods[] = {
      "stand_in(a): ndarray with a's layout over a dummy address (metadata-only NumPy code)"},
     {"view_of", m_view_of, METH_VARARGS,
      "view_of(a, stand_in, r): r (a view of stand_in) as a view of a, or None"},
+    {"arg_reduce", m_arg_reduce, METH_VARARGS,
+     "arg_reduce(argmax, a, out_shape): argmin/argmax along a's last axis (C-contiguous)"},
     {"astype", m_astype, METH_VARARGS,
      "astype(a, code, order): async cast (order 'K' or 'C'), or None if unsupported"},
     {"reduce", m_reduce, METH_VARARGS,
