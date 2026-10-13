@@ -352,6 +352,25 @@ def offload_stats():
     return _viproc.offload_counts()
 
 
+def pool_stats():
+    """Element memory pool: {'hits', 'misses', 'cached', 'dropped', 'limit'}.
+
+    hits/misses count requests served from the pool / from the system,
+    cached is the number of bytes the pool holds, dropped the releases that
+    went back to the system because of the bound (limit, bytes)."""
+    return _viproc.pool_stats()
+
+
+def trim():
+    """Return all element memory cached by the pool to the system."""
+    _viproc.pool_trim()
+
+
+def set_pool_limit(nbytes):
+    """Bound for the bytes the element pool may cache (0: no caching)."""
+    _viproc.pool_set_limit(int(nbytes))
+
+
 def shutdown():
     if _viproc.initialized():
         _viproc.shutdown()

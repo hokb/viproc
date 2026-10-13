@@ -39,11 +39,11 @@ to plain sequential NumPy execution.
 - A pending array references **the task that computes it** (its producer).
   For an in/out array this is the **last** task that writes it.
 - Arrays do **not** reference the tasks that consume them as inputs.
-- A pending array may have no element memory yet; the producer allocates
-  it. (Decided, not implemented yet: element memory comes from viproc's
-  pool and is taken by the main thread at issue time; pool allocations
-  happen on the main thread only, releases on any thread. See
-  `docs/design/memory-management.md`, D3 and D10.)
+- Element memory comes from viproc's element pool and is taken by the main
+  thread when it issues the op that creates the array (phase 1: shapes are
+  known at issue), so tasks reach `allocated` at issue. Pool allocations
+  happen on the main thread only, releases on any thread
+  (`docs/design/memory-management.md`, D3 and D10).
 - **Views share a storage.** A base array and all its views refer to one
   shared *storage*, which holds the current buffer (data version) and the
   last task writing it. Readiness, the producer and `async_reads` belong
@@ -256,7 +256,9 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
   ref.hpp              Ref<T>: non-atomic intrusive refcount (Array, Storage)
   pool.hpp             FixedPool / make_pooled: per-thread pools (Task, Buffer, …)
   offload.*            OffloadPolicy: inline vs. worker for ready tasks
-  buffer.*             Buffer: element memory, lazily allocated; async_reads
+  element_pool.*       ElementPool: process-wide pool for element memory
+                       (quantized bins, LIFO, bound, huge pages)
+  buffer.*             Buffer: element memory (inline ≤ 128 B, else pool); async_reads
   task.*               Task: stages, consumer callbacks, execute(); Kernel interface
   runtime.*            Array (main-thread view), Runtime: issue protocol,
                        worker pool, trampoline, look-ahead limit, wait
@@ -576,7 +578,7 @@ Rules:
   operand is C-contiguous with the output shape or a single element
   (stride 0); otherwise once per innermost row.
 - Measured (4 CPUs, `strong_scaling.py`, 8 chains, Release build, speedup
-  vs. NumPy with 4 workers): 1e6 elements 3.5x; 1e5 3.0x; 1e4 ~3x;
+  vs. NumPy with 4 workers): 1e7 elements ~4x; 1e6 ~3.9x; 1e5 3.0x; 1e4 ~3x;
   3e3 ~2.5x, 1e3 ~0.9x (noisy).
 - "Issue an op, read the result right away" (`sync_latency.py`): 8 elements
   8.1 → 1.4–2.4 µs (NumPy 0.5–0.9), 1e3 5.1 → 1.6–2.7 µs (NumPy 0.8–1.6),
@@ -606,7 +608,8 @@ Rules:
   sleeping; `enqueue()` wakes a sleeper only if nobody spins. This avoids a
   wake-up syscall per small task without taking cores from busy threads.
 - Per-op allocations: one pooled Task (operands inline up to 4), one
-  pooled Buffer (element memory inline up to 128 bytes), one pooled
+  pooled Buffer (element memory inline up to 128 bytes, larger from the
+  element pool: no page faults once warm), one pooled
   `ArrayBlock` (Array and its Storage), the Python object. Shapes/strides
   inline (`SmallVector`), one shared kernel object per resolved loop,
   interned issue sites.

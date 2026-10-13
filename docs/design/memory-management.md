@@ -18,14 +18,14 @@ Status labels:
 |---|----------|--------|
 | D1 | No dedicated (temporary) array types; one `viproc.ndarray` type | Decided |
 | D2 | Deterministic memory management through reference counting | Decided; implemented for objects |
-| D3 | Own memory pool for element memory in the viproc layer | Decided |
+| D3 | Own memory pool for element memory in the viproc layer | Implemented |
 | D4 | Pools for the per-op runtime objects (Task, Buffer, ArrayBlock) | Implemented |
 | D5 | Reuse the buffer of a temporary input for the output | Proposed |
 | D6 | Ownership: Python owns objects, the runtime owns element memory | Implemented |
 | D7 | Array conversions viproc ↔ ndarray: copy-free in both directions | Decided (rule proposed) |
 | D8 | Write-after-read safety by copy-on-write, not by locking | Implemented |
 | D9 | `viproc.ndarray` is a wrapper, not a subclass of `numpy.ndarray` | Decided, implemented |
-| D10 | Access model: pool allocations on the main thread only, releases from any thread | Decided |
+| D10 | Access model: pool allocations on the main thread only, releases from any thread | Implemented |
 
 ## Background: the ILNumerics model
 
@@ -128,7 +128,7 @@ float64):
 (At 1e5 the reused buffer is also cache-warm; a LIFO pool has the same
 advantage.)
 
-**Design (to be implemented in `src/runtime/`):**
+**Design** (implemented: `src/runtime/element_pool.*`, `buffer.*`):
 
 - **Where it plugs in.** The main thread takes a block from the pool when
   it issues the op that creates the buffer (D10); `Buffer::~Buffer()`
@@ -153,24 +153,37 @@ advantage.)
   every element. Creation functions that need zeros (`zeros`, once they
   allocate from the pool) clear explicitly (ONAL: `New(length, init:
   true)`).
-- **Alignment.** 64 bytes for small blocks; page alignment (4 KiB, as ONAL's
-  native pool) for large ones, so they share no pages and huge pages can
-  back them.
-- **Large blocks.** `MADV_HUGEPAGE` above a threshold (e.g. 2 MiB).
+- **Alignment.** 64 bytes below 64 KiB, 4 KiB (page, as ONAL's native
+  pool) from 64 KiB, 2 MiB from 2 MiB, so large blocks share no pages and
+  huge pages can back all of them.
+- **Large blocks.** `MADV_HUGEPAGE` from 2 MiB (Linux; a hint).
 - **Bound.** At most a configured number of cached bytes (counted in
-  capacity; default: half the available memory, as ONAL; `VIPROC_POOL_LIMIT`
-  to override). A released block larger than the bound goes straight back
-  to the system. When a release would exceed the bound, cached blocks are
-  evicted first. `viproc.trim()` and runtime shutdown empty the pool.
-- **Out of memory.** If allocating a fresh block fails: empty the pool and
-  retry; then wait for issued tasks (their completion releases buffers) and
-  retry once more before raising `MemoryError` at the issuing op (ONAL
-  retries the same way, with GC runs in place of waiting).
+  capacity; default: half the physical memory, as ONAL; `VIPROC_POOL_LIMIT`
+  — bytes, `K`/`M`/`G` suffix — to override; `viproc.set_pool_limit()`).
+  A release that would exceed the bound returns its block to the system
+  (the simplest policy; evicting older cached blocks instead is an open
+  question). `viproc.trim()` and runtime shutdown empty the pool.
+- **Process-wide.** One pool per process (`ElementPool::instance()`, never
+  destroyed: blocks may be released at exit). It is trimmed when a runtime
+  shuts down.
+- **Out of memory.** If allocating a fresh block fails, the pool empties
+  itself and retries once, then `std::bad_alloc` propagates. Not done yet:
+  waiting for issued tasks (their completion releases buffers) before
+  giving up, and raising `MemoryError` at the issuing op.
+- **Statistics.** `viproc.pool_stats()`: hits, misses, cached bytes,
+  releases dropped by the bound, limit (C ABI: `vp_pool_get_stats`).
 - **Determinism is kept.** Release into the pool happens at the same moment
   as before; only *where* the memory goes changes. Peak memory: live data +
   memory reserved by issued ops (D10) + the pool bound.
-- **Debugging.** A build option disables the pool, so AddressSanitizer
-  keeps catching use-after-free in element memory.
+- **Debugging.** `-DVIPROC_ELEMENT_POOL=OFF` sets the default bound to 0
+  (no caching), so AddressSanitizer keeps catching use-after-free in
+  element memory.
+
+**Measured after implementation** (Release, same machine): the chain
+`((x + 1) * 2) + 3`, 1 worker: 1e5 0.90 → 0.095 ms, 1e6 9.9 → 2.2 ms,
+1e7 117 → 40 ms, page faults per iteration 554 / 5,827 / 58,596 → 0
+(NumPy with temporaries: 0.61 / 3.8 / 58 ms). `strong_scaling.py`
+(4 workers, 8 chains of length 5): 1e6 238 → 203 ms, 1e7 4.10 → 3.29 s.
 
 **Taken from ILNumerics.ONAL** (`MemoryLayer/MemoryPool.cs`, MIT, read for
 design only): quantized bins with 8 steps per power of two, one LIFO stack
@@ -383,7 +396,10 @@ directly, bypassing every sync point:
 
 ## D10 — Access model: allocate on the main thread, release anywhere
 
-**Decided.** viproc enforces one access model for all its pools (element
+**Decided; implemented** for element memory: buffers take their block
+when they are created, and only the main thread creates buffers (at
+issue); tasks reach `allocated` at issue. viproc enforces one access model
+for all its pools (element
 memory, D3; runtime objects, D4):
 
 - **Allocations from a pool happen only on the main thread** — the thread

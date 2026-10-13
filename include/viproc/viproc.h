@@ -70,6 +70,22 @@ void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive);
 void vp_offload_counts(const vp_runtime* rt, uint64_t* inline_ops, uint64_t* offloaded_ops);
 size_t vp_active_tasks(const vp_runtime* rt);
 
+/* --- Element memory pool (process-wide; docs/design/memory-management.md) */
+
+typedef struct {
+    uint64_t hits;    /* requests served from the pool */
+    uint64_t misses;  /* requests that allocated from the system */
+    uint64_t cached;  /* bytes held by the pool now */
+    uint64_t dropped; /* releases returned to the system (bound reached) */
+    uint64_t limit;   /* upper bound for cached bytes */
+} vp_pool_stats;
+
+void vp_pool_get_stats(vp_pool_stats* out);
+/* [main thread] Returns all cached blocks to the system. */
+void vp_pool_trim(void);
+/* [main thread] Sets the bound for cached bytes (0: no caching). */
+void vp_pool_set_limit(uint64_t bytes);
+
 /* --- Arrays -------------------------------------------------------------- */
 
 /* [GIL] A ready array over the memory of a NumPy array (no copy). The

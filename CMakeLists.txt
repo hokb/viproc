@@ -14,6 +14,7 @@ option(VIPROC_BUILD_TESTS "Build viproc tests" ON)
 find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter Development.Module Development.Embed NumPy)
 
 option(VIPROC_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+option(VIPROC_ELEMENT_POOL "Cache element memory in viproc's pool (OFF for AddressSanitizer runs)" ON)
 
 add_library(viproc_warnings INTERFACE)
 target_compile_options(viproc_warnings INTERFACE
@@ -25,10 +26,14 @@ add_library(viproc
     src/runtime/version.cpp
     src/runtime/layout.cpp
     src/runtime/buffer.cpp
+    src/runtime/element_pool.cpp
     src/runtime/task.cpp
     src/runtime/runtime.cpp
     src/runtime/assign.cpp
     src/runtime/offload.cpp)
+if(NOT VIPROC_ELEMENT_POOL)
+    target_compile_definitions(viproc PRIVATE VIPROC_NO_ELEMENT_POOL)
+endif()
 target_include_directories(viproc PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)

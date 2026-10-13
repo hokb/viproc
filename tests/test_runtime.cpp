@@ -1,6 +1,7 @@
 // Tests of the runtime core (no Python): ordering, parallelism, continuations,
 // copy-on-write, error propagation and the look-ahead limit.
 
+#include "runtime/element_pool.hpp"
 #include "runtime/runtime.hpp"
 
 #include <atomic>
@@ -65,7 +66,6 @@ Layout vec(std::int64_t n) { return Layout::contiguous(DType::Float64, {n}); }
 ArrayPtr make_ready(Runtime& rt, std::int64_t n, double value) {
     Layout l = vec(n);
     auto b = std::make_shared<Buffer>(l.nbytes());
-    b->ensure_allocated();
     std::fill_n(reinterpret_cast<double*>(b->data()), n, value);
     return rt.wrap(l, b);
 }
@@ -289,7 +289,6 @@ void test_consolidated_copy_on_write_of_strided_array() {
     rev.strides[0] = -8;
     rev.offset = 24;
     auto b = std::make_shared<Buffer>(rev.nbytes());
-    b->ensure_allocated();
     for (int i = 0; i < 4; ++i) {
         reinterpret_cast<double*>(b->data())[i] = i; // logical a = [3, 2, 1, 0]
     }
@@ -311,7 +310,6 @@ void test_overlapping_inplace() {
     // a += a[::-1] must read all of `a` before writing (NumPy semantics).
     Layout l = vec(6);
     auto b = std::make_shared<Buffer>(l.nbytes());
-    b->ensure_allocated();
     for (int i = 0; i < 6; ++i) {
         reinterpret_cast<double*>(b->data())[i] = i;
     }
@@ -579,7 +577,68 @@ void test_offload_adaptive_per_site() {
 
 } // namespace
 
+void test_element_pool() {
+    ElementPool& pool = ElementPool::instance();
+    const std::size_t saved_limit = pool.limit();
+    pool.set_limit(std::size_t{1} << 30);
+    pool.trim();
+
+    // Bins: equal or larger, at most 12.5 % larger above 128 bytes.
+    bool bins_ok = true;
+    for (std::size_t n = 1; n < (std::size_t{1} << 22); n = n * 5 / 4 + 1) {
+        const std::size_t c = ElementPool::capacity_for(n);
+        bins_ok = bins_ok && c >= n && (n <= 128 || c * 8 <= n * 9 + 8);
+        bins_ok = bins_ok && ElementPool::capacity_for(c) == c; // stable
+    }
+    check(bins_ok, "element pool: capacity >= request, excess <= 12.5%");
+
+    // LIFO reuse of a released block, also for a smaller request of the bin.
+    std::size_t c1 = 0, c2 = 0, c3 = 0;
+    void* a = pool.allocate(100000, c1);
+    pool.release(a, c1);
+    const auto before = pool.stats();
+    void* b = pool.allocate(99000, c2);
+    check(b == a && c2 == c1 && pool.stats().hits == before.hits + 1,
+          "element pool: same-bin request reuses the released block");
+
+    // Released on another thread, reused by the allocating thread.
+    std::thread([&] { pool.release(b, c2); }).join();
+    void* c = pool.allocate(100000, c3);
+    check(c == b, "element pool: block released on another thread is reused");
+    pool.release(c, c3);
+
+    // Bound: releases beyond the limit go back to the system.
+    pool.trim();
+    pool.set_limit(c1);
+    std::size_t cx = 0, cy = 0;
+    void* x = pool.allocate(100000, cx);
+    void* y = pool.allocate(100000, cy);
+    const auto d0 = pool.stats().dropped;
+    pool.release(x, cx);
+    pool.release(y, cy);
+    check(pool.stats().dropped == d0 + 1 && pool.stats().cached == c1,
+          "element pool: cached bytes stay within the limit");
+    pool.trim();
+    check(pool.stats().cached == 0, "element pool: trim empties the pool");
+
+    // Buffers take pool memory at creation and return it on release.
+    pool.set_limit(std::size_t{1} << 30);
+    void* first = nullptr;
+    {
+        Buffer buf(8 * 50000);
+        first = buf.data();
+        check(buf.capacity() >= buf.nbytes(), "buffer: memory from the pool at creation");
+    }
+    {
+        Buffer buf(8 * 50000);
+        check(buf.data() == first, "buffer: released memory is reused by the next buffer");
+    }
+    pool.trim();
+    pool.set_limit(saved_limit);
+}
+
 int main() {
+    test_element_pool();
     test_chain();
     test_diamond();
     test_main_thread_runs_ahead();

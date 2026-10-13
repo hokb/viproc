@@ -21,7 +21,10 @@ from ._ndarray import (
     init,
     ndarray,
     offload_stats,
+    pool_stats,
+    set_pool_limit,
     shutdown,
+    trim,
     wait_all,
     workers,
 )

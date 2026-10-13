@@ -307,7 +307,6 @@ ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype) {
     }
     Layout l = Layout::contiguous(dtype, {});
     auto buffer = make_pooled<Buffer>(l.nbytes());
-    buffer->ensure_allocated();
     std::memcpy(buffer->data(), PyArray_DATA(reinterpret_cast<PyArrayObject*>(arr)), l.nbytes());
     Py_DECREF(arr);
     return rt.wrap(std::move(l), std::move(buffer));

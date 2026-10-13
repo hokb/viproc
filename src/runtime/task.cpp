@@ -68,10 +68,6 @@ std::vector<std::shared_ptr<Task>> Task::execute() {
     if (!error_) {
         const std::span<const Operand> inputs(operands_.data(), ninputs_);
         const std::span<Operand> outputs(operands_.data() + ninputs_, operands_.size() - ninputs_);
-        for (Operand& out : outputs) {
-            out.buffer->ensure_allocated();
-        }
-        advance(TaskState::Allocated);
         std::feclearexcept(FE_ALL_EXCEPT);
         KernelResult r;
         try {

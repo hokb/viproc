@@ -875,6 +875,34 @@ static PyObject* m_offload_counts(PyObject* self, PyObject* noargs) {
                          (unsigned long long)off);
 }
 
+static PyObject* m_pool_stats(PyObject* self, PyObject* noargs) {
+    (void)self;
+    (void)noargs;
+    vp_pool_stats s;
+    vp_pool_get_stats(&s);
+    return Py_BuildValue("{s:K,s:K,s:K,s:K,s:K}", "hits", (unsigned long long)s.hits, "misses",
+                         (unsigned long long)s.misses, "cached", (unsigned long long)s.cached,
+                         "dropped", (unsigned long long)s.dropped, "limit",
+                         (unsigned long long)s.limit);
+}
+
+static PyObject* m_pool_trim(PyObject* self, PyObject* noargs) {
+    (void)self;
+    (void)noargs;
+    vp_pool_trim();
+    Py_RETURN_NONE;
+}
+
+static PyObject* m_pool_set_limit(PyObject* self, PyObject* arg) {
+    (void)self;
+    unsigned long long v = PyLong_AsUnsignedLongLong(arg);
+    if (v == (unsigned long long)-1 && PyErr_Occurred()) {
+        return NULL;
+    }
+    vp_pool_set_limit(v);
+    Py_RETURN_NONE;
+}
+
 static PyObject* m_shutdown(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
@@ -1035,6 +1063,9 @@ static PyMethodDef methods[] = {
     {"initialized", m_initialized, METH_NOARGS, NULL},
     {"offload_counts", m_offload_counts, METH_NOARGS,
      "{'inline': n, 'offloaded': m}: ops run inline / handed to workers"},
+    {"pool_stats", m_pool_stats, METH_NOARGS, "Element memory pool counters."},
+    {"pool_trim", m_pool_trim, METH_NOARGS, "Return all cached element memory."},
+    {"pool_set_limit", m_pool_set_limit, METH_O, "Bound for cached element memory (bytes)."},
     {"workers", m_workers, METH_NOARGS, NULL},
     {"active_tasks", m_active_tasks, METH_NOARGS, NULL},
     {"wait_all", m_wait_all, METH_NOARGS, NULL},

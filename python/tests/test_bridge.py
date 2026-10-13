@@ -296,3 +296,30 @@ def test_adaptive_policy_switches_site_waited_on_right_away():
         assert viproc.offload_stats()["inline"] > 30
     finally:
         viproc.init()
+
+
+def test_element_pool_reuses_memory_and_trims():
+    viproc.trim()
+    x = viproc.asarray(rng.standard_normal(100_000))
+    expected = ((np.asarray(x) + 1.0) * 2.0) + 3.0
+    before = viproc.pool_stats()
+    for _ in range(20):
+        r = ((x + 1.0) * 2.0) + 3.0
+        assert same(r, expected)
+    after = viproc.pool_stats()
+    assert after["hits"] - before["hits"] > 40  # temporaries come from the pool
+    assert after["cached"] <= after["limit"]
+    viproc.trim()
+    assert viproc.pool_stats()["cached"] == 0
+
+
+def test_element_pool_limit_zero_disables_caching():
+    limit = viproc.pool_stats()["limit"]
+    try:
+        viproc.set_pool_limit(0)
+        x = viproc.asarray(rng.standard_normal(100_000))
+        for _ in range(5):
+            (x * 2).wait()
+        assert viproc.pool_stats()["cached"] == 0
+    finally:
+        viproc.set_pool_limit(limit)

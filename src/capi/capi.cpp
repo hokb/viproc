@@ -4,6 +4,7 @@
 
 #include "kernels/numpy_ufunc.hpp"
 #include "runtime/assign.hpp"
+#include "runtime/element_pool.hpp"
 #include "runtime/runtime.hpp"
 
 #include <cstdio>
@@ -107,6 +108,7 @@ void vp_runtime_destroy(vp_runtime* rt) {
     rt->loops.reset();
     rt->graveyard->drain();
     delete rt;
+    ElementPool::instance().trim(); // cached blocks are not kept across runtimes
 }
 
 size_t vp_worker_count(const vp_runtime* rt) { return rt->rt->worker_count(); }
@@ -122,6 +124,17 @@ void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive) {
 void vp_offload_counts(const vp_runtime* rt, uint64_t* inline_ops, uint64_t* offloaded_ops) {
     *inline_ops = rt->rt->offload_policy().inline_count();
     *offloaded_ops = rt->rt->offload_policy().offload_count();
+}
+
+void vp_pool_get_stats(vp_pool_stats* out) {
+    const ElementPool::Stats s = ElementPool::instance().stats();
+    *out = {s.hits, s.misses, s.cached, s.dropped, ElementPool::instance().limit()};
+}
+
+void vp_pool_trim(void) { ElementPool::instance().trim(); }
+
+void vp_pool_set_limit(uint64_t bytes) {
+    ElementPool::instance().set_limit(static_cast<std::size_t>(bytes));
 }
 
 int vp_array_from_ndarray(vp_runtime* rt, PyObject* ndarray, vp_array** out, char* err,

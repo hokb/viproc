@@ -203,6 +203,7 @@ void Runtime::issue_storage_copy(Storage& s) {
         task->add_upstream_error(*failed);
     }
     task->advance(TaskState::SizeCompleted);
+    task->advance(TaskState::Allocated); // buffers take their memory when created
     s.buffer_ = fresh;
     s.producer_ = task;
     launch(task, producers, static_cast<std::int64_t>(old->nbytes()));
@@ -312,8 +313,10 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     if (failed_input) {
         task->add_upstream_error(*failed_input);
     }
-    // Phase 1: shapes are known at issue time.
+    // Phase 1: shapes are known at issue time, and the main thread takes the
+    // output memory from the pool right here (memory-management.md, D10).
     task->advance(TaskState::SizeCompleted);
+    task->advance(TaskState::Allocated);
     const std::int64_t elements = !new_outputs.empty() ? new_outputs[0].size()
                                   : !inouts.empty()    ? inouts[0]->layout_.size()
                                                        : 0;
