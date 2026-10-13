@@ -730,6 +730,14 @@ Rules:
   vs. NumPy with 4 workers): 1e7 elements ~7.5x (pool + temporary elision;
   NumPy pays page faults for its temporaries); 1e6 ~4.5x; 1e5 3.0x; 1e4 ~3x;
   3e3 ~2.5x, 1e3 ~0.9x (noisy).
+- Benchmark suite (4 CPUs, full run): exact NumPy iteration, casts,
+  views, async indexing and `np.where`, direct path and scalar shortcut:
+  score 52 → 69 (chains 78 → 87, indexing 42 → 52, algorithms 41 → 64,
+  dtypes 47 → 58, scalars 42 → 89); 97/97 bit-identical; remaining
+  fallbacks only `matmul` and int16/float16. Small ready ops (Release):
+  `x * y` (8 elements) 0.63 µs (NumPy 0.35), ops on scalars as NumPy
+  (0.06 µs), `a[i, j]` 0.20 µs (NumPy 0.07), `a.T` ~0.8 µs, `x[idx]`
+  (1,000 elements) 2.9 µs (NumPy 0.7).
 - Async reductions (benchmark suite, 4 CPUs, full run): score 44.7 → 52.2,
   category `reductions` 31 → 75; `reduce_full` medium 1.0x → 5.3x,
   `softmax_rows` medium 1.0x → 3.7x vs NumPy. A small `np.sum` (1,000
