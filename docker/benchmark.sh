@@ -1,7 +1,8 @@
 #!/bin/bash
 # Runs the viproc benchmark suite (python/benchmarks/suite.py) in the Linux
 # image and in the Windows build (Wine image), then merges both into one
-# comparison report. Builds missing images first.
+# comparison report. Builds the images from this checkout first (Docker's
+# cache makes that quick when nothing changed; VIPROC_NO_BUILD=1 skips it).
 #
 #   docker/benchmark.sh [--quick] [SUITE_ARGS...]
 #
@@ -40,13 +41,15 @@ run_and_copy() {
     fi
     docker start -a "$cid"
     mkdir -p "$out/$sub"
+    # No stale report may survive a run that does not write one.
+    rm -f "$out/$sub/report.html" "$out/$sub/report.md" "$out/$sub/results.json"
     docker cp "$cid:/work/reports/$sub/." "$out/$sub"
 }
 
 results=()
 for img in $images; do
-    if ! docker image inspect "viproc:$img" >/dev/null 2>&1; then
-        echo "== building viproc:$img"
+    if [[ -z ${VIPROC_NO_BUILD:-} ]]; then
+        echo "== building viproc:$img (cached when unchanged)"
         docker build -f "$repo/docker/$img/Dockerfile" -t "viproc:$img" "$repo"
     fi
     echo "== benchmark suite on viproc:$img"
@@ -59,4 +62,4 @@ if [[ ${#results[@]} -gt 1 ]]; then
     COPY_IN=$out run_and_copy . viproc:linux \
         python /src/python/benchmarks/suite.py --merge "${results[@]}" --out /work/reports
 fi
-echo "== reports in $out/ (report.html: comparison; <image>/report.html: details)"
+echo "== reports in $(cd "$out" && pwd)/ (report.html: comparison; <image>/report.html: details)"

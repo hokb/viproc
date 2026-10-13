@@ -48,7 +48,11 @@ cmd=${1:-test}
 case "$cmd" in
 test)
     build
-    exec ctest --test-dir "$VIPROC_BUILD" --output-on-failure "$@"
+    status=0
+    ctest --test-dir "$VIPROC_BUILD" --output-on-failure "$@" || status=$?
+    echo "note: 'test' (the default command) runs the test suites only; the benchmark" \
+         "suite is 'benchmark' (docker/benchmark.sh runs it and copies the reports out)" >&2
+    exit $status
     ;;
 pytest)
     build

@@ -49,8 +49,13 @@ the image): `--secret id=ca,src=/path/to/ca.pem`.
 ## Benchmark suite
 
 One call runs the whole suite (python/benchmarks/suite.py) on Linux and on
-the Windows build (Wine image), builds missing images, and writes a
-comparison:
+the Windows build (Wine image), first (re)builds both images from this
+checkout (Docker's cache makes that quick when nothing changed;
+`VIPROC_NO_BUILD=1` skips it), and writes a comparison. Old report files
+in the output directory are deleted before the new ones are copied, so a
+report there is always from this run; its header names the build
+(`build <time> #<fingerprint>`). `docker run IMAGE` without a command
+runs the test suites only, not the benchmark.
 
 ```bash
 docker/benchmark.sh            # Linux, macOS, WSL; add --quick for a short run

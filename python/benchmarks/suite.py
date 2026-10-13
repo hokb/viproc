@@ -356,7 +356,7 @@ def run_suite(args):
 
     print(f"viproc benchmark suite: {len(configs)} configurations, {cores} cores, "
           f"{ram / 2**30:.1f} GiB RAM, workers {workers}, large = "
-          f"{info['large_elements']:,} elements", flush=True)
+          f"{info['large_elements']:,} elements, build {info['build']}", flush=True)
 
     results = []
     for i, (case, size, layout, dtype) in enumerate(configs):
