@@ -101,66 +101,97 @@ parks them in a graveyard drained at the next C ABI call
 released by D2 go back to the pool and are reused by later ops instead of
 being returned to the system allocator. A request is served by a cached
 block of **equal or larger** size, as long as the excess stays below a
-threshold; otherwise a new block of the requested size is allocated.
+threshold (12.5 %, by quantized bins); otherwise a new block is allocated.
 
-**Why.** Fresh element memory costs more than the computation for large
-arrays. Above the mmap threshold of glibc's malloc (128 KiB by default)
-every allocation maps new pages: one page fault per 4 KiB page on first
-write, and `munmap` on release. Page faults and mmap/munmap also take the
-process-wide memory-map lock in the kernel, so they serialize workers and
-limit strong scaling for large arrays. Measured, chain
-`((x + 1) * 2) + 3` on float64 (Release, 1 worker):
+**Why: fresh memory costs page faults and zeroing.** A fresh block from
+the OS is mapped lazily: the first write to each 4 KiB page faults, and the
+kernel zeroes the page (a security requirement) before handing it over.
+Measured (C, `out[i] = in[i] + 1`, 80 MB): fresh block 40 ms (19,532
+faults), with `MADV_HUGEPAGE` 25 ms (625 faults), reused block 14 ms;
+zeroing alone is about one memory pass (~8 ms), the rest is fault handling.
+Huge pages remove most faults but not the zeroing; only reuse removes both.
+Faults also take the kernel's per-process memory-map lock, so they
+serialize workers.
 
-| Elements | NumPy, new temporaries | NumPy, reused buffer (`out=`) | viproc (current, no pool) |
-|---------:|-----------------------:|------------------------------:|--------------------------:|
-| 1e5 | 0.48 ms | 0.06 ms | 0.30 ms |
-| 1e6 | 3.8 ms  | 1.4 ms  | 2.8 ms  |
-| 1e7 | 55 ms   | 23 ms   | 110 ms  |
+Measuring this needs realistic patterns. glibc reuses blocks itself when
+only one is alive at a time (its mmap threshold adapts up to 32 MB), so a
+single-op loop shows no difference. With several live temporaries it trims
+and re-faults memory on every iteration (Python, `((x + 1) * 2) + 3`,
+float64):
+
+| Elements | NumPy, temporaries | NumPy, `out=` reuse | viproc, no pool |
+|---------:|-------------------:|--------------------:|----------------:|
+| 1e5 | 0.61 ms (358 faults)   | 0.08 ms (0) | 0.75 ms (554)    |
+| 1e6 | 3.8 ms (1,319 faults)  | 1.3 ms (0)  | 8.3 ms (5,827)   |
+| 1e7 | 58 ms (1,875 faults)   | 18 ms (0)   | 108 ms (58,596)  |
+
+(At 1e5 the reused buffer is also cache-warm; a LIFO pool has the same
+advantage.)
 
 **Design (to be implemented in `src/runtime/`):**
 
 - **Where it plugs in.** The main thread takes a block from the pool when
   it issues the op that creates the buffer (D10); `Buffer::~Buffer()`
-  returns it, on whatever thread. Buffers wrapping foreign memory (NumPy
-  arrays) are not pooled. Element memory up to 128 bytes stays inline in
-  the `Buffer` object (already implemented, `buffer.hpp`).
-- **Threads.** See D10: allocation on the main thread only, release from
-  any thread. The pool's index is owned by the main thread and needs no
-  lock.
-- **Matching: equal or larger, bounded excess.** The pool hands out the
-  smallest cached block whose capacity is at least the requested size and
-  at most `request · (1 + max_excess)`. Nothing is rounded up on a miss:
-  new blocks get the requested size (rounded to the alignment only), so
-  programs that keep reusing the same shapes get exact fits and no waste.
-  `max_excess` bounds the memory a reused block wastes (default to be
-  measured, e.g. 25 %; configurable). Blocks are kept in an ordered index
-  by capacity (e.g. a `std::multimap` per pool, or sorted bins), so the
-  lookup is a `lower_bound` plus one comparison.
-- **Capacity vs. size.** A `Buffer` keeps two numbers: its logical size
-  (`nbytes()`, what the layout covers) and the capacity of its block.
-  Everything that reasons about the array's data uses the logical size
-  (e.g. the copy-on-write test "the view covers the whole buffer",
-  `CopyKernel`); only the pool and the pool bound see the capacity.
-- **Alignment.** 64 bytes, as today (SIMD loops, no false sharing between
-  buffers).
-- **Large blocks.** Allocated with the transparent-huge-page hint
-  (`madvise(MADV_HUGEPAGE)` on Linux) above a threshold (e.g. 2 MiB), which
-  cuts the number of page faults by 512x.
-- **Bound.** The pool keeps at most a configured number of cached bytes
-  (default: a fraction of physical memory; `VIPROC_POOL_LIMIT` to
-  override; counted in capacity). Beyond it, released memory goes back to
-  the system, least recently released blocks first. `viproc.trim()` (and the runtime shutdown)
-  releases everything cached.
+  returns it, on whatever thread. Foreign memory (NumPy arrays) is never
+  pooled. Element memory up to 128 bytes stays inline in the `Buffer`
+  (implemented).
+- **Matching: equal or larger, bounded excess — by quantized bins** (as
+  ILNumerics.ONAL's `MemoryPool`). Requests are rounded up to a bin
+  length: 8 bins per power of two (bin lengths `(8 + s) · 2^(k-3)`,
+  s = 0..7), i.e. a block is at most 12.5 % larger than requested. All
+  blocks of a bin have the same capacity, so lookup is O(1) (bit-scan of
+  the size, index into an array of free lists) and any cached block of the
+  bin fits. 12.5 % is the excess threshold; coarser bins (e.g. 4 per power
+  of two, 25 %) are a configuration choice, not a different design.
+- **LIFO per bin.** The most recently released block is reused first: it is
+  most likely still in cache and its pages are mapped.
+- **Capacity vs. size.** A `Buffer` keeps its logical size (`nbytes()`,
+  what the layout covers) and the capacity of its block. Everything about
+  the array's data uses the logical size (copy-on-write's "covers the
+  whole buffer" test, `CopyKernel`); only the pool sees the capacity.
+- **Not zeroed.** Pooled blocks keep old contents; op outputs overwrite
+  every element. Creation functions that need zeros (`zeros`, once they
+  allocate from the pool) clear explicitly (ONAL: `New(length, init:
+  true)`).
+- **Alignment.** 64 bytes for small blocks; page alignment (4 KiB, as ONAL's
+  native pool) for large ones, so they share no pages and huge pages can
+  back them.
+- **Large blocks.** `MADV_HUGEPAGE` above a threshold (e.g. 2 MiB).
+- **Bound.** At most a configured number of cached bytes (counted in
+  capacity; default: half the available memory, as ONAL; `VIPROC_POOL_LIMIT`
+  to override). A released block larger than the bound goes straight back
+  to the system. When a release would exceed the bound, cached blocks are
+  evicted first. `viproc.trim()` and runtime shutdown empty the pool.
+- **Out of memory.** If allocating a fresh block fails: empty the pool and
+  retry; then wait for issued tasks (their completion releases buffers) and
+  retry once more before raising `MemoryError` at the issuing op (ONAL
+  retries the same way, with GC runs in place of waiting).
 - **Determinism is kept.** Release into the pool happens at the same moment
-  as before; only *where* the memory goes changes. Peak memory equals the
-  live data, the memory reserved by issued ops (D10) and the pool bound.
-- **Debugging.** A build option disables the pool (direct allocation), so
-  AddressSanitizer keeps catching use-after-free in element memory.
+  as before; only *where* the memory goes changes. Peak memory: live data +
+  memory reserved by issued ops (D10) + the pool bound.
+- **Debugging.** A build option disables the pool, so AddressSanitizer
+  keeps catching use-after-free in element memory.
+
+**Taken from ILNumerics.ONAL** (`MemoryLayer/MemoryPool.cs`, MIT, read for
+design only): quantized bins with 8 steps per power of two, one LIFO stack
+per bin, rounding up on allocation, a byte bound of half the available
+memory, page-aligned native blocks, optional clearing on request, and OOM
+recovery by emptying the pool and retrying. **Not taken:** its growth of
+the bound by 10 % on every overflowing release (the bound drifts upward;
+viproc keeps a fixed bound) and its eviction order (alternately smallest
+and largest bins; viproc prefers the least recently released blocks, which
+are least likely to be reused soon). ONAL also contains a disabled attempt
+to block the issuing thread when allocated bytes exceed the bound; the
+comment notes it failed for memory-heavy algorithms whose pressure does not
+come from pending work, and leaves memory pressure to OOM handling. A
+memory-based look-ahead limit in viproc (below) must avoid that trap.
 
 **Relation to the look-ahead limit.** The limit of 1000 active tasks also
-bounds how much element memory pending ops can hold. A memory-based limit
-(bytes held by pending outputs) is the natural next step once the pool
-knows the totals.
+bounds the memory pending ops hold. A memory-based limit (bytes reserved by
+pending outputs, known exactly to the main thread, D10) may complement it;
+it must count only memory held by *pending* outputs, never live data, or it
+blocks programs that simply use a lot of memory (see ONAL's experience
+above).
 
 ## D4 — Pools for the per-op runtime objects
 
@@ -425,8 +456,8 @@ memory, D3; runtime objects, D4):
   the pool bound promptly.
 - `FixedPool` (D4) still lets any thread allocate; tighten it to the D10
   model (main-thread allocation, assertion in debug builds).
-- `max_excess` default for "equal or larger" matching; whether small
-  blocks (a few KiB) warrant a tighter bound than large ones.
+- Bin granularity (8 vs. 4 per power of two) and the size range served by
+  the pool at all (very small blocks could stay with malloc).
 - Per-thread caches in front of the element pool: only if contention shows
   up in `strong_scaling.py` with large arrays.
 - Huge-page threshold and Windows equivalent (large pages need a
