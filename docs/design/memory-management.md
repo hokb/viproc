@@ -22,8 +22,9 @@ Status labels:
 | D4 | Pools for the per-op runtime objects (Task, Buffer, ArrayBlock) | Implemented |
 | D5 | Reuse the buffer of a temporary input for the output | Proposed |
 | D6 | Ownership: Python owns objects, the runtime owns element memory | Implemented |
-| D7 | Copy-free conversion between viproc arrays and NumPy arrays | Decided (rule proposed) |
+| D7 | Array conversions viproc ↔ ndarray: copy-free in both directions | Decided (rule proposed) |
 | D8 | Write-after-read safety by copy-on-write, not by locking | Implemented |
+| D9 | `viproc.ndarray` is a wrapper, not a subclass of `numpy.ndarray` | Decided, implemented |
 
 ## Background: the ILNumerics model
 
@@ -96,8 +97,10 @@ parks them in a graveyard drained at the next C ABI call
 ## D3 — Own memory pool for element memory
 
 **Decision.** Element memory comes from a pool in the viproc layer. Buffers
-released by D2 go back to the pool and are reused by later ops of the same
-size class, instead of being returned to the system allocator.
+released by D2 go back to the pool and are reused by later ops instead of
+being returned to the system allocator. A request is served by a cached
+block of **equal or larger** size, as long as the excess stays below a
+threshold; otherwise a new block of the requested size is allocated.
 
 **Why.** Fresh element memory costs more than the computation for large
 arrays. Above the mmap threshold of glibc's malloc (128 KiB by default)
@@ -125,9 +128,20 @@ limit strong scaling for large arrays. Measured, chain
   own lock (an allocation of this size costs far more than an uncontended
   lock). A per-thread cache in front is an option if measurements show
   contention.
-- **Size classes.** Geometric, two classes per power of two
-  (2^k and 1.5 · 2^k), so the waste is at most ~33 %. Requests are rounded
-  up to their class; the buffer remembers its class.
+- **Matching: equal or larger, bounded excess.** The pool hands out the
+  smallest cached block whose capacity is at least the requested size and
+  at most `request · (1 + max_excess)`. Nothing is rounded up on a miss:
+  new blocks get the requested size (rounded to the alignment only), so
+  programs that keep reusing the same shapes get exact fits and no waste.
+  `max_excess` bounds the memory a reused block wastes (default to be
+  measured, e.g. 25 %; configurable). Blocks are kept in an ordered index
+  by capacity (e.g. a `std::multimap` per pool, or sorted bins), so the
+  lookup is a `lower_bound` plus one comparison.
+- **Capacity vs. size.** A `Buffer` keeps two numbers: its logical size
+  (`nbytes()`, what the layout covers) and the capacity of its block.
+  Everything that reasons about the array's data uses the logical size
+  (e.g. the copy-on-write test "the view covers the whole buffer",
+  `CopyKernel`); only the pool and the pool bound see the capacity.
 - **Alignment.** 64 bytes, as today (SIMD loops, no false sharing between
   buffers).
 - **Large blocks.** Allocated with the transparent-huge-page hint
@@ -135,8 +149,8 @@ limit strong scaling for large arrays. Measured, chain
   cuts the number of page faults by 512x.
 - **Bound.** The pool keeps at most a configured number of cached bytes
   (default: a fraction of physical memory; `VIPROC_POOL_LIMIT` to
-  override). Beyond it, released memory goes back to the system,
-  largest/oldest classes first. `viproc.trim()` (and the runtime shutdown)
+  override; counted in capacity). Beyond it, released memory goes back to
+  the system, least recently released blocks first. `viproc.trim()` (and the runtime shutdown)
   releases everything cached.
 - **Determinism is kept.** Release into the pool happens at the same moment
   as before; only *where* the memory goes changes. Peak memory equals the
@@ -201,19 +215,41 @@ everything else.
 - **The C ABI** hands out `Array*` as `vp_array*`, one reference each;
   bridges never see C++ ownership types.
 
-## D7 — Copy-free conversion to and from NumPy
+## D7 — Array conversions: viproc ↔ ndarray
 
-**Decided:** conversion between viproc arrays and NumPy arrays copies no
-element data, in both directions. **Proposed:** the rule below that keeps
-results identical to NumPy.
+**Decided:** conversions between viproc arrays and NumPy arrays copy no
+element data, in both directions. A copy happens only where NumPy itself
+would copy (a different dtype, an explicit `copy=True`). **Proposed:** the
+sharing rule below, which keeps results identical to NumPy.
 
-Today `asarray` copies NumPy input and `__array__` / `numpy()` return a
-copy; fallback results are already wrapped without a copy.
+### Conversion paths
+
+| Path | Today | Decided |
+|------|-------|---------|
+| `viproc.asarray(nd)` / `viproc.array(nd)` | copy | adopt the ndarray's memory (no copy); `viproc.array(nd)` copies, as `np.array` does by default |
+| `viproc.asarray(nd, dtype=other)` | copy + cast | one copy (the cast), as in NumPy |
+| NumPy array as operand of a viproc op (`v + nd`) | copy per op | adopt without a copy (same rule as `asarray`) |
+| Results of eager fallbacks (fresh ndarrays) | wrapped without copy | unchanged |
+| Creation functions (`viproc.zeros`, …) | NumPy creates, then copy | NumPy creates, adopted without a copy (later: allocate from the pool directly) |
+| `np.asarray(v)`, `v.__array__()`, `v.numpy()` | copy after sync | view of the viproc buffer after sync (no copy) |
+| `v.__array__(copy=True)` | copy | copy (NumPy 2 protocol) |
+| `v.__array__(copy=False)` | raises | view; raises only if a dtype change makes a copy unavoidable |
+| `v.__array__(dtype=other)` | copy + cast | one copy (the cast) |
+| Scalars (`float(v)`, `v.item()`, scalar indexing) | sync, read one element | unchanged (no array conversion) |
+| Unsupported dtypes / layouts (object, `float16`, byte-swapped, unaligned) | stay NumPy arrays | unchanged: never wrapped, eager NumPy |
+
+Views map onto views: a NumPy view of an adopted array is adopted as a
+runtime view of the same storage, and exporting a viproc view returns a
+NumPy view of the same buffer, so aliasing is preserved in both directions
+(CLAUDE.md: wrapping two NumPy views separately would lose it).
+
+### Why copy-free is safe for the kernels
 
 NumPy loops need no protection: the runtime calls a loop only when all its
 inputs are `completed` and its outputs are allocated, and writes in place
-only without pending readers (D8). The risk is Python code holding a NumPy
-array on the same memory and accessing it outside the task protocol:
+only without pending readers (D8). Writeability flags play no role for the
+loops. The risk is Python code holding a NumPy array on the same memory and
+accessing it outside the task protocol:
 
 ```python
 b = np.asarray(x)   # copy-free: b views the viproc buffer
@@ -233,13 +269,14 @@ x[0] = 7                # user still holds x -> pending tasks on v see it
 exactly whether anybody else can still touch the memory: an outside
 holder, or a view, which references its base.
 
-**Proposed rule** (local, per storage):
+### Proposed sharing rule (local, per storage)
 
 - A storage that shares memory with a NumPy array keeps a reference to that
   ndarray object.
 - **Export** (`__array__`, `numpy()`): wait for the producer and for
   `async_reads == 0`, then return a writable ndarray view of the buffer.
-- **Import** (`asarray`, fallback results): adopt the ndarray's memory.
+- **Import** (`asarray`, operands, fallback results): adopt the ndarray's
+  memory.
 - **Per op touching such a storage:** if the ndarray is referenced outside
   viproc (refcount above viproc's own), the op runs synchronously: it waits
   for its inputs, runs inline and writes in place (no copy-on-write
@@ -249,6 +286,8 @@ holder, or a view, which references its base.
   Short-lived exports (`print(x)`, `np.asarray(x)` inside a library call)
   cost nothing afterwards; an ndarray kept next to a viproc array costs
   asynchrony for that array, never correctness.
+- Shared memory is never pooled (D3): it belongs to the ndarray and is
+  released by NumPy when the last reference to the ndarray goes.
 - Out of reach: C code keeping a raw data pointer without holding a
   reference, which breaks Python's rules anyway.
 
@@ -266,9 +305,57 @@ issue time on the main thread, so layouts never change after they were
 communicated. Known difference to NumPy: strides/flags of an array may
 change after an in-place op (values never do).
 
+## D9 — A wrapper, not a subclass of `numpy.ndarray`
+
+**Decided and implemented** (`python/viproc/_viproc.c`, `_ndarray.py`).
+`viproc.ndarray` is its own type implementing NumPy's array protocols
+(`__array_ufunc__`, NEP 13; `__array_function__`, NEP 18; `__array__`)
+plus all Python operators. It does not derive from `numpy.ndarray`.
+
+**Why not a subclass.** A subclass would pass `isinstance(x, np.ndarray)`
+and `PyArray_Check` in library C code, and libraries would take it without
+conversion. But that C code then reads and writes `PyArray_DATA(x)`
+directly, bypassing every sync point:
+
+1. **No sync point.** C code would read a pending array's memory before its
+   producer completed (wrong values, silently), and writes would race with
+   issued readers.
+2. **Memory protection does not fit.** Bohrium's npbackend subclasses
+   `ndarray` and protects memory (mprotect + signal handler) until a flush.
+   In viproc, workers write the memory while the main thread must not read
+   it; `mprotect` applies to the whole process, not per thread. It would
+   need two mappings of every buffer (protected for the ndarray, writable
+   for workers), syscalls per array and state change, page granularity and
+   TLB shootdowns on all worker cores, which defeats small and medium
+   arrays.
+3. **Copy-on-write would break.** An ndarray has a fixed data pointer that
+   C code may keep; viproc switches a storage to a new buffer when an
+   in-place write meets pending readers (D8), and consolidates layouts.
+4. **Unsafe by default.** A subclass inherits hundreds of C methods that
+   work on the memory directly (`.sum`, `.copy`, `.tobytes`, `.fill`,
+   indexing, pickling); each would need an override, and every one missed
+   returns wrong values silently. With a wrapper, anything not implemented
+   raises or goes through `__array__`, a clean sync point.
+5. **Views created in C.** NumPy creates subclass views itself (slicing,
+   `reshape`, `.T`) without telling viproc, which would lose the mapping
+   onto shared storages.
+
+**Consequences.**
+
+- Library code that requires a real `numpy.ndarray` calls `__array__`
+  (directly or through `np.asarray`): one sync point, and with D7 no copy.
+- `isinstance(x, np.ndarray)` is false outside code that runs with
+  `numpy` mapped to `viproc` (`python -m viproc`, planned), where
+  `np.ndarray` is `viproc.ndarray`.
+- Pure-Python NumPy code in libraries still runs asynchronously on viproc
+  arrays passed to it: their `np.sin(x)` and `x * 2` dispatch through the
+  protocols.
+
 ## Open questions
 
 - Pool bound default (fraction of RAM vs. fixed) and the eviction order.
+- `max_excess` default for "equal or larger" matching; whether small
+  blocks (a few KiB) warrant a tighter bound than large ones.
 - Per-thread caches in front of the element pool: only if contention shows
   up in `strong_scaling.py` with large arrays.
 - Huge-page threshold and Windows equivalent (large pages need a
