@@ -149,6 +149,11 @@ reported with that issue site, not with the worker's stack.
 
 ### Reference counting
 
+Memory decisions (no temporary array types, deterministic release, element
+memory pool, temporary reuse, NumPy interop) are collected in
+`docs/design/memory-management.md`; keep it up to date with any change to
+ownership, release or reuse of memory.
+
 - Tasks, arrays and array memory (buffers) are **reference counted**.
   Tasks and buffers are shared across threads (`std::shared_ptr`, atomic
   counts); arrays and storages are main-thread only (`Ref<T>`, plain int
@@ -239,6 +244,8 @@ execution.
 ## Repository layout
 
 ```
+docs/design/           Design documents (decisions with rationale)
+  memory-management.md ownership, release, pools, NumPy interop, COW
 include/viproc/        Public C ABI (viproc.h). The only interface bridges may use.
 src/runtime/           Runtime core, no Python dependency (library `viproc`)
   layout.*             DType, Layout (shape, byte strides, offset), broadcasting
