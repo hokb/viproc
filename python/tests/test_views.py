@@ -170,3 +170,22 @@ def test_reshape_fuzz():
             except ValueError:
                 with pytest.raises(ValueError):
                     np.reshape(v, dims, order=order, copy=False)
+
+
+def test_getitem_slot_paths():
+    n = np.arange(12.0).reshape(3, 4)
+    v = viproc.asarray(n)
+    assert type(v[1, 2]) is np.float64 and v[1, 2] == n[1, 2]  # ready: NumPy's scalar
+    big = np.arange(1e5).reshape(100, 1000)
+    p = np.sin(viproc.asarray(big))  # above sync_below: pending (async)
+    s = p[1, 2]  # pending: a 0-d snapshot instead of a sync
+    assert not isinstance(s, np.ndarray) and float(s) == np.sin(big)[1, 2]
+    e = v[1, ...][2:3][..., 0]  # Ellipsis: a 0-d array, as NumPy
+    assert isinstance(e, viproc.ndarray) and e.shape == () and float(e) == n[1, 2]
+    same(v[np.array([2, 0])], n[np.array([2, 0])])  # advanced: the Python hook
+    same(v[[True, False, True]], n[[True, False, True]])
+    for key in [(3, 0), (0, 0, 0), 1.5, "x"]:
+        with pytest.raises(Exception) as expected:
+            n[key]
+        with pytest.raises(type(expected.value)):
+            v[key]

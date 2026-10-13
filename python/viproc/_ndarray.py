@@ -1122,37 +1122,6 @@ class ndarray(_viproc._Array):
         all-int key gives a 0-d view)."""
         return _basic(self, key)
 
-    def __getitem__(self, key):
-        r = _viproc.item(self, key)  # a[i, j] of ready data: NumPy's scalar, fast
-        if r is not None:
-            return r
-        v = _viproc.basic_view(self, key)  # None: not basic, or NumPy raises
-        if v is None and _is_basic_index(key):
-            v = self._view(key)  # raises NumPy's error
-        if v is not None:
-            keys = key if isinstance(key, tuple) else (key,)
-            if v.ndim == 0 and not any(k is Ellipsis for k in keys):
-                # NumPy returns a scalar: free if the data is there, else a
-                # 0-d copy (a snapshot, as NumPy's scalar) instead of a sync
-                return _scalar_result(v.copy()) if not _viproc.ready(v) else _viproc.scalar(v)
-            return v
-        if type(self) is ndarray:
-            if type(key) in (ndarray, tuple, np.ndarray):  # a[idx], a[:, idx]: fast path
-                r = _gather_fast(self, key)
-                if r is not None:
-                    return r
-            if self.size <= _small_ops[0] and _viproc.ready(self) and _ready_key(key):
-                # Small and ready: nothing to overlap, NumPy indexes right away
-                # (advanced indexing always copies: the result is fresh).
-                return _adopt(np.asarray(self.numpy()[_numpy_key(key)]))
-            try:
-                r = _gather(self, key)
-            except (TypeError, ValueError, IndexError):
-                r = _NOPE  # NumPy raises its own error
-            if r is not _NOPE:
-                return r
-        return _host_call(lambda a, k: a[k], (self, key), {})
-
     def __setitem__(self, key, value):
         if not _is_basic_index(key):  # NumPy assigns in place, overlap included
             if not self._readonly and type(self) is ndarray:
@@ -1332,6 +1301,35 @@ _OPS = {
         "equal", "not_equal", "greater", "greater_equal",
     )
 }
+def _getitem(self, key):
+    """a[key] beyond the C fast path (_Array.__getitem__ handles integer
+    keys of ready arrays and basic keys itself): advanced indexing, NumPy's
+    scalar of a pending a[i, j], errors."""
+    if _is_basic_index(key):
+        v = _basic(self, key)  # raises NumPy's error for an invalid key
+        if v.ndim == 0:
+            # NumPy returns a scalar: free if the data is there, else a
+            # 0-d copy (a snapshot, as NumPy's scalar) instead of a sync
+            return _scalar_result(v.copy()) if not _viproc.ready(v) else _viproc.scalar(v)
+        return v
+    if type(self) is ndarray:
+        if type(key) in (ndarray, tuple, np.ndarray):  # a[idx], a[:, idx]: fast path
+            r = _gather_fast(self, key)
+            if r is not None:
+                return r
+        if self.size <= _small_ops[0] and _viproc.ready(self) and _ready_key(key):
+            # Small and ready: nothing to overlap, NumPy indexes right away
+            # (advanced indexing always copies: the result is fresh).
+            return _adopt(np.asarray(self.numpy()[_numpy_key(key)]))
+        try:
+            r = _gather(self, key)
+        except (TypeError, ValueError, IndexError):
+            r = _NOPE  # NumPy raises its own error
+        if r is not _NOPE:
+            return r
+    return _host_call(lambda a, k: a[k], (self, key), {})
+
+
 _viproc.setup(
     ndarray,
     tuple(_DTYPES[c] for c in range(7)),
@@ -1341,6 +1339,7 @@ _viproc.setup(
     _OPS,
     np.ndarray,
     np.generic,
+    _getitem,
 )
 
 

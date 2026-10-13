@@ -73,7 +73,7 @@ class Storage : public MainThreadCounted {
 // Buffers and Tasks they refer to.
 class Array : public MainThreadCounted {
   public:
-    Array(Layout layout, Ref<Storage> storage, ArrayBlock* block)
+    Array(Layout&& layout, Ref<Storage> storage, ArrayBlock* block)
         : layout_(std::move(layout)), storage_(std::move(storage)), block_(block) {}
 
     const Layout& layout() const { return layout_; }
@@ -130,7 +130,7 @@ class Runtime {
     ArrayPtr wrap(Layout layout, std::shared_ptr<Buffer> buffer);
     // A view of `base`: same storage, different layout (shape, strides,
     // offset into the storage's buffer). Metadata only, no task.
-    ArrayPtr view(const ArrayPtr& base, Layout layout);
+    ArrayPtr view(const ArrayPtr& base, Layout&& layout);
 
     // Issues one array op and returns immediately.
     //  - `inputs` are read.

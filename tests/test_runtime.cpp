@@ -118,7 +118,7 @@ ArrayPtr slice(Runtime& rt, const ArrayPtr& base, std::int64_t start, std::int64
     l.offset += start * l.strides[0];
     l.strides[0] *= step;
     l.shape[0] = n;
-    return rt.view(base, l);
+    return rt.view(base, std::move(l));
 }
 
 void inplace_add(Runtime& rt, const ArrayPtr& target, const ArrayPtr& other) {

@@ -87,7 +87,9 @@ namespace {
 using BlockPool = FixedPool<sizeof(ArrayBlock), alignof(ArrayBlock)>;
 
 ArrayBlock* new_block(int alive) {
-    auto* b = ::new (BlockPool::allocate()) ArrayBlock();
+    // Default-, not value-initialized: `ArrayBlock()` would zero the whole
+    // block (inline shapes and strides included) before constructing it.
+    auto* b = ::new (BlockPool::allocate()) ArrayBlock;
     b->alive = alive;
     return b;
 }
@@ -131,7 +133,7 @@ ArrayPtr Runtime::wrap(Layout layout, std::shared_ptr<Buffer> buffer) {
     return new_array(std::move(layout), std::move(buffer), nullptr);
 }
 
-ArrayPtr Runtime::view(const ArrayPtr& base, Layout layout) {
+ArrayPtr Runtime::view(const ArrayPtr& base, Layout&& layout) {
     ArrayBlock* block = new_block(1);
     Array& a = block->array.emplace(std::move(layout), base->storage_, block);
     return ArrayPtr(&a);

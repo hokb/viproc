@@ -610,8 +610,12 @@ Rules:
   `PyArray_Diagonal` in Python. Invalid arguments raise NumPy's own error
   from the same call on a zero-stride probe (`np.broadcast_to` of one
   element, no element memory); `python/tests/test_views.py` fuzzes
-  layouts against NumPy. `a[1:3]` ~0.45 µs (NumPy 0.11), `a.T` 0.18 µs
-  (NumPy 0.08); **advanced indexing** as gather / scatter
+  layouts against NumPy. `a[key]` is the C slot `_Array.mp_subscript`:
+  ready integer keys (NumPy's scalar) and basic keys (a view) without a
+  Python frame, the rest through the hook `_getitem` (`setup()`).
+  `a[1:3]` ~1,580 instructions / 0.12 µs (NumPy ~1,520 / 0.10; it was
+  ~4,700 with `__getitem__` in Python), `a.T` ~1,410 / 0.11 µs;
+  **advanced indexing** as gather / scatter
   tasks (`src/runtime/index.*`, element copies, so the element order does
   not matter): integer arrays (viproc arrays may be pending), lists, ints
   next to arrays, boolean masks (they sync: `nonzero()` gives the shape),
@@ -680,7 +684,8 @@ Rules:
   view of viproc memory: NumPy calls on an ndarray bypass viproc and race
   with the workers (fallback exports are made read-only after the call).
 - **Hot path in C** (`_viproc._Array`): everything that runs once per op —
-  `__array_ufunc__` for element-wise calls, all Python operators (number
+  `__array_ufunc__` for element-wise calls, `a[key]` for ready integer and
+  basic keys, all Python operators (number
   protocol and rich comparisons, with NDArrayOperatorsMixin semantics,
   incl. deferring to `__array_ufunc__ = None`), dtype resolution via
   NumPy's `ufunc.resolve_dtypes` cached per (ufunc, input kinds; Python

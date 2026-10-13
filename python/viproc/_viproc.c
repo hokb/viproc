@@ -57,6 +57,7 @@ static PyObject* g_np_ndarray = NULL;    /* numpy.ndarray */
 static PyObject* g_np_generic = NULL;    /* numpy.generic */
 static PyObject* g_np_integer = NULL;    /* numpy.integer */
 static PyObject* g_ops = NULL;           /* dict: operator name -> ufunc */
+static PyObject* g_getitem = NULL;       /* getitem(a, key): a[key] beyond the C fast path */
 
 /* Caches (main thread only). */
 
@@ -287,6 +288,18 @@ static PyGetSetDef Array_getset[] = {
 };
 
 /* --- helpers -------------------------------------------------------------- */
+
+static int check_runtime(void);
+
+/* Arguments (viproc array, any object) of a METH_FASTCALL function; checks
+ * the runtime too. 0 or -1 with an exception. */
+static int array_and_arg(PyObject* const* args, Py_ssize_t nargs) {
+    if (nargs != 2 || !PyObject_TypeCheck(args[0], &ArrayType)) {
+        PyErr_SetString(PyExc_TypeError, "expected (viproc array, object)");
+        return -1;
+    }
+    return check_runtime();
+}
 
 static int check_runtime(void) {
     if (g_rt == NULL) {
@@ -1310,11 +1323,54 @@ static PyMethodDef Array_methods[] = {
     {NULL, NULL, 0, NULL},
 };
 
+static PyObject* m_item(PyObject* self, PyObject* const* args, Py_ssize_t nargs);
+static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t nargs);
+
+/* a[key]. In C for what runs once per op, without a Python frame: an
+ * integer key of a ready array (NumPy's scalar) and basic keys (a view).
+ * Everything else (advanced indexing, a pending a[i, j], errors) goes to the
+ * Python hook, which keeps NumPy's semantics and messages. */
+static PyObject* Array_subscript(PyObject* self, PyObject* key) {
+    PyObject* args[2] = {self, key};
+    PyObject* r = m_item(NULL, args, 2);
+    if (r != Py_None) {
+        return r; /* NumPy's scalar, or NULL */
+    }
+    Py_DECREF(r);
+    r = m_basic_view(NULL, args, 2);
+    if (r == NULL) {
+        return NULL;
+    }
+    if (r != Py_None) {
+        if (vp_array_ndim(((ArrayObject*)r)->a) > 0) {
+            return r;
+        }
+        Py_ssize_t n = PyTuple_Check(key) ? PyTuple_GET_SIZE(key) : 1;
+        for (Py_ssize_t i = 0; i < n; ++i) {
+            if ((PyTuple_Check(key) ? PyTuple_GET_ITEM(key, i) : key) == Py_Ellipsis) {
+                return r; /* a 0-d view, as NumPy's a[..., i] */
+            }
+        }
+        /* NumPy returns a scalar: the hook decides (pending: a 0-d copy) */
+    }
+    Py_DECREF(r);
+    if (g_getitem == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "viproc: setup() was not called");
+        return NULL;
+    }
+    return PyObject_CallFunctionObjArgs(g_getitem, self, key, NULL);
+}
+
+static PyMappingMethods Array_as_mapping = {
+    .mp_subscript = Array_subscript,
+};
+
 static PyTypeObject ArrayType = {
     PyVarObject_HEAD_INIT(NULL, 0).tp_name = "viproc._viproc._Array",
     .tp_basicsize = sizeof(ArrayObject),
     .tp_dealloc = (destructor)Array_dealloc,
     .tp_as_number = &Array_as_number,
+    .tp_as_mapping = &Array_as_mapping,
     .tp_richcompare = Array_richcompare,
     .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
     .tp_doc = "Base class of viproc.ndarray: owns one runtime array.",
@@ -1327,10 +1383,10 @@ static PyTypeObject ArrayType = {
 
 static PyObject* m_setup(PyObject* self, PyObject* args) {
     (void)self;
-    PyObject *cls, *dtypes, *fallback, *asarray, *dirs, *ops, *ndarray, *generic;
-    if (!PyArg_ParseTuple(args, "O!O!OOO!O!OO", &PyType_Type, &cls, &PyTuple_Type, &dtypes,
+    PyObject *cls, *dtypes, *fallback, *asarray, *dirs, *ops, *ndarray, *generic, *getitem;
+    if (!PyArg_ParseTuple(args, "O!O!OOO!O!OOO", &PyType_Type, &cls, &PyTuple_Type, &dtypes,
                           &fallback, &asarray, &PyTuple_Type, &dirs, &PyDict_Type, &ops, &ndarray,
-                          &generic)) {
+                          &generic, &getitem)) {
         return NULL;
     }
     if (!PyType_IsSubtype((PyTypeObject*)cls, &ArrayType) || PyTuple_GET_SIZE(dtypes) != 7) {
@@ -1347,6 +1403,7 @@ static PyObject* m_setup(PyObject* self, PyObject* args) {
     Py_XSETREF(g_ops, Py_NewRef(ops));
     Py_XSETREF(g_np_ndarray, Py_NewRef(ndarray));
     Py_XSETREF(g_np_generic, Py_NewRef(generic));
+    Py_XSETREF(g_getitem, Py_NewRef(getitem));
     PyObject* np = PyImport_ImportModule("numpy");
     Py_XSETREF(g_np_integer, np != NULL ? PyObject_GetAttrString(np, "integer") : NULL);
     Py_XDECREF(np);
@@ -1520,12 +1577,12 @@ static PyObject* make_view(PyObject* a, vp_dtype dtype, int nd, const int64_t* s
  * PySlice_Unpack/PySlice_AdjustIndices, as NumPy's PySlice_GetIndicesEx.
  * Returns the view, or None for any other key (and for errors, which the
  * caller leaves to NumPy's messages). An all-int key gives a 0-d view. */
-static PyObject* m_basic_view(PyObject* self, PyObject* args) {
+static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
     (void)self;
-    PyObject *a, *key;
-    if (!PyArg_ParseTuple(args, "O!O", &ArrayType, &a, &key) || check_runtime() < 0) {
+    if (array_and_arg(args, nargs) < 0) {
         return NULL;
     }
+    PyObject *a = args[0], *key = args[1];
     vp_array* x = array_of(a);
     const int nd = vp_array_ndim(x);
     const int64_t* shape = vp_array_shape(x);
@@ -1612,12 +1669,12 @@ static PyObject* m_basic_view(PyObject* self, PyObject* args) {
 
 /* a.transpose(axes) (axes: None or a permutation, negative axes allowed) as
  * NumPy's PyArray_Transpose; None for an invalid permutation (NumPy raises). */
-static PyObject* m_transpose(PyObject* self, PyObject* args) {
+static PyObject* m_transpose(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
     (void)self;
-    PyObject *a, *axes;
-    if (!PyArg_ParseTuple(args, "O!O", &ArrayType, &a, &axes) || check_runtime() < 0) {
+    if (array_and_arg(args, nargs) < 0) {
         return NULL;
     }
+    PyObject *a = args[0], *axes = args[1];
     vp_array* x = array_of(a);
     const int nd = vp_array_ndim(x);
     const int64_t* shape = vp_array_shape(x);
@@ -1827,12 +1884,12 @@ static PyObject* m_scalar(PyObject* self, PyObject* a) {
 /* item(a, key): for an integer key (an int, or a tuple of one int per
  * dimension) the element as NumPy's scalar if `a` is ready; None if `a` is
  * pending or the key is something else. IndexError as NumPy's. */
-static PyObject* m_item(PyObject* self, PyObject* args) {
+static PyObject* m_item(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
     (void)self;
-    PyObject *a, *key;
-    if (!PyArg_ParseTuple(args, "O!O", &ArrayType, &a, &key) || check_runtime() < 0) {
+    if (array_and_arg(args, nargs) < 0) {
         return NULL;
     }
+    PyObject *a = args[0], *key = args[1];
     vp_array* x = array_of(a);
     const int nd = vp_array_ndim(x);
     const Py_ssize_t nk = PyTuple_Check(key) ? PyTuple_GET_SIZE(key) : 1;
@@ -2214,11 +2271,12 @@ static PyMethodDef methods[] = {
     {"assign", m_assign, METH_VARARGS, "assign(dst, src): dst[...] = src"},
     {"scalar", m_scalar, METH_O,
      "scalar(a): NumPy's scalar of a's first element if a is ready (no wait), else None"},
-    {"item", m_item, METH_VARARGS,
+    {"item", (PyCFunction)(void (*)(void))m_item, METH_FASTCALL,
      "item(a, key): NumPy's scalar a[key] for an integer key if a is ready, else None"},
-    {"basic_view", m_basic_view, METH_VARARGS,
+    {"basic_view", (PyCFunction)(void (*)(void))m_basic_view, METH_FASTCALL,
      "basic_view(a, key): a[key] for ints, slices, None, Ellipsis as a view, else None"},
-    {"transpose", m_transpose, METH_VARARGS, "transpose(a, axes): view, None if axes invalid"},
+    {"transpose", (PyCFunction)(void (*)(void))m_transpose, METH_FASTCALL,
+     "transpose(a, axes): view, None if axes invalid"},
     {"reshape", m_reshape, METH_VARARGS,
      "reshape(a, shape, order): view as NumPy's reshape, None if NumPy would copy"},
     {"broadcast_to", m_broadcast_to, METH_VARARGS,
