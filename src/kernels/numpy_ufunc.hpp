@@ -77,6 +77,10 @@ class UfuncLoop {
 // release them through it (a kernel may be destroyed on a worker).
 using DeferRelease = std::function<void(std::function<void()>)>;
 
+// An element-wise iterator template and its pool of reusable copies
+// (numpy_ufunc.cpp).
+struct IterTemplate;
+
 // Caches resolved loops per (ufunc, dtype signature). Main thread with the GIL.
 // Must outlive every task that uses one of its loops (wait for the runtime
 // first, then destroy the cache).
@@ -126,9 +130,9 @@ class LoopCache {
     std::map<std::pair<PyObject*, std::vector<DType>>, std::unique_ptr<UfuncLoop>> loops_;
     std::map<std::tuple<PyObject*, DType, std::array<std::intptr_t, 3>>, std::unique_ptr<UfuncLoop>>
         reduction_loops_;
-    std::unordered_map<std::string, void*> iter_templates_; // NpyIter*
-    PyObject* extobj_var_ = nullptr;                        // NumPy's extobj context variable
-    PyObject* extobj_ = nullptr;                            // its value at the last read
+    std::unordered_map<std::string, std::shared_ptr<IterTemplate>> iter_templates_;
+    PyObject* extobj_var_ = nullptr; // NumPy's extobj context variable
+    PyObject* extobj_ = nullptr;     // its value at the last read
     long buffersize_ = 0;
 };
 

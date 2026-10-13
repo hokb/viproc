@@ -427,6 +427,43 @@ def _():
 # --- algorithms -------------------------------------------------------------
 
 
+@case("kmeans_points", "algorithms",
+      "k-means as in the ILNumerics Accelerator benchmark: a loop over the points, "
+      "per point the distances to all centers and argmin; per cluster nonzero and mean",
+      "cores", [("small", "C"), ("medium", "C"), ("large", "C")])
+def _():
+    # The NumPy program of github.com/hokb/decentralized-array-execution-
+    # artifacts2026 (Appendix, Part 3 KMeans), with a fixed iteration count
+    # (reps) instead of the convergence test. Every point's distance chain
+    # is independent of the others: the parallel width is the number of
+    # points; the per-cluster updates need the labels (nonzero syncs).
+    def make(rng, shape, width):
+        n = int(np.prod(shape))
+        d = max(2, int(round(n ** 0.5)))  # d dimensions x d points
+        return [rng.uniform(0, 10, size=(d, d)), np.array(min(50, max(2, d // 10)))]
+
+    def run(data, reps):
+        X, k = data
+        k = int(k)
+        n = np.size(X, 1)
+        centers = X[:, np.linspace(0, n - 2, k, dtype=np.int64)].copy()
+        # zeros_like: an array of X's kind (np.zeros would make a NumPy
+        # array, and each classes[0, i] = ... would sync on the argmin)
+        classes = np.zeros_like(X, shape=(1, n))
+        for _ in range(reps):
+            for i in range(n):
+                dist = np.sqrt(np.sum(np.square(X[:, i, np.newaxis] - centers), axis=0))
+                classes[0, i] = dist.argmin()
+            for i in range(k):
+                found = np.nonzero(classes == i)[1]
+                in_class = X[:, found]
+                if in_class.size > 0:
+                    centers[:, i] = in_class.mean(axis=1)
+        return classes, centers
+
+    return make, run
+
+
 @case("kmeans", "algorithms",
       "k-means, k = 8, 2-d points: per-cluster distances, labels, centroid update", 8,
       [("small", "vec"), ("medium", "vec"), ("large", "vec")])

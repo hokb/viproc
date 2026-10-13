@@ -1,5 +1,7 @@
 #include "index.hpp"
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -157,9 +159,26 @@ class GatherKernel : public Kernel {
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Operand& out = outputs[0];
+        // Any element order gives the same result (copies only): visit the
+        // result in its memory order, so the innermost loop writes
+        // contiguously (NumPy's index-outer layouts, a[:, idx]).
+        IndexSpec spec = spec_;
+        Strides strides = out.layout.strides;
+        const std::size_t nr = spec.result_axes.size();
+        std::vector<std::size_t> order(nr);
+        for (std::size_t k = 0; k < nr; ++k) {
+            order[k] = k;
+        }
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) {
+            return std::llabs(strides[x]) > std::llabs(strides[y]);
+        });
+        for (std::size_t k = 0; k < nr; ++k) {
+            spec.result_axes[k] = spec_.result_axes[order[k]];
+            strides[k] = out.layout.strides[order[k]];
+        }
         const std::string e = with_copy(itemsize(out.layout.dtype), [&](auto copy) {
-            return for_each_indexed(spec_, inputs[0], inputs.subspan(1),
-                                    reinterpret_cast<char*>(out.first()), out.layout.strides,
+            return for_each_indexed(spec, inputs[0], inputs.subspan(1),
+                                    reinterpret_cast<char*>(out.first()), strides,
                                     [copy](char* src, char* dst) { copy(dst, src); });
         });
         return e.empty() ? KernelResult{} : KernelResult{1, e, 0};

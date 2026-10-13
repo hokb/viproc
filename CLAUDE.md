@@ -95,9 +95,12 @@ to plain sequential NumPy execution.
 
 **Look-ahead limit (back-pressure):** at most **1000 active tasks** (issued,
 not yet `completed`). When the limit is reached, the main thread blocks
-before creating the next task until an active task completes. Fixed
-constant for now; keep it in one place so it can become configurable or
-memory-based later.
+before creating the next task until a quarter of the active tasks
+completed (hysteresis; completions wake it only then: resuming after each
+completion cost a wake-up and a context switch per op). Fixed constant for
+now; keep it in one place so it can become configurable or memory-based
+later (1000 in-flight results of 77 KB each are 77 MB, far more than the
+L2 caches the same ops would reuse with a shallow look-ahead).
 
 When a producer reaches `completed`, its callbacks run on the completing
 thread. The callback that reports the last pending input of a task
@@ -637,7 +640,9 @@ Rules:
   the array path and NumPy's output shape. `float()`, `bool()`,
   `format()`, `round()` of a pending 0-d array sync.
 - **Fallback (sync + eager NumPy on viproc memory, `_Host`):** everything
-  else: other reductions (`out=`, `where=`), gufuncs
+  else (`nonzero`, `flatnonzero`, `argwhere`, `count_nonzero` sync on their
+  argument and run in NumPy on a read-only export, without the general
+  fallback's wait for readers): other reductions (`out=`, `where=`), gufuncs
   (`matmul`), empty advanced-index results, 0-d boolean indices,
   `ufunc.at`, other NumPy functions. NumPy's semantics exactly (design doc
   D7, "Eager fallbacks"): each viproc argument becomes a writable NumPy
@@ -722,8 +727,10 @@ Rules:
   everything else (strided, reversed, broadcast, mixed orders, casts) runs
   on NumPy's iterator, set up as `execute_ufunc_loop` sets it up
   (`LoopCache::iter_elementwise`: a template per (loop, layouts, buffer
-  size) over a dummy address, `NpyIter_Copy` per op,
-  `NpyIter_ResetBasePointers` on the worker). Casts happen in the
+  size) over a dummy address; per op a finished iterator of that template
+  from its pool, else an `NpyIter_Copy`; `NpyIter_ResetBasePointers` on
+  the worker; a fresh copy per op allocated its buffers on the worker and
+  released them later on the main thread, which kept that memory cold). Casts happen in the
   iterator's buffers, or, for 0-d and short 1-d inputs, as a separate cast
   task first (NumPy's `check_for_trivial_loop` copies those).
 - Measured (4 CPUs, `strong_scaling.py`, 8 chains, Release build, speedup

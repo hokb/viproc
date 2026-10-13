@@ -781,12 +781,29 @@ int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, ch
     const Layout& d = arr(dst).layout();
     const Layout& s = arr(src).layout();
     Shape b;
-    if (d.dtype != s.dtype || !broadcast_shapes(d.shape, s.shape, b) || b != d.shape) {
-        set_error(err, errlen, "assign: dtype mismatch or shapes do not broadcast");
+    if (!broadcast_shapes(d.shape, s.shape, b) || b != d.shape) {
+        set_error(err, errlen, "assign: shapes do not broadcast");
         return VP_INVALID;
     }
     const ArrayPtr ins[] = {ref(src)};
     const ArrayPtr io[] = {ref(dst)};
+    if (d.dtype != s.dtype) {
+        // NumPy casts the values in its assignment (unsafe casting): the cast
+        // kernel writes them straight into dst.
+        if (d.size() == 0) {
+            return VP_OK;
+        }
+        std::string e;
+        std::shared_ptr<Kernel> k = numpy::make_cast_kernel(
+            broadcast_to(s, d.shape), d, rt->loops->buffersize(), defer_release(rt->graveyard), e);
+        if (!k) {
+            PyErr_Clear();
+            set_error(err, errlen, e);
+            return VP_UNSUPPORTED;
+        }
+        rt->rt->issue(k, ins, io, {}, site);
+        return VP_OK;
+    }
     static const std::shared_ptr<Kernel> assign = make_assign_kernel();
     rt->rt->issue(assign, ins, io, {}, site);
     return VP_OK;

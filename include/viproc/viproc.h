@@ -254,7 +254,8 @@ int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char
               int keepdims, PyObject* dtype, PyObject* identity, vp_array** result,
               const char* site, char* err, size_t errlen);
 
-/* Issues dst[...] = src (src broadcasts to dst's shape, same dtype). `site`
+/* Issues dst[...] = src (src broadcasts to dst's shape; another dtype is
+ * cast as NumPy's assignment casts, VP_UNSUPPORTED if NumPy cannot). `site`
  * comes from vp_intern. */
 int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, char* err,
               size_t errlen);

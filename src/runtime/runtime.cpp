@@ -144,6 +144,10 @@ void Runtime::wait_active_below(std::size_t limit) {
     // seq_cst pairs with run(): it decrements active_, then reads the waiter
     // count. Either it sees this waiter and notifies, or the load below sees
     // its decrement.
+    // Completions notify only once active_ is below `limit` (wake_below_):
+    // waking the main thread on every completion would cost a futex wake
+    // and a context switch per task.
+    wake_below_.store(limit, std::memory_order_seq_cst);
     active_waiters_.fetch_add(1, std::memory_order_seq_cst);
     for (std::size_t n = active_.load(std::memory_order_seq_cst); n >= limit;
          n = active_.load(std::memory_order_seq_cst)) {
@@ -154,8 +158,14 @@ void Runtime::wait_active_below(std::size_t limit) {
 
 void Runtime::acquire_slot() {
     // Back-pressure: limit how far the main thread runs ahead. Only the main
-    // thread increments active_, so check-then-increment is race free.
-    wait_active_below(options_.max_active_tasks);
+    // thread increments active_, so check-then-increment is race free. At
+    // the limit it waits until a quarter of the active tasks completed
+    // (hysteresis): resuming after every single completion ping-pongs
+    // between the threads, one wake-up per op.
+    const std::size_t limit = options_.max_active_tasks;
+    if (active_.load(std::memory_order_acquire) >= limit) {
+        wait_active_below(limit - limit / 4);
+    }
     active_.fetch_add(1, std::memory_order_acq_rel);
 }
 
@@ -465,8 +475,9 @@ void Runtime::wait_all() { wait_active_below(1); }
 
 std::vector<std::shared_ptr<Task>> Runtime::run(const std::shared_ptr<Task>& task) {
     std::vector<std::shared_ptr<Task>> runnable = task->execute();
-    active_.fetch_sub(1, std::memory_order_seq_cst);
-    if (active_waiters_.load(std::memory_order_seq_cst) > 0) {
+    const std::size_t left = active_.fetch_sub(1, std::memory_order_seq_cst) - 1;
+    if (active_waiters_.load(std::memory_order_seq_cst) > 0 &&
+        left < wake_below_.load(std::memory_order_seq_cst)) {
         active_.notify_all();
     }
     return runnable;

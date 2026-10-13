@@ -214,6 +214,7 @@ class Runtime {
     std::atomic<std::size_t> active_{0};
     // Threads waiting in wait_active_below(): run() notifies only if > 0.
     std::atomic<int> active_waiters_{0};
+    std::atomic<std::size_t> wake_below_{0}; // a waiter's threshold (wait_active_below)
     // Blocks until fewer than `limit` tasks are active.
     void wait_active_below(std::size_t limit);
 

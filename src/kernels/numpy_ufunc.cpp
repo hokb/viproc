@@ -10,6 +10,7 @@
 #include <numpy/ufuncobject.h>
 
 #include <cstring>
+#include <mutex>
 
 namespace viproc::numpy {
 
@@ -443,16 +444,64 @@ constexpr std::size_t kMaxOps = 32;
 // Iterator templates kept per LoopCache (all dropped when full).
 constexpr std::size_t kMaxIterTemplates = 1024;
 
+// Iterators of kernels that finished are kept per template and reused: a
+// new copy (NpyIter_Copy) per op would also allocate its buffers on the
+// worker at the first reset (DELAY_BUFALLOC), and freeing them later on the
+// main thread keeps that memory cold. Main thread pops, any thread returns.
+constexpr std::size_t kMaxPooledIters = 16;
+
+} // namespace
+
+struct IterTemplate {
+    NpyIter* templ = nullptr;
+    DeferRelease defer;
+    std::mutex mutex;
+    std::vector<NpyIter*> free; // finished iterators, ready for a reset
+
+    ~IterTemplate() {
+        std::vector<NpyIter*> all = std::move(free);
+        all.push_back(templ);
+        defer([all] {
+            for (NpyIter* it : all) {
+                NpyIter_Deallocate(it);
+            }
+        });
+    }
+
+    // A clean iterator to reuse, or nullptr. Main thread.
+    NpyIter* pop() {
+        std::lock_guard lock(mutex);
+        if (free.empty()) {
+            return nullptr;
+        }
+        NpyIter* it = free.back();
+        free.pop_back();
+        return it;
+    }
+
+    // Takes back an iterator after a complete iteration (nothing left in
+    // its buffers to write back); others are released. Any thread.
+    void give_back(NpyIter* it, bool clean) {
+        if (clean) {
+            std::lock_guard lock(mutex);
+            if (free.size() < kMaxPooledIters) {
+                free.push_back(it);
+                return;
+            }
+        }
+        defer([it] { NpyIter_Deallocate(it); });
+    }
+};
+
+namespace {
+
 // NumPy's element-wise ufunc loop over its iterator (execute_ufunc_loop).
 class IterElementwiseKernel : public Kernel {
   public:
-    IterElementwiseKernel(const UfuncLoop* loop, NpyIter* iter, DeferRelease defer)
-        : loop_(loop), iter_(iter), defer_(std::move(defer)) {}
+    IterElementwiseKernel(const UfuncLoop* loop, NpyIter* iter, std::shared_ptr<IterTemplate> pool)
+        : loop_(loop), iter_(iter), pool_(std::move(pool)) {}
 
-    ~IterElementwiseKernel() override {
-        NpyIter* iter = iter_;
-        defer_([iter] { NpyIter_Deallocate(iter); });
-    }
+    ~IterElementwiseKernel() override { pool_->give_back(iter_, clean_); }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const auto nin = static_cast<std::size_t>(loop_->nin());
@@ -462,6 +511,7 @@ class IterElementwiseKernel : public Kernel {
         }
         base[nin] = reinterpret_cast<char*>(outputs[0].first());
         char* errmsg = nullptr;
+        clean_ = false;
         // Points the iterator at the buffers (no GIL: errmsg variant); with
         // buffering it also copies the first block.
         if (NpyIter_ResetBasePointers(iter_, base, &errmsg) != NPY_SUCCEED) {
@@ -472,6 +522,7 @@ class IterElementwiseKernel : public Kernel {
                 return {1, "NumPy loop failed", 0};
             }
         } while (iternext_(iter_));
+        clean_ = true;
         return {};
     }
 
@@ -483,7 +534,8 @@ class IterElementwiseKernel : public Kernel {
   private:
     const UfuncLoop* loop_;
     NpyIter* iter_;
-    DeferRelease defer_;
+    std::shared_ptr<IterTemplate> pool_;
+    bool clean_ = true; // a fresh copy has nothing in its buffers
 };
 
 // An array with `l`'s shape and strides over `data` (not owned, never read
@@ -673,9 +725,7 @@ std::shared_ptr<Kernel> make_cast_kernel(const Layout& in, const Layout& out, lo
 }
 
 LoopCache::~LoopCache() {
-    for (auto& [key, iter] : iter_templates_) {
-        NpyIter_Deallocate(static_cast<NpyIter*>(iter));
-    }
+    iter_templates_.clear(); // kernels still holding one release it later
     Py_XDECREF(extobj_);
     Py_XDECREF(extobj_var_);
 }
@@ -734,10 +784,11 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
             put(l.strides[d]);
         }
     }
-    NpyIter* templ = nullptr;
+    std::shared_ptr<IterTemplate> pool;
     if (auto it = iter_templates_.find(key); it != iter_templates_.end()) {
-        templ = static_cast<NpyIter*>(it->second);
+        pool = it->second;
     } else {
+        NpyIter* templ = nullptr;
         // Templates over a dummy address: nothing is read or written before
         // a kernel resets the base pointers, and without COPY_IF_OVERLAP the
         // iterator never compares addresses (viproc's copy-on-write already
@@ -794,19 +845,22 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
             return nullptr;
         }
         if (iter_templates_.size() >= kMaxIterTemplates) {
-            for (auto& [k, t] : iter_templates_) {
-                NpyIter_Deallocate(static_cast<NpyIter*>(t));
-            }
             iter_templates_.clear();
         }
-        iter_templates_.emplace(std::move(key), templ);
+        pool = std::make_shared<IterTemplate>();
+        pool->templ = templ;
+        pool->defer = std::move(defer);
+        iter_templates_.emplace(std::move(key), pool);
     }
-    NpyIter* iter = NpyIter_Copy(templ);
+    NpyIter* iter = pool->pop();
+    if (iter == nullptr) {
+        iter = NpyIter_Copy(pool->templ);
+    }
     if (iter == nullptr) {
         error = fetch_python_error();
         return nullptr;
     }
-    auto kernel = std::make_shared<IterElementwiseKernel>(loop, iter, std::move(defer));
+    auto kernel = std::make_shared<IterElementwiseKernel>(loop, iter, pool);
     kernel->iternext_ = NpyIter_GetIterNext(iter, nullptr);
     if (kernel->iternext_ == nullptr) {
         error = fetch_python_error();

@@ -381,7 +381,7 @@ def _r_arg(argmax):
             return _NOPE
         keep = keepdims is True
         if axis is None:
-            src = a.reshape(-1)
+            src = a if a.ndim == 1 else a.reshape(-1)
             shape = (1,) * a.ndim if keep else ()
         else:
             try:
@@ -503,7 +503,30 @@ def _where(condition, *xy):
     return _scalar_result(r) if r.ndim == 0 else r
 
 
-_VIEW_HANDLERS = {np.reshape: _reshape, np.ravel: _ravel, np.where: _where}
+def _readonly_call(fn):
+    """A NumPy function with a data-dependent result shape that only reads
+    its argument (nonzero, ...): it syncs on the argument and runs in NumPy,
+    on a read-only export instead of the general fallback, which would also
+    wait for the argument's readers and make it writable first."""
+    def handler(a, *args, **kwargs):
+        global fallback_calls
+        if type(a) is not ndarray:
+            return _NOPE
+        fallback_calls += 1
+        r = fn(a.numpy(), *args, **kwargs)
+        if isinstance(r, tuple):
+            return tuple(_adopt(x) if isinstance(x, np.ndarray) and x.flags.owndata else x
+                         for x in r)
+        return _adopt(r) if isinstance(r, np.ndarray) and r.flags.owndata else r
+
+    return handler
+
+
+_VIEW_HANDLERS = {np.reshape: _reshape, np.ravel: _ravel, np.where: _where,
+                  np.nonzero: _readonly_call(np.nonzero),
+                  np.flatnonzero: _readonly_call(np.flatnonzero),
+                  np.argwhere: _readonly_call(np.argwhere),
+                  np.count_nonzero: _readonly_call(np.count_nonzero)}
 
 
 # --- advanced indexing ---------------------------------------------------------
@@ -660,14 +683,43 @@ def _result_strides(v, arrays, axes, res, bshape, pattern):
 _INDEX_DTYPES = (np.dtype(np.int64), np.dtype(np.int32))
 
 
+_FULL = slice(None)
+
+
 def _gather_fast(a, key):
-    """a[idx] for one integer viproc array on C-contiguous data, the common
-    case: NumPy's result is in C order (index dimensions, then the remaining
-    axes). None if the key is not like that."""
-    if key.dtype in _INDEX_DTYPES and a.ndim and a.size and key.size and a._c_contiguous:
-        res = [-1 - d for d in range(key.ndim)] + list(range(1, a.ndim))
-        return _viproc.gather(a, (key,), (0,), res, None)
-    return None
+    """a[idx] or a[:, ..., :, idx] for one integer index array on
+    C-contiguous data, the common cases, without the general parsing. NumPy's
+    result layout there: the index dimensions outermost in memory, the other
+    axes inside them in C order (for a[idx] that is C order). None if the key
+    is not like that."""
+    if type(key) is tuple:
+        p = len(key) - 1
+        if p < 0 or p >= a.ndim or any(type(k) is not slice or k != _FULL for k in key[:p]):
+            return None
+        idx = key[p]
+    else:
+        p, idx = 0, key
+    if type(idx) is not ndarray:
+        if type(idx) is not np.ndarray or idx.dtype.kind not in "iu" or not idx.ndim:
+            return None
+        idx = asarray(idx if idx.dtype in _INDEX_DTYPES else idx.astype(np.intp))
+    if (idx.dtype not in _INDEX_DTYPES or not a.ndim or not a.size or not idx.size
+            or not a._c_contiguous):
+        return None
+    nb = idx.ndim
+    res = list(range(p)) + [-1 - d for d in range(nb)] + list(range(p + 1, a.ndim))
+    if p == 0:
+        return _viproc.gather(a, (idx,), (0,), res, None)
+    shape = a.shape[:p] + idx.shape + a.shape[p + 1:]
+    strides = [0] * len(shape)
+    step = a.itemsize
+    for k in reversed([k for k in range(len(shape)) if not p <= k < p + nb]):
+        strides[k] = step
+        step *= shape[k]
+    for k in reversed(range(p, p + nb)):
+        strides[k] = step
+        step *= shape[k]
+    return _viproc.gather(a, (idx,), (p,), res, strides)
 
 
 def _gather(a, key):
@@ -849,7 +901,7 @@ class ndarray(_viproc._Array):
                 return _scalar_result(v.copy()) if not _viproc.ready(v) else _viproc.scalar(v)
             return v
         if type(self) is ndarray:
-            if type(key) is ndarray:  # a[idx]: the gather's own fast path first
+            if type(key) in (ndarray, tuple, np.ndarray):  # a[idx], a[:, idx]: fast path
                 r = _gather_fast(self, key)
                 if r is not None:
                     return r
@@ -884,10 +936,13 @@ class ndarray(_viproc._Array):
             raise ValueError("assignment destination is read-only")
         target = self._view(key)
         if isinstance(value, ndarray):
-            src = value if value.dtype == self.dtype else value.astype(self.dtype)
+            src = value  # another dtype: cast in the assignment (vp_assign)
         else:
             src = asarray(np.asarray(value).astype(self.dtype, copy=False))
-        _viproc.assign(target, src)
+        try:
+            _viproc.assign(target, src)
+        except NotImplementedError:  # a cast NumPy refused (warning turned into an error)
+            _viproc.assign(target, asarray(np.asarray(src).astype(self.dtype, copy=False)))
 
     # --- NumPy protocols -------------------------------------------------------
     def __array_function__(self, func, types, args, kwargs):
