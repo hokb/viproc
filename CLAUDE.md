@@ -55,6 +55,8 @@ to plain sequential NumPy execution.
   - The main thread increments it when it issues a task reading the array.
   - The reading task decrements it when it has finished reading (at the
     latest on `completed`), on whatever thread it runs.
+  - An op's reads of the buffer it writes in place are not counted: every
+    later writer waits for it as the storage's producer anyway.
   - Only the main thread increments, so **`async_reads == 0` seen by the
     main thread stays 0** until the main thread itself issues a new reader
     (same reasoning as `ready`, see "Thread rules").
@@ -555,6 +557,12 @@ Rules:
   tables ~100. Each entry holds a reference to its key object. Sites and
   signatures are cleared when the runtime shuts down (handles and interned
   sites belong to it).
+- **Temporary elision** (design doc D5): an operator whose operand is a
+  temporary (dtype/shape of the output, buffer reusable per
+  `vp_array_reusable_bytes`, object only on the interpreter stack) writes
+  into that operand. Temporaries are detected exactly on CPython ≥ 3.14;
+  on 3.12/3.13 (glibc) by refcount 1 plus a backtrace compared with
+  calibrated interpreter call chains (≥ 256 KiB only); off elsewhere.
 - Evaluated and rejected: caching/reusing `viproc.ndarray` objects. Their
   allocation and deallocation is ~1% of the per-op instructions.
 - One Python thread only: the thread that initialized the runtime.
@@ -578,7 +586,8 @@ Rules:
   operand is C-contiguous with the output shape or a single element
   (stride 0); otherwise once per innermost row.
 - Measured (4 CPUs, `strong_scaling.py`, 8 chains, Release build, speedup
-  vs. NumPy with 4 workers): 1e7 elements ~4x; 1e6 ~3.9x; 1e5 3.0x; 1e4 ~3x;
+  vs. NumPy with 4 workers): 1e7 elements ~7.5x (pool + temporary elision;
+  NumPy pays page faults for its temporaries); 1e6 ~4.5x; 1e5 3.0x; 1e4 ~3x;
   3e3 ~2.5x, 1e3 ~0.9x (noisy).
 - "Issue an op, read the result right away" (`sync_latency.py`): 8 elements
   8.1 → 1.4–2.4 µs (NumPy 0.5–0.9), 1e3 5.1 → 1.6–2.7 µs (NumPy 0.8–1.6),

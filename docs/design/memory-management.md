@@ -20,7 +20,7 @@ Status labels:
 | D2 | Deterministic memory management through reference counting | Decided; implemented for objects |
 | D3 | Own memory pool for element memory in the viproc layer | Implemented |
 | D4 | Pools for the per-op runtime objects (Task, Buffer, ArrayBlock) | Implemented |
-| D5 | Reuse the buffer of a temporary input for the output | Proposed |
+| D5 | Reuse the buffer of a temporary input for the output | Implemented |
 | D6 | Ownership: Python owns objects, the runtime owns element memory | Implemented |
 | D7 | Array conversions viproc ↔ ndarray: copy-free in both directions | Decided (rule proposed) |
 | D8 | Write-after-read safety by copy-on-write, not by locking | Implemented |
@@ -220,29 +220,63 @@ Per op this leaves one pooled `Task`, one pooled `Buffer`, one pooled
 per-op cost dropped from ~7,100 to ~5,400 instructions (CLAUDE.md, "Python
 bridge").
 
-## D5 — Reuse the buffer of a temporary input (proposed)
+## D5 — Reuse the buffer of a temporary input
 
-The runtime counterpart of ILNumerics' persistence cast, without a type:
-when an input of an element-wise op is a temporary, the op writes its
-result into that input's buffer instead of a new one.
+**Implemented** (`python/viproc/_viproc.c`: `elision_candidate`,
+`is_temporary`; C ABI `vp_array_reusable_bytes`). The runtime counterpart
+of ILNumerics' persistence cast, without a type: when an operand of an
+element-wise **operator** (`+ - * / // % << >> & | ^ @`, unary `- + ~`) is
+a temporary, the op writes its result into that operand's buffer instead of
+a new one, and returns the operand's object. Function calls (`np.add(t, 1)`),
+in-place operators and comparisons are not elided (as in NumPy).
 
-An input counts as temporary when, at issue time on the main thread:
+An operand qualifies when, at issue time on the main thread:
 
-1. its Python object is referenced only by the interpreter's value stack
-   (refcount 1) and the call comes straight from the interpreter (C code
-   may hold borrowed references; NumPy's own temporary elision checks the
-   call chain for the same reason),
-2. its `Array` and `Storage` have no other references (no views),
-3. no issued task still reads its buffer (`async_reads == 0`; a pending
-   *producer* is fine, the op is its consumer anyway),
-4. dtype, shape and layout equal the output's (element-wise ops may read
-   and write the same element in one loop call, as NumPy does in place).
+1. **dtype and shape equal the output's** (no broadcasting into it; element
+   -wise loops read and write the same element in one call, as NumPy does
+   in place);
+2. **the runtime may reuse its buffer** (`vp_array_reusable_bytes`): the
+   `Array` has no other reference and its `Storage` no other array (no
+   views), the buffer is pool memory (so never memory shared with NumPy),
+   no issued task still reads it (`async_reads == 0`; a pending *producer*
+   is fine, the op is its consumer), and the array covers the buffer
+   contiguously from offset 0;
+3. **its Python object is a temporary**, referenced only by the
+   interpreter's value stack:
+   - CPython ≥ 3.14: `PyUnstable_Object_IsUniqueReferencedTemporary`
+     (exact; mode `"exact"`).
+   - CPython 3.12/3.13 on glibc: reference count 1 **and** the operator was
+     applied by the bytecode interpreter itself, not by C code that may hold
+     a borrowed reference to an object owned elsewhere (mode
+     `"backtrace"`). The check compares the first two return addresses
+     after viproc's frames (`backtrace()`, the runtime's `PyNumber_*` entry
+     and its caller) with chains recorded once by running every operator on
+     a probe object. Entries that tail-call the slot (`PyNumber_Negative`)
+     leave no frame of their own, so their first address is already the
+     interpreter's call site; calibrating through two different entries
+     (module code, a function called from C) tells the two kinds apart.
+     Recorded addresses work with the BOLT/PGO layout of distribution
+     builds, where the interpreter's code lies outside its symbol's range.
+     Stricter than NumPy: builtins in the runtime (`sum()`,
+     `operator.add`) do not elide either. Only for buffers ≥ 256 KiB (a
+     backtrace costs ~1–2 µs), as NumPy.
+   - Otherwise (e.g. Windows with CPython < 3.14): off (mode `"off"`).
+   `viproc._viproc.elision_mode()` reports the mode, `_viproc.elided()`
+   counts elided ops.
 
-Then the op is issued with the input as an in/out operand (no new buffer,
-no copy-on-write since nothing else reads it). This halves the memory of
-expression chains and avoids most pool traffic for them. NumPy does the
-same above 256 KiB; in viproc it is a local issue-time decision, like
-everything else.
+Then the op is issued with the operand as its `out=` array: an in/out op
+writing in place. That needed one change to D8's accounting: an op does not
+count its reads of the buffer it writes in place in `async_reads`
+(`Operand::counted_read`); every later writer waits for it as the storage's
+producer anyway. Before, a pending in-place op made the next in-place op on
+the same array copy-on-write, and blocked the next elision.
+
+**Measured** (Release, `((x + 1) * 2) + 3`, 1 worker; before = pool only):
+1e5 0.118 → 0.067 ms, 1e6 2.0 → 1.45 ms, 1e7 39 → 17 ms (NumPy 0.40 /
+3.6 / 60 ms); pool memory held after the loop 1e7: 266 → 88 MiB.
+`strong_scaling.py` 1e7 (4 workers, 8 chains of length 5): 2.96 → 1.98 s,
+7.5x NumPy (above 4x because NumPy pays page faults for its temporaries
+and viproc writes in place, saving memory bandwidth).
 
 ## D6 — Ownership
 
@@ -343,7 +377,9 @@ writes the current buffer only if nobody still reads it and no input of the
 op overlaps it through another view; otherwise the storage switches to a
 new buffer and the old one lives on through its readers' references.
 Single-view storages are *consolidated* (the op writes a fresh contiguous
-buffer, no copy); storages with views get a copy task first. Decided at
+buffer, no copy); storages with views get a copy task first. An op's reads
+of the buffer it writes in place are not counted (D5): later writers wait
+for it as the producer anyway. Decided at
 issue time on the main thread, so layouts never change after they were
 communicated. Known difference to NumPy: strides/flags of an array may
 change after an in-place op (values never do).

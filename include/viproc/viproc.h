@@ -113,6 +113,14 @@ vp_dtype vp_array_dtype(const vp_array* a);
 int vp_array_ready(vp_array* a);
 /* 1 if both arrays share their storage (base and views). */
 int vp_array_same_storage(const vp_array* a, const vp_array* b);
+/* [main thread] Size in bytes if `a`'s buffer may be overwritten by an op
+ * that takes `a` as a temporary input (docs/design/memory-management.md, D5):
+ * `a` is the only array on its storage (no views, one reference: the
+ * caller's), the buffer is pool memory (not shared with NumPy), no issued
+ * task still reads it, and `a` covers it contiguously from offset 0.
+ * 0 otherwise. Whether the *caller's* object is a temporary is for the
+ * bridge to decide. */
+size_t vp_array_reusable_bytes(const vp_array* a);
 
 /* [no GIL] Sync point: waits until `a` is ready. Returns VP_ERROR with the
  * failing op's message and issue site if a task computing it failed. */

@@ -307,7 +307,9 @@ def test_element_pool_reuses_memory_and_trims():
         r = ((x + 1.0) * 2.0) + 3.0
         assert same(r, expected)
     after = viproc.pool_stats()
-    assert after["hits"] - before["hits"] > 40  # temporaries come from the pool
+    # x + 1 takes a buffer each time (from the pool after the first); the
+    # other two ops may write into the temporary instead (D5).
+    assert after["hits"] - before["hits"] >= 15
     assert after["cached"] <= after["limit"]
     viproc.trim()
     assert viproc.pool_stats()["cached"] == 0
@@ -323,3 +325,44 @@ def test_element_pool_limit_zero_disables_caching():
         assert viproc.pool_stats()["cached"] == 0
     finally:
         viproc.set_pool_limit(limit)
+
+
+_ELISION = viproc._viproc.elision_mode()
+
+
+@pytest.mark.skipif(_ELISION == "off", reason="no safe temporary test on this platform")
+def test_temporary_elision_reuses_buffers_and_keeps_results():
+    x = viproc.asarray(rng.standard_normal(100_000))  # 800 KB: above every bound
+    xn = np.asarray(x)
+    e0 = viproc._viproc.elided()
+    r = ((x + 1.0) * 2.0) + 3.0  # two ops write into their temporary operand
+    assert viproc._viproc.elided() - e0 == 2
+    assert same(r, ((xn + 1.0) * 2.0) + 3.0)
+    e0 = viproc._viproc.elided()
+    r = -(x * 2.0)
+    assert viproc._viproc.elided() - e0 == 1
+    assert same(r, -(xn * 2.0))
+
+
+@pytest.mark.skipif(_ELISION == "off", reason="no safe temporary test on this platform")
+def test_temporary_elision_never_touches_referenced_arrays():
+    import operator
+
+    x = viproc.asarray(rng.standard_normal(100_000))
+    xn = np.asarray(x)
+    t = x * 2.0  # a named variable is not a temporary
+    e0 = viproc._viproc.elided()
+    y = t + 1.0
+    assert viproc._viproc.elided() == e0
+    assert same(t, xn * 2.0) and same(y, xn * 2.0 + 1.0)
+    items = [x * 1.0, x * 2.0]  # held by a list; sum() calls the operator from C
+    s = sum(items)
+    assert viproc._viproc.elided() == e0
+    assert same(items[0], xn) and same(s, xn * 1.0 + xn * 2.0)
+    w = operator.add(x * 2.0, 1.0)  # called from C, not by the interpreter
+    assert viproc._viproc.elided() == e0
+    assert same(w, xn * 2.0 + 1.0)
+    i = viproc.asarray(np.arange(100_000))
+    f = (i + 1) / 2  # int64 temporary, float64 result: different dtype
+    assert viproc._viproc.elided() == e0
+    assert same(f, (np.arange(100_000) + 1) / 2)

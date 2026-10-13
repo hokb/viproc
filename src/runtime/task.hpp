@@ -34,6 +34,10 @@ enum class TaskState : std::uint8_t {
 struct Operand {
     std::shared_ptr<Buffer> buffer;
     Layout layout;
+    // Input only: counted in buffer->async_reads. An op does not count reads
+    // of the buffer it writes in place: every later writer waits for it as
+    // the storage's producer anyway.
+    bool counted_read = true;
 
     std::byte* first() const { return buffer->data() + layout.offset; }
 };

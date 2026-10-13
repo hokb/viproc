@@ -219,6 +219,22 @@ void test_inout_in_place() {
     check(a->buffer().get() == before, "... writes in place (no copy)");
 }
 
+void test_inout_chain_stays_in_place() {
+    // A pending in/out op reads the buffer it writes; later writers wait for
+    // it anyway, so that read must not force them to copy-on-write.
+    Runtime rt(opts(2));
+    ArrayPtr gate = issue1(rt, add_const(0.0, 30ms), {make_ready(rt, 8, 0.0)}, 8);
+    ArrayPtr a = make_ready(rt, 8, 1.0);
+    Buffer* before = a->buffer().get();
+    std::vector<ArrayPtr> io{a};
+    for (int k = 0; k < 3; ++k) {
+        std::vector<ArrayPtr> in{gate}; // pending: the in/out ops stay pending too
+        rt.issue(add_all(), in, io, {}, "a += gate");
+    }
+    check(value(rt, a, 3) == 1.0, "in/out chain: a += gate (x3) gives the right value");
+    check(a->buffer().get() == before, "in/out chain stays in place (no copy-on-write)");
+}
+
 void test_copy_on_write() {
     Runtime rt(opts(2));
     ArrayPtr a = make_ready(rt, 8, 1.0);
@@ -646,6 +662,7 @@ int main() {
     test_continuation_on_same_thread();
     test_deep_chain_no_stack_growth();
     test_inout_in_place();
+    test_inout_chain_stays_in_place();
     test_copy_on_write();
     test_view_write_visible_in_base();
     test_view_write_waits_for_base_producer();

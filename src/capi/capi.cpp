@@ -197,6 +197,16 @@ int vp_array_same_storage(const vp_array* a, const vp_array* b) {
     return arr(a).storage() == arr(b).storage() ? 1 : 0;
 }
 
+size_t vp_array_reusable_bytes(const vp_array* a) {
+    const Array& x = arr(a);
+    const Buffer& b = *x.buffer();
+    const Layout& l = x.layout();
+    const bool ok = x.ref_count() == 1 && x.storage().use_count() == 1 && b.capacity() != 0 &&
+                    b.async_reads.load(std::memory_order_acquire) == 0 && l.offset == 0 &&
+                    l.c_contiguous() && l.nbytes() == b.nbytes();
+    return ok ? b.nbytes() : 0;
+}
+
 int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
     std::optional<TaskError> e = rt->rt->wait(arr(a));
     if (e) {

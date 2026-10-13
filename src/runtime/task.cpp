@@ -86,7 +86,9 @@ std::vector<std::shared_ptr<Task>> Task::execute() {
     // Done reading: release the inputs (and the async_reads they hold).
     for (std::size_t i = 0; i < ninputs_; ++i) {
         Operand& in = operands_[i];
-        in.buffer->async_reads.fetch_sub(1, std::memory_order_release);
+        if (in.counted_read) {
+            in.buffer->async_reads.fetch_sub(1, std::memory_order_release);
+        }
     }
     operands_.clear();
     kernel_.reset();

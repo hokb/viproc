@@ -15,6 +15,22 @@
 
 #include <string.h>
 
+/* Temporary elision (docs/design/memory-management.md, D5) needs to know
+ * that an operand is referenced only by the interpreter's value stack.
+ * CPython >= 3.14 answers that exactly. Before, a reference count of 1 is
+ * necessary but not sufficient (C code may hold a borrowed reference to an
+ * object owned elsewhere), so the C call chain is checked as NumPy does:
+ * only frames of this module and of the Python runtime between the operator
+ * slot and the bytecode interpreter. That needs glibc's backtrace() and
+ * dladdr1(). */
+#if PY_VERSION_HEX >= 0x030E0000
+#define VP_ELIDE_EXACT 1
+#elif defined(__GLIBC__)
+#define VP_ELIDE_BACKTRACE 1
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
+
 #define ERRLEN 1024
 #define MAXDIMS 64
 #define MAXIN 3 /* element-wise ufuncs have at most 3 inputs */
@@ -320,6 +336,230 @@ static const char* issue_site(void) {
     return vp_intern(g_rt, "<unknown>");
 }
 
+/* --- temporary elision (D5) ---------------------------------------------- */
+
+static unsigned long long g_elided = 0; /* ops that reused a temporary's buffer */
+
+#if defined(VP_ELIDE_BACKTRACE)
+/* Outputs smaller than this are not worth a backtrace (~1-2 us). NumPy uses
+ * the same bound for its own elision. */
+#define VP_ELIDE_MIN_BYTES (256 * 1024)
+
+enum { FRAME_OTHER = 0, FRAME_OURS, FRAME_PYTHON };
+
+/* Code address of a function (ISO C has no function -> object pointer cast). */
+typedef void (*vp_fn)(void);
+static void* code_address(vp_fn f) {
+    void* p;
+    memcpy(&p, &f, sizeof p);
+    return p;
+}
+
+/* Shared object of a return address: this module, the Python runtime or
+ * something else. Cached per address (direct-mapped). */
+static int frame_class(void* addr) {
+    static struct {
+        void* addr;
+        int cls;
+    } cache[256];
+    static void* ours = NULL;
+    static void* python = NULL;
+    if (ours == NULL) {
+        Dl_info info;
+        if (dladdr(code_address((vp_fn)frame_class), &info)) {
+            ours = info.dli_fbase;
+        }
+        if (dladdr(code_address((vp_fn)PyNumber_Add), &info)) {
+            python = info.dli_fbase;
+        }
+    }
+    const size_t slot = ((uintptr_t)addr >> 4) & 255;
+    if (cache[slot].addr == addr) {
+        return cache[slot].cls;
+    }
+    Dl_info info;
+    int cls = FRAME_OTHER;
+    if (dladdr(addr, &info)) {
+        cls = info.dli_fbase == ours     ? FRAME_OURS
+              : info.dli_fbase == python ? FRAME_PYTHON
+                                         : FRAME_OTHER;
+    }
+    cache[slot].addr = addr;
+    cache[slot].cls = cls;
+    return cls;
+}
+
+/* The two return addresses after this module's frames: the runtime's
+ * operator entry (PyNumber_Add, ...) and its caller. Entries that tail-call
+ * the slot (PyNumber_Negative) leave no frame of their own; then the first is
+ * already the caller. NULL entries if the stack is too short. */
+typedef struct {
+    void* a;
+    void* b;
+} call_chain;
+
+static call_chain operator_call_chain(void) {
+    void* frames[16];
+    const int n = backtrace(frames, 16);
+    int i = 1;
+    while (i < n && frame_class(frames[i]) == FRAME_OURS) {
+        ++i;
+    }
+    call_chain c = {NULL, NULL};
+    if (i + 1 < n && frame_class(frames[i]) == FRAME_PYTHON) {
+        c.a = frames[i];
+        c.b = frames[i + 1];
+    }
+    return c;
+}
+
+/* The call chains of all operators that may elide, as the bytecode
+ * interpreter produces them (BINARY_OP, UNARY_NEGATIVE, ...), learned once by
+ * running each operator on a probe object. Only matches elide: any other
+ * caller of PyNumber_* (C extensions, builtins such as sum()) differs. For
+ * entries that tail-call the slot, `a` is already the interpreter's call site
+ * and `b` belongs to whoever entered the interpreter; those chains match on
+ * `a` alone (`b` == NULL). Calibrating through two different entries (module
+ * code, and a function called from C) tells the two kinds apart. Recorded
+ * addresses also survive the BOLT/PGO layout of distribution builds, where
+ * symbol ranges do not. */
+#define MAX_CHAINS 32
+static call_chain g_chains[MAX_CHAINS];
+static int g_chains_n = -1;     /* -1: not calibrated yet */
+static call_chain* g_recording; /* where probe_record writes, or NULL */
+static int g_recorded;
+
+static PyObject* probe_record(PyObject* self) {
+    if (g_recording != NULL && g_recorded < MAX_CHAINS) {
+        g_recording[g_recorded++] = operator_call_chain();
+    }
+    return Py_NewRef(self);
+}
+static PyObject* probe_binary(PyObject* a, PyObject* b) {
+    (void)b;
+    return probe_record(a);
+}
+static PyNumberMethods probe_as_number = {
+    .nb_add = probe_binary,
+    .nb_subtract = probe_binary,
+    .nb_multiply = probe_binary,
+    .nb_remainder = probe_binary,
+    .nb_negative = probe_record,
+    .nb_positive = probe_record,
+    .nb_invert = probe_record,
+    .nb_lshift = probe_binary,
+    .nb_rshift = probe_binary,
+    .nb_and = probe_binary,
+    .nb_xor = probe_binary,
+    .nb_or = probe_binary,
+    .nb_floor_divide = probe_binary,
+    .nb_true_divide = probe_binary,
+    .nb_matrix_multiply = probe_binary,
+};
+static PyTypeObject ProbeType = {
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "viproc._viproc._ElisionProbe",
+    .tp_basicsize = sizeof(PyObject),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_as_number = &probe_as_number,
+    .tp_new = PyType_GenericNew,
+};
+
+static void calibrate_operator_chains(void) {
+    g_chains_n = 0;
+    call_chain run1[MAX_CHAINS], run2[MAX_CHAINS];
+    int n1 = 0, n2 = 0;
+    PyObject* globals = PyDict_New();
+    PyObject* probe =
+        PyType_Ready(&ProbeType) == 0 ? PyObject_CallNoArgs((PyObject*)&ProbeType) : NULL;
+    if (globals != NULL && probe != NULL && PyDict_SetItemString(globals, "p", probe) == 0 &&
+        PyDict_SetItemString(globals, "__builtins__", PyEval_GetBuiltins()) == 0) {
+#define VP_PROBE_OPS                                                                               \
+    "p + p; p - p; p * p; p / p; p // p; p % p\n"                                                  \
+    "p << p; p >> p; p & p; p | p; p ^ p; p @ p\n"                                                 \
+    "-p; +p; ~p\n"
+        g_recording = run1; /* entered through module code (PyEval_EvalCode) */
+        g_recorded = 0;
+        PyObject* r = PyRun_String(VP_PROBE_OPS "def f(p):\n"
+                                                "    p + p; p - p; p * p; p / p; p // p; p % p\n"
+                                                "    p << p; p >> p; p & p; p | p; p ^ p; p @ p\n"
+                                                "    -p; +p; ~p\n",
+                                   Py_file_input, globals, globals);
+        n1 = g_recorded;
+        Py_XDECREF(r);
+        PyObject* f = PyDict_GetItemString(globals, "f"); /* borrowed */
+        if (f != NULL) {
+            g_recording = run2; /* entered through a call from C */
+            g_recorded = 0;
+            r = PyObject_CallOneArg(f, probe);
+            n2 = g_recorded;
+            Py_XDECREF(r);
+        }
+        g_recording = NULL;
+#undef VP_PROBE_OPS
+    }
+    PyErr_Clear();
+    Py_XDECREF(probe);
+    Py_XDECREF(globals);
+    for (int k = 0; k < n1 && k < n2; ++k) {
+        if (run1[k].a == NULL || run1[k].a != run2[k].a) {
+            continue; /* not a stable chain: never elide on it */
+        }
+        g_chains[g_chains_n].a = run1[k].a;
+        g_chains[g_chains_n].b = run1[k].b == run2[k].b ? run1[k].b : NULL;
+        ++g_chains_n;
+    }
+}
+
+/* 1 if the operator was applied by the bytecode interpreter itself (not by C
+ * code holding a possibly borrowed reference). */
+static int called_from_interpreter(void) {
+    if (g_chains_n < 0) {
+        calibrate_operator_chains();
+    }
+    const call_chain c = operator_call_chain();
+    for (int i = 0; i < g_chains_n; ++i) {
+        if (g_chains[i].a == c.a && (g_chains[i].b == NULL || g_chains[i].b == c.b)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+#endif
+
+/* 1 if `obj` (an operand of the operator being applied) is referenced only
+ * by the interpreter's value stack, so its buffer may take the result.
+ * `nbytes` is the size of the buffer that would be reused. */
+static int is_temporary(PyObject* obj, size_t nbytes) {
+#if defined(VP_ELIDE_EXACT)
+    (void)nbytes;
+    return PyUnstable_Object_IsUniqueReferencedTemporary(obj);
+#elif defined(VP_ELIDE_BACKTRACE)
+    return Py_REFCNT(obj) == 1 && nbytes >= VP_ELIDE_MIN_BYTES && called_from_interpreter();
+#else
+    (void)obj;
+    (void)nbytes;
+    return 0; /* no safe test on this platform / Python version */
+#endif
+}
+
+/* An input of an operator whose buffer can take the result: same dtype and
+ * shape as the output, reusable per the runtime, and a temporary. */
+static PyObject* elision_candidate(PyObject* const* inputs, vp_array* const* ins, Py_ssize_t n,
+                                   int out_code, int ndim, const int64_t* shape) {
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        if (!is_array(inputs[i]) || (int)vp_array_dtype(ins[i]) != out_code ||
+            vp_array_ndim(ins[i]) != ndim ||
+            memcmp(vp_array_shape(ins[i]), shape, (size_t)ndim * sizeof(int64_t)) != 0) {
+            continue;
+        }
+        const size_t nbytes = vp_array_reusable_bytes(ins[i]);
+        if (nbytes != 0 && is_temporary(inputs[i], nbytes)) {
+            return inputs[i];
+        }
+    }
+    return NULL;
+}
+
 /* --- the ufunc fast path -------------------------------------------------- */
 
 /* Input kinds in the dtype-resolution cache key. Arrays and NumPy scalars use
@@ -477,7 +717,7 @@ static int broadcast_into(int64_t* shape, int* ndim, int nd, const int64_t* d) {
  * (new reference), 0 if the fast path does not handle the call, -1 on a
  * Python error. `out` is NULL or a viproc array. */
 static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, PyObject* out,
-                      PyObject** result) {
+                      int elide, PyObject** result) {
     if (g_rt == NULL || g_array_cls == NULL || n > MAXIN ||
         PyThread_get_thread_ident() != g_main_thread) {
         return 0;
@@ -550,6 +790,13 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             status = 1; /* casting or broadcasting into out=: fallback */
         }
     }
+    if (status == 0 && elide && out == NULL) {
+        /* Operators only (as NumPy): write into a temporary operand. */
+        out = elision_candidate(inputs, ins, n, codes[n], ndim, shape);
+        if (out != NULL) {
+            ++g_elided;
+        }
+    }
     int handled = 0;
     if (status == 0) {
         char err[ERRLEN] = "";
@@ -597,7 +844,7 @@ static PyObject* Array_array_ufunc(PyObject* self, PyObject* const* args, Py_ssi
             }
         }
         PyObject* result = NULL;
-        int r = fast_ufunc(args[0], inputs, n, out, &result);
+        int r = fast_ufunc(args[0], inputs, n, out, 0, &result);
         if (r != 0) {
             return r > 0 ? result : NULL;
         }
@@ -659,7 +906,7 @@ static PyObject* binop(const char* name, PyObject* a, PyObject* b) {
     }
     PyObject* args[2] = {a, b};
     PyObject* result = NULL;
-    int r = fast_ufunc(ufunc, args, 2, NULL, &result);
+    int r = fast_ufunc(ufunc, args, 2, NULL, 1, &result);
     if (r != 0) {
         return r > 0 ? result : NULL;
     }
@@ -676,7 +923,7 @@ static PyObject* inplace_op(const char* name, PyObject* a, PyObject* b) {
     }
     PyObject* args[2] = {a, b};
     PyObject* result = NULL;
-    int r = fast_ufunc(ufunc, args, 2, a, &result);
+    int r = fast_ufunc(ufunc, args, 2, a, 0, &result);
     if (r != 0) {
         return r > 0 ? result : NULL;
     }
@@ -694,7 +941,7 @@ static PyObject* unop(const char* name, PyObject* a) {
         return NULL;
     }
     PyObject* result = NULL;
-    int r = fast_ufunc(ufunc, &a, 1, NULL, &result);
+    int r = fast_ufunc(ufunc, &a, 1, NULL, 1, &result);
     if (r != 0) {
         return r > 0 ? result : NULL;
     }
@@ -903,6 +1150,24 @@ static PyObject* m_pool_set_limit(PyObject* self, PyObject* arg) {
     Py_RETURN_NONE;
 }
 
+static PyObject* m_elision_mode(PyObject* self, PyObject* noargs) {
+    (void)self;
+    (void)noargs;
+#if defined(VP_ELIDE_EXACT)
+    return PyUnicode_FromString("exact");
+#elif defined(VP_ELIDE_BACKTRACE)
+    return PyUnicode_FromString("backtrace");
+#else
+    return PyUnicode_FromString("off");
+#endif
+}
+
+static PyObject* m_elided(PyObject* self, PyObject* noargs) {
+    (void)self;
+    (void)noargs;
+    return PyLong_FromUnsignedLongLong(g_elided);
+}
+
 static PyObject* m_shutdown(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
@@ -1064,6 +1329,9 @@ static PyMethodDef methods[] = {
     {"offload_counts", m_offload_counts, METH_NOARGS,
      "{'inline': n, 'offloaded': m}: ops run inline / handed to workers"},
     {"pool_stats", m_pool_stats, METH_NOARGS, "Element memory pool counters."},
+    {"elided", m_elided, METH_NOARGS, "Ops that wrote into a temporary operand's buffer."},
+    {"elision_mode", m_elision_mode, METH_NOARGS,
+     "How temporaries are recognized: 'exact', 'backtrace' or 'off'."},
     {"pool_trim", m_pool_trim, METH_NOARGS, "Return all cached element memory."},
     {"pool_set_limit", m_pool_set_limit, METH_O, "Bound for cached element memory (bytes)."},
     {"workers", m_workers, METH_NOARGS, NULL},

@@ -285,9 +285,15 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         }
     }
 
-    // 3. Outputs.
+    // 3. Outputs. Count the reads; reads of a buffer this op writes in place
+    //    are not counted (see Operand::counted_read).
     for (Operand& op : in_ops) {
-        op.buffer->async_reads.fetch_add(1, std::memory_order_relaxed);
+        for (const ArrayPtr& ap : inouts) {
+            op.counted_read = op.counted_read && op.buffer != ap->storage_->buffer_;
+        }
+        if (op.counted_read) {
+            op.buffer->async_reads.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     const std::size_t ninputs = in_ops.size();
