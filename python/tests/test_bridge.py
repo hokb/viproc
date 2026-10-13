@@ -366,3 +366,30 @@ def test_temporary_elision_never_touches_referenced_arrays():
     f = (i + 1) / 2  # int64 temporary, float64 result: different dtype
     assert viproc._viproc.elided() == e0
     assert same(f, (np.arange(100_000) + 1) / 2)
+
+
+@pytest.mark.skipif(_ELISION == "off", reason="no safe temporary test on this platform")
+def test_temporary_elision_and_views():
+    x = viproc.asarray(rng.standard_normal(200_000))
+    xn = np.asarray(x).copy()
+    t = x * 2.0
+    keep = []
+
+    def stash(a):
+        keep.append(a[::2])  # a view outlives the call
+        return a
+
+    cases = [
+        (lambda: x[:] + 1.0, xn + 1.0, 0),  # view of a named array
+        (lambda: x[::2] + 1.0, xn[::2] + 1.0, 0),
+        (lambda: t[:] + 1.0, xn * 2.0 + 1.0, 0),
+        (lambda: (x * 2.0)[1:] + 1.0, (xn * 2.0)[1:] + 1.0, 0),  # offset: not the whole buffer
+        (lambda: (x * 2.0)[::2] + 1.0, (xn * 2.0)[::2] + 1.0, 0),  # strided
+        (lambda: stash(x * 2.0) + 1.0, xn * 2.0 + 1.0, 0),  # storage still has a view
+        (lambda: (x * 2.0)[:] + 1.0, xn * 2.0 + 1.0, 1),  # only array on its storage
+    ]
+    for f, expected, elisions in cases:
+        e0 = viproc._viproc.elided()
+        assert same(f(), expected)
+        assert viproc._viproc.elided() - e0 == elisions
+    assert same(x, xn) and same(t, xn * 2.0) and same(keep[0], (xn * 2.0)[::2])

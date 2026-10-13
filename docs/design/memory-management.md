@@ -264,6 +264,16 @@ An operand qualifies when, at issue time on the main thread:
    `viproc._viproc.elision_mode()` reports the mode, `_viproc.elided()`
    counts elided ops.
 
+**Views.** Rule 2 works on the storage, not on the Python object, so views
+are covered: a temporary view of a named array (`x[::2] + 1`) shares its
+storage with `x` and is never reused; neither is a temporary whose storage
+still has another view (e.g. one kept in a list). A view that is the only
+array left on its storage and covers its buffer contiguously from offset 0
+(`(x * 2)[:] + 1`) is reused, correctly: nothing else can see that buffer.
+Offset or strided views are not reused (conservative). **For D7:** once
+exports to NumPy are copy-free, a storage shared with a NumPy array must
+fail rule 2 as well (its memory is pool memory then); today exports copy.
+
 Then the op is issued with the operand as its `out=` array: an in/out op
 writing in place. That needed one change to D8's accounting: an op does not
 count its reads of the buffer it writes in place in `async_reads`
