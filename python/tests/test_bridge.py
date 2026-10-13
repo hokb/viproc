@@ -393,3 +393,61 @@ def test_temporary_elision_and_views():
         assert same(f(), expected)
         assert viproc._viproc.elided() - e0 == elisions
     assert same(x, xn) and same(t, xn * 2.0) and same(keep[0], (xn * 2.0)[::2])
+
+
+def test_export_is_copy_free_and_read_only():
+    x = viproc.asarray(rng.standard_normal(1000))
+    a, b = np.asarray(x), x.numpy()
+    assert np.shares_memory(a, b)  # both views of the viproc buffer
+    assert not a.flags.writeable
+    with pytest.raises(ValueError):
+        a[0] = 1.0  # NumPy must not write behind viproc's back
+    c = np.array(x)  # explicit copy: writable, independent
+    assert c.flags.writeable and not np.shares_memory(c, a)
+    assert np.shares_memory(np.asarray(x, copy=False), a)
+    assert np.asarray(x, dtype=np.float32).dtype == np.float32
+
+
+def test_export_keeps_copy_semantics():
+    x = viproc.asarray(np.arange(100_000, dtype=np.float64))
+    before = np.asarray(x)  # held across in-place writes
+    snapshot = before.copy()
+    x += 1.0  # pending reader (the export): x switches buffers
+    x[:10] = -5.0
+    assert same(before, snapshot)  # the export keeps what it showed
+    expected = np.arange(100_000, dtype=np.float64) + 1.0
+    expected[:10] = -5.0
+    assert same(x, expected)
+    del before
+    y = np.asarray(x)
+    x *= 2.0  # no export alive any more ... except y: copy-on-write again
+    assert same(y, expected) and same(x, expected * 2.0)
+
+
+def test_export_view_of_view_and_strides():
+    base = viproc.asarray(rng.standard_normal((40, 30)))
+    v = base[::2, 1::3]
+    a = np.asarray(v)
+    assert np.shares_memory(a, np.asarray(base))
+    assert same(a, np.asarray(base)[::2, 1::3])
+
+
+def test_creation_functions_and_fallback_results_are_adopted():
+    z = viproc.zeros(1000)
+    assert same(z, np.zeros(1000))
+    user = np.ones(5)
+    r = np.atleast_1d(viproc.asarray(user))  # fallback: returns a copy-free export view
+    assert same(r, user)
+    user[0] = 7.0  # user's array: never shared with viproc (asarray copied)
+    assert same(r, np.ones(5))
+
+
+def test_fallback_out_argument_is_written_back():
+    x = viproc.asarray(rng.standard_normal((4, 5)))
+    out = viproc.zeros(5)
+    np.sum(x, axis=0, out=out)  # function fallback with out=
+    assert same(out, np.asarray(x).sum(axis=0))
+    i = viproc.asarray(np.arange(6))
+    o = viproc.zeros(6)
+    np.add(i, 0.5, out=o)  # ufunc fallback (casting) with out=
+    assert same(o, np.arange(6) + 0.5)

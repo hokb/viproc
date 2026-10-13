@@ -195,8 +195,8 @@ ownership, release or reuse of memory.
 - Known difference to NumPy: consolidation can change the observable
   strides / flags of an array after an in-place op (`a.strides`,
   `a.flags.c_contiguous`). Values are always identical.
-- Sync points that hand memory back to plain NumPy for *writing* also
-  wait until `async_reads == 0`.
+- Memory is never handed to plain NumPy for *writing*: exports are
+  read-only and count as readers (design doc D7).
 
 ### Goals and non-goals
 
@@ -532,9 +532,16 @@ Rules:
   except `np.copyto`, which maps to assignment.
 - **Sync points:** `np.asarray(x)`, `x.numpy()`, printing, `float(x)`,
   `bool(x)`, scalar indexing, iteration, `x.wait()`, `viproc.wait_all()`.
-- `asarray` copies NumPy input (the runtime then owns the memory; the
-  user's array may be modified freely). Results of fallbacks are wrapped
-  without copy.
+- **Conversions (design doc D7):** exports (`np.asarray(x)`, `x.numpy()`,
+  `__array__`) are copy-free **read-only** NumPy views; each holds an
+  `async_reads` count on the buffer while it lives, so later in-place
+  writes to `x` copy-on-write and the export keeps its values (copy
+  semantics without a copy). Imports copy user-held NumPy arrays
+  (`asarray(nd)`, `v + nd`: the user may write `nd` later); fresh memory
+  (creation functions, fallback results that own their data and are no
+  argument) is adopted without a copy. Never give NumPy code a writable
+  view of viproc memory: NumPy calls on an ndarray bypass viproc and race
+  with the workers.
 - **Hot path in C** (`_viproc._Array`): everything that runs once per op —
   `__array_ufunc__` for element-wise calls, all Python operators (number
   protocol and rich comparisons, with NDArrayOperatorsMixin semantics,

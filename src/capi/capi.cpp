@@ -216,7 +216,7 @@ int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
     return VP_OK;
 }
 
-PyObject* vp_array_to_ndarray(const vp_array* a) { return numpy::to_ndarray(arr(a)); }
+PyObject* vp_array_export(const vp_array* a) { return numpy::export_ndarray(arr(a)); }
 
 int vp_ufunc_loop(vp_runtime* rt, PyObject* ufunc, int nin, const vp_dtype* dtypes,
                   const vp_loop** out, char* err, size_t errlen) {

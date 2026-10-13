@@ -14,6 +14,7 @@ import atexit
 import numpy as _np
 
 from . import _viproc
+from ._ndarray import _wrap_numpy
 from ._ndarray import (
     AsyncError,
     array,
@@ -34,7 +35,11 @@ __version__ = _viproc.version
 
 def _creator(np_func):
     def create(*args, **kwargs):
-        return asarray(np_func(*args, **kwargs))
+        arr = np_func(*args, **kwargs)  # fresh: adopted without a copy (D7)
+        wrapped = _wrap_numpy(arr)
+        if wrapped is None:
+            raise TypeError(f"viproc: unsupported dtype {arr.dtype}")
+        return wrapped
 
     create.__name__ = np_func.__name__
     create.__doc__ = f"Like numpy.{np_func.__name__}, returning a viproc array."

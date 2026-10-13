@@ -1285,13 +1285,13 @@ static PyObject* m_wait(PyObject* self, PyObject* o) {
     Py_RETURN_NONE;
 }
 
-static PyObject* m_to_ndarray(PyObject* self, PyObject* o) {
+static PyObject* m_export(PyObject* self, PyObject* o) {
     (void)self;
     vp_array* a = array_of(o);
     if (a == NULL || check_runtime() < 0 || wait_array(a) < 0) {
         return NULL;
     }
-    return vp_array_to_ndarray(a);
+    return vp_array_export(a);
 }
 
 static PyObject* m_assign(PyObject* self, PyObject* args) {
@@ -1342,7 +1342,7 @@ static PyMethodDef methods[] = {
     {"ready", m_ready, METH_O, NULL},
     {"same_storage", m_same_storage, METH_VARARGS, NULL},
     {"wait", m_wait, METH_O, "Sync point: wait for a, raise AsyncError on failure."},
-    {"to_ndarray", m_to_ndarray, METH_O, "Sync point: copy of a as a NumPy array."},
+    {"export", m_export, METH_O, "Sync point: read-only NumPy view of a (no copy)."},
     {"assign", m_assign, METH_VARARGS, "assign(dst, src): dst[...] = src"},
     {NULL, NULL, 0, NULL},
 };

@@ -125,8 +125,11 @@ size_t vp_array_reusable_bytes(const vp_array* a);
 /* [no GIL] Sync point: waits until `a` is ready. Returns VP_ERROR with the
  * failing op's message and issue site if a task computing it failed. */
 int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen);
-/* [GIL] New NumPy array with a copy of the data. `a` must be ready. */
-PyObject* vp_array_to_ndarray(const vp_array* a);
+/* [GIL, main thread] Copy-free export: a read-only NumPy view of the data.
+ * `a` must be ready. The view counts as a pending reader of the buffer
+ * while it lives, so later in-place writes to `a` copy-on-write and the view
+ * keeps its data (copy semantics; docs/design/memory-management.md, D7). */
+PyObject* vp_array_export(const vp_array* a);
 
 /* --- Ops (all [GIL], all asynchronous) ------------------------------------ */
 

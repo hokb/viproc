@@ -79,7 +79,12 @@ bool supported_ndarray(PyObject* arr);
 // with a Python exception set on failure).
 ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype);
 
-// New NumPy array with a copy of `a`'s data. `a` must be ready.
-PyObject* to_ndarray(const Array& a);
+// Copy-free export (docs/design/memory-management.md, D7): a read-only NumPy
+// view of `a`'s buffer, with `a`'s shape and strides. `a` must be ready. While
+// the view (or any NumPy view of it) lives, it counts as a pending reader of
+// the buffer (async_reads), so a later in-place write to `a` switches `a` to a
+// new buffer (copy-on-write) and the NumPy view keeps the data it showed:
+// copy semantics without a copy. Main thread, with the GIL.
+PyObject* export_ndarray(const Array& a);
 
 } // namespace viproc::numpy

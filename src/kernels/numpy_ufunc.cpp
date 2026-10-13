@@ -312,19 +312,48 @@ ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype) {
     return rt.wrap(std::move(l), std::move(buffer));
 }
 
-PyObject* to_ndarray(const Array& a) {
+namespace {
+
+// Base object of exported NumPy views: keeps the buffer alive and holds one
+// async_reads count on it until the last NumPy view is gone.
+constexpr const char* kExportCapsule = "viproc.export";
+
+struct ExportHold {
+    std::shared_ptr<Buffer> buffer;
+};
+
+void release_export(PyObject* capsule) {
+    std::unique_ptr<ExportHold> hold(
+        static_cast<ExportHold*>(PyCapsule_GetPointer(capsule, kExportCapsule)));
+    if (hold) {
+        hold->buffer->async_reads.fetch_sub(1, std::memory_order_release);
+    }
+}
+
+} // namespace
+
+PyObject* export_ndarray(const Array& a) {
     const Layout& l = a.layout();
     std::vector<npy_intp> shape(l.shape.begin(), l.shape.end());
     std::vector<npy_intp> strides(l.strides.begin(), l.strides.end());
-    PyObject* view =
-        PyArray_New(&PyArray_Type, static_cast<int>(shape.size()), shape.data(), type_num(l.dtype),
-                    strides.data(), a.buffer()->data() + l.offset, 0, 0, nullptr);
-    if (view == nullptr) {
+    auto hold = std::make_unique<ExportHold>(ExportHold{a.buffer()});
+    PyObject* capsule = PyCapsule_New(hold.get(), kExportCapsule, release_export);
+    if (capsule == nullptr) {
         return nullptr;
     }
-    PyObject* copy = PyArray_NewCopy(reinterpret_cast<PyArrayObject*>(view), NPY_CORDER);
-    Py_DECREF(view);
-    return copy;
+    hold->buffer->async_reads.fetch_add(1, std::memory_order_relaxed);
+    hold.release(); // owned by the capsule now
+    // Read-only: NumPy code must not write behind viproc's back.
+    PyObject* view =
+        PyArray_New(&PyArray_Type, static_cast<int>(shape.size()), shape.data(), type_num(l.dtype),
+                    strides.data(), a.buffer()->data() + l.offset, 0, NPY_ARRAY_ALIGNED, nullptr);
+    if (view == nullptr ||
+        PyArray_SetBaseObject(reinterpret_cast<PyArrayObject*>(view), capsule) < 0) {
+        Py_XDECREF(view);
+        Py_DECREF(capsule);
+        return nullptr;
+    }
+    return view; // the capsule reference went to the view
 }
 
 } // namespace viproc::numpy

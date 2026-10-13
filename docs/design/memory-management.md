@@ -22,7 +22,7 @@ Status labels:
 | D4 | Pools for the per-op runtime objects (Task, Buffer, ArrayBlock) | Implemented |
 | D5 | Reuse the buffer of a temporary input for the output | Implemented |
 | D6 | Ownership: Python owns objects, the runtime owns element memory | Implemented |
-| D7 | Array conversions viproc ↔ ndarray: copy-free in both directions | Decided (rule proposed) |
+| D7 | Array conversions viproc ↔ ndarray: copy-free export, copy-free import of fresh memory | Implemented |
 | D8 | Write-after-read safety by copy-on-write, not by locking | Implemented |
 | D9 | `viproc.ndarray` is a wrapper, not a subclass of `numpy.ndarray` | Decided, implemented |
 | D10 | Access model: pool allocations on the main thread only, releases from any thread | Implemented |
@@ -270,9 +270,8 @@ storage with `x` and is never reused; neither is a temporary whose storage
 still has another view (e.g. one kept in a list). A view that is the only
 array left on its storage and covers its buffer contiguously from offset 0
 (`(x * 2)[:] + 1`) is reused, correctly: nothing else can see that buffer.
-Offset or strided views are not reused (conservative). **For D7:** once
-exports to NumPy are copy-free, a storage shared with a NumPy array must
-fail rule 2 as well (its memory is pool memory then); today exports copy.
+Offset or strided views are not reused (conservative). Buffers exported to
+NumPy (D7) fail rule 2: a live export counts as a pending reader.
 
 Then the op is issued with the operand as its `out=` array: an in/out op
 writing in place. That needed one change to D8's accounting: an op does not
@@ -304,79 +303,75 @@ and viproc writes in place, saving memory bandwidth).
 
 ## D7 — Array conversions: viproc ↔ ndarray
 
-**Decided:** conversions between viproc arrays and NumPy arrays copy no
-element data, in both directions. A copy happens only where NumPy itself
-would copy (a different dtype, an explicit `copy=True`). **Proposed:** the
-sharing rule below, which keeps results identical to NumPy.
+**Implemented** (`numpy::export_ndarray`, C ABI `vp_array_export`;
+`python/viproc/_ndarray.py`). Exports to NumPy copy no element data;
+imports copy no element data where the memory is provably nobody else's.
+Values stay identical to NumPy in every case.
 
-### Conversion paths
+### Is NumPy only ever called by viproc?
 
-| Path | Today | Decided |
-|------|-------|---------|
-| `viproc.asarray(nd)` / `viproc.array(nd)` | copy | adopt the ndarray's memory (no copy); `viproc.array(nd)` copies, as `np.array` does by default |
-| `viproc.asarray(nd, dtype=other)` | copy + cast | one copy (the cast), as in NumPy |
-| NumPy array as operand of a viproc op (`v + nd`) | copy per op | adopt without a copy (same rule as `asarray`) |
-| Results of eager fallbacks (fresh ndarrays) | wrapped without copy | unchanged |
-| Creation functions (`viproc.zeros`, …) | NumPy creates, then copy | NumPy creates, adopted without a copy (later: allocate from the pool directly) |
-| `np.asarray(v)`, `v.__array__()`, `v.numpy()` | copy after sync | view of the viproc buffer after sync (no copy) |
-| `v.__array__(copy=True)` | copy | copy (NumPy 2 protocol) |
-| `v.__array__(copy=False)` | raises | view; raises only if a dtype change makes a copy unavoidable |
-| `v.__array__(dtype=other)` | copy + cast | one copy (the cast) |
-| Scalars (`float(v)`, `v.item()`, scalar indexing) | sync, read one element | unchanged (no array conversion) |
-| Unsupported dtypes / layouts (object, `float16`, byte-swapped, unaligned) | stay NumPy arrays | unchanged: never wrapped, eager NumPy |
+No, and that decides the design. viproc controls every access to a viproc
+array: NumPy loops run only inside tasks (inputs completed, outputs
+allocated, writes in place only without pending readers, D8), or eagerly on
+the main thread after a sync. But once a plain `numpy.ndarray` exists on
+the same memory, anyone can call NumPy on it directly: user code
+(`b[0] = 5`, `np.add(b, 1, out=b)`), libraries, C extensions. Those calls
+do not pass through viproc (`numpy.ndarray` is NumPy's own type), and they
+run on the main thread *while viproc's workers may still read or write the
+same buffer*. Synchronous with respect to the main thread is not
+synchronous with respect to the workers. So a copy-free conversion needs a
+rule for that outside access.
 
-Views map onto views: a NumPy view of an adopted array is adopted as a
-runtime view of the same storage, and exporting a viproc view returns a
-NumPy view of the same buffer, so aliasing is preserved in both directions
-(CLAUDE.md: wrapping two NumPy views separately would lose it).
+### Export: read-only view that counts as a reader
 
-### Why copy-free is safe for the kernels
+`np.asarray(v)`, `v.__array__()` and `v.numpy()` wait for `v`'s producer,
+then return a **read-only** NumPy view of the buffer (shape, strides and
+offset of `v`; views of views work). Its base object holds the buffer and
+**one `async_reads` count** until the last NumPy view on it is gone. Hence:
 
-NumPy loops need no protection: the runtime calls a loop only when all its
-inputs are `completed` and its outputs are allocated, and writes in place
-only without pending readers (D8). Writeability flags play no role for the
-loops. The risk is Python code holding a NumPy array on the same memory and
-accessing it outside the task protocol:
+- Nobody writes through the export (read-only), so concurrent viproc
+  readers are safe.
+- A later in-place write to `v` sees a pending reader and copies-on-write
+  (D8): `v` moves to a new buffer, the export keeps the values it showed.
+  These are exactly the semantics of the former copy, paid only when `v`
+  is written while an export is alive.
+- Temporary elision (D5) never reuses an exported buffer (rule 2 requires
+  `async_reads == 0`).
+- Short-lived exports (`print(v)`, `float(v)`, a NumPy function on `v`)
+  cost nothing afterwards.
+- `np.array(v)`, `__array__(copy=True)` and `v.numpy().copy()` give a
+  writable copy; `__array__(copy=False)` is allowed now, `dtype=` changes
+  cast (one copy).
+- Inside the bridge, the places where NumPy writes on viproc's behalf
+  (fallbacks with `out=`, advanced-index assignment) use writable copies
+  and assign the result back through viproc.
 
-```python
-b = np.asarray(x)   # copy-free: b views the viproc buffer
-y = x * 2           # issued asynchronously, reads the buffer later
-b[0] = 5            # main thread writes now -> y may see 5 (NumPy: no)
-```
+Measured (1e7 float64): `np.asarray(v)` 18.8 ms → 0.001 ms; `np.sum(v)`
+(eager fallback) 25 ms → 3.5 ms.
 
-```python
-x = np.ones(5)
-v = viproc.asarray(x)   # adopted without a copy
-x[0] = 7                # user still holds x -> pending tasks on v see it
-```
+### Import: adopt only memory nobody else holds
 
 "A function no longer uses an array it returned" does not hold for views
-(`a[1:]`, `a.T`, `reshape`, `df.values` into pandas' internal blocks,
-`np.frombuffer`, memmaps, cached arrays). Python's reference count tells
-exactly whether anybody else can still touch the memory: an outside
-holder, or a view, which references its base.
+(`a[1:]`, `a.T`, `df.values`, `np.frombuffer`, memmaps) or for functions
+returning an argument (`np.atleast_1d(a)`), and a user's own array may be
+written at any time. Adopted memory is therefore limited to arrays that
+provably have no other user:
 
-### Proposed sharing rule (local, per storage)
+| Path | Conversion |
+|------|-----------|
+| Creation functions (`viproc.zeros`, `ones`, `arange`, …) | NumPy creates, viproc adopts (no copy) |
+| Results of eager fallbacks | adopted if fresh: the array owns its data, has no base, is writable and is none of the call's arguments; copied otherwise |
+| `viproc.asarray(nd)`, NumPy operand in a viproc op (`v + nd`) | copy: the caller still holds `nd` and may write it |
+| `viproc.asarray(nd, dtype=other)` | one copy (the cast) |
+| Unsupported dtypes / layouts | stay NumPy arrays (eager NumPy) |
 
-- A storage that shares memory with a NumPy array keeps a reference to that
-  ndarray object.
-- **Export** (`__array__`, `numpy()`): wait for the producer and for
-  `async_reads == 0`, then return a writable ndarray view of the buffer.
-- **Import** (`asarray`, operands, fallback results): adopt the ndarray's
-  memory.
-- **Per op touching such a storage:** if the ndarray is referenced outside
-  viproc (refcount above viproc's own), the op runs synchronously: it waits
-  for its inputs, runs inline and writes in place (no copy-on-write
-  switch). Exactly NumPy semantics, views included. Once the outside
-  references are gone, ops on the storage are asynchronous again.
-- Cost: one refcount check per op, only for storages shared with NumPy.
-  Short-lived exports (`print(x)`, `np.asarray(x)` inside a library call)
-  cost nothing afterwards; an ndarray kept next to a viproc array costs
-  asynchrony for that array, never correctness.
-- Shared memory is never pooled (D3): it belongs to the ndarray and is
-  released by NumPy when the last reference to the ndarray goes.
-- Out of reach: C code keeping a raw data pointer without holding a
-  reference, which breaks Python's rules anyway.
+**Considered, not taken:** sharing a user-held ndarray and running every
+op on that storage synchronously while the ndarray is referenced outside
+viproc (refcount check per op). Correct, but `x = viproc.asarray(a)` with
+`a` still in scope (the common case) would lose all asynchrony for `x`;
+one copy at import is cheaper than that. Writable exports with the same
+rule were rejected for the same reason and because copy-on-write would
+have to be replaced by input copies for such storages.
 
 ## D8 — Write-after-read safety: copy-on-write
 
