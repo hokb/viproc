@@ -118,6 +118,26 @@ def cpu_model():
     return platform.processor() or platform.machine()
 
 
+def build_stamp():
+    """Build time of the extension module and a fingerprint of the package
+    (Python sources and extension), so a report shows which build it ran."""
+    import hashlib
+
+    import viproc
+
+    pkg = os.path.dirname(viproc.__file__)
+    h, newest = hashlib.sha256(), 0.0
+    for name in sorted(os.listdir(pkg)):
+        if name.endswith((".py", ".so", ".pyd")):
+            path = os.path.join(pkg, name)
+            with open(path, "rb") as f:
+                h.update(name.encode() + f.read())
+            if name.endswith((".so", ".pyd")):
+                newest = max(newest, os.path.getmtime(path))
+    built = datetime.datetime.fromtimestamp(newest).isoformat(timespec="seconds") if newest else "?"
+    return f"{built} #{h.hexdigest()[:8]}"
+
+
 def machine_info(cores, ram):
     import viproc
 
@@ -131,6 +151,7 @@ def machine_info(cores, ram):
         "python": sys.version.split()[0],
         "numpy": np.__version__,
         "viproc": viproc.__version__,
+        "build": build_stamp(),
         "build_type": os.environ.get("VIPROC_BUILD_TYPE", ""),
         "elision": viproc._viproc.elision_mode(),
         "blas_threads": os.environ.get("OPENBLAS_NUM_THREADS", "default"),

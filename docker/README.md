@@ -78,7 +78,11 @@ Without a mount the reports stay inside the container; the command then
 prints the `docker cp` line with this container's ID. That works only
 while the container exists: `--rm` deletes it when the command ends, so
 run it without `--rm` (or with `--name bench`, then `docker cp
-bench:/work/reports ./reports`, and `docker rm bench`). Native Windows
+bench:/work/reports/. ./reports`, and `docker rm bench`). Mind the `/.`:
+without it, an existing `./reports` gets the copy one level deeper
+(`./reports/reports/...`) and the old report stays where it was. Each
+report shows the build it measured (`build` in its header: build time of
+the extension module and a fingerprint of the package). Native Windows
 image: `docker run --rm -v "${PWD}:C:\work" viproc:windows benchmark`
 (writes `.\reports\windows`), then merge its `results.json` with others:
 `suite.py --merge A/results.json B/results.json --out DIR`.

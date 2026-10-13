@@ -74,7 +74,7 @@ benchmark)
         cat >&2 <<NOTE
 note: /work is not mounted, the reports are only inside this container.
   Copy them out (impossible after 'docker run --rm', which deletes the container):
-    docker cp $(hostname):/work/reports ./reports
+    docker cp $(hostname):/work/reports/. ./reports
   Or mount the current directory, so they land in ./reports:
     bash, zsh:   docker run --rm -v "\$PWD:/work" IMAGE benchmark ...
     PowerShell:  docker run --rm -v "\${PWD}:/work" IMAGE benchmark ...

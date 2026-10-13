@@ -65,7 +65,8 @@ def summary_markdown(run):
         f"## Parallel efficiency score: **{_fmt_score(s['score'])}** / 100",
         "",
         f"{m['label']} · {m['cpu']} · {m['cores']} cores · {_gib(m['ram_bytes'])} RAM · "
-        f"Python {m['python']} · NumPy {m['numpy']} · viproc {m['viproc']}",
+        f"Python {m['python']} · NumPy {m['numpy']} · viproc {m['viproc']}"
+        f"{' · build ' + m['build'] if m.get('build') else ''}",
         "",
         "| | |",
         "|---|---|",
@@ -322,7 +323,7 @@ def report_html(run):
 <body><main>
 <h1>viproc benchmark suite</h1>
 <p class="sub">{html.escape(m['label'])} · {html.escape(m['cpu'])} · {m['cores']} cores ·
-{_gib(m['ram_bytes'])} RAM · NumPy {m['numpy']} · {m['date']}</p>
+{_gib(m['ram_bytes'])} RAM · NumPy {m['numpy']} · {m['date']}{' · build ' + html.escape(m['build']) if m.get('build') else ''}</p>
 {_tiles(run)}
 <h2>Scores</h2>
 {_score_tables(run['summary'])}
