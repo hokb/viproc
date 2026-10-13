@@ -6,6 +6,7 @@
 #include "kernels/numpy_ufunc.hpp"
 #include "runtime/assign.hpp"
 #include "runtime/element_pool.hpp"
+#include "runtime/index.hpp"
 #include "runtime/runtime.hpp"
 
 #include <cstdio>
@@ -529,6 +530,110 @@ int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array
     ArrayPtr res;
     rt->rt->issue(k, ins, {}, std::span(&out, 1), site, std::span(&res, 1));
     *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
+namespace {
+
+// The IndexSpec of an indexing call and the shape of its result.
+bool index_spec(const Layout& view, int nidx, vp_array* const* idx, const int* idx_axes, int nres,
+                const int* result_axes, IndexSpec& spec, Shape& shape, char* err, size_t errlen) {
+    const int nd = static_cast<int>(view.shape.size());
+    for (int j = 0; j < nidx; ++j) {
+        const Layout& il = arr(idx[j]).layout();
+        Shape b;
+        if ((il.dtype != DType::Int32 && il.dtype != DType::Int64) || idx_axes[j] < 0 ||
+            idx_axes[j] >= nd || !broadcast_shapes(spec.bshape, il.shape, b)) {
+            set_error(err, errlen, "index arrays: wrong dtype, axis or shape");
+            return false;
+        }
+        spec.bshape = std::move(b);
+        spec.index_axes.push_back(idx_axes[j]);
+    }
+    for (int k = 0; k < nres; ++k) {
+        const int a = result_axes[k];
+        if (a >= nd || (a < 0 && -1 - a >= static_cast<int>(spec.bshape.size()))) {
+            set_error(err, errlen, "result axes out of range");
+            return false;
+        }
+        spec.result_axes.push_back(a);
+        shape.push_back(a >= 0 ? view.shape[static_cast<std::size_t>(a)]
+                               : spec.bshape[static_cast<std::size_t>(-1 - a)]);
+    }
+    return true;
+}
+
+} // namespace
+
+int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, const int* idx_axes,
+              int nres, const int* result_axes, const int64_t* result_strides, vp_array** result,
+              const char* site, char* err, size_t errlen) {
+    rt->graveyard->drain();
+    const Layout& v = arr(src).layout();
+    IndexSpec spec;
+    Shape shape;
+    if (!index_spec(v, nidx, idx, idx_axes, nres, result_axes, spec, shape, err, errlen)) {
+        return VP_INVALID;
+    }
+    Layout out = Layout::contiguous(v.dtype, std::move(shape));
+    if (result_strides != nullptr) {
+        out.strides.assign(result_strides, result_strides + nres);
+        if (!out.dense() && out.size() != 0) {
+            set_error(err, errlen, "gather: result strides are not dense");
+            return VP_INVALID;
+        }
+    }
+    std::vector<ArrayPtr> ins{ref(src)};
+    for (int j = 0; j < nidx; ++j) {
+        ins.push_back(ref(idx[j]));
+    }
+    ArrayPtr res;
+    rt->rt->issue(make_gather_kernel(std::move(spec)), ins, {}, std::span(&out, 1), site,
+                  std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
+int vp_scatter(vp_runtime* rt, vp_array* dst, int nidx, vp_array* const* idx, const int* idx_axes,
+               int nres, const int* result_axes, vp_array* values, const char* site, char* err,
+               size_t errlen) {
+    rt->graveyard->drain();
+    const Layout& v = arr(dst).layout();
+    IndexSpec spec;
+    Shape shape;
+    if (!index_spec(v, nidx, idx, idx_axes, nres, result_axes, spec, shape, err, errlen)) {
+        return VP_INVALID;
+    }
+    const Layout& vl = arr(values).layout();
+    Shape b;
+    if (vl.dtype != v.dtype || !broadcast_shapes(shape, vl.shape, b) || b != shape) {
+        set_error(err, errlen, "scatter: values have the wrong dtype or shape");
+        return VP_INVALID;
+    }
+    std::vector<ArrayPtr> ins{ref(values)};
+    for (int j = 0; j < nidx; ++j) {
+        ins.push_back(ref(idx[j]));
+    }
+    const ArrayPtr io[] = {ref(dst)};
+    rt->rt->issue(make_scatter_kernel(std::move(spec)), ins, io, {}, site);
+    return VP_OK;
+}
+
+int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* value, const char* site,
+                   char* err, size_t errlen) {
+    rt->graveyard->drain();
+    const Layout& d = arr(dst).layout();
+    const Layout& m = arr(mask).layout();
+    Shape b;
+    if (m.dtype != DType::Bool || arr(value).layout().dtype != d.dtype ||
+        arr(value).layout().size() != 1 || !broadcast_shapes(d.shape, m.shape, b) || b != d.shape) {
+        set_error(err, errlen, "mask assignment: wrong dtypes or shapes");
+        return VP_INVALID;
+    }
+    const ArrayPtr ins[] = {ref(value), ref(mask)};
+    const ArrayPtr io[] = {ref(dst)};
+    static const std::shared_ptr<Kernel> kernel = make_mask_assign_kernel();
+    rt->rt->issue(kernel, ins, io, {}, site);
     return VP_OK;
 }
 

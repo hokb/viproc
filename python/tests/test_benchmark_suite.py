@@ -24,7 +24,7 @@ def test_suite_runs_and_writes_reports(tmp_path):
     assert 0 < run["summary"]["score"]
     by = {(r["case"], r["dtype"]): r for r in run["results"]}
     assert by[("dtype_chains", "int16")]["not_in_viproc"] == ["int16"]
-    assert by[("gather", "float64")]["fallbacks"] > 0
+    assert by[("gather", "float64")]["fallbacks"] == 0  # gathers run as tasks
     html = (out / "report.html").read_text(encoding="utf-8")
     assert "Parallel efficiency score" in html and "gather" in html
     assert "Parallel efficiency score" in (out / "report.md").read_text(encoding="utf-8")

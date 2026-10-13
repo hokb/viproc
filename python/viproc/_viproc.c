@@ -45,6 +45,7 @@
 static vp_runtime* g_rt = NULL;
 static unsigned long g_main_thread = 0;
 static PyObject* AsyncError = NULL;
+static PyObject* AsyncIndexError = NULL; /* AsyncError and IndexError */
 
 /* Registered by _ndarray.py via _viproc.setup(). */
 static PyTypeObject* g_array_cls = NULL; /* viproc.ndarray */
@@ -271,7 +272,9 @@ static int raise_status(int status, const char* err) {
         PyErr_SetString(PyExc_ValueError, err);
         return -1;
     default:
-        PyErr_SetString(AsyncError, err);
+        /* Kernels report index errors as "IndexError: ...": raise them as an
+         * IndexError too, as NumPy would have. */
+        PyErr_SetString(strncmp(err, "IndexError: ", 12) == 0 ? AsyncIndexError : AsyncError, err);
         return -1;
     }
 }
@@ -1589,6 +1592,114 @@ static PyObject* m_arg_reduce(PyObject* self, PyObject* args) {
     return wrap_array(res);
 }
 
+/* Reads (index arrays, their axes, result axes) for gather/scatter. */
+static int read_index_args(PyObject* idx_o, PyObject* axes_o, PyObject* res_o, vp_array** idx,
+                           int* axes, int* nidx, int* res, int* nres) {
+    PyObject* fi = PySequence_Fast(idx_o, "index arrays: a sequence expected");
+    if (fi == NULL) {
+        return -1;
+    }
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(fi);
+    int64_t tmp[MAXDIMS];
+    if (n > MAXDIMS || read_dims(axes_o, tmp) != n) {
+        Py_DECREF(fi);
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_ValueError, "one axis per index array expected");
+        }
+        return -1;
+    }
+    for (Py_ssize_t j = 0; j < n; ++j) {
+        PyObject* x = PySequence_Fast_GET_ITEM(fi, j);
+        if (!PyObject_TypeCheck(x, &ArrayType)) {
+            Py_DECREF(fi);
+            PyErr_SetString(PyExc_TypeError, "index arrays must be viproc arrays");
+            return -1;
+        }
+        idx[j] = array_of(x);
+        axes[j] = (int)tmp[j];
+    }
+    Py_DECREF(fi);
+    *nidx = (int)n;
+    const int nr = read_dims(res_o, tmp);
+    if (nr < 0) {
+        return -1;
+    }
+    for (int k = 0; k < nr; ++k) {
+        res[k] = (int)tmp[k];
+    }
+    *nres = nr;
+    return 0;
+}
+
+static PyObject* m_gather(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *a, *idx_o, *axes_o, *res_o, *strides_o;
+    if (!PyArg_ParseTuple(args, "O!OOOO", &ArrayType, &a, &idx_o, &axes_o, &res_o, &strides_o) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    vp_array* idx[MAXDIMS];
+    int axes[MAXDIMS], res[MAXDIMS], nidx, nres;
+    if (read_index_args(idx_o, axes_o, res_o, idx, axes, &nidx, res, &nres) < 0) {
+        return NULL;
+    }
+    int64_t strides[MAXDIMS];
+    const int ns = strides_o == Py_None ? nres : read_dims(strides_o, strides);
+    if (ns != nres) {
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_ValueError, "one stride per result axis expected");
+        }
+        return NULL;
+    }
+    vp_array* r = NULL;
+    char err[ERRLEN] = "";
+    const int status =
+        vp_gather(g_rt, array_of(a), nidx, idx, axes, nres, res,
+                  strides_o == Py_None ? NULL : strides, &r, issue_site(), err, sizeof err);
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    return wrap_array(r);
+}
+
+static PyObject* m_scatter(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *a, *idx_o, *axes_o, *res_o, *values;
+    if (!PyArg_ParseTuple(args, "O!OOOO!", &ArrayType, &a, &idx_o, &axes_o, &res_o, &ArrayType,
+                          &values) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    vp_array* idx[MAXDIMS];
+    int axes[MAXDIMS], res[MAXDIMS], nidx, nres;
+    if (read_index_args(idx_o, axes_o, res_o, idx, axes, &nidx, res, &nres) < 0) {
+        return NULL;
+    }
+    char err[ERRLEN] = "";
+    const int status = vp_scatter(g_rt, array_of(a), nidx, idx, axes, nres, res, array_of(values),
+                                  issue_site(), err, sizeof err);
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject* m_mask_assign(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *a, *mask, *value;
+    if (!PyArg_ParseTuple(args, "O!O!O!", &ArrayType, &a, &ArrayType, &mask, &ArrayType, &value) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    char err[ERRLEN] = "";
+    const int status = vp_mask_assign(g_rt, array_of(a), array_of(mask), array_of(value),
+                                      issue_site(), err, sizeof err);
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
 static PyObject* m_issue_site(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
@@ -1633,6 +1744,11 @@ static PyMethodDef methods[] = {
      "stand_in(a): ndarray with a's layout over a dummy address (metadata-only NumPy code)"},
     {"view_of", m_view_of, METH_VARARGS,
      "view_of(a, stand_in, r): r (a view of stand_in) as a view of a, or None"},
+    {"gather", m_gather, METH_VARARGS,
+     "gather(a, idx, idx_axes, result_axes, result_strides): a[idx...] (vp_gather)"},
+    {"scatter", m_scatter, METH_VARARGS,
+     "scatter(a, idx, idx_axes, result_axes, values): a[idx...] = values (vp_scatter)"},
+    {"mask_assign", m_mask_assign, METH_VARARGS, "mask_assign(a, mask, value): a[mask] = value"},
     {"arg_reduce", m_arg_reduce, METH_VARARGS,
      "arg_reduce(argmax, a, out_shape): argmin/argmax along a's last axis (C-contiguous)"},
     {"astype", m_astype, METH_VARARGS,
@@ -1669,8 +1785,17 @@ PyMODINIT_FUNC PyInit__viproc(void) {
         "An array op that ran asynchronously failed. Raised at the next sync "
         "point touching its result; the message names where the op was issued.",
         PyExc_RuntimeError, NULL);
-    if (s_call == NULL || s_out == NULL || AsyncError == NULL ||
+    PyObject* bases = AsyncError != NULL ? PyTuple_Pack(2, AsyncError, PyExc_IndexError) : NULL;
+    AsyncIndexError =
+        bases != NULL
+            ? PyErr_NewExceptionWithDoc("viproc._viproc.AsyncIndexError",
+                                        "An index out of bounds in an asynchronous indexing op.",
+                                        bases, NULL)
+            : NULL;
+    Py_XDECREF(bases);
+    if (s_call == NULL || s_out == NULL || AsyncError == NULL || AsyncIndexError == NULL ||
         PyModule_AddObjectRef(m, "AsyncError", AsyncError) < 0 ||
+        PyModule_AddObjectRef(m, "AsyncIndexError", AsyncIndexError) < 0 ||
         PyModule_AddObjectRef(m, "_Array", (PyObject*)&ArrayType) < 0 ||
         PyModule_AddStringConstant(m, "version", vp_version()) < 0) {
         Py_DECREF(m);

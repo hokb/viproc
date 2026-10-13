@@ -191,6 +191,29 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
 int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array** result,
               const char* site, char* err, size_t errlen);
 
+/* Advanced indexing (element copies, so any element order gives NumPy's
+ * values). `idx` are `nidx` int32/int64 index arrays into the axes
+ * `idx_axes` of the view `src` / `dst`; they broadcast together. Each of the
+ * `nres` result axes comes from a non-indexed axis of the view
+ * (result_axes[k] >= 0) or from dimension d of the broadcast index shape
+ * (result_axes[k] = -1 - d); NumPy's placement rules are the caller's.
+ * Out-of-bounds indices fail the task: the next sync point raises
+ * AsyncIndexError (an IndexError). */
+/* r = src[idx...]: a new array with `result_strides` (NumPy's layout for the
+ * indexing result; NULL for C order). */
+int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, const int* idx_axes,
+              int nres, const int* result_axes, const int64_t* result_strides, vp_array** result,
+              const char* site, char* err, size_t errlen);
+/* dst[idx...] = values (dst's dtype, broadcastable to the indexing result's
+ * shape); the last of repeated indices wins, as in NumPy. */
+int vp_scatter(vp_runtime* rt, vp_array* dst, int nidx, vp_array* const* idx, const int* idx_axes,
+               int nres, const int* result_axes, vp_array* values, const char* site, char* err,
+               size_t errlen);
+/* dst[mask] = value: `value` 0-d with dst's dtype, `mask` bool broadcastable
+ * to dst. */
+int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* value,
+                   const char* site, char* err, size_t errlen);
+
 /* Issues argmax (`argmax` != 0) or argmin of `in` along its last axis with
  * NumPy's per-dtype functions, one call per row, as PyArray_ArgMax calls
  * them. `in` must be C-contiguous with at least one dimension (the bridge

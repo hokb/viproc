@@ -30,6 +30,7 @@ add_library(viproc
     src/runtime/task.cpp
     src/runtime/runtime.cpp
     src/runtime/assign.cpp
+    src/runtime/index.cpp
     src/runtime/offload.cpp)
 if(NOT VIPROC_ELEMENT_POOL)
     target_compile_definitions(viproc PRIVATE VIPROC_NO_ELEMENT_POOL)

@@ -271,6 +271,7 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
   runtime.*            Array (main-thread view), Runtime: issue protocol,
                        worker pool, trampoline, look-ahead limit, wait
   assign.*             element copy kernel (dst[...] = src)
+  index.*              gather / scatter / masked assignment (advanced indexing)
 src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
   numpy_ufunc.*        UfuncLoop / LoopCache (resolved NumPy loops),
                        element-wise kernel, wrap_ndarray / to_ndarray
@@ -588,7 +589,17 @@ Rules:
   makes a view, else an async copy first): NumPy runs them on a stand-in
   ndarray with the array's layout over a dummy address
   (`vp_array_stand_in`), and the view it returns maps back onto the
-  storage (`vp_array_view_of`);
+  storage (`vp_array_view_of`); **advanced indexing** as gather / scatter
+  tasks (`src/runtime/index.*`, element copies, so the element order does
+  not matter): integer arrays (viproc arrays may be pending), lists, ints
+  next to arrays, boolean masks (they sync: `nonzero()` gives the shape),
+  `x[mask] = scalar` without a sync (masked assignment); NumPy's
+  placement of the broadcast index dimensions (adjacent in the key or
+  first) and NumPy's result layout, taken from NumPy indexing a tiny
+  stand-in with the same axis order (cached per pattern); out-of-bounds
+  indices raise `AsyncIndexError` (an `IndexError`) at the sync point;
+  scalar indexing returns NumPy's scalar if the array is ready, else a 0-d
+  copy (no sync);
   `__setitem__` with basic keys (assign kernel); **reductions** (NumPy ≥
   2.3): `ufunc.reduce` of reorderable ufuncs (add, multiply, minimum,
   maximum, fmin, fmax, logical and/or/xor, bitwise and/or/xor) and
@@ -605,7 +616,7 @@ Rules:
   cached per (ufunc, dtype, ndim, axis, keepdims) (`_reduce_plans`).
 - **Fallback (sync + eager NumPy on viproc memory, `_Host`):** everything
   else: other reductions (`out=`, `where=`), gufuncs
-  (`matmul`), advanced indexing,
+  (`matmul`), empty advanced-index results, 0-d boolean indices,
   `ufunc.at`, other NumPy functions. NumPy's semantics exactly (design doc
   D7, "Eager fallbacks"): each viproc argument becomes a writable NumPy
   view after `vp_array_prepare_write` (wait for producer and task readers,

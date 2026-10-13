@@ -475,6 +475,197 @@ def _ravel(a, order="C"):
 _VIEW_HANDLERS = {np.reshape: _reshape, np.ravel: _ravel}
 
 
+# --- advanced indexing ---------------------------------------------------------
+# Integer array indices (and boolean masks, as their nonzero() indices) run
+# as gather / scatter tasks: element copies, so any element order gives
+# NumPy's values. NumPy's rules decide the result: the basic part of the key
+# is applied first as a view; the index arrays broadcast together, and their
+# dimensions replace the indexed axes if those are adjacent, else go first.
+# NumPy's result layout comes from NumPy itself, indexing a tiny stand-in
+# with the same axis order (extents 1 or 2, so it costs nothing).
+_layout_cache = {}
+
+
+def _parse_index(a, key):
+    """(view, index arrays, their view axes, result axes, broadcast shape,
+    key pattern) for an advanced index, or None to leave the key to NumPy.
+    Boolean masks sync (their nonzero() indices give the result's shape)."""
+    keys = key if isinstance(key, tuple) else (key,)
+    items = []  # ("b", basic item) / ("a", index) / ("m", mask as NumPy array)
+    for k in keys:
+        if k is None or k is Ellipsis or isinstance(k, slice):
+            items.append(("b", k))
+        elif isinstance(k, (bool, np.bool_)):
+            return None
+        elif isinstance(k, (int, np.integer)):
+            items.append(("i", int(k)))
+        elif isinstance(k, ndarray):
+            if k.dtype == np.bool_:
+                items.append(("m", k.numpy()))  # sync on the mask
+            elif k.dtype in (np.int32, np.int64):
+                items.append(("a", k))
+            else:
+                return None
+        else:
+            try:
+                x = np.asarray(k)
+            except Exception:
+                return None
+            if x.dtype == np.bool_:
+                items.append(("m", x))
+            elif x.dtype.kind in "iu" and x.size:
+                items.append(("a", x))
+            else:
+                return None
+    if not any(t in ("a", "m") for t, _ in items):
+        return None
+    if sum(1 for t, k in items if k is Ellipsis) > 1:
+        return None
+    consumed = 0
+    for t, k in items:
+        if t == "m":
+            if k.ndim == 0:
+                return None
+            consumed += k.ndim
+        elif not (t == "b" and (k is None or k is Ellipsis)):
+            consumed += 1
+    if consumed > a.ndim:
+        return None
+    # The basic part as a view; `pattern` is the key for that view (slices
+    # for its axes, the Ellipsis kept: NumPy's placement depends on it).
+    basic, idx, axes, pos, pattern, masks = [], [], [], [], [], []
+    vax = n = 0
+    for t, k in items:
+        if t == "b":
+            basic.append(k)
+            pattern.append(Ellipsis if k is Ellipsis else slice(None))
+            vax += a.ndim - consumed if k is Ellipsis else 1
+            n += 1
+            continue
+        group = np.nonzero(k) if t == "m" else (k,)  # a mask: one array per axis
+        if t == "m":
+            masks.append((vax, k.shape))
+        for x in group:
+            basic.append(slice(None))
+            pattern.append(len(idx))
+            idx.append(x)
+            axes.append(vax)
+            pos.append(n)
+            vax += 1
+            n += 1
+    v = a._view(tuple(basic))
+    for ax, shape in masks:
+        if v.shape[ax:ax + len(shape)] != shape:
+            return None  # NumPy raises
+    arrays = []
+    for k in idx:
+        if isinstance(k, ndarray):
+            arrays.append(k)
+        else:
+            x = np.asarray(k)
+            if x.dtype not in (np.int32, np.int64):
+                x = x.astype(np.intp)
+            arrays.append(asarray(x))
+    try:
+        bshape = np.broadcast_shapes(*(x.shape for x in arrays))
+    except ValueError:
+        return None
+    if 0 in v.shape or 0 in bshape:
+        return None
+    rest = [k for k in range(v.ndim) if k not in axes]
+    bdims = [-1 - d for d in range(len(bshape))]
+    # Adjacent in the key (NumPy: any other item between them, even an
+    # Ellipsis standing for no axes, puts the broadcast dimensions first).
+    if pos == list(range(pos[0], pos[0] + len(pos))):
+        res = [k for k in rest if k < axes[0]] + bdims + [k for k in rest if k > axes[-1]]
+    else:
+        res = bdims + rest
+    return v, arrays, axes, res, bshape, tuple(pattern)
+
+
+def _result_strides(v, arrays, axes, res, bshape, pattern):
+    """NumPy's strides for the indexing result (see above)."""
+    order = sorted(range(v.ndim), key=lambda k: -abs(v.strides[k]))
+    sig = (v.ndim, tuple(order), tuple(st < 0 for st in v.strides),
+           tuple(st == 0 for st in v.strides), tuple(n == 1 for n in v.shape), pattern,
+           tuple(tuple(n == 1 for n in x.shape) for x in arrays), v.itemsize)
+    perm = _layout_cache.get(sig)
+    if perm is None:
+        small = [1 if n == 1 else 2 for n in v.shape]
+        pstr = [0] * v.ndim
+        step = v.itemsize
+        for k in reversed(order):
+            if v.strides[k] != 0:
+                pstr[k] = step
+                step *= small[k]
+        buf = np.zeros(max(step // v.itemsize, 1), v.dtype)
+        p = np.lib.stride_tricks.as_strided(buf, shape=small, strides=pstr)
+        p = p[tuple(slice(None, None, -1) if st < 0 else slice(None) for st in v.strides)]
+        key = tuple(np.zeros([1 if n == 1 else 2 for n in arrays[k].shape], np.intp)
+                    if isinstance(k, int) else k for k in pattern)
+        r = p[key]
+        # Axes of extent 2 in memory order (innermost first); an extent-1
+        # axis has the stride of the extent-2 axes inside it: how many, its
+        # stride tells.
+        inner = sorted((k for k in range(r.ndim) if r.shape[k] != 1), key=lambda k: r.strides[k])
+        ones = {k: sum(1 for j in inner if r.strides[j] < r.strides[k])
+                for k in range(r.ndim) if r.shape[k] == 1}
+        perm = (inner, ones)
+        if len(_layout_cache) > 1024:
+            _layout_cache.clear()
+        _layout_cache[sig] = perm
+    inner, ones = perm
+    shape = [v.shape[k] if k >= 0 else bshape[-1 - k] for k in res]
+    strides = [0] * len(shape)
+    steps = [v.itemsize]
+    for k in inner:
+        strides[k] = steps[-1]
+        steps.append(steps[-1] * shape[k])
+    for k, c in ones.items():
+        strides[k] = steps[c]
+    return strides
+
+
+def _gather(a, key):
+    parsed = _parse_index(a, key)
+    if parsed is None:
+        return _NOPE
+    v, arrays, axes, res, bshape, pattern = parsed
+    strides = _result_strides(v, arrays, axes, res, bshape, pattern)
+    return _viproc.gather(v, arrays, axes, res, strides)
+
+
+def _as_values(value, dtype):
+    """`value` as a viproc array of `dtype` (NumPy's setitem conversion)."""
+    if isinstance(value, ndarray):
+        return value if value.dtype == dtype else value.astype(dtype)
+    return asarray(np.asarray(value).astype(dtype, copy=False))
+
+
+def _scatter(a, key, value):
+    if isinstance(key, (ndarray, np.ndarray)) and key.dtype == np.bool_ and (
+            np.ndim(value) == 0 and key.ndim and key.shape == a.shape[:key.ndim]):
+        # a[mask] = scalar: no count needed (where-assignment, mask broadcast
+        # over the remaining axes)
+        m = key if isinstance(key, ndarray) else asarray(key)
+        m = m[(Ellipsis,) + (None,) * (a.ndim - key.ndim)]
+        _viproc.mask_assign(a, m, _as_values(value, a.dtype))
+        return True
+    parsed = _parse_index(a, key)
+    if parsed is None:
+        return False
+    v, arrays, axes, res, bshape, _ = parsed
+    vals = _as_values(value, a.dtype)
+    shape = tuple(v.shape[k] if k >= 0 else bshape[-1 - k] for k in res)
+    try:
+        if np.broadcast_shapes(vals.shape, shape) != shape:
+            return False
+    except ValueError:
+        return False  # NumPy raises
+    _viproc.scatter(v, arrays, axes, res, vals)
+    return True
+
+
 def _is_basic_index(key):
     key = key if isinstance(key, tuple) else (key,)
     for k in key:
@@ -594,12 +785,28 @@ class ndarray(_viproc._Array):
             v = self._view(key)
             keys = key if isinstance(key, tuple) else (key,)
             if v.ndim == 0 and not any(k is Ellipsis for k in keys):
-                return v.numpy()[()]  # NumPy returns a scalar here: sync point
+                # NumPy returns a scalar: free if the data is there, else a
+                # 0-d copy (a snapshot, as NumPy's scalar) instead of a sync
+                return v.numpy()[()] if _viproc.ready(v) else v.copy()
             return v
+        if type(self) is ndarray:
+            try:
+                r = _gather(self, key)
+            except (TypeError, ValueError, IndexError):
+                r = _NOPE  # NumPy raises its own error
+            if r is not _NOPE:
+                return r
         return _host_call(lambda a, k: a[k], (self, key), {})
 
     def __setitem__(self, key, value):
         if not _is_basic_index(key):  # NumPy assigns in place, overlap included
+            if not self._readonly and type(self) is ndarray:
+                try:
+                    done = _scatter(self, key, value)
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    done = False  # NumPy raises its own error
+                if done:
+                    return
 
             def assign(a, k, v):
                 a[k] = v
@@ -609,9 +816,10 @@ class ndarray(_viproc._Array):
         if self._readonly:
             raise ValueError("assignment destination is read-only")
         target = self._view(key)
-        src = value if isinstance(value, ndarray) else None
-        if src is None or src.dtype != self.dtype:
-            src = asarray(np.asarray(_to_numpy(value)).astype(self.dtype, copy=False))
+        if isinstance(value, ndarray):
+            src = value if value.dtype == self.dtype else value.astype(self.dtype)
+        else:
+            src = asarray(np.asarray(value).astype(self.dtype, copy=False))
         _viproc.assign(target, src)
 
     # --- NumPy protocols -------------------------------------------------------
