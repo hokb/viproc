@@ -554,7 +554,8 @@ void test_offload_small_ops_run_inline() {
     ArrayPtr dep = issue1(rt, add_one_where(main), {gate}, 4096);
     check(!dep->ready(), "op with a pending input is issued asynchronously");
     rt.wait(*dep);
-    check(rt.offload_policy().inline_count() == 1, "only the small ready op ran inline");
+    check(rt.direct_count() == 1 && rt.offload_policy().inline_count() == 0,
+          "only the small ready op ran on the main thread (directly, without a task)");
 }
 
 void test_offload_adaptive_per_site() {

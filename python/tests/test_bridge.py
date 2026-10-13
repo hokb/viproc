@@ -276,8 +276,8 @@ def test_offload_policy_small_ops_inline_and_deterministic_mode():
         small = viproc.asarray(np.arange(10.0))
         before = viproc.offload_stats()
         r = small * 2
-        assert r.ready()  # ran inline: nothing to wait for
-        assert viproc.offload_stats()["inline"] == before["inline"] + 1
+        assert r.ready()  # ran on the main thread: nothing to wait for
+        assert viproc.offload_stats()["direct"] == before["direct"] + 1  # without a task
         assert same(r, np.arange(10.0) * 2)
 
         viproc.init(workers=2, sync_below=0, adaptive=False)  # deterministic: always async

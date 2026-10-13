@@ -159,6 +159,9 @@ bool single_call(std::span<const Layout* const> inputs, const Layout& out, std::
 std::shared_ptr<Kernel> make_cast_kernel(const Layout& in, const Layout& out, long buffersize,
                                          DeferRelease defer, std::string& error);
 
+// NumPy's scalar of the element at `data` (dtype `dtype`). GIL held.
+PyObject* scalar_object(DType dtype, const void* data);
+
 // A writable ndarray with `l`'s dtype, shape and strides over a dummy
 // address (see vp_array_stand_in). New reference or nullptr. GIL held.
 PyObject* stand_in(const Layout& l);

@@ -68,6 +68,9 @@ size_t vp_worker_count(const vp_runtime* rt);
 void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive);
 /* Number of ops the policy ran inline / handed to workers so far. */
 void vp_offload_counts(const vp_runtime* rt, uint64_t* inline_ops, uint64_t* offloaded_ops);
+/* Ops that ran directly on the main thread, without a task (small, all
+ * inputs ready; Runtime::issue). */
+uint64_t vp_direct_count(const vp_runtime* rt);
 size_t vp_active_tasks(const vp_runtime* rt);
 
 /* --- Element memory pool (process-wide; docs/design/memory-management.md) */
@@ -97,6 +100,9 @@ int vp_array_from_ndarray(vp_runtime* rt, PyObject* ndarray, vp_array** out, cha
  * converted to `dtype` with NumPy's rules (e.g. OverflowError for a Python
  * int out of range). Returns VP_PYERR with the Python exception set. */
 int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array** out);
+/* [GIL, main thread] NumPy's scalar of the first element of `a`, which must
+ * be ready (vp_array_ready). New reference. */
+PyObject* vp_array_scalar(const vp_array* a);
 /* [GIL] A stand-in for `a` in NumPy code that only rearranges metadata
  * (transpose, reshape without copy, real, ...): a writable ndarray with a's
  * dtype, shape and strides over a dummy address. Its data must never be
@@ -213,6 +219,12 @@ int vp_scatter(vp_runtime* rt, vp_array* dst, int nidx, vp_array* const* idx, co
  * to dst. */
 int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* value,
                    const char* site, char* err, size_t errlen);
+
+/* np.where(cond, x, y) with `cond` bool and x, y already of the result's
+ * dtype (the caller casts as NumPy does); all three broadcast. The result
+ * has NumPy's layout (order K over the three inputs). */
+int vp_select(vp_runtime* rt, vp_array* cond, vp_array* x, vp_array* y, vp_array** result,
+              const char* site, char* err, size_t errlen);
 
 /* Issues argmax (`argmax` != 0) or argmin of `in` along its last axis with
  * NumPy's per-dtype functions, one call per row, as PyArray_ArgMax calls

@@ -159,6 +159,8 @@ void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive) {
     rt->rt->set_offload_options(o);
 }
 
+uint64_t vp_direct_count(const vp_runtime* rt) { return rt->rt->direct_count(); }
+
 void vp_offload_counts(const vp_runtime* rt, uint64_t* inline_ops, uint64_t* offloaded_ops) {
     *inline_ops = rt->rt->offload_policy().inline_count();
     *offloaded_ops = rt->rt->offload_policy().offload_count();
@@ -203,6 +205,11 @@ int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_arr
     }
     *out = hand_out(std::move(a));
     return VP_OK;
+}
+
+PyObject* vp_array_scalar(const vp_array* a) {
+    const Array& x = arr(a);
+    return numpy::scalar_object(x.layout().dtype, x.buffer()->data() + x.layout().offset);
 }
 
 PyObject* vp_array_stand_in(const vp_array* a) { return numpy::stand_in(arr(a).layout()); }
@@ -616,6 +623,25 @@ int vp_scatter(vp_runtime* rt, vp_array* dst, int nidx, vp_array* const* idx, co
     }
     const ArrayPtr io[] = {ref(dst)};
     rt->rt->issue(make_scatter_kernel(std::move(spec)), ins, io, {}, site);
+    return VP_OK;
+}
+
+int vp_select(vp_runtime* rt, vp_array* cond, vp_array* x, vp_array* y, vp_array** result,
+              const char* site, char* err, size_t errlen) {
+    rt->graveyard->drain();
+    const Layout ls[] = {arr(cond).layout(), arr(x).layout(), arr(y).layout()};
+    Shape a, b;
+    if (ls[0].dtype != DType::Bool || ls[1].dtype != ls[2].dtype ||
+        !broadcast_shapes(ls[0].shape, ls[1].shape, a) || !broadcast_shapes(a, ls[2].shape, b)) {
+        set_error(err, errlen, "where: wrong dtypes or shapes");
+        return VP_INVALID;
+    }
+    Layout out = Layout::keep_order(ls[1].dtype, std::move(b), ls);
+    const ArrayPtr ins[] = {ref(cond), ref(x), ref(y)};
+    ArrayPtr res;
+    static const std::shared_ptr<Kernel> kernel = make_select_kernel();
+    rt->rt->issue(kernel, ins, {}, std::span(&out, 1), site, std::span(&res, 1));
+    *result = hand_out(std::move(res));
     return VP_OK;
 }
 

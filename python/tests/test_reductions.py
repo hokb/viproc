@@ -146,7 +146,10 @@ def test_reductions_run_asynchronously_without_syncs():
     ]
     assert fallbacks() == f0  # nothing ran eagerly, nothing synced
     for got, expected in results:
-        assert isinstance(got, viproc.ndarray)
+        # 0-d results: NumPy's scalar if the data was there already, else a
+        # pending 0-d array that behaves as one
+        assert isinstance(got, viproc.ndarray if np.ndim(expected) else (viproc.ndarray,
+                                                                         np.generic))
         assert same(got, expected)
 
 
@@ -282,6 +285,6 @@ def test_argmin_argmax_run_asynchronously(dtype):
             for fn in (np.argmax, np.argmin):
                 for kw in [{}, {"keepdims": True}] + [{"axis": i} for i in range(-a.ndim, a.ndim)]:
                     got = fn(v, **kw)
-                    assert isinstance(got, viproc.ndarray)
+                    assert isinstance(got, (viproc.ndarray, np.generic))
                     assert same(got, fn(a, **kw)), (fn.__name__, shape, kw)
     assert fallbacks() == f0

@@ -35,4 +35,9 @@ std::shared_ptr<Kernel> make_scatter_kernel(IndexSpec spec);
 // Operands: inputs = {value, mask, dst (in/out)}, outputs = {dst}.
 std::shared_ptr<Kernel> make_mask_assign_kernel();
 
+// np.where(cond, x, y): out = cond ? x : y element by element, all three
+// (bool cond; x, y of out's dtype) broadcast to out. Operands: inputs =
+// {cond, x, y}, outputs = {out}.
+std::shared_ptr<Kernel> make_select_kernel();
+
 } // namespace viproc

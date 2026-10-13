@@ -46,7 +46,9 @@ def _env_policy():
 def _ensure_runtime():
     if not _viproc.initialized():
         workers = int(os.environ.get("VIPROC_WORKERS", "0"))
-        _viproc.init(workers, 0, *_env_policy())
+        sync_below, adaptive = _env_policy()
+        _viproc.init(workers, 0, sync_below, adaptive)
+        _small_ops[0] = 2048 if sync_below < 0 else sync_below
 
 
 def _wrap_numpy(arr):
@@ -239,7 +241,19 @@ def _reduce(ufunc, a, axis=None, keepdims=False, dtype=None, initial=_NV):
         return None
     flags, keep, requested = plan
     start = ufunc.identity if initial is _NV else initial
-    return _viproc.reduce(ufunc, a, flags, keep, requested, start)
+    r = _viproc.reduce(ufunc, a, flags, keep, requested, start)
+    return _scalar_result(r) if r is not None and r.ndim == 0 else r
+
+
+def _scalar_result(r):
+    """A 0-d result NumPy returns as a scalar: NumPy's scalar if the data is
+    there already (it ran directly), else the pending 0-d array, marked so
+    that in-place operators rebind it as they rebind NumPy's scalars."""
+    s = _viproc.scalar(r)
+    if s is not None:
+        return s
+    r._scalar = True
+    return r
 
 
 def _reduced_count(a, axis):
@@ -354,17 +368,9 @@ def _r_var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=_NV, *, where=_N
     if v is None:
         v = np.add.reduce(x, axis=axis, dtype=dtype, keepdims=keepdims is True)
     v = _divide_by_count(v, max(count - ddof, 0))
-    return np.sqrt(v, out=v) if sqrt else v
-
-
-def _c_contiguous(a):
-    step = a.itemsize
-    for n, st in zip(reversed(a.shape), reversed(a.strides)):
-        if n != 1:
-            if st != step:
-                return False
-            step *= n
-    return True
+    if not sqrt:
+        return v
+    return np.sqrt(v, out=v) if isinstance(v, ndarray) else np.sqrt(v)
 
 
 def _r_arg(argmax):
@@ -389,10 +395,12 @@ def _r_arg(argmax):
             shape = src.shape[:-1]
             if keep:
                 shape = shape[:ax] + (1,) + shape[ax:]
-        if not _c_contiguous(src):
+        if not src._c_contiguous:
             src = src.astype(src.dtype, order="C")
         r = _viproc.arg_reduce(argmax, src, shape)
-        return _NOPE if r is None else r
+        if r is None:
+            return _NOPE
+        return _scalar_result(r) if r.ndim == 0 else r
 
     return handler
 
@@ -472,7 +480,30 @@ def _ravel(a, order="C"):
     return _reshape(a, -1)
 
 
-_VIEW_HANDLERS = {np.reshape: _reshape, np.ravel: _ravel}
+def _where(condition, *xy):
+    """np.where(cond, x, y) as a select task: the result dtype as NumPy's
+    (np.result_type, Python scalars weak), x and y cast to it, cond as bool."""
+    if len(xy) != 2:
+        return _NOPE  # np.where(cond): nonzero, data-dependent shape
+    try:
+        dtype = np.result_type(*(a.dtype if isinstance(a, ndarray) else a for a in xy))
+    except TypeError:
+        return _NOPE
+    if dtype not in _CODES:
+        return _NOPE
+    ops = []
+    for a, want in ((condition, np.dtype(np.bool_)), (xy[0], dtype), (xy[1], dtype)):
+        if isinstance(a, ndarray):
+            if type(a) is not ndarray:
+                return _NOPE
+            ops.append(a if a.dtype == want else a.astype(want))
+        else:
+            ops.append(asarray(np.asarray(a).astype(want)))
+    r = _viproc.select(*ops)
+    return _scalar_result(r) if r.ndim == 0 else r
+
+
+_VIEW_HANDLERS = {np.reshape: _reshape, np.ravel: _ravel, np.where: _where}
 
 
 # --- advanced indexing ---------------------------------------------------------
@@ -626,6 +657,19 @@ def _result_strides(v, arrays, axes, res, bshape, pattern):
     return strides
 
 
+_INDEX_DTYPES = (np.dtype(np.int64), np.dtype(np.int32))
+
+
+def _gather_fast(a, key):
+    """a[idx] for one integer viproc array on C-contiguous data, the common
+    case: NumPy's result is in C order (index dimensions, then the remaining
+    axes). None if the key is not like that."""
+    if key.dtype in _INDEX_DTYPES and a.ndim and a.size and key.size and a._c_contiguous:
+        res = [-1 - d for d in range(key.ndim)] + list(range(1, a.ndim))
+        return _viproc.gather(a, (key,), (0,), res, None)
+    return None
+
+
 def _gather(a, key):
     parsed = _parse_index(a, key)
     if parsed is None:
@@ -666,6 +710,22 @@ def _scatter(a, key, value):
     return True
 
 
+# Ops on at most this many elements whose data is ready run right away
+# (Runtime::issue's direct path; small advanced indexing in NumPy itself).
+_small_ops = [2048]
+
+
+def _ready_key(key):
+    keys = key if isinstance(key, tuple) else (key,)
+    return all(not isinstance(k, ndarray) or _viproc.ready(k) for k in keys)
+
+
+def _numpy_key(key):
+    if isinstance(key, tuple):
+        return tuple(k.numpy() if isinstance(k, ndarray) else k for k in key)
+    return key.numpy() if isinstance(key, ndarray) else key
+
+
 def _is_basic_index(key):
     key = key if isinstance(key, tuple) else (key,)
     for k in key:
@@ -690,10 +750,6 @@ class ndarray(_viproc._Array):
     __array_priority__ = 100
 
     # --- metadata (no sync) -------------------------------------------------
-    @property
-    def size(self):
-        return int(np.prod(self.shape, dtype=np.int64))
-
     @property
     def itemsize(self):
         return self.dtype.itemsize
@@ -781,15 +837,26 @@ class ndarray(_viproc._Array):
         return _viproc.view_of(self, fake, fake[keys])
 
     def __getitem__(self, key):
+        r = _viproc.item(self, key)  # a[i, j] of ready data: NumPy's scalar, fast
+        if r is not None:
+            return r
         if _is_basic_index(key):
             v = self._view(key)
             keys = key if isinstance(key, tuple) else (key,)
             if v.ndim == 0 and not any(k is Ellipsis for k in keys):
                 # NumPy returns a scalar: free if the data is there, else a
                 # 0-d copy (a snapshot, as NumPy's scalar) instead of a sync
-                return v.numpy()[()] if _viproc.ready(v) else v.copy()
+                return _scalar_result(v.copy()) if not _viproc.ready(v) else _viproc.scalar(v)
             return v
         if type(self) is ndarray:
+            if type(key) is ndarray:  # a[idx]: the gather's own fast path first
+                r = _gather_fast(self, key)
+                if r is not None:
+                    return r
+            if self.size <= _small_ops[0] and _viproc.ready(self) and _ready_key(key):
+                # Small and ready: nothing to overlap, NumPy indexes right away
+                # (advanced indexing always copies: the result is fresh).
+                return _adopt(np.asarray(self.numpy()[_numpy_key(key)]))
             try:
                 r = _gather(self, key)
             except (TypeError, ValueError, IndexError):
@@ -1011,13 +1078,15 @@ def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
     """
     env_sync, env_adaptive = _env_policy()
     shutdown()
-    _viproc.init(workers, max_active_tasks,
-                 env_sync if sync_below is None else sync_below,
+    sync_below = env_sync if sync_below is None else sync_below
+    _viproc.init(workers, max_active_tasks, sync_below,
                  env_adaptive if adaptive is None else adaptive)
+    _small_ops[0] = 2048 if sync_below < 0 else sync_below
 
 
 def offload_stats():
-    """{'inline': n, 'offloaded': m}: ready ops run inline / handed to workers."""
+    """{'inline': n, 'offloaded': m, 'direct': d}: ready ops run inline as a task /
+    handed to workers / run directly without a task (small, inputs ready)."""
     _ensure_runtime()
     return _viproc.offload_counts()
 

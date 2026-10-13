@@ -109,13 +109,18 @@ def test_integer_array_indexing_runs_asynchronously():
 
 
 def test_out_of_bounds_indices_raise_index_error_at_the_sync_point():
-    v = viproc.asarray(np.arange(10.0))
-    idx = viproc.asarray(np.array([1, 12]))
+    v = viproc.asarray(np.arange(10000.0))  # large: a gather task
+    idx = viproc.asarray(np.array([1, 12000]))
     r = v[idx]
-    with pytest.raises(IndexError, match="index 12 is out of bounds"):
+    with pytest.raises(IndexError, match="index 12000 is out of bounds"):
         np.asarray(r)
     with pytest.raises(IndexError):
-        np.asarray(v[[3, -11]])
+        np.asarray(v[[3, -10001]])
+    small = viproc.asarray(np.arange(10.0))  # small and ready: NumPy, right away
+    with pytest.raises(IndexError):
+        small[[1, 12]]
+    with pytest.raises(IndexError, match="out of bounds for axis 0 with size 10"):
+        small[10]
 
 
 def test_repeated_indices_last_write_wins_as_in_numpy():
@@ -176,3 +181,21 @@ def test_scalar_indexing_of_pending_arrays_does_not_sync():
     ready = viproc.asarray(x)
     viproc.wait_all()
     assert isinstance(ready[0, 1], np.float64)  # ready data: NumPy's scalar
+
+
+def test_where_runs_as_a_select_task():
+    rng = np.random.default_rng(8)
+    f0 = fallbacks()
+    for dx, dy in [("f8", "f8"), ("f4", "i8"), ("i4", "f4"), ("?", "c8")]:
+        c = rng.random((30, 20)) < 0.5
+        x = (rng.standard_normal((30, 20)) * 5).astype(dx)
+        y = (rng.standard_normal(20) * 5).astype(dy)
+        vc, vx, vy = viproc.asarray(c), viproc.asarray(x), viproc.asarray(y)
+        for got, expected in [(np.where(vc, vx, vy), np.where(c, x, y)),
+                              (np.where(vx > 0, vx, 0.5), np.where(x > 0, x, 0.5)),
+                              (np.where(vc.T, vx.T, 1), np.where(c.T, x.T, 1)),
+                              (np.where(vx, vx, vy), np.where(x, x, y))]:
+            g = np.asarray(got)
+            assert g.dtype == expected.dtype and g.strides == expected.strides
+            assert np.array_equal(g, expected)
+    assert fallbacks() == f0

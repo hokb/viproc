@@ -271,7 +271,7 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
   runtime.*            Array (main-thread view), Runtime: issue protocol,
                        worker pool, trampoline, look-ahead limit, wait
   assign.*             element copy kernel (dst[...] = src)
-  index.*              gather / scatter / masked assignment (advanced indexing)
+  index.*              gather / scatter / masked assignment / select (indexing, np.where)
 src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
   numpy_ufunc.*        UfuncLoop / LoopCache (resolved NumPy loops),
                        element-wise kernel, wrap_ndarray / to_ndarray
@@ -389,9 +389,18 @@ reference counting.
   hand-off is pure latency. Hybrid policy, after the ILNumerics
   Accelerator's "scalar shortcut" and "adaptive fork suppression":
   1. **`sync_below` (N_min, default 2048 output elements):** smaller ready
-     tasks always run inline. Deterministic, one comparison. Calibrated
-     with `strong_scaling.py` (4 CPUs, sin/cos chains): inline wins up to
-     ~1000 elements, async from ~3000.
+     ops always run on the main thread. Deterministic, one comparison.
+     Calibrated with `strong_scaling.py` (4 CPUs, sin/cos chains): inline
+     wins up to ~1000 elements, async from ~3000. Such an op takes the
+     **direct path** (`Runtime::issue_direct`): no task at all. Its kernel
+     runs right in `issue()` and its outputs are created ready; in/outs
+     qualify when nothing reads them and no input reads them through
+     another view (else copy-on-write: the task path). A kernel error is
+     stored on the outputs and raised at their sync point, as with a
+     task. Before, such ops built a task and ran it inline: the threshold
+     decided *where* an op ran, not whether it paid for the task protocol
+     (task, operand capture, read counting, look-ahead slot, completion),
+     ~1 µs per op even for scalars. `offload_stats()["direct"]` counts them.
   2. **Adaptive above N_min, per (issue site, log2 size class):** count
      async issues and how many of their results the main thread accessed
      "right away" — a sync point within `window` = 2 issued ops of the
@@ -599,7 +608,8 @@ Rules:
   stand-in with the same axis order (cached per pattern); out-of-bounds
   indices raise `AsyncIndexError` (an `IndexError`) at the sync point;
   scalar indexing returns NumPy's scalar if the array is ready, else a 0-d
-  copy (no sync);
+  copy (no sync); `np.where(cond, x, y)` as a select task (NumPy's result
+  dtype, x and y cast to it, layout order K);
   `__setitem__` with basic keys (assign kernel); **reductions** (NumPy ≥
   2.3): `ufunc.reduce` of reorderable ufuncs (add, multiply, minimum,
   maximum, fmin, fmax, logical and/or/xor, bitwise and/or/xor) and
@@ -610,10 +620,22 @@ Rules:
   count in the promoted dtype and cast back; squared deviations, for
   complex data through NumPy's float view of the deviations);
   `argmin`/`argmax` (NumPy's per-dtype functions, one call per row of a
-  C-contiguous copy with the axis last, as `PyArray_ArgMax`). Results
-  are viproc arrays (0-d for full reductions), not NumPy scalars;
-  `float()`, `bool()`, `format()`, `round()` sync. Per-call preparation is
-  cached per (ufunc, dtype, ndim, axis, keepdims) (`_reduce_plans`).
+  C-contiguous copy with the axis last, as `PyArray_ArgMax`). Per-call
+  preparation is cached per (ufunc, dtype, ndim, axis, keepdims)
+  (`_reduce_plans`).
+- **0-d results and the scalar shortcut.** Where NumPy returns a scalar
+  (full reductions, `a[i, j]`, ufuncs on 0-d operands), viproc returns
+  NumPy's scalar if the data is there already (the op ran directly), else
+  a pending 0-d array marked `_scalar`: in-place operators on it rebind
+  (as on NumPy's immutable scalars; a plain 0-d array keeps NumPy's
+  in-place semantics). An operator or ufunc call whose operands are all
+  scalars (ready 0-d viproc arrays, Python and NumPy scalars) has nothing
+  to run asynchronously: the C hot path converts them to NumPy scalars
+  and lets NumPy compute it right there (`scalars_of`; operators as NumPy
+  scalar math, ufunc calls as NumPy's ufunc), returning NumPy's scalar,
+  as the NumPy program would. Any n-d operand, even of one element, keeps
+  the array path and NumPy's output shape. `float()`, `bool()`,
+  `format()`, `round()` of a pending 0-d array sync.
 - **Fallback (sync + eager NumPy on viproc memory, `_Host`):** everything
   else: other reductions (`out=`, `where=`), gufuncs
   (`matmul`), empty advanced-index results, 0-d boolean indices,

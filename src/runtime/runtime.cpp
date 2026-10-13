@@ -3,6 +3,7 @@
 #include "pool.hpp"
 
 #include <algorithm>
+#include <cfenv>
 #include <chrono>
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
@@ -222,6 +223,14 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
                     std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
                     const char* issue_site, std::span<ArrayPtr> results, std::int64_t work_elements,
                     std::span<const std::shared_ptr<Buffer>> output_buffers) {
+    const std::int64_t elements = work_elements >= 0     ? work_elements
+                                  : !new_outputs.empty() ? new_outputs[0].size()
+                                  : !inouts.empty()      ? inouts[0]->layout_.size()
+                                                         : 0;
+    if (issue_direct(kernel, inputs, inouts, new_outputs, issue_site, results, elements,
+                     output_buffers)) {
+        return;
+    }
     // The task first (back-pressure: wait for a slot before creating it), so
     // the operands are built in place.
     acquire_slot();
@@ -331,11 +340,79 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     // output memory from the pool right here (memory-management.md, D10).
     task->advance(TaskState::SizeCompleted);
     task->advance(TaskState::Allocated);
-    const std::int64_t elements = work_elements >= 0     ? work_elements
-                                  : !new_outputs.empty() ? new_outputs[0].size()
-                                  : !inouts.empty()      ? inouts[0]->layout_.size()
-                                                         : 0;
     launch(task, producers, elements);
+}
+
+bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
+                           std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
+                           const char* issue_site, std::span<ArrayPtr> results,
+                           std::int64_t elements,
+                           std::span<const std::shared_ptr<Buffer>> output_buffers) {
+    if (options_.should_offload || elements >= policy_.options().sync_below) {
+        return false;
+    }
+    for (const ArrayPtr& a : inputs) {
+        Storage& s = *a->storage_;
+        if (!s.ready() || s.last_error_) {
+            return false;
+        }
+    }
+    for (const ArrayPtr& a : inouts) {
+        Storage& s = *a->storage_;
+        if (!s.ready() || s.last_error_ || s.buffer_->has_readers()) {
+            return false; // copy-on-write or upstream errors: the task path
+        }
+        for (const ArrayPtr& in : inputs) {
+            if (in->storage_ == a->storage_ && !same_view(in->layout_, a->layout_)) {
+                return false;
+            }
+        }
+    }
+    Operands ops;
+    for (const ArrayPtr& a : inputs) {
+        ops.push_back({a->storage_->buffer_, a->layout_, false});
+    }
+    for (const ArrayPtr& a : inouts) {
+        ops.push_back({a->storage_->buffer_, a->layout_, false});
+    }
+    const std::size_t ninputs = ops.size();
+    for (const ArrayPtr& a : inouts) {
+        ops.push_back({a->storage_->buffer_, a->layout_, false});
+    }
+    for (std::size_t i = 0; i < new_outputs.size(); ++i) {
+        const Layout& l = new_outputs[i];
+        if (i < output_buffers.size() && output_buffers[i]) {
+            ops.push_back({output_buffers[i], l, false});
+            results[i] = new_array(l, output_buffers[i], nullptr);
+            continue;
+        }
+        Layout contiguous = l.dense() ? l : Layout::contiguous(l.dtype, l.shape);
+        auto buffer = make_pooled<Buffer>(contiguous.nbytes());
+        ops.push_back({buffer, contiguous, false});
+        results[i] = new_array(std::move(contiguous), std::move(buffer), nullptr);
+    }
+    ++seq_;
+    ++direct_;
+    std::feclearexcept(FE_ALL_EXCEPT);
+    KernelResult r;
+    try {
+        r = kernel->run(std::span<const Operand>(ops.data(), ninputs),
+                        std::span<const Operand>(ops.data() + ninputs, ops.size() - ninputs));
+    } catch (const std::exception& e) {
+        r = KernelResult{1, e.what(), 0};
+    } catch (...) {
+        r = KernelResult{1, "unknown exception in kernel", 0};
+    }
+    if (r.status != 0) {
+        const TaskError e{std::move(r.message), issue_site};
+        for (const ArrayPtr& a : inouts) {
+            a->storage_->last_error_ = e;
+        }
+        for (std::size_t i = 0; i < new_outputs.size(); ++i) {
+            results[i]->storage_->last_error_ = e;
+        }
+    }
+    return true;
 }
 
 void Runtime::trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t elements) {

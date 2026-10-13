@@ -55,6 +55,7 @@ static PyObject* g_asarray = NULL;       /* asarray(ndarray) -> viproc.ndarray *
 static PyObject* g_internal_dirs = NULL; /* tuple of path prefixes skipped for issue sites */
 static PyObject* g_np_ndarray = NULL;    /* numpy.ndarray */
 static PyObject* g_np_generic = NULL;    /* numpy.generic */
+static PyObject* g_np_integer = NULL;    /* numpy.integer */
 static PyObject* g_ops = NULL;           /* dict: operator name -> ufunc */
 
 /* Caches (main thread only). */
@@ -153,6 +154,7 @@ static PyObject* s_out = NULL;  /* "out" */
 typedef struct {
     PyObject_HEAD vp_array* a;
     int readonly; /* NumPy's WRITEABLE == False (e.g. views NumPy made read-only) */
+    int scalar;   /* 0-d result NumPy returns as a scalar (reductions, a[i]) */
 } ArrayObject;
 
 static PyTypeObject ArrayType; /* forward */
@@ -219,6 +221,21 @@ static PyObject* Array_get_dtype(ArrayObject* self, void* c) {
     return Py_NewRef(d);
 }
 
+static PyObject* Array_get_scalar(ArrayObject* self, void* c) {
+    (void)c;
+    return PyBool_FromLong(self->scalar);
+}
+
+static int Array_set_scalar(ArrayObject* self, PyObject* v, void* c) {
+    (void)c;
+    const int t = v != NULL ? PyObject_IsTrue(v) : 0;
+    if (t < 0) {
+        return -1;
+    }
+    self->scalar = t;
+    return 0;
+}
+
 static PyObject* Array_get_readonly(ArrayObject* self, void* c) {
     (void)c;
     return PyBool_FromLong(self->readonly);
@@ -234,7 +251,32 @@ static int Array_set_readonly(ArrayObject* self, PyObject* v, void* c) {
     return 0;
 }
 
+static int c_contiguous(const vp_array* a);
+
+static PyObject* Array_get_size(ArrayObject* self, void* c) {
+    (void)c;
+    const int nd = vp_array_ndim(self->a);
+    const int64_t* shape = vp_array_shape(self->a);
+    long long n = 1;
+    for (int i = 0; i < nd; ++i) {
+        n *= (long long)shape[i];
+    }
+    return PyLong_FromLongLong(n);
+}
+
+static PyObject* Array_get_c_contiguous(ArrayObject* self, void* c) {
+    (void)c;
+    return PyBool_FromLong(c_contiguous(self->a));
+}
+
 static PyGetSetDef Array_getset[] = {
+    {"size", (getter)Array_get_size, NULL, "Number of elements (no sync).", NULL},
+    {"_c_contiguous", (getter)Array_get_c_contiguous, NULL,
+     "C-contiguous, as NumPy's flag (no sync).", NULL},
+    {"_scalar", (getter)Array_get_scalar, (setter)Array_set_scalar,
+     "0-d result NumPy would return as a scalar: in-place operators rebind, as on NumPy's "
+     "scalars",
+     NULL},
     {"_readonly", (getter)Array_get_readonly, (setter)Array_set_readonly,
      "True if writes raise, as for a NumPy array with WRITEABLE == False.", NULL},
     {"shape", (getter)Array_get_shape, NULL, "Shape (no sync).", NULL},
@@ -687,6 +729,52 @@ static PyObject* elision_candidate(PyObject* const* inputs, vp_array* const* ins
     return NULL;
 }
 
+/* --- scalar shortcut ------------------------------------------------------ */
+
+/* An op on scalars only (ready 0-d viproc arrays, Python and NumPy scalars)
+ * has nothing to run asynchronously: NumPy computes it right here, on NumPy
+ * scalars, as the NumPy program would (its 0-d values are NumPy scalars:
+ * reductions and scalar indexing return them, and ufuncs on 0-d arrays do
+ * too). Its result is NumPy's: a NumPy scalar. Any n-d operand (even of one
+ * element) keeps the array path, so NumPy's output shapes stay as they
+ * are. Fills `out` with new references and returns 1, or 0 if an operand is
+ * not a ready scalar. */
+static int scalars_of(PyObject* const* inputs, Py_ssize_t n, PyObject** out) {
+    if (g_rt == NULL || n > MAXIN) {
+        return 0;
+    }
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject* x = inputs[i];
+        if (is_array(x)) {
+            vp_array* a = ((ArrayObject*)x)->a;
+            if (vp_array_ndim(a) != 0 || !vp_array_ready(a)) {
+                return 0;
+            }
+        } else if (!(PyFloat_CheckExact(x) || PyLong_CheckExact(x) || PyBool_Check(x) ||
+                     PyComplex_CheckExact(x) ||
+                     PyObject_TypeCheck(x, (PyTypeObject*)g_np_generic))) {
+            return 0;
+        }
+    }
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject* x = inputs[i];
+        out[i] = is_array(x) ? vp_array_scalar(((ArrayObject*)x)->a) : Py_NewRef(x);
+        if (out[i] == NULL) {
+            for (Py_ssize_t j = 0; j < i; ++j) {
+                Py_DECREF(out[j]);
+            }
+            return -1;
+        }
+    }
+    return 1;
+}
+
+static void release_all(PyObject** objs, Py_ssize_t n) {
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        Py_DECREF(objs[i]);
+    }
+}
+
 /* --- the ufunc fast path -------------------------------------------------- */
 
 /* Input kinds in the dtype-resolution cache key. Arrays and NumPy scalars use
@@ -934,6 +1022,9 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
                                 err, sizeof err);
         if (st == VP_OK) {
             *result = out != NULL ? Py_NewRef(out) : wrap_array(res);
+            if (out == NULL && *result != NULL && ndim == 0) {
+                ((ArrayObject*)*result)->scalar = 1; /* NumPy returns a scalar */
+            }
             handled = *result != NULL ? 1 : -1;
         } else if (st != VP_UNSUPPORTED) {
             raise_status(st, err);
@@ -969,6 +1060,18 @@ static PyObject* Array_array_ufunc(PyObject* self, PyObject* const* args, Py_ssi
                 out = PyTuple_GET_ITEM(o, 0);
             } else {
                 goto fallback;
+            }
+        }
+        if (out == NULL) {
+            PyObject* sc[MAXIN];
+            const int k = scalars_of(inputs, n, sc);
+            if (k < 0) {
+                return NULL;
+            }
+            if (k > 0) {
+                PyObject* r = PyObject_Vectorcall(args[0], sc, (size_t)n, NULL);
+                release_all(sc, n);
+                return r;
             }
         }
         PyObject* result = NULL;
@@ -1024,9 +1127,19 @@ static int defers(PyObject* other) {
     return r;
 }
 
-static PyObject* binop(const char* name, PyObject* a, PyObject* b) {
+static PyObject* binop(const char* name, binaryfunc scalar_op, PyObject* a, PyObject* b) {
     if (defers(is_array(a) ? b : a)) {
         Py_RETURN_NOTIMPLEMENTED;
+    }
+    PyObject* sc[2];
+    PyObject* in2[2] = {a, b};
+    const int k = scalar_op != NULL ? scalars_of(in2, 2, sc) : 0;
+    if (k != 0) {
+        PyObject* r = k > 0 ? scalar_op(sc[0], sc[1]) : NULL;
+        if (k > 0) {
+            release_all(sc, 2);
+        }
+        return r;
     }
     PyObject* ufunc = op_ufunc(name);
     if (ufunc == NULL) {
@@ -1041,9 +1154,13 @@ static PyObject* binop(const char* name, PyObject* a, PyObject* b) {
     return PyObject_CallFunctionObjArgs(ufunc, a, b, NULL); /* NumPy dispatch -> fallback */
 }
 
-static PyObject* inplace_op(const char* name, PyObject* a, PyObject* b) {
+static PyObject* inplace_op(const char* name, binaryfunc scalar_op, PyObject* a, PyObject* b) {
     if (defers(b)) {
         Py_RETURN_NOTIMPLEMENTED;
+    }
+    if (((ArrayObject*)a)->scalar) {
+        /* A NumPy scalar in the NumPy program: `s += 1` rebinds s. */
+        return binop(name, scalar_op, a, b);
     }
     PyObject* ufunc = op_ufunc(name);
     if (ufunc == NULL) {
@@ -1063,7 +1180,14 @@ static PyObject* inplace_op(const char* name, PyObject* a, PyObject* b) {
     return res;
 }
 
-static PyObject* unop(const char* name, PyObject* a) {
+static PyObject* unop(const char* name, unaryfunc scalar_op, PyObject* a) {
+    PyObject* sc;
+    const int k = scalars_of(&a, 1, &sc);
+    if (k != 0) {
+        PyObject* r = k > 0 ? scalar_op(sc) : NULL;
+        Py_XDECREF(k > 0 ? sc : NULL);
+        return r;
+    }
     PyObject* ufunc = op_ufunc(name);
     if (ufunc == NULL) {
         return NULL;
@@ -1076,61 +1200,74 @@ static PyObject* unop(const char* name, PyObject* a) {
     return PyObject_CallOneArg(ufunc, a);
 }
 
-#define BINOP(fn, name)                                                                            \
-    static PyObject* fn(PyObject* a, PyObject* b) { return binop(name, a, b); }
-#define INPLACE(fn, name)                                                                          \
-    static PyObject* fn(PyObject* a, PyObject* b) { return inplace_op(name, a, b); }
-#define UNOP(fn, name)                                                                             \
-    static PyObject* fn(PyObject* a) { return unop(name, a); }
+#define BINOP(fn, name, scalar_op)                                                                 \
+    static PyObject* fn(PyObject* a, PyObject* b) { return binop(name, scalar_op, a, b); }
+#define INPLACE(fn, name, scalar_op)                                                               \
+    static PyObject* fn(PyObject* a, PyObject* b) { return inplace_op(name, scalar_op, a, b); }
+#define UNOP(fn, name, scalar_op)                                                                  \
+    static PyObject* fn(PyObject* a) { return unop(name, scalar_op, a); }
 
-BINOP(nb_add, "add")
-BINOP(nb_sub, "subtract")
-BINOP(nb_mul, "multiply")
-BINOP(nb_truediv, "true_divide")
-BINOP(nb_floordiv, "floor_divide")
-BINOP(nb_rem, "remainder")
-BINOP(nb_divmod, "divmod")
-BINOP(nb_lshift, "left_shift")
-BINOP(nb_rshift, "right_shift")
-BINOP(nb_and, "bitwise_and")
-BINOP(nb_or, "bitwise_or")
-BINOP(nb_xor, "bitwise_xor")
-BINOP(nb_matmul, "matmul")
-INPLACE(nb_iadd, "add")
-INPLACE(nb_isub, "subtract")
-INPLACE(nb_imul, "multiply")
-INPLACE(nb_itruediv, "true_divide")
-INPLACE(nb_ifloordiv, "floor_divide")
-INPLACE(nb_irem, "remainder")
-INPLACE(nb_ilshift, "left_shift")
-INPLACE(nb_irshift, "right_shift")
-INPLACE(nb_iand, "bitwise_and")
-INPLACE(nb_ior, "bitwise_or")
-INPLACE(nb_ixor, "bitwise_xor")
-INPLACE(nb_imatmul, "matmul")
-UNOP(nb_neg, "negative")
-UNOP(nb_pos, "positive")
-UNOP(nb_abs, "absolute")
-UNOP(nb_invert, "invert")
+BINOP(nb_add, "add", PyNumber_Add)
+BINOP(nb_sub, "subtract", PyNumber_Subtract)
+BINOP(nb_mul, "multiply", PyNumber_Multiply)
+BINOP(nb_truediv, "true_divide", PyNumber_TrueDivide)
+BINOP(nb_floordiv, "floor_divide", PyNumber_FloorDivide)
+BINOP(nb_rem, "remainder", PyNumber_Remainder)
+BINOP(nb_divmod, "divmod", PyNumber_Divmod)
+BINOP(nb_lshift, "left_shift", PyNumber_Lshift)
+BINOP(nb_rshift, "right_shift", PyNumber_Rshift)
+BINOP(nb_and, "bitwise_and", PyNumber_And)
+BINOP(nb_or, "bitwise_or", PyNumber_Or)
+BINOP(nb_xor, "bitwise_xor", PyNumber_Xor)
+BINOP(nb_matmul, "matmul", NULL) /* matmul of 0-d operands raises: NumPy's error */
+INPLACE(nb_iadd, "add", PyNumber_Add)
+INPLACE(nb_isub, "subtract", PyNumber_Subtract)
+INPLACE(nb_imul, "multiply", PyNumber_Multiply)
+INPLACE(nb_itruediv, "true_divide", PyNumber_TrueDivide)
+INPLACE(nb_ifloordiv, "floor_divide", PyNumber_FloorDivide)
+INPLACE(nb_irem, "remainder", PyNumber_Remainder)
+INPLACE(nb_ilshift, "left_shift", PyNumber_Lshift)
+INPLACE(nb_irshift, "right_shift", PyNumber_Rshift)
+INPLACE(nb_iand, "bitwise_and", PyNumber_And)
+INPLACE(nb_ior, "bitwise_or", PyNumber_Or)
+INPLACE(nb_ixor, "bitwise_xor", PyNumber_Xor)
+INPLACE(nb_imatmul, "matmul", NULL)
+UNOP(nb_neg, "negative", PyNumber_Negative)
+UNOP(nb_pos, "positive", PyNumber_Positive)
+UNOP(nb_abs, "absolute", PyNumber_Absolute)
+UNOP(nb_invert, "invert", PyNumber_Invert)
+
+static PyObject* scalar_pow(PyObject* a, PyObject* b) { return PyNumber_Power(a, b, Py_None); }
 
 static PyObject* nb_pow(PyObject* a, PyObject* b, PyObject* mod) {
     if (mod != Py_None) {
         Py_RETURN_NOTIMPLEMENTED;
     }
-    return binop("power", a, b);
+    return binop("power", scalar_pow, a, b);
 }
 
 static PyObject* nb_ipow(PyObject* a, PyObject* b, PyObject* mod) {
     if (mod != Py_None) {
         Py_RETURN_NOTIMPLEMENTED;
     }
-    return inplace_op("power", a, b);
+    return inplace_op("power", scalar_pow, a, b);
 }
+
+#define CMP(fn, op)                                                                                \
+    static PyObject* fn(PyObject* a, PyObject* b) { return PyObject_RichCompare(a, b, op); }
+CMP(scalar_lt, Py_LT)
+CMP(scalar_le, Py_LE)
+CMP(scalar_eq, Py_EQ)
+CMP(scalar_ne, Py_NE)
+CMP(scalar_gt, Py_GT)
+CMP(scalar_ge, Py_GE)
 
 static PyObject* Array_richcompare(PyObject* a, PyObject* b, int op) {
     static const char* names[] = {"less",      "less_equal", "equal",
                                   "not_equal", "greater",    "greater_equal"};
-    return binop(names[op], a, b);
+    static const binaryfunc cmp[] = {scalar_lt, scalar_le, scalar_eq,
+                                     scalar_ne, scalar_gt, scalar_ge};
+    return binop(names[op], cmp[op], a, b);
 }
 
 static PyNumberMethods Array_as_number = {
@@ -1210,6 +1347,12 @@ static PyObject* m_setup(PyObject* self, PyObject* args) {
     Py_XSETREF(g_ops, Py_NewRef(ops));
     Py_XSETREF(g_np_ndarray, Py_NewRef(ndarray));
     Py_XSETREF(g_np_generic, Py_NewRef(generic));
+    PyObject* np = PyImport_ImportModule("numpy");
+    Py_XSETREF(g_np_integer, np != NULL ? PyObject_GetAttrString(np, "integer") : NULL);
+    Py_XDECREF(np);
+    if (g_np_integer == NULL) {
+        return NULL;
+    }
     Py_RETURN_NONE;
 }
 
@@ -1246,8 +1389,9 @@ static PyObject* m_offload_counts(PyObject* self, PyObject* noargs) {
     }
     uint64_t inl = 0, off = 0;
     vp_offload_counts(g_rt, &inl, &off);
-    return Py_BuildValue("{s:K,s:K}", "inline", (unsigned long long)inl, "offloaded",
-                         (unsigned long long)off);
+    return Py_BuildValue("{s:K,s:K,s:K}", "inline", (unsigned long long)inl, "offloaded",
+                         (unsigned long long)off, "direct",
+                         (unsigned long long)vp_direct_count(g_rt));
 }
 
 static PyObject* m_pool_stats(PyObject* self, PyObject* noargs) {
@@ -1385,6 +1529,68 @@ static PyObject* m_view(PyObject* self, PyObject* args) {
         ((ArrayObject*)v)->readonly = ((ArrayObject*)base)->readonly; /* as NumPy views */
     }
     return v;
+}
+
+static PyObject* m_scalar(PyObject* self, PyObject* a) {
+    (void)self;
+    if (!PyObject_TypeCheck(a, &ArrayType) || check_runtime() < 0) {
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_TypeError, "scalar: a viproc array expected");
+        }
+        return NULL;
+    }
+    vp_array* x = array_of(a);
+    if (!vp_array_ready(x)) {
+        Py_RETURN_NONE;
+    }
+    char err[ERRLEN] = "";
+    if (raise_status(vp_array_wait(g_rt, x, err, sizeof err), err) < 0) {
+        return NULL; /* the producer failed */
+    }
+    return vp_array_scalar(x);
+}
+
+/* item(a, key): for an integer key (an int, or a tuple of one int per
+ * dimension) the element as NumPy's scalar if `a` is ready; None if `a` is
+ * pending or the key is something else. IndexError as NumPy's. */
+static PyObject* m_item(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *a, *key;
+    if (!PyArg_ParseTuple(args, "O!O", &ArrayType, &a, &key) || check_runtime() < 0) {
+        return NULL;
+    }
+    vp_array* x = array_of(a);
+    const int nd = vp_array_ndim(x);
+    const Py_ssize_t nk = PyTuple_Check(key) ? PyTuple_GET_SIZE(key) : 1;
+    if (nk != nd || nd == 0 || !vp_array_ready(x)) {
+        Py_RETURN_NONE;
+    }
+    const int64_t* shape = vp_array_shape(x);
+    const int64_t* strides = vp_array_strides(x);
+    int64_t offset = 0;
+    for (int i = 0; i < nd; ++i) {
+        PyObject* k = PyTuple_Check(key) ? PyTuple_GET_ITEM(key, i) : key;
+        if (PyBool_Check(k) ||
+            !(PyLong_Check(k) ||
+              (g_np_integer != NULL && PyObject_TypeCheck(k, (PyTypeObject*)g_np_integer)))) {
+            Py_RETURN_NONE; /* arrays, slices, masks, np.bool_: the general path */
+        }
+        const Py_ssize_t v = PyNumber_AsSsize_t(k, PyExc_IndexError);
+        if (v == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
+        if (v < -shape[i] || v >= shape[i]) {
+            PyErr_Format(PyExc_IndexError, "index %zd is out of bounds for axis %d with size %lld",
+                         v, i, (long long)shape[i]);
+            return NULL;
+        }
+        offset += (v < 0 ? v + shape[i] : v) * strides[i];
+    }
+    int64_t zero = 0;
+    vp_array* e = vp_array_view(g_rt, x, vp_array_dtype(x), 0, &zero, &zero, offset);
+    PyObject* r = vp_array_scalar(e);
+    vp_array_release(e);
+    return r;
 }
 
 static PyObject* m_stand_in(PyObject* self, PyObject* a) {
@@ -1684,6 +1890,27 @@ static PyObject* m_scatter(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+static PyObject* m_select(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *c, *x, *y;
+    if (!PyArg_ParseTuple(args, "O!O!O!", &ArrayType, &c, &ArrayType, &x, &ArrayType, &y) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    vp_array* r = NULL;
+    char err[ERRLEN] = "";
+    const int status =
+        vp_select(g_rt, array_of(c), array_of(x), array_of(y), &r, issue_site(), err, sizeof err);
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    PyObject* w = wrap_array(r);
+    if (w != NULL && vp_array_ndim(r) == 0) {
+        ((ArrayObject*)w)->scalar = 1;
+    }
+    return w;
+}
+
 static PyObject* m_mask_assign(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *a, *mask, *value;
@@ -1740,6 +1967,10 @@ static PyMethodDef methods[] = {
     {"export", m_export, METH_VARARGS,
      "export(a, writable=False): sync point, NumPy view of a without a copy."},
     {"assign", m_assign, METH_VARARGS, "assign(dst, src): dst[...] = src"},
+    {"scalar", m_scalar, METH_O,
+     "scalar(a): NumPy's scalar of a's first element if a is ready (no wait), else None"},
+    {"item", m_item, METH_VARARGS,
+     "item(a, key): NumPy's scalar a[key] for an integer key if a is ready, else None"},
     {"stand_in", m_stand_in, METH_O,
      "stand_in(a): ndarray with a's layout over a dummy address (metadata-only NumPy code)"},
     {"view_of", m_view_of, METH_VARARGS,
@@ -1748,6 +1979,7 @@ static PyMethodDef methods[] = {
      "gather(a, idx, idx_axes, result_axes, result_strides): a[idx...] (vp_gather)"},
     {"scatter", m_scatter, METH_VARARGS,
      "scatter(a, idx, idx_axes, result_axes, values): a[idx...] = values (vp_scatter)"},
+    {"select", m_select, METH_VARARGS, "select(cond, x, y): np.where(cond, x, y) (vp_select)"},
     {"mask_assign", m_mask_assign, METH_VARARGS, "mask_assign(a, mask, value): a[mask] = value"},
     {"arg_reduce", m_arg_reduce, METH_VARARGS,
      "arg_reduce(argmax, a, out_shape): argmin/argmax along a's last axis (C-contiguous)"},

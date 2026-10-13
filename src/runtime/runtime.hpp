@@ -148,6 +148,15 @@ class Runtime {
     // elements of the first output (a reduction passes its input's size).
     // `output_buffers` (optional, one per new output) supplies the memory of
     // a new output, laid out as given (e.g. a result NumPy allocated).
+    //
+    // Direct path: an op below the dispatch policy's `sync_below` whose
+    // inputs and in/outs are all ready (no error, in/outs without readers
+    // and not read through another view) runs right here, without a task:
+    // its kernel is called on the main thread and its outputs are created
+    // ready. The task path would run it inline too (rule 1 of the policy),
+    // but pays for the task, its operand capture, read counting, the
+    // look-ahead slot and the completion protocol. A kernel error is stored
+    // on the outputs (raised at their next sync point, as with a task).
     void issue(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
                std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
                const char* issue_site, std::span<ArrayPtr> results, std::int64_t work_elements = -1,
@@ -173,6 +182,8 @@ class Runtime {
     std::size_t active_tasks() const { return active_.load(std::memory_order_acquire); }
     // Main thread: the dispatch policy and its counters.
     const OffloadPolicy& offload_policy() const { return policy_; }
+    // Ops that took the direct path (see issue()).
+    std::uint64_t direct_count() const { return direct_; }
     // Main thread, before issuing ops: replaces the dispatch policy.
     void set_offload_options(const OffloadOptions& o) { policy_ = OffloadPolicy(o); }
     std::size_t worker_count() const { return workers_.size(); }
@@ -183,6 +194,11 @@ class Runtime {
     std::vector<std::shared_ptr<Task>> run(const std::shared_ptr<Task>& task);
     void enqueue(std::shared_ptr<Task> task);
     void trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t elements);
+    // The direct path of issue(): see there.
+    bool issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
+                      std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
+                      const char* issue_site, std::span<ArrayPtr> results, std::int64_t elements,
+                      std::span<const std::shared_ptr<Buffer>> output_buffers);
     void acquire_slot();
     // Registers `task` on its pending producers and triggers it if none.
     void launch(const std::shared_ptr<Task>& task,
@@ -192,8 +208,9 @@ class Runtime {
     void issue_storage_copy(Storage& s);
 
     RuntimeOptions options_;
-    OffloadPolicy policy_;  // main thread only
-    std::uint64_t seq_ = 0; // ops issued so far (main thread only)
+    OffloadPolicy policy_;     // main thread only
+    std::uint64_t seq_ = 0;    // ops issued so far (main thread only)
+    std::uint64_t direct_ = 0; // ... of which ran directly, without a task
     std::atomic<std::size_t> active_{0};
     // Threads waiting in wait_active_below(): run() notifies only if > 0.
     std::atomic<int> active_waiters_{0};

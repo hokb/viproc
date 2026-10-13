@@ -822,6 +822,13 @@ namespace {
 alignas(64) char g_stand_in_data[64];
 }
 
+PyObject* scalar_object(DType dtype, const void* data) {
+    PyArray_Descr* descr = PyArray_DescrFromType(type_num(dtype));
+    PyObject* r = PyArray_Scalar(const_cast<void*>(data), descr, nullptr);
+    Py_DECREF(descr);
+    return r;
+}
+
 PyObject* stand_in(const Layout& l) {
     return reinterpret_cast<PyObject*>(template_array(l, g_stand_in_data, true));
 }
