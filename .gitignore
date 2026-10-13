@@ -1,4 +1,6 @@
 # Build output
+/reports/
+/viproc-benchmark/
 /build*/
 /out/
 /install/

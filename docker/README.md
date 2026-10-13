@@ -57,12 +57,20 @@ docker/benchmark.sh            # Linux, macOS, WSL; add --quick for a short run
 docker\benchmark.ps1           # Windows, Docker Desktop (Linux containers)
 ```
 
-Reports: `viproc-benchmark/report.html` (comparison of the platforms) and
-`viproc-benchmark/<platform>/report.html` (details; also `report.md` and
-`results.json`). A single image: `docker run --rm -v "$PWD:/work"
-viproc:linux benchmark` (writes `./viproc-benchmark`). Native Windows image:
-`docker run --rm -v "${PWD}:C:\work" viproc:windows benchmark`, then merge
-its `results.json` with others: `suite.py --merge A/results.json
+The reports are copied out of the containers (`docker cp`, no bind mount
+needed, also with a remote Docker daemon) into `reports/` in the current
+directory: `reports/report.html` (comparison of the platforms) and
+`reports/<image>/report.html` (details; also `report.md` and
+`results.json`). `VIPROC_BENCH_OUT` picks another directory.
+
+A single image writes to `/work/reports/<platform>` (`linux`,
+`windows-wine`, `windows`); mount the working directory to get them there:
+`docker run --rm -v "$PWD:/work" viproc:linux benchmark` (writes
+`./reports/linux`). Without a mount the reports stay in the container and
+the command says how to copy them (`docker cp <container>:/work/reports
+./reports`). Native Windows image: `docker run --rm -v "${PWD}:C:\work"
+viproc:windows benchmark` (writes `.\reports\windows`), then merge its
+`results.json` with others: `suite.py --merge A/results.json
 B/results.json --out DIR`.
 
 The suite runs ~100 configurations (element-wise chains, basic and advanced
@@ -88,7 +96,7 @@ docker run [--rm -it] [-v DIR:/work] IMAGE [COMMAND [ARGS...]]
 | `test [CTEST_ARGS...]` | all test suites with `ctest` (default) |
 | `pytest [PYTEST_ARGS...]` | the Python bridge tests |
 | `python [ARGS...]` | Python with viproc importable; interactive with `-it` |
-| `benchmark [NAME] [ARGS]` | `python/benchmarks/NAME.py`; default `suite`, the benchmark suite (below) |
+| `benchmark [NAME] [ARGS]` | `python/benchmarks/NAME.py`; default `suite`, the benchmark suite (below), reports to `/work/reports/<platform>` |
 | `build` | bring the build up to date |
 | `info` | platform, Python, NumPy, build type, temporary elision mode |
 | `help` | usage |

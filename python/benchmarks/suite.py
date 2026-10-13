@@ -385,7 +385,7 @@ def main():
     warnings.simplefilter("ignore", RuntimeWarning)
     np.seterr(all="ignore")
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--out", default="viproc-benchmark", help="output directory")
+    p.add_argument("--out", default="reports", help="output directory (default: ./reports)")
     p.add_argument("--quick", action="store_true", help="shorter runs, fewer large cases")
     p.add_argument("--filter", help="regular expression on case/size/layout")
     p.add_argument("--workers", default="1,max",

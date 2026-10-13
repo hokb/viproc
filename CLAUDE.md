@@ -328,7 +328,7 @@ clang-format -i <files>                                 # format
 PYTHONPATH=build/python python3 -m pytest -q python/tests
 PYTHONPATH=build/python python3 python/benchmarks/strong_scaling.py   # use a Release build
 PYTHONPATH=build/python python3 python/benchmarks/suite.py [--quick]   # all cases, score, report
-docker/benchmark.sh [--quick]     # suite on Linux + Windows (Wine), comparison report
+docker/benchmark.sh [--quick]     # suite on Linux + Windows (Wine), reports copied to ./reports
 ```
 
 `ctest` also runs the pytest suite. Tests need `pytest`

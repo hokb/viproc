@@ -5,15 +5,43 @@
 #
 #   docker/benchmark.sh [--quick] [SUITE_ARGS...]
 #
-# Results: viproc-benchmark/<platform>/report.{html,md}, results.json and the
-# comparison in viproc-benchmark/report.{html,md} (relative to the current
-# directory). Images: VIPROC_IMAGES="linux wine" (default).
+# The reports are copied out of the containers (docker cp, no bind mount,
+# so this also works with a remote Docker daemon) into ./reports, relative
+# to the current directory:
+#   reports/report.{html,md}               comparison of the platforms
+#   reports/<image>/report.{html,md}       details, and results.json
+# Output directory: VIPROC_BENCH_OUT (default reports). Images:
+# VIPROC_IMAGES="linux wine" (default).
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
-out=${VIPROC_BENCH_OUT:-viproc-benchmark}
+out=${VIPROC_BENCH_OUT:-reports}
 images=${VIPROC_IMAGES:-linux wine}
 mkdir -p "$out"
+
+containers=()
+cleanup() {
+    for c in "${containers[@]}"; do
+        docker rm -f "$c" >/dev/null 2>&1 || true
+    done
+}
+trap cleanup EXIT
+
+# Runs IMAGE ARGS... in a new container, then copies its /work/reports/SUB
+# to $out/SUB. Extra inputs: COPY_IN (a host directory copied to /work/in).
+run_and_copy() {
+    local sub=$1 img=$2
+    shift 2
+    local cid
+    cid=$(docker create -e VIPROC_REPORTS_COPIED=1 "$img" "$@")
+    containers+=("$cid")
+    if [[ -n ${COPY_IN:-} ]]; then
+        docker cp "$COPY_IN/." "$cid:/work/in"
+    fi
+    docker start -a "$cid"
+    mkdir -p "$out/$sub"
+    docker cp "$cid:/work/reports/$sub/." "$out/$sub"
+}
 
 results=()
 for img in $images; do
@@ -22,13 +50,13 @@ for img in $images; do
         docker build -f "$repo/docker/$img/Dockerfile" -t "viproc:$img" "$repo"
     fi
     echo "== benchmark suite on viproc:$img"
-    docker run --rm -v "$(cd "$out" && pwd):/work" "viproc:$img" \
-        benchmark suite --out "/work/$img" "$@"
-    results+=("/work/$img/results.json")
+    run_and_copy "$img" "viproc:$img" benchmark suite --out "/work/reports/$img" "$@"
+    results+=("/work/in/$img/results.json")
 done
 
 if [[ ${#results[@]} -gt 1 ]]; then
-    docker run --rm -v "$(cd "$out" && pwd):/work" viproc:linux \
-        python /src/python/benchmarks/suite.py --merge "${results[@]}" --out /work
+    echo "== comparison"
+    COPY_IN=$out run_and_copy . viproc:linux \
+        python /src/python/benchmarks/suite.py --merge "${results[@]}" --out /work/reports
 fi
-echo "== reports in $out/ (report.html: comparison; <platform>/report.html: details)"
+echo "== reports in $out/ (report.html: comparison; <image>/report.html: details)"

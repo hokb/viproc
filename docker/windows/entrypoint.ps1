@@ -62,6 +62,9 @@ switch ($Command) {
         $named = $Rest.Count -gt 0 -and -not $Rest[0].StartsWith('-')
         $name = if ($named) { $Rest[0] } else { 'suite' }
         $more = if ($named) { @($Rest | Select-Object -Skip 1) } else { $Rest }
+        if ($name -eq 'suite' -and $more -notcontains '--out' -and $more -notcontains '--merge') {
+            $more = @('--out', "C:\work\reports\$env:VIPROC_PLATFORM") + $more
+        }
         Exit-With python (@("$env:VIPROC_SRC\python\benchmarks\$name.py") + $more)
     }
     'build' {
@@ -89,7 +92,8 @@ commands:
   pytest [PYTEST_ARGS...]  build, then run the Python bridge tests
   python [ARGS...]         Python with viproc importable (interactive with -it)
   benchmark [NAME [ARGS]]  run python/benchmarks/NAME.py (default: suite, the full
-                           benchmark suite; reports go to ./viproc-benchmark)
+                           benchmark suite; reports go to C:\work\reports\<platform>:
+                           mount a directory on C:\work to keep them)
   build                    bring the build up to date
   info                     platform, Python, NumPy and viproc configuration
   help                     this text

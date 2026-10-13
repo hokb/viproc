@@ -16,7 +16,8 @@ commands:
   pytest [PYTEST_ARGS...]  build, then run the Python bridge tests
   python [ARGS...]         Python with viproc importable (interactive with -it)
   benchmark [NAME [ARGS]]  run python/benchmarks/NAME.py (default: suite, the full
-                           benchmark suite; reports go to ./viproc-benchmark)
+                           benchmark suite; reports go to /work/reports/<platform>:
+                           mount a directory on /work to keep them)
   build                    bring the build up to date
   info                     platform, Python, NumPy and viproc configuration
   help                     this text
@@ -64,7 +65,14 @@ benchmark)
         name=$1
         shift
     fi
-    exec python "$VIPROC_SRC/python/benchmarks/$name.py" "$@"
+    if [[ $name == suite && " $* " != *" --out "* && " $* " != *" --merge "* ]]; then
+        set -- --out "/work/reports/$VIPROC_PLATFORM" "$@"
+    fi
+    python "$VIPROC_SRC/python/benchmarks/$name.py" "$@"
+    if [[ $name == suite && -z ${VIPROC_REPORTS_COPIED:-} ]] && ! mountpoint -q /work 2>/dev/null; then
+        echo "note: /work is not mounted; copy the reports out with" \
+             "docker cp <container>:/work/reports ./reports, or run with -v \"\$PWD:/work\"" >&2
+    fi
     ;;
 build)
     build
