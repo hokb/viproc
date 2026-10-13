@@ -146,10 +146,12 @@ class Runtime {
     // `results` receives one array per new output.
     // `work_elements` sizes the op for the dispatch policy; by default the
     // elements of the first output (a reduction passes its input's size).
+    // `output_buffers` (optional, one per new output) supplies the memory of
+    // a new output, laid out as given (e.g. a result NumPy allocated).
     void issue(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
                std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
-               const char* issue_site, std::span<ArrayPtr> results,
-               std::int64_t work_elements = -1);
+               const char* issue_site, std::span<ArrayPtr> results, std::int64_t work_elements = -1,
+               std::span<const std::shared_ptr<Buffer>> output_buffers = {});
     std::vector<ArrayPtr> issue(const std::shared_ptr<Kernel>& kernel,
                                 std::span<const ArrayPtr> inputs, std::span<const ArrayPtr> inouts,
                                 std::span<const Layout> new_outputs, const char* issue_site);

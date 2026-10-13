@@ -220,8 +220,8 @@ std::vector<ArrayPtr> Runtime::issue(const std::shared_ptr<Kernel>& kernel,
 
 void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
                     std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
-                    const char* issue_site, std::span<ArrayPtr> results,
-                    std::int64_t work_elements) {
+                    const char* issue_site, std::span<ArrayPtr> results, std::int64_t work_elements,
+                    std::span<const std::shared_ptr<Buffer>> output_buffers) {
     // The task first (back-pressure: wait for a slot before creating it), so
     // the operands are built in place.
     acquire_slot();
@@ -310,6 +310,11 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     }
     for (std::size_t i = 0; i < new_outputs.size(); ++i) {
         const Layout& l = new_outputs[i];
+        if (i < output_buffers.size() && output_buffers[i]) {
+            in_ops.push_back({output_buffers[i], l});
+            results[i] = new_array(l, output_buffers[i], task);
+            continue;
+        }
         // Dense layouts (C, F, any axis order) are kept: ufunc results follow
         // NumPy's order (Layout::keep_order).
         Layout contiguous = l.dense() ? l : Layout::contiguous(l.dtype, l.shape);

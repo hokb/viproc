@@ -134,6 +134,7 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve(PyObject* ufunc, std::span<const D
         return nullptr;
     }
     std::unique_ptr<UfuncLoop> loop(new UfuncLoop());
+    loop->ufunc_ = ufunc;
     loop->capsule_ = PyTuple_GetItem(res, 1);
     Py_INCREF(loop->capsule_);
     Py_DECREF(res);
@@ -199,6 +200,7 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve_reduction(PyObject* ufunc, DType d
         return nullptr;
     }
     std::unique_ptr<UfuncLoop> loop(new UfuncLoop());
+    loop->ufunc_ = ufunc;
     loop->capsule_ = PyTuple_GetItem(res, 1);
     Py_INCREF(loop->capsule_);
     Py_DECREF(res);
@@ -260,6 +262,73 @@ const UfuncLoop* LoopCache::get(PyObject* ufunc, std::span<const DType> dtypes,
     return loops_.emplace(std::move(key), std::move(loop)).first->second.get();
 }
 
+PyObject* resolve_reduction_info(PyObject* ufunc, PyObject* in_descr, PyObject* dtype,
+                                 std::string& error) {
+    PyObject* dtypes = PyTuple_Pack(3, Py_None, in_descr, Py_None);
+    PyObject* signature = PyTuple_Pack(3, dtype, Py_None, Py_None);
+    PyObject* meth = PyObject_GetAttrString(ufunc, "_resolve_dtypes_and_context");
+    PyObject* args = dtypes != nullptr ? PyTuple_Pack(1, dtypes) : nullptr;
+    PyObject* kwargs = signature != nullptr
+                           ? Py_BuildValue("{s:O,s:O,s:s}", "signature", signature, "reduction",
+                                           Py_True, "casting", "unsafe")
+                           : nullptr;
+    PyObject* res = meth != nullptr && args != nullptr && kwargs != nullptr
+                        ? PyObject_Call(meth, args, kwargs)
+                        : nullptr;
+    Py_XDECREF(dtypes);
+    Py_XDECREF(signature);
+    Py_XDECREF(meth);
+    Py_XDECREF(args);
+    Py_XDECREF(kwargs);
+    if (res == nullptr) {
+        error = fetch_python_error();
+    }
+    return res;
+}
+
+std::unique_ptr<UfuncLoop> UfuncLoop::from_call_info(PyObject* ufunc, PyObject* capsule,
+                                                     std::span<const std::intptr_t> fixed,
+                                                     std::string& error) {
+    std::unique_ptr<UfuncLoop> loop(new UfuncLoop());
+    loop->ufunc_ = ufunc;
+    loop->capsule_ = capsule;
+    Py_INCREF(capsule);
+    PyObject* strides = PyTuple_New(static_cast<Py_ssize_t>(fixed.size()));
+    for (std::size_t i = 0; strides != nullptr && i < fixed.size(); ++i) {
+        PyTuple_SET_ITEM(strides, static_cast<Py_ssize_t>(i),
+                         PyLong_FromSsize_t(static_cast<Py_ssize_t>(fixed[i])));
+    }
+    PyObject* get = PyObject_GetAttrString(ufunc, "_get_strided_loop");
+    PyObject* get_args = PyTuple_Pack(1, capsule);
+    PyObject* get_kwargs =
+        strides != nullptr ? Py_BuildValue("{s:O}", "fixed_strides", strides) : nullptr;
+    PyObject* filled = get != nullptr && get_args != nullptr && get_kwargs != nullptr
+                           ? PyObject_Call(get, get_args, get_kwargs)
+                           : nullptr;
+    Py_XDECREF(strides);
+    Py_XDECREF(get);
+    Py_XDECREF(get_args);
+    Py_XDECREF(get_kwargs);
+    if (filled == nullptr) {
+        error = fetch_python_error();
+        return nullptr;
+    }
+    Py_DECREF(filled);
+    loop->info_ = PyCapsule_GetPointer(capsule, kCallInfoCapsule);
+    if (loop->info_ == nullptr) {
+        error = fetch_python_error();
+        return nullptr;
+    }
+    auto* uf = reinterpret_cast<PyUFuncObject*>(ufunc);
+    loop->nin_ = uf->nin;
+    loop->nout_ = uf->nout;
+    if (loop->requires_pyapi()) {
+        error = "loop requires the Python API; cannot run asynchronously";
+        return nullptr;
+    }
+    return loop;
+}
+
 const UfuncLoop* LoopCache::get_reduction(PyObject* ufunc, DType dtype,
                                           const std::array<std::intptr_t, 3>& fixed,
                                           std::string& error) {
@@ -308,40 +377,20 @@ class ElementwiseKernel : public Kernel {
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Shape& shape = outputs[0].layout.shape;
         const auto nin = static_cast<std::size_t>(loop_->nin());
-        if (nin + outputs.size() <= kMaxFlat) {
-            // Fast path: every operand covers `shape` densely with the
-            // output's strides (C, F or any axis order), or is a single
-            // element (stride 0). Then one loop call covers all elements in
-            // memory order, as in NumPy (element-wise results do not depend
-            // on how the elements are split into calls).
-            const std::int64_t n = outputs[0].layout.size();
-            const Layout& out_layout = outputs[0].layout;
-            const bool out_dense = out_layout.c_contiguous() || dense_from_first(out_layout);
+        if (nin + outputs.size() <= kMaxFlat && outputs.size() == 1) {
+            const Layout* layouts[kMaxFlat];
             char* ptrs[kMaxFlat];
+            for (std::size_t i = 0; i < nin; ++i) {
+                layouts[i] = &inputs[i].layout;
+                ptrs[i] = reinterpret_cast<char*>(inputs[i].first());
+            }
+            ptrs[nin] = reinterpret_cast<char*>(outputs[0].first());
             std::intptr_t strides[kMaxFlat];
-            std::size_t k = 0;
-            auto flat = [&](const Operand& op) {
-                const Layout& l = op.layout;
-                ptrs[k] = reinterpret_cast<char*>(op.first());
-                if (out_dense && same_order(l, out_layout)) {
-                    strides[k++] = static_cast<std::intptr_t>(itemsize(l.dtype));
-                    return true;
-                }
-                strides[k++] = 0;
-                return l.size() == 1;
-            };
-            bool ok = true;
-            for (const Operand& op : inputs.first(nin)) {
-                ok = ok && flat(op);
-            }
-            for (const Operand& op : outputs) {
-                ok = ok && flat(op) && strides[k - 1] != 0; // a broadcast output is not flat
-            }
-            if (ok) {
-                if (n == 0) {
+            if (single_call(std::span(layouts, nin), outputs[0].layout, strides)) {
+                const auto count = static_cast<std::intptr_t>(outputs[0].layout.size());
+                if (count == 0) {
                     return {};
                 }
-                const auto count = static_cast<std::intptr_t>(n);
                 return loop_->call(ptrs, &count, strides) == 0
                            ? KernelResult{}
                            : KernelResult{1, "NumPy loop failed", 0};
@@ -370,10 +419,435 @@ class ElementwiseKernel : public Kernel {
     const UfuncLoop* loop_;
 };
 
+// NumPy's C/F contiguity flags (extent-1 dimensions may have any stride).
+bool f_contiguous(const Layout& l) {
+    std::int64_t step = static_cast<std::int64_t>(itemsize(l.dtype));
+    for (std::size_t i = 0; i < l.shape.size(); ++i) {
+        if (l.shape[i] == 0) {
+            return true;
+        }
+        if (l.shape[i] != 1) {
+            if (l.strides[i] != step) {
+                return false;
+            }
+            step *= l.shape[i];
+        }
+    }
+    return true;
+}
+
+int contiguity(const Layout& l) { return (l.c_contiguous() ? 1 : 0) | (f_contiguous(l) ? 2 : 0); }
+
+// Operands of an element-wise op (NPY_MAXARGS is not a constant in NumPy 2).
+constexpr std::size_t kMaxOps = 32;
+// Iterator templates kept per LoopCache (all dropped when full).
+constexpr std::size_t kMaxIterTemplates = 1024;
+
+// NumPy's element-wise ufunc loop over its iterator (execute_ufunc_loop).
+class IterElementwiseKernel : public Kernel {
+  public:
+    IterElementwiseKernel(const UfuncLoop* loop, NpyIter* iter, DeferRelease defer)
+        : loop_(loop), iter_(iter), defer_(std::move(defer)) {}
+
+    ~IterElementwiseKernel() override {
+        NpyIter* iter = iter_;
+        defer_([iter] { NpyIter_Deallocate(iter); });
+    }
+
+    KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
+        const auto nin = static_cast<std::size_t>(loop_->nin());
+        char* base[kMaxOps];
+        for (std::size_t i = 0; i < nin; ++i) {
+            base[i] = reinterpret_cast<char*>(inputs[i].first());
+        }
+        base[nin] = reinterpret_cast<char*>(outputs[0].first());
+        char* errmsg = nullptr;
+        // Points the iterator at the buffers (no GIL: errmsg variant); with
+        // buffering it also copies the first block.
+        if (NpyIter_ResetBasePointers(iter_, base, &errmsg) != NPY_SUCCEED) {
+            return {1, errmsg != nullptr ? errmsg : "NpyIter_ResetBasePointers failed", 0};
+        }
+        do {
+            if (loop_->call(dataptr_, countptr_, strideptr_) != 0) {
+                return {1, "NumPy loop failed", 0};
+            }
+        } while (iternext_(iter_));
+        return {};
+    }
+
+    NpyIter_IterNextFunc* iternext_ = nullptr;
+    char** dataptr_ = nullptr;
+    npy_intp* strideptr_ = nullptr;
+    npy_intp* countptr_ = nullptr;
+
+  private:
+    const UfuncLoop* loop_;
+    NpyIter* iter_;
+    DeferRelease defer_;
+};
+
+// An array with `l`'s shape and strides over `data` (not owned, never read
+// or written: a template for the iterator's setup).
+PyArrayObject* template_array(const Layout& l, char* data, bool writable) {
+    npy_intp shape[NPY_MAXDIMS];
+    npy_intp strides[NPY_MAXDIMS];
+    for (std::size_t i = 0; i < l.shape.size(); ++i) {
+        shape[i] = static_cast<npy_intp>(l.shape[i]);
+        strides[i] = static_cast<npy_intp>(l.strides[i]);
+    }
+    PyArray_Descr* descr = PyArray_DescrFromType(type_num(l.dtype));
+    return reinterpret_cast<PyArrayObject*>(PyArray_NewFromDescr(
+        &PyArray_Type, descr, static_cast<int>(l.shape.size()), shape, strides, data,
+        NPY_ARRAY_ALIGNED | (writable ? NPY_ARRAY_WRITEABLE : 0), nullptr)); // steals descr
+}
+
+npy_intp numpy_buffersize() {
+    npy_intp buffersize = 0;
+    if (PyObject* np = PyImport_ImportModule("numpy")) {
+        if (PyObject* bs = PyObject_CallMethod(np, "getbufsize", nullptr)) {
+            buffersize = PyLong_AsSsize_t(bs);
+            Py_DECREF(bs);
+        }
+        Py_DECREF(np);
+    }
+    PyErr_Clear();
+    return buffersize;
+}
+
 } // namespace
 
 std::shared_ptr<Kernel> make_elementwise_kernel(const UfuncLoop* loop) {
     return std::make_shared<ElementwiseKernel>(loop);
+}
+
+bool single_call(std::span<const Layout* const> inputs, const Layout& out, std::intptr_t* strides) {
+    const std::size_t nin = inputs.size();
+    const auto isz = [](const Layout& l) { return static_cast<std::intptr_t>(itemsize(l.dtype)); };
+    // NumPy's trivial loop (try_trivial_single_output_loop): 0-d inputs with
+    // stride 0; all other operands with the output's shape, either 1-d (with
+    // their own strides) or all with the same C/F contiguity flags.
+    bool trivial = true;
+    int order = -1;
+    const bool one_d = out.shape.size() == 1;
+    for (std::size_t i = 0; i <= nin && trivial; ++i) {
+        const Layout& l = i < nin ? *inputs[i] : out;
+        if (i < nin && l.shape.empty()) {
+            strides[i] = 0;
+        } else if (l.shape != out.shape) {
+            trivial = false;
+        } else if (one_d) {
+            strides[i] = static_cast<std::intptr_t>(l.strides[0]);
+        } else {
+            const int c = contiguity(l);
+            trivial = c != 0 && (order < 0 || order == c);
+            order = c;
+            strides[i] = isz(l);
+        }
+    }
+    if (trivial) {
+        return !(one_d && out.strides[0] < static_cast<std::int64_t>(isz(out)) &&
+                 out.strides[0] != 0); // self-overlapping output: NumPy's iterator
+    }
+    // NumPy's iterator, where it coalesces all axes into one and buffers
+    // nothing: every operand dense with the output's strides, or a single
+    // element (stride 0).
+    if (!(out.c_contiguous() || dense_from_first(out))) {
+        return false;
+    }
+    for (std::size_t i = 0; i < nin; ++i) {
+        const Layout& l = *inputs[i];
+        if (same_order(l, out)) {
+            strides[i] = isz(l);
+        } else if (l.size() == 1) {
+            strides[i] = 0;
+        } else {
+            return false;
+        }
+    }
+    strides[nin] = isz(out);
+    return true;
+}
+
+namespace {
+
+// A cast with NumPy's cast functions: an iterator over {input, output}
+// requesting the output dtype for both casts the input block by block into
+// its buffer; the kernel copies each block into the output (no arithmetic:
+// the cast happened in NumPy's buffer copy).
+class CastKernel : public Kernel {
+  public:
+    CastKernel(NpyIter* iter, DeferRelease defer) : iter_(iter), defer_(std::move(defer)) {}
+
+    ~CastKernel() override {
+        NpyIter* iter = iter_;
+        defer_([iter] { NpyIter_Deallocate(iter); });
+    }
+
+    KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
+        char* base[2] = {reinterpret_cast<char*>(inputs[0].first()),
+                         reinterpret_cast<char*>(outputs[0].first())};
+        char* errmsg = nullptr;
+        if (NpyIter_ResetBasePointers(iter_, base, &errmsg) != NPY_SUCCEED) {
+            return {1, errmsg != nullptr ? errmsg : "NpyIter_ResetBasePointers failed", 0};
+        }
+        const auto isz = static_cast<std::size_t>(itemsize_);
+        do {
+            const npy_intp n = *countptr_;
+            char* src = dataptr_[0];
+            char* dst = dataptr_[1];
+            if (strideptr_[0] == itemsize_ && strideptr_[1] == itemsize_) {
+                std::memcpy(dst, src, static_cast<std::size_t>(n) * isz);
+            } else {
+                for (npy_intp i = 0; i < n; ++i) {
+                    std::memcpy(dst + i * strideptr_[1], src + i * strideptr_[0], isz);
+                }
+            }
+        } while (iternext_(iter_));
+        return {};
+    }
+
+    NpyIter_IterNextFunc* iternext_ = nullptr;
+    char** dataptr_ = nullptr;
+    npy_intp* strideptr_ = nullptr;
+    npy_intp* countptr_ = nullptr;
+    npy_intp itemsize_ = 0;
+
+  private:
+    NpyIter* iter_;
+    DeferRelease defer_;
+};
+
+// A 0-d layout as one element of a 1-d layout: NumPy's iterator does not
+// buffer (and so would not cast) a 0-d operand.
+Layout at_least_1d(Layout l) {
+    if (l.shape.empty()) {
+        l.shape.push_back(1);
+        l.strides.push_back(static_cast<std::int64_t>(itemsize(l.dtype)));
+    }
+    return l;
+}
+
+} // namespace
+
+std::shared_ptr<Kernel> make_cast_kernel(const Layout& in, const Layout& out, long buffersize,
+                                         DeferRelease defer, std::string& error) {
+    alignas(64) static char dummy[64];
+    PyArrayObject* op[2] = {template_array(at_least_1d(in), dummy, false),
+                            template_array(at_least_1d(out), dummy, true)};
+    PyArray_Descr* descr = PyArray_DescrFromType(type_num(out.dtype));
+    PyArray_Descr* descrs[2] = {descr, descr};
+    npy_uint32 op_flags[2] = {NPY_ITER_READONLY | NPY_ITER_ALIGNED,
+                              NPY_ITER_WRITEONLY | NPY_ITER_ALIGNED | NPY_ITER_NO_BROADCAST};
+    NpyIter* iter = nullptr;
+    if (op[0] != nullptr && op[1] != nullptr) {
+        // Any element order works: each element is cast on its own.
+        iter = NpyIter_AdvancedNew(2, op,
+                                   NPY_ITER_BUFFERED | NPY_ITER_EXTERNAL_LOOP | NPY_ITER_GROWINNER |
+                                       NPY_ITER_ZEROSIZE_OK | NPY_ITER_DELAY_BUFALLOC,
+                                   NPY_KEEPORDER, NPY_UNSAFE_CASTING, op_flags, descrs, -1, nullptr,
+                                   nullptr, static_cast<npy_intp>(buffersize));
+    }
+    Py_XDECREF(op[0]);
+    Py_XDECREF(op[1]);
+    Py_DECREF(descr);
+    if (iter == nullptr) {
+        error = fetch_python_error();
+        return nullptr;
+    }
+    if (NpyIter_IterationNeedsAPI(iter) || NpyIter_GetIterSize(iter) == 0) {
+        NpyIter_Deallocate(iter);
+        error = "cast needs the Python API or is empty";
+        return nullptr;
+    }
+    auto kernel = std::make_shared<CastKernel>(iter, std::move(defer));
+    kernel->iternext_ = NpyIter_GetIterNext(iter, nullptr);
+    if (kernel->iternext_ == nullptr) {
+        error = fetch_python_error();
+        return nullptr;
+    }
+    kernel->dataptr_ = NpyIter_GetDataPtrArray(iter);
+    kernel->strideptr_ = NpyIter_GetInnerStrideArray(iter);
+    kernel->countptr_ = NpyIter_GetInnerLoopSizePtr(iter);
+    kernel->itemsize_ = static_cast<npy_intp>(itemsize(out.dtype));
+    return kernel;
+}
+
+LoopCache::~LoopCache() {
+    for (auto& [key, iter] : iter_templates_) {
+        NpyIter_Deallocate(static_cast<NpyIter*>(iter));
+    }
+    Py_XDECREF(extobj_);
+    Py_XDECREF(extobj_var_);
+}
+
+long LoopCache::buffersize() {
+    // np.getbufsize() costs ~0.5 us; NumPy keeps it (with the error mode) in
+    // the value of a context variable, which np.setbufsize/np.errstate
+    // replace. Re-read only when that value changes (the reference held in
+    // extobj_ keeps its address from being reused).
+    if (extobj_var_ == nullptr) {
+        if (PyObject* m = PyImport_ImportModule("numpy._core._multiarray_umath")) {
+            extobj_var_ = PyObject_GetAttrString(m, "_extobj_contextvar");
+            Py_DECREF(m);
+        }
+        if (extobj_var_ != nullptr && !PyContextVar_CheckExact(extobj_var_)) {
+            Py_CLEAR(extobj_var_);
+        }
+        PyErr_Clear();
+    }
+    PyObject* value = nullptr;
+    if (extobj_var_ != nullptr && PyContextVar_Get(extobj_var_, nullptr, &value) == 0 &&
+        value != nullptr && value == extobj_) {
+        Py_DECREF(value);
+        return buffersize_;
+    }
+    PyErr_Clear();
+    buffersize_ = static_cast<long>(numpy_buffersize());
+    Py_XDECREF(extobj_);
+    extobj_ = value; // the new reference from PyContextVar_Get (or nullptr)
+    return buffersize_;
+}
+
+std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
+                                                    std::span<const DType> dtypes,
+                                                    std::span<const Layout> inputs,
+                                                    const Layout& out, bool out_given,
+                                                    DeferRelease defer, std::string& error) {
+    const std::size_t nin = inputs.size();
+    const std::size_t nop = nin + 1;
+    if (nop > kMaxOps || static_cast<int>(nin) != loop->nin() || loop->nout() != 1) {
+        error = "unsupported number of operands";
+        return nullptr;
+    }
+    const long bufsize = buffersize();
+    std::string key;
+    auto put = [&key](std::int64_t v) { key.append(reinterpret_cast<const char*>(&v), sizeof v); };
+    put(reinterpret_cast<std::intptr_t>(loop));
+    put(out_given ? 1 : 0);
+    put(bufsize);
+    for (std::size_t i = 0; i < nop; ++i) {
+        const Layout& l = i < nin ? inputs[i] : out;
+        put(static_cast<std::int64_t>(l.shape.size()));
+        put(static_cast<std::int64_t>(l.dtype));
+        for (std::size_t d = 0; d < l.shape.size(); ++d) {
+            put(l.shape[d]);
+            put(l.strides[d]);
+        }
+    }
+    NpyIter* templ = nullptr;
+    if (auto it = iter_templates_.find(key); it != iter_templates_.end()) {
+        templ = static_cast<NpyIter*>(it->second);
+    } else {
+        // Templates over a dummy address: nothing is read or written before
+        // a kernel resets the base pointers, and without COPY_IF_OVERLAP the
+        // iterator never compares addresses (viproc's copy-on-write already
+        // separated outputs from overlapping inputs). Alignment is the only
+        // property of the address it uses: element-aligned, as viproc
+        // buffers.
+        alignas(64) static char dummy[64];
+        PyArrayObject* op[kMaxOps] = {};
+        PyArray_Descr* descrs[kMaxOps] = {};
+        npy_uint32 op_flags[kMaxOps];
+        bool ok = true;
+        for (std::size_t i = 0; i < nop && ok; ++i) {
+            const Layout& l = i < nin ? inputs[i] : out;
+            op[i] = template_array(l, dummy, i == nin);
+            ok = op[i] != nullptr;
+            // The loop's dtypes; operands of another dtype are cast in the
+            // iterator's buffers, as in NumPy.
+            descrs[i] = PyArray_DescrFromType(type_num(dtypes[i]));
+            // NumPy's default operand flags for ufuncs (ufunc_object.c,
+            // NPY_UFUNC_DEFAULT_INPUT_FLAGS / _OUTPUT_FLAGS with WRITEONLY;
+            // ALLOCATE does nothing for a given output).
+            op_flags[i] =
+                i < nin ? NPY_ITER_READONLY | NPY_ITER_ALIGNED | NPY_ITER_OVERLAP_ASSUME_ELEMENTWISE
+                        : NPY_ITER_WRITEONLY | NPY_ITER_ALIGNED | NPY_ITER_NO_BROADCAST |
+                              NPY_ITER_NO_SUBTYPE | NPY_ITER_OVERLAP_ASSUME_ELEMENTWISE;
+        }
+        if (ok) {
+            PyObject* ufunc = loop->ufunc();
+            const npy_uint32 uflags =
+                ufunc != nullptr ? reinterpret_cast<PyUFuncObject*>(ufunc)->iter_flags : 0;
+            // execute_ufunc_loop's flags, without COPY_IF_OVERLAP (see
+            // above). An output NumPy allocates is never reversed (no
+            // negative strides): DONT_NEGATE_STRIDES keeps it that way with
+            // viproc's output.
+            const npy_uint32 flags = uflags | NPY_ITER_EXTERNAL_LOOP | NPY_ITER_REFS_OK |
+                                     NPY_ITER_ZEROSIZE_OK | NPY_ITER_BUFFERED | NPY_ITER_GROWINNER |
+                                     NPY_ITER_DELAY_BUFALLOC |
+                                     (out_given ? 0 : NPY_ITER_DONT_NEGATE_STRIDES);
+            templ = NpyIter_AdvancedNew(static_cast<int>(nop), op, flags, NPY_KEEPORDER,
+                                        NPY_UNSAFE_CASTING, op_flags, descrs, -1, nullptr, nullptr,
+                                        bufsize);
+        }
+        for (std::size_t i = 0; i < nop; ++i) {
+            Py_XDECREF(op[i]); // the iterator holds its own references
+            Py_XDECREF(descrs[i]);
+        }
+        if (templ == nullptr) {
+            error = fetch_python_error();
+            return nullptr;
+        }
+        if (NpyIter_IterationNeedsAPI(templ)) {
+            NpyIter_Deallocate(templ);
+            error = "iteration needs the Python API";
+            return nullptr;
+        }
+        if (iter_templates_.size() >= kMaxIterTemplates) {
+            for (auto& [k, t] : iter_templates_) {
+                NpyIter_Deallocate(static_cast<NpyIter*>(t));
+            }
+            iter_templates_.clear();
+        }
+        iter_templates_.emplace(std::move(key), templ);
+    }
+    NpyIter* iter = NpyIter_Copy(templ);
+    if (iter == nullptr) {
+        error = fetch_python_error();
+        return nullptr;
+    }
+    auto kernel = std::make_shared<IterElementwiseKernel>(loop, iter, std::move(defer));
+    kernel->iternext_ = NpyIter_GetIterNext(iter, nullptr);
+    if (kernel->iternext_ == nullptr) {
+        error = fetch_python_error();
+        return nullptr; // the kernel releases the iterator
+    }
+    kernel->dataptr_ = NpyIter_GetDataPtrArray(iter);
+    kernel->strideptr_ = NpyIter_GetInnerStrideArray(iter);
+    kernel->countptr_ = NpyIter_GetInnerLoopSizePtr(iter);
+    return kernel;
+}
+
+namespace {
+alignas(64) char g_stand_in_data[64];
+}
+
+PyObject* stand_in(const Layout& l) {
+    return reinterpret_cast<PyObject*>(template_array(l, g_stand_in_data, true));
+}
+
+bool view_of(PyObject* stand_in, PyObject* r, Layout& layout, bool& writable) {
+    if (!PyArray_Check(r)) {
+        return false;
+    }
+    PyObject* base = r;
+    while (base != stand_in && base != nullptr && PyArray_Check(base)) {
+        base = PyArray_BASE(reinterpret_cast<PyArrayObject*>(base));
+    }
+    if (base != stand_in) {
+        return false; // a copy, or unrelated
+    }
+    auto* arr = reinterpret_cast<PyArrayObject*>(r);
+    if (!dtype_of(PyArray_TYPE(arr), layout.dtype) || !PyArray_ISNOTSWAPPED(arr) ||
+        !PyArray_ISALIGNED(arr)) {
+        return false;
+    }
+    const int nd = PyArray_NDIM(arr);
+    layout.shape.assign(PyArray_DIMS(arr), PyArray_DIMS(arr) + nd);
+    layout.strides.assign(PyArray_STRIDES(arr), PyArray_STRIDES(arr) + nd);
+    layout.offset = PyArray_BYTES(arr) - PyArray_BYTES(reinterpret_cast<PyArrayObject*>(stand_in));
+    writable = PyArray_ISWRITEABLE(arr);
+    return true;
 }
 
 bool supported_ndarray(PyObject* obj) {
@@ -383,6 +857,27 @@ bool supported_ndarray(PyObject* obj) {
     auto* arr = reinterpret_cast<PyArrayObject*>(obj);
     DType d;
     return dtype_of(PyArray_TYPE(arr), d) && PyArray_ISALIGNED(arr) && PyArray_ISNOTSWAPPED(arr);
+}
+
+bool ndarray_layout(PyObject* obj, Layout& l, void*& data, std::size_t& nbytes) {
+    if (!supported_ndarray(obj)) {
+        return false;
+    }
+    auto* arr = reinterpret_cast<PyArrayObject*>(obj);
+    dtype_of(PyArray_TYPE(arr), l.dtype);
+    const int nd = PyArray_NDIM(arr);
+    l.shape.assign(PyArray_SHAPE(arr), PyArray_SHAPE(arr) + nd);
+    l.strides.assign(PyArray_STRIDES(arr), PyArray_STRIDES(arr) + nd);
+    std::int64_t lo = 0;
+    std::int64_t hi = static_cast<std::int64_t>(itemsize(l.dtype));
+    for (int i = 0; i < nd; ++i) {
+        const std::int64_t span = (l.shape[i] - 1) * l.strides[i];
+        (span < 0 ? lo : hi) += l.shape[i] > 0 ? span : 0;
+    }
+    l.offset = -lo;
+    data = PyArray_BYTES(arr) + lo;
+    nbytes = static_cast<std::size_t>(hi - lo);
+    return true;
 }
 
 ArrayPtr wrap_ndarray(Runtime& rt, PyObject* obj, std::string& error, std::shared_ptr<void> owner) {

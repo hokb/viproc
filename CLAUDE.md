@@ -525,11 +525,19 @@ Rules:
   - accumulator starts at `ufunc.identity` (add: +0.0, so `sum([-0.0])` is
     0.0, as NumPy); without identity (min/max) at the first element along
     the reduced axes, which the loop then skips (NumPy's first-visit skip).
-  **Not covered, left to NumPy:** reduced axes that do not coalesce into
-  one (full reduction of a non-contiguous array): there NumPy ≥ 2.3 buffers
-  the input and sums buffer-sized blocks. Fuzzed against NumPy over shapes,
-  axes, layouts and dtypes (`python/tests/test_reductions.py`, incl. signs
-  of zeros and NaNs): bit-identical.
+  `ReducePlan` covers dense inputs (any axis order) without a cast whose
+  reduced axes coalesce into one. **Everything else runs on NumPy's own
+  iterator** (`make_iter_reduction`, `IterReduceKernel`): casts (int32
+  sums accumulate in int64, `dtype=`), `initial=`, non-coalescing reduced
+  axes and strided inputs, which NumPy's iterator may copy into buffers
+  even without a cast (and a loop on a contiguous buffer can round
+  differently from the same loop on strided data). The iterator is built at
+  issue time with the GIL exactly as `PyUFunc_ReduceWrapper` builds it (it
+  also allocates the result in NumPy's layout); the kernel runs NumPy's
+  `reduce_loop` over it without the GIL (`NpyIter_Reset(iter, &errmsg)`).
+  Fuzzed against NumPy over shapes, axes, layouts and dtypes
+  (`python/tests/test_reductions.py`, incl. signs of zeros and NaNs):
+  bit-identical.
 - **NumPy's reduction chunking depends on its version** (measured for a
   contiguous 1-d float64 `np.sum`, 100003 elements, NumPy 2.1–2.5):
   **up to 2.2** the loop is called in chunks of `np.getbufsize()` (default
@@ -570,23 +578,30 @@ Rules:
   Bohrium code is copied (license still open); only the design idea
   (intercept, run elsewhere, fall back, sync on access) is reused.
 - **Supported asynchronously:** element-wise ufunc calls (`ufunc.signature
-  is None`, one output) with exact dtype signatures after NumPy's own
-  resolution (`ufunc.resolve_dtypes`, NEP 50 weak Python scalars), incl.
-  `out=` and in-place operators; basic indexing as views (no sync);
+  is None`, one output) with NumPy's own dtype resolution
+  (`ufunc.resolve_dtypes`, NEP 50 weak Python scalars), incl. casts of
+  inputs, `out=` and in-place operators; `astype` (NumPy's cast functions,
+  NumPy's result layout); basic indexing as views (no sync); metadata-only
+  NumPy functions as views without a sync (`.T`, `transpose`, `swapaxes`,
+  `moveaxis`, `squeeze`, `expand_dims`, `flip`, `rot90`, `broadcast_to`,
+  `diagonal`, `real`/`imag`, `view(dtype)`, `reshape`/`ravel` where NumPy
+  makes a view, else an async copy first): NumPy runs them on a stand-in
+  ndarray with the array's layout over a dummy address
+  (`vp_array_stand_in`), and the view it returns maps back onto the
+  storage (`vp_array_view_of`);
   `__setitem__` with basic keys (assign kernel); **reductions** (NumPy ≥
   2.3): `ufunc.reduce` of reorderable ufuncs (add, multiply, minimum,
   maximum, fmin, fmax, logical and/or/xor, bitwise and/or/xor) and
   `np.sum/prod/min/max/amin/amax/any/all` (also as methods) without
-  `out=`, `initial=`, `where=` and without a cast (int32 `sum` accumulates
-  in int64: NumPy); `any`/`all` of non-bool data as `a != 0` first;
+  `out=` and `where=`, with casts and `initial=`; `any`/`all` of non-bool data as `a != 0` first;
   `mean`, `var`, `std` of float64 composed exactly as NumPy's
   `_methods.py` (sum, divide by the count, squared deviations). Results
   are viproc arrays (0-d for full reductions), not NumPy scalars;
   `float()`, `bool()`, `format()`, `round()` sync. Per-call preparation is
   cached per (ufunc, dtype, ndim, axis, keepdims) (`_reduce_plans`).
 - **Fallback (sync + eager NumPy on viproc memory, `_Host`):** everything
-  else: other reductions (casts, argmin/argmax, float32 mean), gufuncs
-  (`matmul`), casting, advanced indexing,
+  else: other reductions (argmin/argmax, float32 mean), gufuncs
+  (`matmul`), advanced indexing,
   `ufunc.at`, other NumPy functions. NumPy's semantics exactly (design doc
   D7, "Eager fallbacks"): each viproc argument becomes a writable NumPy
   view after `vp_array_prepare_write` (wait for producer and task readers,
@@ -661,9 +676,19 @@ Rules:
   process-wide counter (a shared cache line) for atomics that are not
   4-byte futex words. Task completion and `run()` therefore notify only
   when a waiter registered (`Task::waiters_`, `active_waiters_`).
-- Element-wise kernels call the loop once over all elements when every
-  operand is C-contiguous with the output shape or a single element
-  (stride 0); otherwise once per innermost row.
+- **Element-wise loops are called exactly as NumPy calls them.** Their
+  results depend on the strides of the call: NumPy's SIMD paths (complex
+  multiply, float32 exp/sin/arctan2, ...) round differently from their
+  scalar fallbacks, even for one element. Where NumPy makes one call
+  (`numpy::single_call`: its trivial loop, or an iterator that coalesces
+  everything) the shared kernel makes the same call with NumPy's strides;
+  everything else (strided, reversed, broadcast, mixed orders, casts) runs
+  on NumPy's iterator, set up as `execute_ufunc_loop` sets it up
+  (`LoopCache::iter_elementwise`: a template per (loop, layouts, buffer
+  size) over a dummy address, `NpyIter_Copy` per op,
+  `NpyIter_ResetBasePointers` on the worker). Casts happen in the
+  iterator's buffers, or, for 0-d and short 1-d inputs, as a separate cast
+  task first (NumPy's `check_for_trivial_loop` copies those).
 - Measured (4 CPUs, `strong_scaling.py`, 8 chains, Release build, speedup
   vs. NumPy with 4 workers): 1e7 elements ~7.5x (pool + temporary elision;
   NumPy pays page faults for its temporaries); 1e6 ~4.5x; 1e5 3.0x; 1e4 ~3x;
@@ -728,8 +753,8 @@ Rules:
 - Python objects whose memory a task still uses are released only on the
   main thread with the GIL: a worker dropping the last reference parks
   the object in a graveyard drained at the next C ABI call.
-- Not implemented yet: casting (exact dtype signatures only), reductions
-  with casts or over non-coalescing axes, gufuncs (linalg, fft, matmul),
+- Not implemented yet: casting into `out=` of another dtype, gufuncs
+  (linalg, fft, matmul),
   argmin/argmax, FP-flag reporting to
   Python (NumPy warnings / `np.errstate`), `python -m viproc`.
 

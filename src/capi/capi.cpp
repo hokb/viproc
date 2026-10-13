@@ -9,6 +9,7 @@
 #include "runtime/runtime.hpp"
 
 #include <cstdio>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -24,18 +25,53 @@ namespace {
 struct Graveyard {
     std::mutex mutex;
     std::vector<PyObject*> objects;
+    std::vector<std::function<void()>> releases; // kernels' Python state
 
     void drain() {
         std::vector<PyObject*> dead;
+        std::vector<std::function<void()>> todo;
         {
             std::lock_guard lock(mutex);
             dead.swap(objects);
+            todo.swap(releases);
         }
         for (PyObject* o : dead) {
             Py_DECREF(o);
         }
+        for (auto& f : todo) {
+            f();
+        }
     }
 };
+
+// Releases `f` now if this thread holds the GIL, else at the next C ABI
+// call (main thread). After the runtime is gone (interpreter shutdown) the
+// objects leak.
+numpy::DeferRelease defer_release(const std::shared_ptr<Graveyard>& graveyard) {
+    std::weak_ptr<Graveyard> weak = graveyard;
+    return [weak](std::function<void()> f) {
+        if (PyGILState_Check()) {
+            f();
+        } else if (auto g = weak.lock()) {
+            std::lock_guard lock(g->mutex);
+            g->releases.push_back(std::move(f));
+        }
+    };
+}
+
+// Keeps `obj` (a new reference) alive as a buffer owner; dropped with the GIL.
+std::shared_ptr<void> python_owner(const std::shared_ptr<Graveyard>& graveyard, PyObject* obj) {
+    std::weak_ptr<Graveyard> weak = graveyard;
+    return std::shared_ptr<void>(obj, [weak](void* p) {
+        auto* o = static_cast<PyObject*>(p);
+        if (PyGILState_Check()) {
+            Py_DECREF(o);
+        } else if (auto g = weak.lock()) {
+            std::lock_guard lock(g->mutex);
+            g->objects.push_back(o);
+        } // else: runtime gone, interpreter shutting down; leak
+    });
+}
 
 void set_error(char* err, std::size_t errlen, const std::string& msg) {
     if (err != nullptr && errlen > 0) {
@@ -146,16 +182,7 @@ int vp_array_from_ndarray(vp_runtime* rt, PyObject* ndarray, vp_array** out, cha
         return VP_UNSUPPORTED;
     }
     Py_INCREF(ndarray);
-    std::weak_ptr<Graveyard> weak = rt->graveyard;
-    std::shared_ptr<void> owner(ndarray, [weak](void* p) {
-        auto* o = static_cast<PyObject*>(p);
-        if (PyGILState_Check()) {
-            Py_DECREF(o);
-        } else if (auto g = weak.lock()) {
-            std::lock_guard lock(g->mutex);
-            g->objects.push_back(o);
-        } // else: runtime gone, interpreter shutting down; leak
-    });
+    std::shared_ptr<void> owner = python_owner(rt->graveyard, ndarray);
     std::string e;
     ArrayPtr a = numpy::wrap_ndarray(*rt->rt, ndarray, e, std::move(owner));
     if (!a) {
@@ -175,6 +202,20 @@ int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_arr
     }
     *out = hand_out(std::move(a));
     return VP_OK;
+}
+
+PyObject* vp_array_stand_in(const vp_array* a) { return numpy::stand_in(arr(a).layout()); }
+
+vp_array* vp_array_view_of(vp_runtime* rt, const vp_array* a, PyObject* stand_in, PyObject* r,
+                           int* readonly) {
+    Layout l;
+    bool writable = true;
+    if (!numpy::view_of(stand_in, r, l, writable)) {
+        return nullptr;
+    }
+    *readonly = writable ? 0 : 1;
+    l.offset += arr(a).layout().offset;
+    return hand_out(rt->rt->view(ref(a), std::move(l)));
 }
 
 vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, vp_dtype dtype, int ndim,
@@ -251,6 +292,97 @@ int vp_ufunc_loop(vp_runtime* rt, PyObject* ufunc, int nin, const vp_dtype* dtyp
     return VP_OK;
 }
 
+namespace {
+
+// F-contiguous as NumPy's flag: extent-1 dimensions may have any stride.
+bool f_contiguous(const Layout& l) {
+    std::int64_t step = static_cast<std::int64_t>(itemsize(l.dtype));
+    for (std::size_t i = 0; i < l.shape.size(); ++i) {
+        if (l.shape[i] == 0) {
+            return true;
+        }
+        if (l.shape[i] != 1) {
+            if (l.strides[i] != step) {
+                return false;
+            }
+            step *= l.shape[i];
+        }
+    }
+    return true;
+}
+
+// The kernel of an element-wise op: the loop's shared kernel where NumPy
+// calls the loop once over all elements, else one driven by NumPy's iterator
+// (LoopCache::iter_elementwise), which also casts inputs of another dtype.
+// nullptr if NumPy cannot run it so.
+std::shared_ptr<Kernel> elementwise_kernel(vp_runtime* rt, const vp_loop& loop,
+                                           std::span<const ArrayPtr> ins, const Layout& out,
+                                           bool out_given, char* err, size_t errlen) {
+    const Layout* ptrs[3];
+    bool cast = false;
+    for (std::size_t i = 0; i < ins.size(); ++i) {
+        ptrs[i] = &ins[i]->layout();
+        cast = cast || ptrs[i]->dtype != loop.dtypes[i];
+    }
+    std::intptr_t strides[4];
+    if (out.size() == 0 ||
+        (!cast && numpy::single_call(std::span(ptrs, ins.size()), out, strides))) {
+        return loop.loop->elementwise_kernel();
+    }
+    Layout layouts[3];
+    for (std::size_t i = 0; i < ins.size(); ++i) {
+        layouts[i] = ins[i]->layout();
+    }
+    const std::span<const Layout> ls(layouts, ins.size());
+    std::string e;
+    std::shared_ptr<Kernel> k = rt->loops->iter_elementwise(
+        loop.loop, loop.dtypes, ls, out, out_given, defer_release(rt->graveyard), e);
+    if (!k) {
+        PyErr_Clear();
+        set_error(err, errlen, e);
+    }
+    return k;
+}
+
+// Inputs of another dtype than the loop's: NumPy's ufuncs copy 0-d and short
+// 1-d ones (up to the buffer size) into a cast array first and keep the
+// single loop call (check_for_trivial_loop); longer and n-d ones are cast
+// in the iterator's buffers (elementwise_kernel). Replaces the first kind by
+// the result of an issued cast task. False if NumPy cannot cast.
+bool cast_small_inputs(vp_runtime* rt, const vp_loop& loop, std::span<ArrayPtr> ins,
+                       const char* site, char* err, size_t errlen) {
+    long bufsize = -1;
+    for (std::size_t i = 0; i < ins.size(); ++i) {
+        const Layout& l = ins[i]->layout();
+        const DType to = loop.dtypes[i];
+        if (l.dtype == to || l.size() == 0 || l.shape.size() > 1) {
+            continue;
+        }
+        if (bufsize < 0) {
+            bufsize = rt->loops->buffersize();
+        }
+        if (l.shape.size() == 1 && l.shape[0] > bufsize) {
+            continue;
+        }
+        std::string e;
+        const Layout dst = Layout::contiguous(to, l.shape);
+        std::shared_ptr<Kernel> k =
+            numpy::make_cast_kernel(l, dst, bufsize, defer_release(rt->graveyard), e);
+        if (!k) {
+            PyErr_Clear();
+            set_error(err, errlen, e);
+            return false;
+        }
+        ArrayPtr res;
+        const ArrayPtr in[] = {ins[i]};
+        rt->rt->issue(k, in, {}, std::span(&dst, 1), site, std::span(&res, 1));
+        ins[i] = std::move(res);
+    }
+    return true;
+}
+
+} // namespace
+
 int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs, int out_ndim,
                    const int64_t* out_shape, vp_array* out, vp_array** result, const char* site,
                    char* err, size_t errlen) {
@@ -264,9 +396,12 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
     for (int i = 0; i < nin; ++i) {
         ins[i] = ref(inputs[i]);
     }
+    if (!cast_small_inputs(rt, *loop, std::span(ins, static_cast<std::size_t>(nin)), site, err,
+                           errlen)) {
+        return VP_UNSUPPORTED;
+    }
     const DType out_dtype = loop->dtypes[static_cast<std::size_t>(nin)];
     Shape shape(out_shape, out_shape + out_ndim);
-    const std::shared_ptr<Kernel>& kernel = loop->loop->elementwise_kernel();
     const std::span<const ArrayPtr> in_span(ins, static_cast<std::size_t>(nin));
     if (out != nullptr) {
         const Layout& ol = arr(out).layout();
@@ -275,7 +410,11 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
             return VP_INVALID;
         }
         const ArrayPtr o = ref(out);
-        rt->rt->issue(kernel, in_span, std::span(&o, 1), {}, site);
+        std::shared_ptr<Kernel> k = elementwise_kernel(rt, *loop, in_span, ol, true, err, errlen);
+        if (!k) {
+            return VP_UNSUPPORTED;
+        }
+        rt->rt->issue(k, in_span, std::span(&o, 1), {}, site);
         *result = nullptr;
         return VP_OK;
     }
@@ -285,9 +424,27 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
         const Layout& il = ins[i]->layout();
         all_c = all_c && (il.c_contiguous() || il.size() <= 1);
     }
+    // NumPy's trivial loop allocates F order when every input is a 0-d array
+    // or F- (and not C-) contiguous with the result's shape, without a cast; that fixes the
+    // strides of extent-1 dimensions too, which keep_order() would not.
+    bool all_f = !all_c && out_ndim > 1;
+    for (int i = 0; i < nin && all_f; ++i) {
+        const Layout& il = ins[i]->layout();
+        all_f = il.shape.empty() || (il.shape == shape && f_contiguous(il) && !il.c_contiguous() &&
+                                     il.dtype == loop->dtypes[i]);
+    }
     Layout l;
     if (all_c) {
         l = Layout::contiguous(out_dtype, std::move(shape));
+    } else if (all_f) {
+        l.dtype = out_dtype;
+        l.strides.resize(shape.size());
+        std::int64_t step = static_cast<std::int64_t>(itemsize(out_dtype));
+        for (std::size_t i = 0; i < shape.size(); ++i) {
+            l.strides[i] = step;
+            step *= shape[i];
+        }
+        l.shape = std::move(shape);
     } else {
         Layout in_layouts[3];
         for (int i = 0; i < nin; ++i) {
@@ -296,8 +453,12 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
         l = Layout::keep_order(out_dtype, std::move(shape),
                                std::span<const Layout>(in_layouts, static_cast<std::size_t>(nin)));
     }
+    std::shared_ptr<Kernel> k = elementwise_kernel(rt, *loop, in_span, l, false, err, errlen);
+    if (!k) {
+        return VP_UNSUPPORTED;
+    }
     ArrayPtr res;
-    rt->rt->issue(kernel, in_span, {}, std::span(&l, 1), site, std::span(&res, 1));
+    rt->rt->issue(k, in_span, {}, std::span(&l, 1), site, std::span(&res, 1));
     *result = hand_out(std::move(res));
     return VP_OK;
 }
@@ -318,9 +479,62 @@ int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, 
     return vp_ufunc_issue(rt, loop, inputs, out_ndim, out_shape, out, result, site, err, errlen);
 }
 
+int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array** result,
+              const char* site, char* err, size_t errlen) {
+    rt->graveyard->drain();
+    const Layout& l = arr(in).layout();
+    const DType to = to_dtype(dtype);
+    Layout out;
+    if (order == 'C' || l.c_contiguous() || l.shape.size() <= 1) {
+        out = Layout::contiguous(to, l.shape);
+    } else if (order == 'K') {
+        // PyArray_NewLikeArray(KEEPORDER): F order if `in` is F-contiguous,
+        // else axes by decreasing |stride| (stable), C order among equals.
+        out.dtype = to;
+        out.shape = l.shape;
+        out.strides.resize(l.shape.size());
+        std::vector<std::size_t> perm(l.shape.size());
+        for (std::size_t i = 0; i < perm.size(); ++i) {
+            perm[i] = i;
+        }
+        if (!f_contiguous(l)) {
+            std::stable_sort(perm.begin(), perm.end(), [&](std::size_t a, std::size_t b) {
+                return std::llabs(l.strides[a]) > std::llabs(l.strides[b]);
+            });
+        } else {
+            std::reverse(perm.begin(), perm.end());
+        }
+        std::int64_t step = static_cast<std::int64_t>(itemsize(to));
+        for (std::size_t k = perm.size(); k-- > 0;) {
+            out.strides[perm[k]] = step;
+            step *= l.shape[perm[k]];
+        }
+    } else {
+        set_error(err, errlen, "unsupported order");
+        return VP_UNSUPPORTED;
+    }
+    if (l.size() == 0) {
+        set_error(err, errlen, "empty");
+        return VP_UNSUPPORTED;
+    }
+    std::string e;
+    std::shared_ptr<Kernel> k =
+        numpy::make_cast_kernel(l, out, rt->loops->buffersize(), defer_release(rt->graveyard), e);
+    if (!k) {
+        PyErr_Clear(); // e.g. a ComplexWarning raised as an error: NumPy raises it again
+        set_error(err, errlen, e);
+        return VP_UNSUPPORTED;
+    }
+    const ArrayPtr ins[] = {ref(in)};
+    ArrayPtr res;
+    rt->rt->issue(k, ins, {}, std::span(&out, 1), site, std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
 int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
-              int keepdims, PyObject* identity, vp_array** result, const char* site, char* err,
-              size_t errlen) {
+              int keepdims, PyObject* dtype, PyObject* identity, vp_array** result,
+              const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout& l = arr(in).layout();
     if (l.size() == 0) {
@@ -340,18 +554,51 @@ int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char
     }
     Layout out_layout = Layout::contiguous(l.dtype, std::move(out_shape));
     const std::span<const bool> reduced(reinterpret_cast<const bool*>(flags.data()), nd);
-    numpy::ReducePlan plan = numpy::plan_reduction(l, reduced, out_layout);
-    if (!plan.supported()) {
-        set_error(err, errlen, "reduced axes do not coalesce (NumPy buffers them)");
-        return VP_UNSUPPORTED;
+    if (dtype == nullptr) {
+        dtype = Py_None;
     }
+    if (identity == nullptr) {
+        identity = Py_None;
+    }
+    numpy::ReducePlan plan = numpy::plan_reduction(l, reduced, out_layout);
     std::string e;
+    // Fast path: no cast, a dense input (in any axis order) whose reduced axes
+    // coalesce: the loop calls follow from the plan. Everything else, NumPy's
+    // iterator drives: it may buffer strided inputs even without a cast, and
+    // a loop called on a buffer can round differently than on strided data
+    // (complex multiply has a SIMD path for contiguous operands only).
+    Layout dense_check = l;
+    dense_check.offset = 0;
     const numpy::UfuncLoop* loop =
-        rt->loops->get_reduction(ufunc, l.dtype, plan.inner_strides(), e);
+        dtype == Py_None && plan.supported() && dense_check.dense()
+            ? rt->loops->get_reduction(ufunc, l.dtype, plan.inner_strides(), e)
+            : nullptr;
     if (loop == nullptr) {
         PyErr_Clear();
-        set_error(err, errlen, e);
-        return VP_UNSUPPORTED;
+        numpy::IterReduction ir;
+        if (!numpy::make_iter_reduction(ufunc, l, arr(in).buffer(), reduced, keepdims != 0, dtype,
+                                        identity, rt->loops->buffersize(),
+                                        defer_release(rt->graveyard), ir, e)) {
+            PyErr_Clear();
+            set_error(err, errlen, e);
+            return VP_UNSUPPORTED;
+        }
+        void* data = nullptr;
+        std::size_t nbytes = 0;
+        Layout rl;
+        if (!numpy::ndarray_layout(ir.result, rl, data, nbytes)) {
+            Py_DECREF(ir.result);
+            set_error(err, errlen, "unsupported result dtype");
+            return VP_UNSUPPORTED;
+        }
+        auto buffer =
+            std::make_shared<Buffer>(data, nbytes, python_owner(rt->graveyard, ir.result));
+        const ArrayPtr ins[] = {ref(in)};
+        ArrayPtr res;
+        rt->rt->issue(ir.kernel, ins, {}, std::span(&rl, 1), site, std::span(&res, 1), l.size(),
+                      std::span(&buffer, 1));
+        *result = hand_out(std::move(res));
+        return VP_OK;
     }
     std::vector<std::byte> init;
     if (identity != nullptr && identity != Py_None &&

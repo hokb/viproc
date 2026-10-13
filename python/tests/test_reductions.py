@@ -2,6 +2,8 @@
 the blocks NumPy would use. Every result must be bit-identical to NumPy (also
 the sign of zeros and NaNs), for all shapes, axes and memory layouts."""
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -197,7 +199,7 @@ def test_reduction_arguments_and_errors_follow_numpy():
     x = np.arange(12.0).reshape(3, 4)
     v = viproc.asarray(x)
     assert same(np.sum(v, axis=-1), np.sum(x, axis=-1))
-    assert same(np.sum(v, dtype=np.float32), np.sum(x, dtype=np.float32))  # casts: NumPy
+    assert same(np.sum(v, dtype=np.float32), np.sum(x, dtype=np.float32))  # casts
     assert same(np.sum(v, initial=5.0), np.sum(x, initial=5.0))
     assert same(np.sum(v, where=x > 3), np.sum(x, where=x > 3))
     i = np.arange(10, dtype=np.int32)
@@ -216,3 +218,34 @@ def test_scalar_results_behave_like_numpy_scalars():
     assert round(s, 1) == round(np.sum(x), 1)
     assert float(s) == np.sum(x) and int(s) == 4 and s == np.sum(x)
     assert s.item() == np.sum(x).item()
+
+
+@pytest.mark.skipif(not ASYNC, reason="async reductions need NumPy >= 2.3")
+@pytest.mark.parametrize("seed", range(3))
+def test_casting_reductions_run_asynchronously_on_numpys_iterator(seed):
+    rng = np.random.default_rng(10 + seed)
+    f0 = fallbacks()
+    checked = 0
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for _ in range(60):
+            nd = int(rng.integers(1, 4))
+            shape = tuple(int(rng.choice([1, 3, 7, 33, 257])) for _ in range(nd))
+            dtype = str(rng.choice(["f4", "f8", "c8", "i4", "i8", "b1"]))
+            base = sensitive(rng, shape, dtype)
+            ops = view_ops(rng, nd)
+            x, v = apply(base, ops), apply(viproc.asarray(base), ops)
+            to = rng.choice([None, "f4", "f8", "i8", "c16"])
+            axis = tuple(i for i in range(nd) if rng.random() < 0.5) or None
+            for fn in (np.sum, np.prod):
+                try:
+                    expected = fn(x, axis=axis, dtype=to)
+                except TypeError:
+                    continue
+                got = fn(v, axis=axis, dtype=to)
+                assert same(got, expected), (fn.__name__, dtype, to, x.shape, ops, axis)
+                checked += 1
+            expected = np.sum(x, axis=axis, initial=3)
+            assert same(np.sum(v, axis=axis, initial=3), expected)
+    assert checked > 60
+    assert fallbacks() == f0

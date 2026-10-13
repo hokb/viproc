@@ -97,6 +97,17 @@ int vp_array_from_ndarray(vp_runtime* rt, PyObject* ndarray, vp_array** out, cha
  * converted to `dtype` with NumPy's rules (e.g. OverflowError for a Python
  * int out of range). Returns VP_PYERR with the Python exception set. */
 int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array** out);
+/* [GIL] A stand-in for `a` in NumPy code that only rearranges metadata
+ * (transpose, reshape without copy, real, ...): a writable ndarray with a's
+ * dtype, shape and strides over a dummy address. Its data must never be
+ * read or written. vp_array_view_of() maps a view NumPy derived from it back
+ * onto `a`'s storage. New reference, or NULL with a Python error. */
+PyObject* vp_array_stand_in(const vp_array* a);
+/* [GIL] If `r` is an ndarray view of `stand_in` (from vp_array_stand_in(a))
+ * with a viproc dtype, returns the same view of `a` (metadata only) and sets
+ * *readonly if NumPy made `r` read-only; else NULL. */
+vp_array* vp_array_view_of(vp_runtime* rt, const vp_array* a, PyObject* stand_in, PyObject* r,
+                           int* readonly);
 /* [GIL] A view of `base` sharing its storage. `offset` is in bytes, relative
  * to base's first element; strides are in bytes. Metadata only. */
 vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, vp_dtype dtype, int ndim,
@@ -170,6 +181,16 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
                    const int64_t* out_shape, vp_array* out, vp_array** result, const char* site,
                    char* err, size_t errlen);
 
+/* Issues a cast of `in` to `dtype` (NumPy's a.astype(dtype, order)) with
+ * NumPy's cast functions. `order` 'K' gives the result NumPy's layout for
+ * astype (PyArray_NewLikeArray: C or F if `in` is, else its axis order),
+ * 'C' C order. Returns VP_UNSUPPORTED if NumPy cannot cast without the
+ * Python API or the cast is empty. NumPy's warnings (ComplexWarning) are
+ * issued during the call, as by NumPy (VP_UNSUPPORTED if a warning filter
+ * turns one into an error: NumPy raises it in the fallback). */
+int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array** result,
+              const char* site, char* err, size_t errlen);
+
 /* Issues a reduction of `in` with the binary `ufunc` (add, multiply, minimum,
  * maximum, logical_and, ...) over the dimensions flagged in `axes` (one entry
  * per dimension of `in`; nonzero = reduced). viproc calls NumPy's own
@@ -178,12 +199,17 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
  * result has the input's dtype; reduced dimensions stay with extent 1 if
  * `keepdims`. `identity` is the value the accumulator starts at (the
  * ufunc's identity), or Py_None to start at the first element along the
- * reduced axes (minimum, maximum). Returns VP_UNSUPPORTED (reason in `err`)
- * if the input is empty, the reduction would cast, or the loop needs the
- * Python API; the caller then falls back to NumPy. */
+ * reduced axes (minimum, maximum). `dtype` (Py_None or a dtype) is the
+ * reduction's dtype= argument; NumPy's rules pick the accumulator (int32
+ * sums in int64). Reductions that cast or whose reduced axes do not coalesce
+ * run on NumPy's own iterator (NpyIter, buffered as in NumPy); the result is
+ * then the array that iterator allocates, in NumPy's layout. Returns
+ * VP_UNSUPPORTED (reason in `err`) if the input is empty, the result dtype is
+ * not supported, the loop needs the Python API, or a reduction without
+ * initial value casts; the caller then falls back to NumPy. */
 int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
-              int keepdims, PyObject* identity, vp_array** result, const char* site, char* err,
-              size_t errlen);
+              int keepdims, PyObject* dtype, PyObject* identity, vp_array** result,
+              const char* site, char* err, size_t errlen);
 
 /* Issues dst[...] = src (src broadcasts to dst's shape, same dtype). `site`
  * comes from vp_intern. */

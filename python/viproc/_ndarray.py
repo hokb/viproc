@@ -10,13 +10,12 @@ operators) is implemented in C by the base class ``_viproc._Array``; this
 module adds everything else and the fallbacks the C code calls.
 """
 
+import builtins
 import os
-
 import warnings
 
 import numpy as np
 from numpy.lib.array_utils import normalize_axis_tuple
-from numpy.lib.stride_tricks import as_strided
 
 from . import _viproc
 
@@ -191,6 +190,7 @@ _REDUCE_UFUNCS = frozenset((
     np.logical_or, np.logical_xor, np.bitwise_and, np.bitwise_or, np.bitwise_xor,
 ))
 _MISS = object()
+_NV = np._NoValue
 # (ufunc, dtype, ndim, axis, keepdims, requested dtype) -> (axis flags,
 # keepdims, identity), or None if viproc cannot run that reduction. Per-call
 # work is then one lookup (normalizing axes and probing NumPy's result dtype
@@ -199,30 +199,29 @@ _reduce_plans = {}
 
 
 def _plan_reduce(ufunc, dtype, ndim, axis, keepdims, requested):
-    if requested is not None:
-        if np.dtype(requested) != dtype:
-            return None  # a cast
-    else:
-        try:  # e.g. sum of int32 accumulates in int64: a cast
-            if ufunc.reduce(np.zeros(1, dtype)).dtype != dtype:
+    try:  # NumPy's result dtype (int32 sums accumulate in int64); a viproc dtype?
+        with warnings.catch_warnings():  # the probe only: the call itself warns
+            warnings.simplefilter("ignore")
+            if ufunc.reduce(np.zeros(1, dtype), dtype=requested).dtype not in _CODES:
                 return None
-        except (TypeError, ValueError):
-            return None
+    except (TypeError, ValueError):
+        return None  # NumPy raises the error
     if axis is None:
         flags = (True,) * ndim
     else:
         try:
             axes = normalize_axis_tuple(axis, ndim)
         except (TypeError, ValueError, np.exceptions.AxisError):
-            return None  # NumPy raises the error
+            return None
         flags = tuple(i in axes for i in range(ndim))
-    return flags, bool(keepdims), ufunc.identity
+    return flags, bool(keepdims), None if requested is None else np.dtype(requested)
 
 
-def _reduce(ufunc, a, axis=None, keepdims=False, dtype=None):
-    """ufunc.reduce(a, axis, keepdims=..., dtype=...) issued asynchronously,
-    or None if viproc cannot run it (the caller falls back to NumPy; empty
-    inputs too, vp_reduce refuses them)."""
+def _reduce(ufunc, a, axis=None, keepdims=False, dtype=None, initial=_NV):
+    """ufunc.reduce(a, axis, dtype=..., keepdims=..., initial=...) issued
+    asynchronously, or None if viproc cannot run it (the caller falls back to
+    NumPy; empty inputs too, vp_reduce refuses them). Casting reductions and
+    strided ones NumPy buffers run on NumPy's own iterator (vp_reduce)."""
     if not _REDUCE_ASYNC or type(a) is not ndarray or ufunc not in _REDUCE_UFUNCS:
         return None
     try:
@@ -238,7 +237,9 @@ def _reduce(ufunc, a, axis=None, keepdims=False, dtype=None):
             _reduce_plans[key] = plan
     if plan is None:
         return None
-    return _viproc.reduce(ufunc, a, *plan)
+    flags, keep, requested = plan
+    start = ufunc.identity if initial is _NV else initial
+    return _viproc.reduce(ufunc, a, flags, keep, requested, start)
 
 
 def _reduced_count(a, axis):
@@ -252,7 +253,6 @@ def _reduced_count(a, axis):
 
 
 _NOPE = object()  # handler result: not supported here, fall back
-_NV = np._NoValue
 
 
 def _sum_or_numpy(x, axis, keepdims):
@@ -262,9 +262,9 @@ def _sum_or_numpy(x, axis, keepdims):
 
 def _r_sum(ufunc):
     def handler(a, axis=None, dtype=None, out=None, keepdims=_NV, initial=_NV, where=_NV):
-        if out is not None or initial is not _NV or where is not _NV:
+        if out is not None or where is not _NV:
             return _NOPE
-        r = _reduce(ufunc, a, axis, keepdims is True, dtype)
+        r = _reduce(ufunc, a, axis, keepdims is True, dtype, initial)
         return _NOPE if r is None else r
 
     return handler
@@ -272,9 +272,9 @@ def _r_sum(ufunc):
 
 def _r_minmax(ufunc):
     def handler(a, axis=None, out=None, keepdims=_NV, initial=_NV, where=_NV):
-        if out is not None or initial is not _NV or where is not _NV:
+        if out is not None or where is not _NV:
             return _NOPE
-        r = _reduce(ufunc, a, axis, keepdims is True)
+        r = _reduce(ufunc, a, axis, keepdims is True, None, initial)
         return _NOPE if r is None else r
 
     return handler
@@ -344,6 +344,63 @@ _REDUCTIONS = {
     np.var: _r_var,
     np.std: _r_std,
 }
+
+
+# --- views (metadata only, no sync) --------------------------------------------
+# NumPy functions that only rearrange metadata (shape, strides, offset, dtype)
+# run on a stand-in: an ndarray with the viproc array's shape and strides over
+# a one-element dummy. Its data is never read (these functions do not touch
+# it); the view NumPy returns is mapped onto a runtime view of the same
+# storage. NumPy validates the arguments and raises its own errors.
+_VIEW_FUNCS = frozenset((
+    np.transpose, np.swapaxes, np.moveaxis, np.rollaxis, np.squeeze, np.expand_dims,
+    np.flip, np.fliplr, np.flipud, np.rot90, np.atleast_1d, np.atleast_2d, np.atleast_3d,
+    np.broadcast_to, np.diagonal, np.real, np.matrix_transpose, np.permute_dims,
+))
+
+
+def _meta_view(fn, a, args=(), kwargs=None):
+    """fn(a, *args, **kwargs) as a runtime view of `a` if NumPy's result is a
+    view of its argument, else _NOPE. `fn` must not read data."""
+    if type(a) is not ndarray:
+        return _NOPE
+    fake = _viproc.stand_in(a)
+    r = fn(fake, *args, **(kwargs or {})) if kwargs else fn(fake, *args)
+    if r is fake:
+        return a  # NumPy returns its argument itself (np.real of real data, ...)
+    w = _viproc.view_of(a, fake, r)
+    return _NOPE if w is None else w
+
+
+def _reshape(a, *args, **kwargs):
+    """np.reshape: a view where NumPy makes one, else NumPy's copy (C or F
+    order, as requested) as an async copy, reshaped."""
+    if type(a) is not ndarray or kwargs.get("copy") is not None:
+        return _NOPE
+    fake = _viproc.stand_in(a)
+    try:
+        r = np.reshape(fake, *args, copy=False, **kwargs)
+    except ValueError:  # NumPy would copy: copy (async), then view
+        order = kwargs.get("order", "C")
+        if order not in ("C", "F"):
+            return _NOPE
+        c = a.astype(a.dtype, order="C") if order == "C" else _NOPE
+        if c is _NOPE:
+            return _NOPE
+        return _reshape(c, *args, **kwargs)
+    if r is fake:
+        return a
+    w = _viproc.view_of(a, fake, r)
+    return _NOPE if w is None else w
+
+
+def _ravel(a, order="C"):
+    if order not in ("C",):
+        return _NOPE
+    return _reshape(a, -1)
+
+
+_VIEW_HANDLERS = {np.reshape: _reshape, np.ravel: _ravel}
 
 
 def _is_basic_index(key):
@@ -454,14 +511,11 @@ class ndarray(_viproc._Array):
     # --- indexing ------------------------------------------------------------
     def _view(self, key):
         """Basic indexing as a runtime view (metadata only, no sync)."""
-        dummy = np.empty(1, dtype=self.dtype)
-        fake = as_strided(dummy, shape=self.shape, strides=self.strides, writeable=False)
+        fake = _viproc.stand_in(self)
         keys = key if isinstance(key, tuple) else (key,)
         if not any(k is Ellipsis for k in keys):
             keys = keys + (Ellipsis,)  # always a view, never a NumPy scalar
-        v = fake[keys]
-        offset = v.__array_interface__["data"][0] - dummy.__array_interface__["data"][0]
-        return _viproc.view(self, v.shape, v.strides, offset)
+        return _viproc.view_of(self, fake, fake[keys])
 
     def __getitem__(self, key):
         if _is_basic_index(key):
@@ -493,7 +547,11 @@ class ndarray(_viproc._Array):
         if func is np.copyto and len(args) >= 2 and isinstance(args[0], ndarray) and not kwargs:
             args[0][...] = args[1]
             return None
-        handler = _REDUCTIONS.get(func)
+        if func in _VIEW_FUNCS and args:
+            r = _meta_view(func, args[0], args[1:], kwargs)
+            if r is not _NOPE:
+                return r
+        handler = _REDUCTIONS.get(func) or _VIEW_HANDLERS.get(func)
         if handler is not None:
             try:
                 r = handler(*args, **kwargs)
@@ -504,11 +562,17 @@ class ndarray(_viproc._Array):
         return _host_call(func, args, kwargs)
 
     # --- common methods (NumPy semantics via the protocols) -------------------
-    def astype(self, dtype, copy=True):
+    def astype(self, dtype, order="K", casting="unsafe", subok=True, copy=True):
         dtype = np.dtype(dtype)
         if dtype == self.dtype and not copy:
             return self
-        return _adopt(self.numpy().astype(dtype))  # fresh copy
+        code = _CODES.get(dtype)
+        if (code is not None and order in ("K", "C") and casting == "unsafe"
+                and self.size and type(self) is ndarray):
+            r = _viproc.astype(self, code, order)  # NumPy's casts, asynchronously
+            if r is not None:
+                return r
+        return _host_call(lambda a: a.astype(dtype, order, casting, subok, copy), (self,), {})
 
     def copy(self):
         out = _wrap_numpy(np.empty(self.shape, self.dtype))
@@ -516,11 +580,61 @@ class ndarray(_viproc._Array):
         return out
 
     def reshape(self, *shape, **kwargs):
-        return np.reshape(self, shape[0] if len(shape) == 1 else shape, **kwargs)
+        shape = shape[0] if len(shape) == 1 else shape
+        r = _reshape(self, shape, **kwargs) if not kwargs else _NOPE
+        return np.reshape(self, shape, **kwargs) if r is _NOPE else r
+
+    def ravel(self, order="C"):
+        return np.ravel(self, order)
+
+    def flatten(self, order="C"):
+        if order == "C" and type(self) is ndarray:
+            return self.astype(self.dtype, order="C").reshape(-1)  # always a copy
+        return _host_call(lambda a: a.flatten(order), (self,), {})
 
     @property
     def T(self):
-        return np.transpose(self)
+        r = _meta_view(np.transpose, self)  # no __array_function__ dispatch
+        return np.transpose(self) if r is _NOPE else r
+
+    @property
+    def mT(self):
+        return np.matrix_transpose(self)
+
+    def transpose(self, *axes):
+        if len(axes) == 1 and (axes[0] is None or isinstance(axes[0], (tuple, list))):
+            axes = axes[0]
+        return np.transpose(self, axes if axes != () else None)
+
+    def swapaxes(self, axis1, axis2):
+        return np.swapaxes(self, axis1, axis2)
+
+    def squeeze(self, axis=None):
+        return np.squeeze(self, axis)
+
+    def diagonal(self, offset=0, axis1=0, axis2=1):
+        return np.diagonal(self, offset, axis1, axis2)
+
+    @property
+    def real(self):
+        return np.real(self)
+
+    @property
+    def imag(self):
+        if self.dtype.kind == "c":
+            r = _meta_view(lambda a: a.imag, self)
+            if r is not _NOPE:
+                return r
+        return _host_call(lambda a: a.imag, (self,), {})
+
+    def view(self, dtype=None, type=None):
+        if type is None and dtype is not None and not (
+                isinstance(dtype, builtins.type) and issubclass(dtype, np.ndarray)):
+            r = _meta_view(lambda a: a.view(dtype), self)
+            if r is not _NOPE:
+                return r
+        return _host_call(lambda a: a.view(dtype) if type is None else a.view(dtype, type),
+                          (self,), {})
 
     def sum(self, *a, **k):
         return np.sum(self, *a, **k)
@@ -558,9 +672,9 @@ class ndarray(_viproc._Array):
 
 def _ufunc_reduce(ufunc, a, axis=0, dtype=None, out=None, keepdims=False, initial=_NV,
                   where=True):
-    if out is not None or initial is not _NV or where is not True:
+    if out is not None or where is not True:
         return None
-    return _reduce(ufunc, a, axis, keepdims, dtype)
+    return _reduce(ufunc, a, axis, keepdims, dtype, initial)
 
 
 def _fallback_ufunc(ufunc, method, inputs, kwargs):

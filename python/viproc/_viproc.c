@@ -636,10 +636,40 @@ static int is_temporary(PyObject* obj, size_t nbytes) {
 #endif
 }
 
+/* C-contiguous (extent-1 dimensions may have any stride). */
+static int c_contiguous(const vp_array* a) {
+    const int nd = vp_array_ndim(a);
+    const int64_t* shape = vp_array_shape(a);
+    const int64_t* strides = vp_array_strides(a);
+    static const int64_t itemsizes[] = {1, 4, 8, 4, 8, 8, 16}; /* vp_dtype order */
+    int64_t step = itemsizes[vp_array_dtype(a)];
+    for (int i = nd; i-- > 0;) {
+        if (shape[i] == 0) {
+            return 1;
+        }
+        if (shape[i] != 1) {
+            if (strides[i] != step) {
+                return 0;
+            }
+            step *= shape[i];
+        }
+    }
+    return 1;
+}
+
 /* An input of an operator whose buffer can take the result: same dtype and
- * shape as the output, reusable per the runtime, and a temporary. */
+ * shape as the output, reusable per the runtime, and a temporary. The other
+ * array inputs must be C-contiguous too (any shape): then NumPy would
+ * allocate its result in C order, the temporary's layout, and its iterator
+ * calls the loop the same way with either output (strided or mixed-order
+ * operands make the iteration depend on the output's layout). */
 static PyObject* elision_candidate(PyObject* const* inputs, vp_array* const* ins, Py_ssize_t n,
                                    int out_code, int ndim, const int64_t* shape) {
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        if (is_array(inputs[i]) && !c_contiguous(ins[i])) {
+            return NULL;
+        }
+    }
     for (Py_ssize_t i = 0; i < n; ++i) {
         if (!is_array(inputs[i]) || ((ArrayObject*)inputs[i])->readonly ||
             (int)vp_array_dtype(ins[i]) != out_code || vp_array_ndim(ins[i]) != ndim ||
@@ -765,8 +795,9 @@ static int resolve_slow(PyObject* ufunc, int nin, const int* kinds, long long* p
     int ok = 1;
     for (int i = 0; i <= nin && ok; ++i) {
         int c = dtype_code(PyTuple_GET_ITEM(res, i));
-        /* Typed inputs must keep their dtype: anything else is a cast. */
-        ok = c >= 0 && (i == nin || kinds[i] >= K_PYBOOL || kinds[i] == c);
+        /* Typed inputs of another dtype are cast as NumPy casts them
+         * (vp_ufunc_issue); every dtype must be a viproc dtype. */
+        ok = c >= 0;
         p |= (long long)c << (8 * i);
     }
     Py_DECREF(res);
@@ -1353,6 +1384,35 @@ static PyObject* m_view(PyObject* self, PyObject* args) {
     return v;
 }
 
+static PyObject* m_stand_in(PyObject* self, PyObject* a) {
+    (void)self;
+    if (!PyObject_TypeCheck(a, &ArrayType) || check_runtime() < 0) {
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_TypeError, "stand_in: a viproc array expected");
+        }
+        return NULL;
+    }
+    return vp_array_stand_in(array_of(a));
+}
+
+static PyObject* m_view_of(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *a, *fake, *r;
+    if (!PyArg_ParseTuple(args, "O!OO", &ArrayType, &a, &fake, &r) || check_runtime() < 0) {
+        return NULL;
+    }
+    int readonly = 0;
+    vp_array* v = vp_array_view_of(g_rt, array_of(a), fake, r, &readonly);
+    if (v == NULL) {
+        Py_RETURN_NONE;
+    }
+    PyObject* w = wrap_array(v);
+    if (w != NULL) {
+        ((ArrayObject*)w)->readonly = ((ArrayObject*)a)->readonly || readonly;
+    }
+    return w;
+}
+
 static PyObject* m_ready(PyObject* self, PyObject* o) {
     (void)self;
     vp_array* a = array_of(o);
@@ -1435,15 +1495,17 @@ static PyObject* m_assign(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
-/* reduce(ufunc, a, axes, keepdims, identity): async reduction with NumPy's
- * reduction loop (vp_reduce). `axes`: a sequence of bools, one per
- * dimension of `a`. Returns the (pending) result, or None if viproc cannot
- * run it (the caller falls back to NumPy). */
+/* reduce(ufunc, a, axes, keepdims, dtype, initial): async reduction with
+ * NumPy's reduction loop (vp_reduce). `axes`: a sequence of bools, one per
+ * dimension of `a`; `dtype`: dtype= or None; `initial`: start value or None
+ * (start at the first elements). Returns the (pending) result, or None if
+ * viproc cannot run it (the caller falls back to NumPy). */
 static PyObject* m_reduce(PyObject* self, PyObject* args) {
     (void)self;
-    PyObject *ufunc, *a, *axes, *identity;
+    PyObject *ufunc, *a, *axes, *dtype, *identity;
     int keepdims;
-    if (!PyArg_ParseTuple(args, "OO!OpO", &ufunc, &ArrayType, &a, &axes, &keepdims, &identity) ||
+    if (!PyArg_ParseTuple(args, "OO!OpOO", &ufunc, &ArrayType, &a, &axes, &keepdims, &dtype,
+                          &identity) ||
         check_runtime() < 0) {
         return NULL;
     }
@@ -1470,8 +1532,29 @@ static PyObject* m_reduce(PyObject* self, PyObject* args) {
     Py_DECREF(fast);
     vp_array* res = NULL;
     char err[ERRLEN] = "";
-    const int status =
-        vp_reduce(g_rt, ufunc, in, flags, keepdims, identity, &res, issue_site(), err, sizeof err);
+    const int status = vp_reduce(g_rt, ufunc, in, flags, keepdims, dtype, identity, &res,
+                                 issue_site(), err, sizeof err);
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    return wrap_array(res);
+}
+
+static PyObject* m_astype(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject* a;
+    int code;
+    int order;
+    if (!PyArg_ParseTuple(args, "O!iC", &ArrayType, &a, &code, &order) || check_runtime() < 0) {
+        return NULL;
+    }
+    vp_array* res = NULL;
+    char err[ERRLEN] = "";
+    const int status = vp_astype(g_rt, array_of(a), (vp_dtype)code, (char)order, &res, issue_site(),
+                                 err, sizeof err);
     if (status == VP_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
@@ -1521,8 +1604,14 @@ static PyMethodDef methods[] = {
     {"export", m_export, METH_VARARGS,
      "export(a, writable=False): sync point, NumPy view of a without a copy."},
     {"assign", m_assign, METH_VARARGS, "assign(dst, src): dst[...] = src"},
+    {"stand_in", m_stand_in, METH_O,
+     "stand_in(a): ndarray with a's layout over a dummy address (metadata-only NumPy code)"},
+    {"view_of", m_view_of, METH_VARARGS,
+     "view_of(a, stand_in, r): r (a view of stand_in) as a view of a, or None"},
+    {"astype", m_astype, METH_VARARGS,
+     "astype(a, code, order): async cast (order 'K' or 'C'), or None if unsupported"},
     {"reduce", m_reduce, METH_VARARGS,
-     "reduce(ufunc, a, axes, keepdims, identity): async reduction, or None if unsupported"},
+     "reduce(ufunc, a, axes, keepdims, dtype, initial): async reduction, or None if unsupported"},
     {NULL, NULL, 0, NULL},
 };
 

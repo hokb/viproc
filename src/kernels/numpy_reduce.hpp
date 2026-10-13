@@ -31,6 +31,7 @@
 
 #include <array>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <span>
 #include <vector>
@@ -67,5 +68,30 @@ ReducePlan plan_reduction(const Layout& in, std::span<const bool> reduced, const
 // {result}. `loop` must stay alive while tasks use the kernel (LoopCache).
 std::shared_ptr<Kernel> make_reduce_kernel(const UfuncLoop* loop, ReducePlan plan,
                                            std::vector<std::byte> identity);
+
+// A reduction NumPy's own iterator drives, for what ReducePlan does not
+// cover: reductions that cast (int32 sums accumulate in int64, dtype=...)
+// and reduced axes that do not coalesce (NumPy buffers the input then).
+// Set up at issue time, with the GIL, exactly as PyUFunc_ReduceWrapper does:
+// NpyIter over a NumPy view of the input buffer (its contents may still be
+// pending; the iterator reads nothing before NpyIter_Reset), which also
+// allocates the result in NumPy's layout, and the loop for the iterator's
+// inner strides. The kernel then does what NumPy does without the GIL:
+// initial values, NpyIter_Reset(errmsg), NumPy's reduce_loop (first-visit
+// skipping included) over the iterator's blocks; casts happen in NumPy's
+// buffer copies. Bit-identical by construction.
+struct IterReduction {
+    std::shared_ptr<Kernel> kernel;
+    PyObject* result = nullptr; // new reference: the result array the iterator allocated
+};
+// `dtype`: the requested accumulator dtype or Py_None; `initial`: the start
+// value (identity or initial=) or Py_None to start at the first elements;
+// `buffersize`: np.getbufsize() (LoopCache::buffersize()).
+// Returns false (Python error cleared, reason in `error`) if NumPy cannot run
+// it this way (empty, the loop needs the Python API, a cast without initial).
+bool make_iter_reduction(PyObject* ufunc, const Layout& in, std::shared_ptr<Buffer> in_buffer,
+                         std::span<const bool> reduced, bool keepdims, PyObject* dtype,
+                         PyObject* initial, long buffersize, DeferRelease defer, IterReduction& out,
+                         std::string& error);
 
 } // namespace viproc::numpy
