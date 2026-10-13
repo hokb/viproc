@@ -282,6 +282,9 @@ python/viproc/         Python package
   __init__.py          module API (asarray, zeros, …; other names from NumPy)
 python/tests/          pytest tests of the bridge (bit-identical to NumPy)
 python/benchmarks/     strong_scaling.py, sync_latency.py
+  suite.py             benchmark suite: runner, machine detection, score
+  suite_cases.py       its cases (plain NumPy programs, width P, variants)
+  suite_report.py      its Markdown / HTML reports, multi-run comparison
 docker/                images that build, test and run viproc (README.md):
   entrypoint.sh        command line of the Linux and Wine images
   linux/               GCC, CPython (python:<ver>-bookworm)
@@ -317,6 +320,8 @@ clang-format -i <files>                                 # format
 # Python bridge
 PYTHONPATH=build/python python3 -m pytest -q python/tests
 PYTHONPATH=build/python python3 python/benchmarks/strong_scaling.py   # use a Release build
+PYTHONPATH=build/python python3 python/benchmarks/suite.py [--quick]   # all cases, score, report
+docker/benchmark.sh [--quick]     # suite on Linux + Windows (Wine), comparison report
 ```
 
 `ctest` also runs the pytest suite. Tests need `pytest`
@@ -707,6 +712,15 @@ Rules:
   optimizations until there is a benchmark that shows the need.
 - Measure success as strong scaling: benchmark whole array programs
   (fixed problem size) against plain NumPy at 1, 2, 4, … worker threads.
+- **Benchmark suite** (`python/benchmarks/suite.py`): the yardstick for
+  changes that affect performance; run it before and after. Score =
+  100 x geomean over categories of geomean(efficiency), efficiency =
+  speedup vs NumPy / ideal, ideal = min(cores, P) for medium and large
+  data and 1 (parity) for scalar, tiny and small data; P is the case's
+  parallel width; `large` scales with RAM per core. New op paths (casting,
+  reductions, int16/float16, advanced indexing) should show up as fewer
+  fallbacks and higher category scores. Cases are plain NumPy code and
+  must stay bit-identical; add a case for every new kind of program.
 
 ## Licensing
 

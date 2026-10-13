@@ -9,7 +9,7 @@
 $ErrorActionPreference = 'Stop'
 
 $Command = if ($args.Count -gt 0) { $args[0] } else { 'test' }
-$Rest = if ($args.Count -gt 1) { $args[1..($args.Count - 1)] } else { @() }
+$Rest = @($args | Select-Object -Skip 1) # always an array, also for one element
 
 function Enter-Msvc {
     Import-Module "$env:VS_INSTALL\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
@@ -58,8 +58,10 @@ switch ($Command) {
     }
     'benchmark' {
         Update-Build
-        $name = if ($Rest.Count -gt 0) { $Rest[0] } else { 'strong_scaling' }
-        $more = if ($Rest.Count -gt 1) { $Rest[1..($Rest.Count - 1)] } else { @() }
+        # "benchmark --quick" runs the suite with --quick
+        $named = $Rest.Count -gt 0 -and -not $Rest[0].StartsWith('-')
+        $name = if ($named) { $Rest[0] } else { 'suite' }
+        $more = if ($named) { @($Rest | Select-Object -Skip 1) } else { $Rest }
         Exit-With python (@("$env:VIPROC_SRC\python\benchmarks\$name.py") + $more)
     }
     'build' {
@@ -86,7 +88,8 @@ commands:
   test [CTEST_ARGS...]     build, then run all test suites with ctest (default)
   pytest [PYTEST_ARGS...]  build, then run the Python bridge tests
   python [ARGS...]         Python with viproc importable (interactive with -it)
-  benchmark [NAME [ARGS]]  run python/benchmarks/NAME.py (default: strong_scaling)
+  benchmark [NAME [ARGS]]  run python/benchmarks/NAME.py (default: suite, the full
+                           benchmark suite; reports go to ./viproc-benchmark)
   build                    bring the build up to date
   info                     platform, Python, NumPy and viproc configuration
   help                     this text

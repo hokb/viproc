@@ -28,6 +28,7 @@ cmake -S . -B build -G Ninja
 cmake --build build
 ctest --test-dir build --output-on-failure     # needs: pip install pytest
 PYTHONPATH=build/python python3 python/benchmarks/strong_scaling.py
+PYTHONPATH=build/python python3 python/benchmarks/suite.py      # benchmark suite: score + HTML report
 ```
 
 ## Docker

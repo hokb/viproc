@@ -163,7 +163,13 @@ class _Host:
         return _adopt(r.copy())
 
 
+# Eager fallbacks run so far (each one is a sync point); read by benchmarks.
+fallback_calls = 0
+
+
 def _host_call(fn, args, kwargs):
+    global fallback_calls
+    fallback_calls += 1
     host = _Host()
     np_args = host.numpy(args)
     np_kwargs = host.numpy(kwargs)

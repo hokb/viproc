@@ -46,6 +46,37 @@ Behind a TLS-inspecting proxy, pass its CA certificate to the Linux and
 Wine builds as a BuildKit secret (used for downloads only, not stored in
 the image): `--secret id=ca,src=/path/to/ca.pem`.
 
+## Benchmark suite
+
+One call runs the whole suite (python/benchmarks/suite.py) on Linux and on
+the Windows build (Wine image), builds missing images, and writes a
+comparison:
+
+```bash
+docker/benchmark.sh            # Linux, macOS, WSL; add --quick for a short run
+docker\benchmark.ps1           # Windows, Docker Desktop (Linux containers)
+```
+
+Reports: `viproc-benchmark/report.html` (comparison of the platforms) and
+`viproc-benchmark/<platform>/report.html` (details; also `report.md` and
+`results.json`). A single image: `docker run --rm -v "$PWD:/work"
+viproc:linux benchmark` (writes `./viproc-benchmark`). Native Windows image:
+`docker run --rm -v "${PWD}:C:\work" viproc:windows benchmark`, then merge
+its `results.json` with others: `suite.py --merge A/results.json
+B/results.json --out DIR`.
+
+The suite runs ~100 configurations (element-wise chains, basic and advanced
+indexing, reductions, algorithms such as k-means, Black-Scholes, Mandelbrot,
+n-body; scalar to large data; vector, row/column-major, strided, (n,1)/(1,n)
+layouts; float64, float32, int32, int16, complex128, float16 and mixed
+types) as plain NumPy and on viproc (1 worker, one worker per core), checks
+that every result is bit-identical, and reports the **parallel efficiency
+score** (0-100, normalized to the machine's cores and RAM; how it is
+computed is in the report). Full run: ~4 minutes per platform on 4 cores
+(wider machines get wider programs, so somewhat longer); `--quick`: about
+half. `--filter REGEX` selects configurations, `--workers 1,2,4,max` adds
+scaling columns.
+
 ## Command line
 
 ```
@@ -57,7 +88,7 @@ docker run [--rm -it] [-v DIR:/work] IMAGE [COMMAND [ARGS...]]
 | `test [CTEST_ARGS...]` | all test suites with `ctest` (default) |
 | `pytest [PYTEST_ARGS...]` | the Python bridge tests |
 | `python [ARGS...]` | Python with viproc importable; interactive with `-it` |
-| `benchmark [NAME [ARGS]]` | `python/benchmarks/NAME.py` (default `strong_scaling`) |
+| `benchmark [NAME] [ARGS]` | `python/benchmarks/NAME.py`; default `suite`, the benchmark suite (below) |
 | `build` | bring the build up to date |
 | `info` | platform, Python, NumPy, build type, temporary elision mode |
 | `help` | usage |
@@ -71,7 +102,7 @@ docker run --rm viproc:linux                                  # all tests
 docker run --rm viproc:wine pytest -q -k elision              # some bridge tests
 docker run --rm -it viproc:linux python                       # REPL with viproc
 docker run --rm -v "$PWD:/work" viproc:wine python prog.py    # a program, on Windows
-docker run --rm viproc:linux benchmark strong_scaling
+docker run --rm viproc:linux benchmark strong_scaling --workers 1,2,4,8
 ```
 
 ```powershell

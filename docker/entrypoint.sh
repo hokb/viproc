@@ -15,7 +15,8 @@ commands:
   test [CTEST_ARGS...]     build, then run all test suites with ctest (default)
   pytest [PYTEST_ARGS...]  build, then run the Python bridge tests
   python [ARGS...]         Python with viproc importable (interactive with -it)
-  benchmark [NAME [ARGS]]  run python/benchmarks/NAME.py (default: strong_scaling)
+  benchmark [NAME [ARGS]]  run python/benchmarks/NAME.py (default: suite, the full
+                           benchmark suite; reports go to ./viproc-benchmark)
   build                    bring the build up to date
   info                     platform, Python, NumPy and viproc configuration
   help                     this text
@@ -58,8 +59,11 @@ python)
     ;;
 benchmark)
     build
-    name=${1:-strong_scaling}
-    [[ $# -gt 0 ]] && shift
+    name=suite # "benchmark --quick" runs the suite with --quick
+    if [[ $# -gt 0 && $1 != -* ]]; then
+        name=$1
+        shift
+    fi
     exec python "$VIPROC_SRC/python/benchmarks/$name.py" "$@"
     ;;
 build)
