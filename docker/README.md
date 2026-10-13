@@ -64,14 +64,24 @@ directory: `reports/report.html` (comparison of the platforms) and
 `results.json`). `VIPROC_BENCH_OUT` picks another directory.
 
 A single image writes to `/work/reports/<platform>` (`linux`,
-`windows-wine`, `windows`); mount the working directory to get them there:
-`docker run --rm -v "$PWD:/work" viproc:linux benchmark` (writes
-`./reports/linux`). Without a mount the reports stay in the container and
-the command says how to copy them (`docker cp <container>:/work/reports
-./reports`). Native Windows image: `docker run --rm -v "${PWD}:C:\work"
-viproc:windows benchmark` (writes `.\reports\windows`), then merge its
-`results.json` with others: `suite.py --merge A/results.json
-B/results.json --out DIR`.
+`windows-wine`, `windows`). Mount the current directory on `/work` to get
+them into `./reports/<platform>`; the syntax for the current directory
+depends on the shell:
+
+```
+docker run --rm -v "$PWD:/work" viproc:linux benchmark      # bash, zsh
+docker run --rm -v "${PWD}:/work" viproc:linux benchmark    # PowerShell
+docker run --rm -v "%cd%:/work" viproc:linux benchmark      # cmd.exe
+```
+
+Without a mount the reports stay inside the container; the command then
+prints the `docker cp` line with this container's ID. That works only
+while the container exists: `--rm` deletes it when the command ends, so
+run it without `--rm` (or with `--name bench`, then `docker cp
+bench:/work/reports ./reports`, and `docker rm bench`). Native Windows
+image: `docker run --rm -v "${PWD}:C:\work" viproc:windows benchmark`
+(writes `.\reports\windows`), then merge its `results.json` with others:
+`suite.py --merge A/results.json B/results.json --out DIR`.
 
 The suite runs ~100 configurations (element-wise chains, basic and advanced
 indexing, reductions, algorithms such as k-means, Black-Scholes, Mandelbrot,

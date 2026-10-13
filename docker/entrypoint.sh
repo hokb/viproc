@@ -70,8 +70,17 @@ benchmark)
     fi
     python "$VIPROC_SRC/python/benchmarks/$name.py" "$@"
     if [[ $name == suite && -z ${VIPROC_REPORTS_COPIED:-} ]] && ! mountpoint -q /work 2>/dev/null; then
-        echo "note: /work is not mounted; copy the reports out with" \
-             "docker cp <container>:/work/reports ./reports, or run with -v \"\$PWD:/work\"" >&2
+        # The host name is the container's ID unless --hostname was given.
+        cat >&2 <<NOTE
+note: /work is not mounted, the reports are only inside this container.
+  Copy them out (impossible after 'docker run --rm', which deletes the container):
+    docker cp $(hostname):/work/reports ./reports
+  Or mount the current directory, so they land in ./reports:
+    bash, zsh:   docker run --rm -v "\$PWD:/work" IMAGE benchmark ...
+    PowerShell:  docker run --rm -v "\${PWD}:/work" IMAGE benchmark ...
+    cmd.exe:     docker run --rm -v "%cd%:/work" IMAGE benchmark ...
+  docker/benchmark.sh and docker\benchmark.ps1 copy the reports out themselves.
+NOTE
     fi
     ;;
 build)
