@@ -1,6 +1,8 @@
 """Python bridge: viproc arrays must behave like NumPy arrays (bit-identical
 results), with supported ops running asynchronously."""
 
+import platform
+import sys
 import time
 
 import numpy as np
@@ -330,6 +332,16 @@ def test_element_pool_limit_zero_disables_caching():
 _ELISION = viproc._viproc.elision_mode()
 
 
+def test_temporary_elision_is_available_on_linux_and_windows():
+    if sys.version_info >= (3, 14):
+        assert _ELISION == "exact"
+    elif sys.platform == "win32" or (sys.platform == "linux" and platform.libc_ver()[0] == "glibc"):
+        assert _ELISION == "backtrace"
+        # every operator (12 binary, 3 unary) calibrated to a chain that
+        # reaches the interpreter's call site
+        assert len(viproc._viproc.elision_chains()) == 15
+
+
 @pytest.mark.skipif(_ELISION == "off", reason="no safe temporary test on this platform")
 def test_temporary_elision_reuses_buffers_and_keeps_results():
     x = viproc.asarray(rng.standard_normal(100_000))  # 800 KB: above every bound
@@ -360,6 +372,10 @@ def test_temporary_elision_never_touches_referenced_arrays():
     assert viproc._viproc.elided() == e0
     assert same(items[0], xn) and same(s, xn * 1.0 + xn * 2.0)
     w = operator.add(x * 2.0, 1.0)  # called from C, not by the interpreter
+    # The backtrace check refuses any C caller. CPython >= 3.14 knows that the
+    # temporary's only reference is the calling frame's stack (the argument
+    # operator.add borrows), so reusing it is safe there.
+    e0 += 1 if _ELISION == "exact" else 0
     assert viproc._viproc.elided() == e0
     assert same(w, xn * 2.0 + 1.0)
     i = viproc.asarray(np.arange(100_000))

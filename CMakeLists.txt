@@ -44,6 +44,9 @@ target_compile_definitions(viproc PRIVATE
 target_include_directories(viproc PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
 find_package(Threads REQUIRED)
 target_link_libraries(viproc PUBLIC Threads::Threads PRIVATE viproc_warnings)
+if(WIN32)
+    target_link_libraries(viproc PRIVATE advapi32) # large-page privilege (element pool)
+endif()
 
 # Kernel adapters that run tasks with NumPy's loops (needs CPython + NumPy).
 # Links only Python's headers (Python3::Module): an extension module must not

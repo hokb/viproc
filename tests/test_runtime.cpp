@@ -239,12 +239,12 @@ void test_prepare_host_write() {
     Runtime rt(opts(2));
     // Live NumPy views (host_views): the storage moves to a copy first.
     ArrayPtr a = make_ready(rt, 8, 3.0);
-    Buffer* before = a->buffer().get();
-    ++a->buffer()->host_views; // as a read-only export would
+    std::shared_ptr<Buffer> exported = a->buffer(); // held, as a read-only export does
+    ++exported->host_views;
     rt.prepare_host_write(*a);
-    check(a->buffer().get() != before && value(rt, a, 7) == 3.0,
+    check(a->buffer() != exported && value(rt, a, 7) == 3.0,
           "prepare_host_write: copy-on-write while NumPy views are alive");
-    --before->host_views;
+    --exported->host_views;
     // Issued readers: waits until they are done, keeps the buffer.
     ArrayPtr b = make_ready(rt, 8, 1.0);
     ArrayPtr reader = issue1(rt, add_const(1.0, 30ms), {b}, 8);

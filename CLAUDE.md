@@ -282,6 +282,11 @@ python/viproc/         Python package
   __init__.py          module API (asarray, zeros, …; other names from NumPy)
 python/tests/          pytest tests of the bridge (bit-identical to NumPy)
 python/benchmarks/     strong_scaling.py, sync_latency.py
+docker/                images that build, test and run viproc (README.md):
+  entrypoint.sh        command line of the Linux and Wine images
+  linux/               GCC, CPython (python:<ver>-bookworm)
+  windows/             native Windows container: MSVC, entrypoint.ps1
+  wine/                Windows build (llvm-mingw) run under Wine on Linux
 tests/
   test_numpy_loops.cpp    spike: NumPy loops on a worker without the GIL
   test_runtime.cpp        runtime core with C++ test kernels
@@ -320,6 +325,24 @@ PYTHONPATH=build/python python3 python/benchmarks/strong_scaling.py   # use a Re
 Windows / Visual Studio: Debug builds work with a regular (release)
 Python installation; the extension module is written to
 `build/python/viproc` for every configuration (`ctest -C Debug`).
+
+Docker (`docker/README.md`): each image builds this checkout and runs all
+suites by default; `python`, `pytest`, `benchmark`, `info` make it a
+command line. The Wine image tests the Windows build on a Linux host.
+
+```bash
+docker build -f docker/linux/Dockerfile -t viproc:linux .
+docker build -f docker/wine/Dockerfile -t viproc:wine .
+docker run --rm viproc:wine                         # all suites, Windows build
+docker run --rm -v "$PWD:/src" viproc:linux         # test this checkout (incremental)
+```
+
+Linux and Windows must behave identically: same results, same features
+(temporary elision, element pool, huge/large pages where the OS allows).
+Platform-specific code stays behind small functions with one
+implementation per platform (`capture_stack`/`module_base` in
+`_viproc.c`, `system_allocate` in `element_pool.cpp`), and both builds run
+the same tests.
 
 Build with `-DVIPROC_WARNINGS_AS_ERRORS=OFF` only for local experiments;
 the default build treats warnings as errors. Always build and run the tests
@@ -580,8 +603,11 @@ Rules:
   temporary (dtype/shape of the output, buffer reusable per
   `vp_array_reusable_bytes`, object only on the interpreter stack) writes
   into that operand. Temporaries are detected exactly on CPython ≥ 3.14;
-  on 3.12/3.13 (glibc) by refcount 1 plus a backtrace compared with
-  calibrated interpreter call chains (≥ 256 KiB only); off elsewhere.
+  on 3.12/3.13 (glibc, Windows) by refcount 1 plus the C stack, which
+  must start with a calibrated chain reaching the interpreter's call
+  site (≥ 256 KiB only); off elsewhere. The chain is the common prefix of
+  two calibration runs, not a fixed frame count: how many frames
+  CPython's operator entry has depends on its build.
 - Evaluated and rejected: caching/reusing `viproc.ndarray` objects. Their
   allocation and deallocation is ~1% of the per-op instructions.
 - One Python thread only: the thread that initialized the runtime.
@@ -734,3 +760,7 @@ functions.
 - [ ] Evaluate a generic path under free-threaded CPython: workers call the
       regular NumPy entry (no reimplementation of NumPy semantics).
 - [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.
+- [ ] Run `docker/windows` (MSVC) on a Windows host; so far the Windows
+      code paths are verified with the Wine image (llvm-mingw build).
+- [ ] MSVC warning level: `-Wall -Wextra -Wpedantic -Werror` apply to
+      GCC/Clang only; decide on `/W4 /WX` once an MSVC build is in CI.

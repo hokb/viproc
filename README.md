@@ -29,3 +29,14 @@ cmake --build build
 ctest --test-dir build --output-on-failure     # needs: pip install pytest
 PYTHONPATH=build/python python3 python/benchmarks/strong_scaling.py
 ```
+
+## Docker
+
+Images for Linux, Windows (native, MSVC) and Windows-under-Wine build this checkout, run all
+test suites by default and serve as a command line ([docker/README.md](docker/README.md)):
+
+```bash
+docker build -f docker/linux/Dockerfile -t viproc:linux .
+docker run --rm viproc:linux                                # all test suites
+docker run --rm -v "$PWD:/work" viproc:linux python prog.py # run a program with viproc
+```

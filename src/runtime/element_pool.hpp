@@ -14,6 +14,10 @@
 //
 // Released blocks are not zeroed. A release that would grow the cached bytes
 // beyond the bound goes straight back to the system.
+//
+// Blocks from 2 MiB on come page-aligned from the system and use huge pages
+// where the OS allows it: transparent huge pages on Linux (madvise), large
+// pages on Windows when the process holds SeLockMemoryPrivilege.
 #pragma once
 
 #include <atomic>

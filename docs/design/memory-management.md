@@ -156,7 +156,13 @@ advantage.)
 - **Alignment.** 64 bytes below 64 KiB, 4 KiB (page, as ONAL's native
   pool) from 64 KiB, 2 MiB from 2 MiB, so large blocks share no pages and
   huge pages can back all of them.
-- **Large blocks.** `MADV_HUGEPAGE` from 2 MiB (Linux; a hint).
+- **Large blocks.** `MADV_HUGEPAGE` from 2 MiB (Linux; a hint). Windows:
+  blocks from 2 MiB come from `VirtualAlloc` (page-aligned, lazily
+  committed like on Linux) and use large pages (`MEM_LARGE_PAGES`) when
+  the process holds the "Lock pages in memory" privilege
+  (`SeLockMemoryPrivilege`, enabled once at first use) and the block is a
+  whole number of large pages (always from 16 MiB on). Without the
+  privilege, which Windows does not grant by default, plain pages.
 - **Bound.** At most a configured number of cached bytes (counted in
   capacity; default: half the physical memory, as ONAL; `VIPROC_POOL_LIMIT`
   — bytes, `K`/`M`/`G` suffix — to override; `viproc.set_pool_limit()`).
@@ -246,22 +252,33 @@ An operand qualifies when, at issue time on the main thread:
    interpreter's value stack:
    - CPython ≥ 3.14: `PyUnstable_Object_IsUniqueReferencedTemporary`
      (exact; mode `"exact"`).
-   - CPython 3.12/3.13 on glibc: reference count 1 **and** the operator was
-     applied by the bytecode interpreter itself, not by C code that may hold
-     a borrowed reference to an object owned elsewhere (mode
-     `"backtrace"`). The check compares the first two return addresses
-     after viproc's frames (`backtrace()`, the runtime's `PyNumber_*` entry
-     and its caller) with chains recorded once by running every operator on
-     a probe object. Entries that tail-call the slot (`PyNumber_Negative`)
-     leave no frame of their own, so their first address is already the
-     interpreter's call site; calibrating through two different entries
-     (module code, a function called from C) tells the two kinds apart.
-     Recorded addresses work with the BOLT/PGO layout of distribution
-     builds, where the interpreter's code lies outside its symbol's range.
-     Stricter than NumPy: builtins in the runtime (`sum()`,
-     `operator.add`) do not elide either. Only for buffers ≥ 256 KiB (a
-     backtrace costs ~1–2 µs), as NumPy.
-   - Otherwise (e.g. Windows with CPython < 3.14): off (mode `"off"`).
+   - CPython 3.12/3.13 on glibc and on Windows: reference count 1 **and**
+     the operator was applied by the bytecode interpreter itself, not by C
+     code that may hold a borrowed reference to an object owned elsewhere
+     (mode `"backtrace"`). The return addresses after viproc's frames
+     (`backtrace()` / `RtlCaptureStackBackTrace()`; module of an address
+     via `dladdr()` / `GetModuleHandleExW()`) must start with a chain
+     recorded once by running every operator on a probe object, entered
+     two ways: module code and a function called from C. The frames both
+     runs share are the runtime's operator entry and the interpreter's
+     call site; below that they differ. That common prefix is the chain.
+     Its length depends on how CPython was compiled: `PyNumber_Negative`
+     tail-calls the slot (1 frame: the interpreter's call site);
+     `PyNumber_Add` is 2 frames in Ubuntu's build, 3 in the `python:3.13`
+     Docker image, where `binary_op1` is not inlined. A fixed count of two
+     frames, used before, stopped inside the runtime there, so `sum()`
+     matched and elided (caught by the test suite in that image). A third
+     calibration run applies the operators through `operator.add` & Co.
+     (C callers); a chain one of them matches would not reach the
+     interpreter and is dropped. Recorded addresses work with the
+     BOLT/PGO layout of distribution builds, where the interpreter's code
+     lies outside its symbol's range. Stricter than NumPy: builtins in the
+     runtime (`sum()`, `operator.add`) do not elide either. Only for
+     buffers ≥ 256 KiB (a backtrace costs ~1–2 µs), as NumPy.
+     `_viproc.elision_chains()` lists the calibrated chain lengths (one
+     per operator, 15).
+   - Otherwise (other C libraries, macOS with CPython < 3.14): off (mode
+     `"off"`).
    `viproc._viproc.elision_mode()` reports the mode, `_viproc.elided()`
    counts elided ops.
 
@@ -580,8 +597,8 @@ memory, D3; runtime objects, D4):
   the pool at all (very small blocks could stay with malloc).
 - Per-thread caches in front of the element pool: only if contention shows
   up in `strong_scaling.py` with large arrays.
-- Huge-page threshold and Windows equivalent (large pages need a
-  privilege; probably plain `VirtualAlloc` reuse only).
+- Huge-page threshold. Windows large pages are not swappable and need a
+  privilege; measure whether they pay off before recommending it.
 - Memory-based look-ahead limit (bytes held by pending outputs) instead of,
   or in addition to, 1000 active tasks.
 - D5's interpreter check: how to tell "called from the interpreter" cheaply

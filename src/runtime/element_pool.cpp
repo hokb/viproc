@@ -52,6 +52,32 @@ std::align_val_t alignment_for(std::size_t capacity) {
     return std::size_t{2} << 30;
 }
 
+#if defined(_WIN32)
+// Windows counterpart of transparent huge pages: large pages need the
+// "Lock pages in memory" privilege (SeLockMemoryPrivilege). Enabled once if
+// the account holds it; 0 otherwise.
+std::size_t large_page_size() {
+    static const std::size_t size = [] {
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+            return std::size_t{0};
+        }
+        TOKEN_PRIVILEGES tp{};
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        // AdjustTokenPrivileges succeeds without the privilege, too; only
+        // GetLastError() tells.
+        const bool held =
+            LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid) &&
+            AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) &&
+            GetLastError() == ERROR_SUCCESS;
+        CloseHandle(token);
+        return held ? static_cast<std::size_t>(GetLargePageMinimum()) : std::size_t{0};
+    }();
+    return size;
+}
+#endif
+
 // VIPROC_POOL_LIMIT: bytes, optionally with a K/M/G suffix; 0 disables caching.
 std::size_t default_limit() {
 #if defined(VIPROC_NO_ELEMENT_POOL)
@@ -122,6 +148,25 @@ int ElementPool::bin_of(std::size_t capacity) {
 }
 
 void* ElementPool::system_allocate(std::size_t capacity) {
+#if defined(_WIN32)
+    if (capacity >= kHugeFrom) {
+        // Page-aligned from the system, as on Linux; large pages when allowed
+        // and the block is a whole number of them (always from 16 MiB on).
+        const std::size_t large = large_page_size();
+        void* p = nullptr;
+        if (large != 0 && capacity % large == 0) {
+            p = VirtualAlloc(nullptr, capacity, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                             PAGE_READWRITE);
+        }
+        if (p == nullptr) {
+            p = VirtualAlloc(nullptr, capacity, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        }
+        if (p == nullptr) {
+            throw std::bad_alloc();
+        }
+        return p;
+    }
+#endif
     void* p = ::operator new(capacity, alignment_for(capacity));
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
     if (capacity >= kHugeFrom) {
@@ -132,6 +177,12 @@ void* ElementPool::system_allocate(std::size_t capacity) {
 }
 
 void ElementPool::system_release(void* block, std::size_t capacity) {
+#if defined(_WIN32)
+    if (capacity >= kHugeFrom) {
+        VirtualFree(block, 0, MEM_RELEASE);
+        return;
+    }
+#endif
     ::operator delete(block, alignment_for(capacity));
 }
 

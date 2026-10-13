@@ -21,10 +21,17 @@
  * necessary but not sufficient (C code may hold a borrowed reference to an
  * object owned elsewhere), so the C call chain is checked as NumPy does:
  * only frames of this module and of the Python runtime between the operator
- * slot and the bytecode interpreter. That needs glibc's backtrace() and
- * dladdr1(). */
+ * slot and the bytecode interpreter. That needs the return addresses of the
+ * C stack and the module each belongs to: backtrace() and dladdr() with
+ * glibc, RtlCaptureStackBackTrace() and GetModuleHandleExW() on Windows. */
 #if PY_VERSION_HEX >= 0x030E0000
 #define VP_ELIDE_EXACT 1
+#elif defined(_WIN32)
+#define VP_ELIDE_BACKTRACE 1
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #elif defined(__GLIBC__)
 #define VP_ELIDE_BACKTRACE 1
 #include <dlfcn.h>
@@ -373,6 +380,31 @@ static void* code_address(vp_fn f) {
     return p;
 }
 
+/* Load address of the shared object (DLL) containing `addr`, or NULL. */
+static void* module_base(void* addr) {
+#if defined(_WIN32)
+    HMODULE m = NULL;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)addr, &m)) {
+        return (void*)m; /* an HMODULE is the module's load address */
+    }
+    return NULL;
+#else
+    Dl_info info;
+    return dladdr(addr, &info) ? info.dli_fbase : NULL;
+#endif
+}
+
+/* Return addresses of the calling thread's stack, innermost first. */
+static int capture_stack(void** frames, int max) {
+#if defined(_WIN32)
+    return (int)RtlCaptureStackBackTrace(0, (DWORD)max, frames, NULL);
+#else
+    return backtrace(frames, max);
+#endif
+}
+
 /* Shared object of a return address: this module, the Python runtime or
  * something else. Cached per address (direct-mapped). */
 static int frame_class(void* addr) {
@@ -383,64 +415,70 @@ static int frame_class(void* addr) {
     static void* ours = NULL;
     static void* python = NULL;
     if (ours == NULL) {
-        Dl_info info;
-        if (dladdr(code_address((vp_fn)frame_class), &info)) {
-            ours = info.dli_fbase;
-        }
-        if (dladdr(code_address((vp_fn)PyNumber_Add), &info)) {
-            python = info.dli_fbase;
-        }
+        ours = module_base(code_address((vp_fn)frame_class));
+        python = module_base(code_address((vp_fn)PyNumber_Add));
     }
     const size_t slot = ((uintptr_t)addr >> 4) & 255;
     if (cache[slot].addr == addr) {
         return cache[slot].cls;
     }
-    Dl_info info;
+    void* base = module_base(addr);
     int cls = FRAME_OTHER;
-    if (dladdr(addr, &info)) {
-        cls = info.dli_fbase == ours     ? FRAME_OURS
-              : info.dli_fbase == python ? FRAME_PYTHON
-                                         : FRAME_OTHER;
+    if (base != NULL) {
+        cls = base == ours ? FRAME_OURS : base == python ? FRAME_PYTHON : FRAME_OTHER;
     }
     cache[slot].addr = addr;
     cache[slot].cls = cls;
     return cls;
 }
 
-/* The two return addresses after this module's frames: the runtime's
- * operator entry (PyNumber_Add, ...) and its caller. Entries that tail-call
- * the slot (PyNumber_Negative) leave no frame of their own; then the first is
- * already the caller. NULL entries if the stack is too short. */
+/* The return addresses after this module's frames, innermost first: the
+ * runtime's operator entry (PyNumber_Add and the helpers it calls, unless
+ * inlined or tail-called), the interpreter's call site, and whoever entered
+ * the interpreter. Empty if the first one is not in the Python runtime. */
+#define CHAIN_FRAMES 8
 typedef struct {
-    void* a;
-    void* b;
+    void* f[CHAIN_FRAMES];
+    int n;
 } call_chain;
 
 static call_chain operator_call_chain(void) {
-    void* frames[16];
-    const int n = backtrace(frames, 16);
+    void* frames[32];
+    const int n = capture_stack(frames, 32);
     int i = 1;
     while (i < n && frame_class(frames[i]) == FRAME_OURS) {
         ++i;
     }
-    call_chain c = {NULL, NULL};
-    if (i + 1 < n && frame_class(frames[i]) == FRAME_PYTHON) {
-        c.a = frames[i];
-        c.b = frames[i + 1];
+    call_chain c;
+    c.n = 0;
+    if (i < n && frame_class(frames[i]) == FRAME_PYTHON) {
+        for (; i < n && c.n < CHAIN_FRAMES; ++i) {
+            c.f[c.n++] = frames[i];
+        }
     }
     return c;
 }
 
+/* 1 if `c` starts with the frames of `prefix`. */
+static int chain_starts_with(const call_chain* c, const call_chain* prefix) {
+    return c->n >= prefix->n && memcmp(c->f, prefix->f, (size_t)prefix->n * sizeof(void*)) == 0;
+}
+
 /* The call chains of all operators that may elide, as the bytecode
  * interpreter produces them (BINARY_OP, UNARY_NEGATIVE, ...), learned once by
- * running each operator on a probe object. Only matches elide: any other
- * caller of PyNumber_* (C extensions, builtins such as sum()) differs. For
- * entries that tail-call the slot, `a` is already the interpreter's call site
- * and `b` belongs to whoever entered the interpreter; those chains match on
- * `a` alone (`b` == NULL). Calibrating through two different entries (module
- * code, and a function called from C) tells the two kinds apart. Recorded
- * addresses also survive the BOLT/PGO layout of distribution builds, where
- * symbol ranges do not. */
+ * running each operator on a probe object, entered two ways: module code
+ * (PyEval_EvalCode) and a function called from C. The frames both runs share
+ * end with the interpreter's call site; below it they differ. That common
+ * prefix is the chain: an operator elides only if its stack starts with it,
+ * so any other caller of PyNumber_* (C extensions, builtins such as sum())
+ * differs where the interpreter's call site would be. How many frames the
+ * runtime's operator entry contributes depends on how CPython was compiled
+ * (inlining, tail calls: 0 to 2 frames seen), hence a prefix, not a fixed
+ * count. A third run applies the operators from C (operator.add, ...): a
+ * chain that one of them matches does not reach the interpreter's call site,
+ * and is dropped. Recorded addresses
+ * also survive the BOLT/PGO layout of distribution builds, where symbol
+ * ranges do not. */
 #define MAX_CHAINS 32
 static call_chain g_chains[MAX_CHAINS];
 static int g_chains_n = -1;     /* -1: not calibrated yet */
@@ -484,8 +522,8 @@ static PyTypeObject ProbeType = {
 
 static void calibrate_operator_chains(void) {
     g_chains_n = 0;
-    call_chain run1[MAX_CHAINS], run2[MAX_CHAINS];
-    int n1 = 0, n2 = 0;
+    call_chain run1[MAX_CHAINS], run2[MAX_CHAINS], run3[MAX_CHAINS];
+    int n1 = 0, n2 = 0, n3 = 0;
     PyObject* globals = PyDict_New();
     PyObject* probe =
         PyType_Ready(&ProbeType) == 0 ? PyObject_CallNoArgs((PyObject*)&ProbeType) : NULL;
@@ -512,19 +550,44 @@ static void calibrate_operator_chains(void) {
             n2 = g_recorded;
             Py_XDECREF(r);
         }
+        g_recording = run3; /* called from C: the operator module */
+        g_recorded = 0;
+        r = PyRun_String("import operator as o\n"
+                         "o.add(p, p); o.sub(p, p); o.mul(p, p); o.truediv(p, p)\n"
+                         "o.floordiv(p, p); o.mod(p, p); o.lshift(p, p); o.rshift(p, p)\n"
+                         "o.and_(p, p); o.or_(p, p); o.xor(p, p); o.matmul(p, p)\n"
+                         "o.neg(p); o.pos(p); o.invert(p)\n",
+                         Py_file_input, globals, globals);
+        n3 = g_recorded;
+        Py_XDECREF(r);
         g_recording = NULL;
 #undef VP_PROBE_OPS
     }
     PyErr_Clear();
     Py_XDECREF(probe);
     Py_XDECREF(globals);
-    for (int k = 0; k < n1 && k < n2; ++k) {
-        if (run1[k].a == NULL || run1[k].a != run2[k].a) {
-            continue; /* not a stable chain: never elide on it */
+    if (n1 != n2 || n3 != n1) {
+        return; /* not the expected probes: never elide */
+    }
+    for (int k = 0; k < n1; ++k) {
+        call_chain c;
+        c.n = 0;
+        while (c.n < run1[k].n && c.n < run2[k].n && run1[k].f[c.n] == run2[k].f[c.n]) {
+            c.f[c.n] = run1[k].f[c.n];
+            ++c.n;
         }
-        g_chains[g_chains_n].a = run1[k].a;
-        g_chains[g_chains_n].b = run1[k].b == run2[k].b ? run1[k].b : NULL;
-        ++g_chains_n;
+        if (c.n == 0 || c.n == run1[k].n || c.n == run2[k].n) {
+            continue; /* no common frame, or no divergence seen: never elide on it */
+        }
+        int reaches_interpreter = 1;
+        for (int j = 0; j < n3; ++j) {
+            if (chain_starts_with(&run3[j], &c)) {
+                reaches_interpreter = 0; /* a C caller would match it */
+            }
+        }
+        if (reaches_interpreter) {
+            g_chains[g_chains_n++] = c;
+        }
     }
 }
 
@@ -536,11 +599,24 @@ static int called_from_interpreter(void) {
     }
     const call_chain c = operator_call_chain();
     for (int i = 0; i < g_chains_n; ++i) {
-        if (g_chains[i].a == c.a && (g_chains[i].b == NULL || g_chains[i].b == c.b)) {
+        if (chain_starts_with(&c, &g_chains[i])) {
             return 1;
         }
     }
     return 0;
+}
+
+static PyObject* m_elision_chains(PyObject* self, PyObject* noargs) {
+    (void)self;
+    (void)noargs;
+    if (g_chains_n < 0) {
+        calibrate_operator_chains();
+    }
+    PyObject* r = PyList_New(g_chains_n);
+    for (int i = 0; r != NULL && i < g_chains_n; ++i) {
+        PyList_SET_ITEM(r, i, PyLong_FromLong(g_chains[i].n));
+    }
+    return r;
 }
 #endif
 
@@ -1382,6 +1458,10 @@ static PyMethodDef methods[] = {
     {"elided", m_elided, METH_NOARGS, "Ops that wrote into a temporary operand's buffer."},
     {"elision_mode", m_elision_mode, METH_NOARGS,
      "How temporaries are recognized: 'exact', 'backtrace' or 'off'."},
+#if defined(VP_ELIDE_BACKTRACE)
+    {"elision_chains", m_elision_chains, METH_NOARGS,
+     "Frames per calibrated operator call chain (backtrace mode; one per operator)."},
+#endif
     {"pool_trim", m_pool_trim, METH_NOARGS, "Return all cached element memory."},
     {"pool_set_limit", m_pool_set_limit, METH_O, "Bound for cached element memory (bytes)."},
     {"workers", m_workers, METH_NOARGS, NULL},
