@@ -300,6 +300,8 @@ int vp_ufunc_loop(vp_runtime* rt, PyObject* ufunc, int nin, const vp_dtype* dtyp
     return VP_OK;
 }
 
+} // extern "C"
+
 namespace {
 
 // F-contiguous as NumPy's flag: extent-1 dimensions may have any stride.
@@ -390,6 +392,8 @@ bool cast_small_inputs(vp_runtime* rt, const vp_loop& loop, std::span<ArrayPtr> 
 }
 
 } // namespace
+
+extern "C" {
 
 int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs, int out_ndim,
                    const int64_t* out_shape, vp_array* out, vp_array** result, const char* site,
@@ -540,6 +544,8 @@ int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array
     return VP_OK;
 }
 
+} // extern "C"
+
 namespace {
 
 // The IndexSpec of an indexing call and the shape of its result.
@@ -571,6 +577,8 @@ bool index_spec(const Layout& view, int nidx, vp_array* const* idx, const int* i
 }
 
 } // namespace
+
+extern "C" {
 
 int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, const int* idx_axes,
               int nres, const int* result_axes, const int64_t* result_strides, vp_array** result,
