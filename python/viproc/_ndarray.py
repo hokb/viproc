@@ -11,11 +11,12 @@ module adds everything else and the fallbacks the C code calls.
 """
 
 import builtins
+import operator
 import os
 import warnings
 
 import numpy as np
-from numpy.lib.array_utils import normalize_axis_tuple
+from numpy.lib.array_utils import normalize_axis_index, normalize_axis_tuple
 
 from . import _viproc
 
@@ -427,57 +428,293 @@ _REDUCTIONS = {
 
 
 # --- views (metadata only, no sync) --------------------------------------------
-# NumPy functions that only rearrange metadata (shape, strides, offset, dtype)
-# run on a stand-in: an ndarray with the viproc array's shape and strides over
-# a one-element dummy. Its data is never read (these functions do not touch
-# it); the view NumPy returns is mapped onto a runtime view of the same
-# storage. NumPy validates the arguments and raises its own errors.
-_VIEW_FUNCS = frozenset((
-    np.transpose, np.swapaxes, np.moveaxis, np.rollaxis, np.squeeze, np.expand_dims,
-    np.flip, np.fliplr, np.flipud, np.rot90, np.atleast_1d, np.atleast_2d, np.atleast_3d,
-    np.broadcast_to, np.diagonal, np.real, np.matrix_transpose, np.permute_dims,
-))
+# Views are computed here and in C (_viproc.basic_view, transpose, reshape,
+# broadcast_to) with NumPy's own rules (get_view_from_index, PyArray_Transpose,
+# PyArray_Newshape / _attempt_nocopy_reshape, PyArray_Diagonal, ...); no
+# ndarray is created for them. Invalid arguments: NumPy raises its own error
+# on a zero-stride shape probe (np.broadcast_to of one element: no element
+# memory), so the messages stay NumPy's.
 
 
-def _meta_view(fn, a, args=(), kwargs=None):
-    """fn(a, *args, **kwargs) as a runtime view of `a` if NumPy's result is a
-    view of its argument, else _NOPE. `fn` must not read data."""
+def _numpy_error(fn, a, *args, **kwargs):
+    """Raise the error NumPy raises for fn(a, ...) (a's shape and dtype
+    matter only); _NOPE if NumPy does not raise (the caller falls back)."""
+    probe = np.broadcast_to(np.empty((), a.dtype), a.shape)
+    fn(probe, *args, **kwargs)
+    return _NOPE
+
+
+def _transpose(a, axes=None):
     if type(a) is not ndarray:
         return _NOPE
-    fake = _viproc.stand_in(a)
-    r = fn(fake, *args, **(kwargs or {})) if kwargs else fn(fake, *args)
-    if r is fake:
-        return a  # NumPy returns its argument itself (np.real of real data, ...)
-    w = _viproc.view_of(a, fake, r)
-    return _NOPE if w is None else w
+    r = _viproc.transpose(a, axes)
+    return _numpy_error(np.transpose, a, axes) if r is None else r
 
 
-def _reshape(a, *args, **kwargs):
-    """np.reshape: a view where NumPy makes one, else NumPy's copy (C or F
-    order, as requested) as an async copy, reshaped."""
-    if type(a) is not ndarray or kwargs.get("copy") is not None:
+def _swapaxes(a, axis1, axis2):
+    if type(a) is not ndarray:
         return _NOPE
-    fake = _viproc.stand_in(a)
-    try:
-        r = np.reshape(fake, *args, copy=False, **kwargs)
-    except ValueError:  # NumPy would copy: copy (async), then view
-        order = kwargs.get("order", "C")
-        if order not in ("C", "F"):
+    i = normalize_axis_index(axis1, a.ndim, "axis1")
+    j = normalize_axis_index(axis2, a.ndim, "axis2")
+    perm = list(range(a.ndim))
+    perm[i], perm[j] = perm[j], perm[i]
+    return _viproc.transpose(a, perm)
+
+
+def _moveaxis(a, source, destination):
+    # numpy/_core/numeric.py: moveaxis
+    if type(a) is not ndarray:
+        return _NOPE
+    source = normalize_axis_tuple(source, a.ndim, "source")
+    destination = normalize_axis_tuple(destination, a.ndim, "destination")
+    if len(source) != len(destination):
+        raise ValueError("`source` and `destination` arguments must have "
+                         "the same number of elements")
+    order = [n for n in range(a.ndim) if n not in source]
+    for dest, src in sorted(zip(destination, source)):
+        order.insert(dest, src)
+    return _viproc.transpose(a, order)
+
+
+def _matrix_transpose(x):
+    if type(x) is not ndarray:
+        return _NOPE
+    if x.ndim < 2:
+        return _numpy_error(np.matrix_transpose, x)
+    perm = list(range(x.ndim))
+    perm[-2], perm[-1] = perm[-1], perm[-2]
+    return _viproc.transpose(x, perm)
+
+
+def _basic(a, key):
+    """a[key] for a basic key as a view (also for an all-int key: 0-d)."""
+    r = _viproc.basic_view(a, key)
+    if r is None:
+        probe = np.broadcast_to(np.empty((), a.dtype), a.shape)
+        probe[key]  # NumPy's IndexError
+        raise IndexError(f"invalid index {key!r}")
+    return r
+
+
+def _squeeze(a, axis=None):
+    if type(a) is not ndarray:
+        return _NOPE
+    if axis is None:
+        axes = [i for i, n in enumerate(a.shape) if n == 1]
+    else:
+        axes = normalize_axis_tuple(axis, a.ndim)
+        if any(a.shape[i] != 1 for i in axes):
+            raise ValueError("cannot select an axis to squeeze out which has size not "
+                             "equal to one")
+    if not axes:
+        return _viproc.basic_view(a, ())
+    return _viproc.basic_view(a, tuple(0 if i in axes else slice(None)
+                                       for i in range(a.ndim)))
+
+
+def _expand_dims(a, axis):
+    # numpy/lib/_shape_base_impl.py: expand_dims, a.reshape(shape)
+    if type(a) is not ndarray:
+        return _NOPE
+    if type(axis) not in (tuple, list):
+        axis = (axis,)
+    out_ndim = len(axis) + a.ndim
+    axis = normalize_axis_tuple(axis, out_ndim)
+    it = iter(a.shape)
+    shape = [1 if ax in axis else next(it) for ax in range(out_ndim)]
+    return _reshape(a, shape)
+
+
+def _flip(m, axis=None):
+    if type(m) is not ndarray:
+        return _NOPE
+    if axis is None:
+        key = (slice(None, None, -1),) * m.ndim
+    else:
+        axes = normalize_axis_tuple(axis, m.ndim)
+        key = tuple(slice(None, None, -1) if i in axes else slice(None)
+                    for i in range(m.ndim))
+    return _viproc.basic_view(m, key)
+
+
+def _fliplr(m):
+    if type(m) is not ndarray:
+        return _NOPE
+    if m.ndim < 2:
+        raise ValueError("Input must be >= 2-d.")
+    return _viproc.basic_view(m, (slice(None), slice(None, None, -1)))
+
+
+def _flipud(m):
+    if type(m) is not ndarray:
+        return _NOPE
+    if m.ndim < 1:
+        raise ValueError("Input must be >= 1-d.")
+    return _viproc.basic_view(m, (slice(None, None, -1),))
+
+
+def _rot90(m, k=1, axes=(0, 1)):
+    # numpy/lib/_function_base_impl.py: rot90
+    if type(m) is not ndarray:
+        return _NOPE
+    axes = tuple(axes)
+    if len(axes) != 2:
+        raise ValueError("len(axes) must be 2.")
+    if axes[0] == axes[1] or abs(axes[0] - axes[1]) == m.ndim:
+        raise ValueError("Axes must be different.")
+    if (axes[0] >= m.ndim or axes[0] < -m.ndim or axes[1] >= m.ndim or axes[1] < -m.ndim):
+        raise ValueError(f"Axes={axes} out of range for array of ndim={m.ndim}.")
+    k %= 4
+    if k == 0:
+        return _viproc.basic_view(m, ())
+    if k == 2:
+        return _flip(_flip(m, axes[0]), axes[1])
+    axes_list = list(range(m.ndim))
+    (axes_list[axes[0]], axes_list[axes[1]]) = (axes_list[axes[1]], axes_list[axes[0]])
+    if k == 1:
+        return _viproc.transpose(_flip(m, axes[1]), axes_list)
+    return _flip(_viproc.transpose(m, axes_list), axes[1])
+
+
+def _atleast(n):
+    # numpy/_core/shape_base.py: atleast_1d / 2d / 3d
+    def one(a):
+        if a.ndim >= n:
+            return a
+        if n == 1 or a.ndim == 0:
+            return _reshape(a, (1,) * n)
+        if n == 2:
+            return _viproc.basic_view(a, (None, slice(None)))
+        if a.ndim == 1:
+            return _viproc.basic_view(a, (None, slice(None), None))
+        return _viproc.basic_view(a, (slice(None), slice(None), None))
+
+    def handler(*arys):
+        if not arys or any(type(a) is not ndarray for a in arys):
             return _NOPE
-        c = a.astype(a.dtype, order="C") if order == "C" else _NOPE
-        if c is _NOPE:
+        res = tuple(one(a) for a in arys)
+        return res[0] if len(res) == 1 else res
+
+    return handler
+
+
+def _broadcast_to(array, shape, subok=False):
+    if type(array) is not ndarray:
+        return _NOPE
+    shape = (shape,) if isinstance(shape, (int, np.integer)) else tuple(shape)
+    r = _viproc.broadcast_to(array, shape)
+    return _numpy_error(np.broadcast_to, array, shape) if r is None else r
+
+
+def _diagonal(a, offset=0, axis1=0, axis2=1):
+    # PyArray_Diagonal: a read-only view
+    if type(a) is not ndarray:
+        return _NOPE
+    if a.ndim < 2:
+        raise ValueError("diag requires an array of at least two dimensions")
+    axis1 = normalize_axis_index(axis1, a.ndim, "axis1")
+    axis2 = normalize_axis_index(axis2, a.ndim, "axis2")
+    if axis1 == axis2:
+        raise ValueError("axis1 and axis2 cannot be the same")
+    shape, strides = a.shape, a.strides
+    dim1, dim2 = shape[axis1], shape[axis2]
+    offset = operator.index(offset)
+    if offset >= 0:
+        step, dim2 = strides[axis2], dim2 - offset
+    else:
+        offset, step, dim1 = -offset, strides[axis1], dim1 + offset
+    size = min(dim1, dim2)
+    start = 0
+    if size < 0:
+        size = 0
+    else:
+        start = offset * step
+    keep = [i for i in range(a.ndim) if i not in (axis1, axis2)]
+    v = _viproc.view(a, [shape[i] for i in keep] + [size],
+                     [strides[i] for i in keep] + [strides[axis1] + strides[axis2]], start)
+    v._readonly = True
+    return v
+
+
+def _real(val):
+    if type(val) is not ndarray:
+        return _NOPE
+    if val.dtype.kind != "c":
+        return val  # NumPy: the array itself
+    return _viproc.view(val, val.shape, val.strides, 0, _CODES[_REAL_OF[val.dtype]])
+
+
+_REAL_OF = {np.dtype(np.complex64): np.dtype(np.float32),
+            np.dtype(np.complex128): np.dtype(np.float64)}
+
+
+def _dtype_view(a, dtype):
+    """a.view(dtype) as NumPy computes it (array_descr_set): the same layout
+    for the same item size; else the last axis, which must be contiguous,
+    rescaled. _NOPE for anything else (NumPy decides, and raises)."""
+    code = _CODES.get(dtype)
+    if code is None and not (dtype.subdtype and dtype.subdtype[0] in _CODES):
+        return _NOPE
+    if dtype.subdtype:  # (base, shape): a.view((float64, (2,))) appends axes
+        base, sub = dtype.subdtype
+        if base.itemsize * int(np.prod(sub)) != a.itemsize or not sub:
             return _NOPE
-        return _reshape(c, *args, **kwargs)
-    if r is fake:
-        return a
-    w = _viproc.view_of(a, fake, r)
-    return _NOPE if w is None else w
+        strides = list(a.strides)
+        inner = []
+        step = base.itemsize
+        for n in reversed(sub):
+            inner.insert(0, step)
+            step *= n
+        return _viproc.view(a, a.shape + tuple(sub), tuple(strides) + tuple(inner), 0,
+                            _CODES[base])
+    if dtype.itemsize == a.itemsize:
+        return _viproc.view(a, a.shape, a.strides, 0, code)
+    if a.ndim == 0 or a.strides[-1] != a.itemsize or (a.shape[-1] * a.itemsize) % dtype.itemsize:
+        return _NOPE
+    shape = a.shape[:-1] + (a.shape[-1] * a.itemsize // dtype.itemsize,)
+    return _viproc.view(a, shape, a.strides[:-1] + (dtype.itemsize,), 0, code)
+
+
+def _reshape(a, shape=None, order="C", *, newshape=None, copy=None):
+    """np.reshape: a view where NumPy makes one, else NumPy's copy (in the
+    requested order) reshaped; copy=False raises as NumPy."""
+    if type(a) is not ndarray:
+        return _NOPE
+    if newshape is not None:
+        if shape is not None:
+            return _NOPE  # NumPy raises
+        shape = newshape
+    if shape is None or order not in ("C", "F", "A"):
+        return _NOPE
+    shape = (shape,) if isinstance(shape, (int, np.integer)) else tuple(shape)
+    if copy:
+        src = a.astype(a.dtype, order="F" if order == "F" else "C")
+        return _viproc.reshape(src, shape, order)
+    r = _viproc.reshape(a, shape, order)
+    if r is not None:
+        return r
+    if copy is False:
+        raise ValueError("Unable to avoid creating a copy while reshaping.")
+    if order == "A":
+        order = "C"  # A on an array that is not F-contiguous
+    r = _viproc.reshape(a.astype(a.dtype, order=order), shape, order)
+    return _NOPE if r is None else r
 
 
 def _ravel(a, order="C"):
-    if order not in ("C",):
+    if type(a) is not ndarray or order not in ("C", "F", "A"):
         return _NOPE
-    return _reshape(a, -1)
+    return _reshape(a, -1, order)
+
+
+_VIEW_HANDLERS = {
+    np.transpose: _transpose, np.permute_dims: _transpose, np.swapaxes: _swapaxes,
+    np.moveaxis: _moveaxis, np.matrix_transpose: _matrix_transpose, np.squeeze: _squeeze,
+    np.expand_dims: _expand_dims, np.flip: _flip, np.fliplr: _fliplr, np.flipud: _flipud,
+    np.rot90: _rot90, np.atleast_1d: _atleast(1), np.atleast_2d: _atleast(2),
+    np.atleast_3d: _atleast(3), np.broadcast_to: _broadcast_to, np.diagonal: _diagonal,
+    np.real: _real, np.reshape: _reshape, np.ravel: _ravel,
+}
 
 
 def _where(condition, *xy):
@@ -522,11 +759,11 @@ def _readonly_call(fn):
     return handler
 
 
-_VIEW_HANDLERS = {np.reshape: _reshape, np.ravel: _ravel, np.where: _where,
+_VIEW_HANDLERS.update({np.where: _where,
                   np.nonzero: _readonly_call(np.nonzero),
                   np.flatnonzero: _readonly_call(np.flatnonzero),
                   np.argwhere: _readonly_call(np.argwhere),
-                  np.count_nonzero: _readonly_call(np.count_nonzero)}
+                  np.count_nonzero: _readonly_call(np.count_nonzero)})
 
 
 # --- advanced indexing ---------------------------------------------------------
@@ -535,8 +772,8 @@ _VIEW_HANDLERS = {np.reshape: _reshape, np.ravel: _ravel, np.where: _where,
 # NumPy's values. NumPy's rules decide the result: the basic part of the key
 # is applied first as a view; the index arrays broadcast together, and their
 # dimensions replace the indexed axes if those are adjacent, else go first.
-# NumPy's result layout comes from NumPy itself, indexing a tiny stand-in
-# with the same axis order (extents 1 or 2, so it costs nothing).
+# NumPy's result layout comes from NumPy itself, indexing a tiny proxy with
+# the same axis order (extents 1 or 2) once per key pattern (cached).
 _layout_cache = {}
 
 
@@ -881,19 +1118,18 @@ class ndarray(_viproc._Array):
 
     # --- indexing ------------------------------------------------------------
     def _view(self, key):
-        """Basic indexing as a runtime view (metadata only, no sync)."""
-        fake = _viproc.stand_in(self)
-        keys = key if isinstance(key, tuple) else (key,)
-        if not any(k is Ellipsis for k in keys):
-            keys = keys + (Ellipsis,)  # always a view, never a NumPy scalar
-        return _viproc.view_of(self, fake, fake[keys])
+        """Basic indexing as a runtime view (metadata only, no sync; an
+        all-int key gives a 0-d view)."""
+        return _basic(self, key)
 
     def __getitem__(self, key):
         r = _viproc.item(self, key)  # a[i, j] of ready data: NumPy's scalar, fast
         if r is not None:
             return r
-        if _is_basic_index(key):
-            v = self._view(key)
+        v = _viproc.basic_view(self, key)  # None: not basic, or NumPy raises
+        if v is None and _is_basic_index(key):
+            v = self._view(key)  # raises NumPy's error
+        if v is not None:
             keys = key if isinstance(key, tuple) else (key,)
             if v.ndim == 0 and not any(k is Ellipsis for k in keys):
                 # NumPy returns a scalar: free if the data is there, else a
@@ -949,10 +1185,6 @@ class ndarray(_viproc._Array):
         if func is np.copyto and len(args) >= 2 and isinstance(args[0], ndarray) and not kwargs:
             args[0][...] = args[1]
             return None
-        if func in _VIEW_FUNCS and args:
-            r = _meta_view(func, args[0], args[1:], kwargs)
-            if r is not _NOPE:
-                return r
         handler = _REDUCTIONS.get(func) or _VIEW_HANDLERS.get(func)
         if handler is not None:
             try:
@@ -969,7 +1201,7 @@ class ndarray(_viproc._Array):
         if dtype == self.dtype and not copy:
             return self
         code = _CODES.get(dtype)
-        if (code is not None and order in ("K", "C") and casting == "unsafe"
+        if (code is not None and order in ("K", "C", "F") and casting == "unsafe"
                 and self.size and type(self) is ndarray):
             r = _viproc.astype(self, code, order)  # NumPy's casts, asynchronously
             if r is not None:
@@ -996,43 +1228,41 @@ class ndarray(_viproc._Array):
 
     @property
     def T(self):
-        r = _meta_view(np.transpose, self)  # no __array_function__ dispatch
-        return np.transpose(self) if r is _NOPE else r
+        return _viproc.transpose(self, None)
 
     @property
     def mT(self):
-        return np.matrix_transpose(self)
+        return _matrix_transpose(self)
 
     def transpose(self, *axes):
         if len(axes) == 1 and (axes[0] is None or isinstance(axes[0], (tuple, list))):
             axes = axes[0]
-        return np.transpose(self, axes if axes != () else None)
+        return _transpose(self, axes if axes != () else None)
 
     def swapaxes(self, axis1, axis2):
-        return np.swapaxes(self, axis1, axis2)
+        return _swapaxes(self, axis1, axis2)
 
     def squeeze(self, axis=None):
-        return np.squeeze(self, axis)
+        return _squeeze(self, axis)
 
     def diagonal(self, offset=0, axis1=0, axis2=1):
-        return np.diagonal(self, offset, axis1, axis2)
+        return _diagonal(self, offset, axis1, axis2)
 
     @property
     def real(self):
-        return np.real(self)
+        return _real(self)
 
     @property
     def imag(self):
-        if self.dtype.kind == "c":
-            r = _meta_view(lambda a: a.imag, self)
-            if r is not _NOPE:
-                return r
-        return _host_call(lambda a: a.imag, (self,), {})
+        if self.dtype.kind == "c":  # the second half of each element
+            return _viproc.view(self, self.shape, self.strides, self.itemsize // 2,
+                                _CODES[_REAL_OF[self.dtype]])
+        return _host_call(lambda a: a.imag, (self,), {})  # NumPy: read-only zeros
 
     def view(self, dtype=None, type=None):
         if type is None and dtype is not None and not (
                 isinstance(dtype, builtins.type) and issubclass(dtype, np.ndarray)):
-            r = _meta_view(lambda a: a.view(dtype), self)
+            r = _dtype_view(self, np.dtype(dtype))
             if r is not _NOPE:
                 return r
         return _host_call(lambda a: a.view(dtype) if type is None else a.view(dtype, type),

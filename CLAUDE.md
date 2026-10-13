@@ -598,17 +598,28 @@ Rules:
   NumPy functions as views without a sync (`.T`, `transpose`, `swapaxes`,
   `moveaxis`, `squeeze`, `expand_dims`, `flip`, `rot90`, `broadcast_to`,
   `diagonal`, `real`/`imag`, `view(dtype)`, `reshape`/`ravel` where NumPy
-  makes a view, else an async copy first): NumPy runs them on a stand-in
-  ndarray with the array's layout over a dummy address
-  (`vp_array_stand_in`), and the view it returns maps back onto the
-  storage (`vp_array_view_of`); **advanced indexing** as gather / scatter
+  makes a view, else an async copy first, `atleast_*d`, `fliplr`/`flipud`,
+  `matrix_transpose`). **No ndarray is built for a view:** NumPy has no
+  public function that computes view metadata (`get_view_from_index`,
+  `_attempt_nocopy_reshape` are internal), so viproc computes the layout
+  itself, after NumPy's rules (as ILNumerics does): basic keys in C
+  (`_viproc.basic_view`, slices through CPython's `PySlice_Unpack` /
+  `PySlice_AdjustIndices`, as NumPy), `_viproc.transpose`,
+  `vp_array_reshape` (`reshape_view` in `layout.cpp`, a port of
+  `_attempt_nocopy_reshape`; NULL where NumPy copies), `broadcast_to`,
+  `PyArray_Diagonal` in Python. Invalid arguments raise NumPy's own error
+  from the same call on a zero-stride probe (`np.broadcast_to` of one
+  element, no element memory); `python/tests/test_views.py` fuzzes
+  layouts against NumPy. `a[1:3]` ~0.45 µs (NumPy 0.11), `a.T` 0.18 µs
+  (NumPy 0.08); **advanced indexing** as gather / scatter
   tasks (`src/runtime/index.*`, element copies, so the element order does
   not matter): integer arrays (viproc arrays may be pending), lists, ints
   next to arrays, boolean masks (they sync: `nonzero()` gives the shape),
   `x[mask] = scalar` without a sync (masked assignment); NumPy's
   placement of the broadcast index dimensions (adjacent in the key or
-  first) and NumPy's result layout, taken from NumPy indexing a tiny
-  stand-in with the same axis order (cached per pattern); out-of-bounds
+  first) and NumPy's result layout (the order of the result's axes),
+  taken once per key pattern from NumPy indexing a tiny proxy (extents
+  1 or 2, same axis order) and cached, never per op; out-of-bounds
   indices raise `AsyncIndexError` (an `IndexError`) at the sync point;
   scalar indexing returns NumPy's scalar if the array is ready, else a 0-d
   copy (no sync); `np.where(cond, x, y)` as a select task (NumPy's result

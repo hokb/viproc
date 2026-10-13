@@ -1502,6 +1502,280 @@ static PyObject* m_from_ndarray(PyObject* self, PyObject* arr) {
     return wrap_array(a);
 }
 
+/* --- views: NumPy's metadata rules, computed here ------------------------- */
+
+/* A view of `a` with this layout (offset relative to a's first element),
+ * read-only if `a` is; new reference or NULL. */
+static PyObject* make_view(PyObject* a, vp_dtype dtype, int nd, const int64_t* shape,
+                           const int64_t* strides, int64_t offset, int readonly) {
+    PyObject* v = wrap_array(vp_array_view(g_rt, array_of(a), dtype, nd, shape, strides, offset));
+    if (v != NULL) {
+        ((ArrayObject*)v)->readonly = ((ArrayObject*)a)->readonly || readonly;
+    }
+    return v;
+}
+
+/* Basic indexing (ints, slices, None, one Ellipsis) as NumPy's
+ * get_view_from_index computes it: slices through CPython's
+ * PySlice_Unpack/PySlice_AdjustIndices, as NumPy's PySlice_GetIndicesEx.
+ * Returns the view, or None for any other key (and for errors, which the
+ * caller leaves to NumPy's messages). An all-int key gives a 0-d view. */
+static PyObject* m_basic_view(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *a, *key;
+    if (!PyArg_ParseTuple(args, "O!O", &ArrayType, &a, &key) || check_runtime() < 0) {
+        return NULL;
+    }
+    vp_array* x = array_of(a);
+    const int nd = vp_array_ndim(x);
+    const int64_t* shape = vp_array_shape(x);
+    const int64_t* strides = vp_array_strides(x);
+    PyObject* const* items = PyTuple_Check(key) ? &PyTuple_GET_ITEM(key, 0) : &key;
+    const Py_ssize_t n = PyTuple_Check(key) ? PyTuple_GET_SIZE(key) : 1;
+    /* Count the dimensions the key consumes. */
+    int consumed = 0, ellipses = 0;
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject* k = items[i];
+        if (k == Py_Ellipsis) {
+            ++ellipses;
+        } else if (k != Py_None) {
+            if (!(PySlice_Check(k) || (PyLong_Check(k) && !PyBool_Check(k)) ||
+                  (g_np_integer != NULL && PyObject_TypeCheck(k, (PyTypeObject*)g_np_integer)))) {
+                Py_RETURN_NONE; /* arrays, bools, lists, ...: not basic */
+            }
+            ++consumed;
+        }
+    }
+    if (ellipses > 1 || consumed > nd) {
+        Py_RETURN_NONE;
+    }
+    int64_t nshape[MAXDIMS], nstrides[MAXDIMS];
+    int newnd = 0, od = 0;
+    int64_t offset = 0;
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject* k = items[i];
+        if (k == Py_None) {
+            if (newnd >= MAXDIMS) {
+                Py_RETURN_NONE;
+            }
+            nshape[newnd] = 1;
+            nstrides[newnd++] = 0;
+        } else if (k == Py_Ellipsis) {
+            for (int j = 0; j < nd - consumed; ++j, ++od) {
+                if (newnd >= MAXDIMS) {
+                    Py_RETURN_NONE;
+                }
+                nshape[newnd] = shape[od];
+                nstrides[newnd++] = strides[od];
+            }
+        } else if (PySlice_Check(k)) {
+            Py_ssize_t start, stop, step;
+            if (PySlice_Unpack(k, &start, &stop, &step) < 0) {
+                PyErr_Clear();
+                Py_RETURN_NONE;
+            }
+            Py_ssize_t len = PySlice_AdjustIndices((Py_ssize_t)shape[od], &start, &stop, step);
+            if (len <= 0) { /* as NumPy: points to the start */
+                len = 0;
+                step = 1;
+                start = 0;
+            }
+            if (newnd >= MAXDIMS) {
+                Py_RETURN_NONE;
+            }
+            offset += strides[od] * start;
+            nshape[newnd] = len;
+            nstrides[newnd++] = strides[od] * step;
+            ++od;
+        } else {
+            const Py_ssize_t v = PyNumber_AsSsize_t(k, NULL);
+            if (v == -1 && PyErr_Occurred()) {
+                PyErr_Clear();
+                Py_RETURN_NONE;
+            }
+            if (v < -shape[od] || v >= shape[od]) {
+                Py_RETURN_NONE; /* NumPy raises its IndexError */
+            }
+            offset += strides[od] * (v < 0 ? v + shape[od] : v);
+            ++od;
+        }
+    }
+    for (; od < nd; ++od) { /* implicit trailing Ellipsis */
+        if (newnd >= MAXDIMS) {
+            Py_RETURN_NONE;
+        }
+        nshape[newnd] = shape[od];
+        nstrides[newnd++] = strides[od];
+    }
+    return make_view(a, vp_array_dtype(x), newnd, nshape, nstrides, offset, 0);
+}
+
+/* a.transpose(axes) (axes: None or a permutation, negative axes allowed) as
+ * NumPy's PyArray_Transpose; None for an invalid permutation (NumPy raises). */
+static PyObject* m_transpose(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *a, *axes;
+    if (!PyArg_ParseTuple(args, "O!O", &ArrayType, &a, &axes) || check_runtime() < 0) {
+        return NULL;
+    }
+    vp_array* x = array_of(a);
+    const int nd = vp_array_ndim(x);
+    const int64_t* shape = vp_array_shape(x);
+    const int64_t* strides = vp_array_strides(x);
+    int64_t perm[MAXDIMS];
+    if (axes == Py_None) {
+        for (int i = 0; i < nd; ++i) {
+            perm[i] = nd - 1 - i;
+        }
+    } else {
+        const int n = read_dims(axes, perm);
+        if (n < 0) {
+            PyErr_Clear();
+            Py_RETURN_NONE;
+        }
+        if (n != nd) {
+            Py_RETURN_NONE;
+        }
+        int seen[MAXDIMS] = {0};
+        for (int i = 0; i < nd; ++i) {
+            if (perm[i] < 0) {
+                perm[i] += nd;
+            }
+            if (perm[i] < 0 || perm[i] >= nd || seen[perm[i]]++) {
+                Py_RETURN_NONE;
+            }
+        }
+    }
+    int64_t nshape[MAXDIMS], nstrides[MAXDIMS];
+    for (int i = 0; i < nd; ++i) {
+        nshape[i] = shape[perm[i]];
+        nstrides[i] = strides[perm[i]];
+    }
+    return make_view(a, vp_array_dtype(x), nd, nshape, nstrides, 0, 0);
+}
+
+/* reshape(a, shape, order): NumPy's a.reshape(shape, order=order) ('C',
+ * 'F' or 'A') as a view, None if NumPy would copy. One -1 is resolved and
+ * size mismatches raise as in NumPy (_fix_unknown_dimension). */
+static PyObject* m_reshape(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *a, *shape_o;
+    int order;
+    if (!PyArg_ParseTuple(args, "O!OC", &ArrayType, &a, &shape_o, &order) || check_runtime() < 0) {
+        return NULL;
+    }
+    vp_array* x = array_of(a);
+    int64_t dims[MAXDIMS];
+    const int nd = read_dims(shape_o, dims);
+    if (nd < 0) {
+        return NULL;
+    }
+    int64_t size = 1;
+    for (int i = 0; i < vp_array_ndim(x); ++i) {
+        size *= vp_array_shape(x)[i];
+    }
+    int unknown = -1;
+    int64_t known = 1;
+    for (int i = 0; i < nd; ++i) {
+        if (dims[i] < 0) {
+            if (unknown >= 0) {
+                PyErr_SetString(PyExc_ValueError, "can only specify one unknown dimension");
+                return NULL;
+            }
+            unknown = i;
+        } else {
+            known *= dims[i];
+        }
+    }
+    if (unknown >= 0) {
+        if (known == 0 || size % known != 0) {
+            known = -1; /* mismatch */
+        } else {
+            dims[unknown] = size / known;
+            known = size;
+        }
+    }
+    if (known != size) {
+        PyObject* t = PyTuple_New(nd);
+        for (int i = 0; t != NULL && i < nd; ++i) {
+            PyTuple_SET_ITEM(t, i, PyLong_FromLongLong(dims[i]));
+        }
+        if (t != NULL) {
+            PyErr_Format(PyExc_ValueError, "cannot reshape array of size %lld into shape %R",
+                         (long long)size, t);
+            Py_DECREF(t);
+        }
+        return NULL;
+    }
+    if (order == 'A') { /* F if the array is F- and not C-contiguous */
+        const int64_t* shape = vp_array_shape(x);
+        const int64_t* strides = vp_array_strides(x);
+        const int n = vp_array_ndim(x);
+        static const int64_t itemsizes[] = {1, 4, 8, 4, 8, 8, 16}; /* vp_dtype order */
+        int64_t step = itemsizes[vp_array_dtype(x)];
+        int f = 1;
+        for (int i = 0; i < n && f; ++i) {
+            if (shape[i] == 0) {
+                break;
+            }
+            if (shape[i] != 1) {
+                f = strides[i] == step;
+                step *= shape[i];
+            }
+        }
+        order = f && !c_contiguous(x) ? 'F' : 'C';
+    }
+    if (order != 'C' && order != 'F') {
+        Py_RETURN_NONE;
+    }
+    vp_array* r = vp_array_reshape(g_rt, x, nd, dims, (char)order);
+    if (r == NULL) {
+        Py_RETURN_NONE;
+    }
+    PyObject* v = wrap_array(r);
+    if (v != NULL) {
+        ((ArrayObject*)v)->readonly = ((ArrayObject*)a)->readonly;
+    }
+    return v;
+}
+
+/* broadcast_to(a, shape): NumPy's read-only broadcast view (stride 0 for
+ * broadcast dimensions); None if the shapes do not broadcast. */
+static PyObject* m_broadcast_to(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *a, *shape_o;
+    if (!PyArg_ParseTuple(args, "O!O", &ArrayType, &a, &shape_o) || check_runtime() < 0) {
+        return NULL;
+    }
+    vp_array* x = array_of(a);
+    int64_t dims[MAXDIMS], st[MAXDIMS];
+    const int nd = read_dims(shape_o, dims);
+    const int ond = vp_array_ndim(x);
+    if (nd < 0) {
+        PyErr_Clear();
+        Py_RETURN_NONE;
+    }
+    if (nd < ond) {
+        Py_RETURN_NONE;
+    }
+    for (int i = 0; i < nd; ++i) {
+        const int j = i - (nd - ond);
+        if (dims[i] < 0) {
+            Py_RETURN_NONE;
+        }
+        if (j < 0) {
+            st[i] = 0;
+        } else if (vp_array_shape(x)[j] == dims[i]) {
+            st[i] = dims[i] == 1 ? 0 : vp_array_strides(x)[j]; /* nditer: 0 for extent 1 */
+        } else if (vp_array_shape(x)[j] == 1) {
+            st[i] = 0;
+        } else {
+            Py_RETURN_NONE;
+        }
+    }
+    return make_view(a, vp_array_dtype(x), nd, dims, st, 0, 1);
+}
+
 static PyObject* m_view(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *base, *shape_o, *strides_o;
@@ -1591,35 +1865,6 @@ static PyObject* m_item(PyObject* self, PyObject* args) {
     PyObject* r = vp_array_scalar(e);
     vp_array_release(e);
     return r;
-}
-
-static PyObject* m_stand_in(PyObject* self, PyObject* a) {
-    (void)self;
-    if (!PyObject_TypeCheck(a, &ArrayType) || check_runtime() < 0) {
-        if (!PyErr_Occurred()) {
-            PyErr_SetString(PyExc_TypeError, "stand_in: a viproc array expected");
-        }
-        return NULL;
-    }
-    return vp_array_stand_in(array_of(a));
-}
-
-static PyObject* m_view_of(PyObject* self, PyObject* args) {
-    (void)self;
-    PyObject *a, *fake, *r;
-    if (!PyArg_ParseTuple(args, "O!OO", &ArrayType, &a, &fake, &r) || check_runtime() < 0) {
-        return NULL;
-    }
-    int readonly = 0;
-    vp_array* v = vp_array_view_of(g_rt, array_of(a), fake, r, &readonly);
-    if (v == NULL) {
-        Py_RETURN_NONE;
-    }
-    PyObject* w = wrap_array(v);
-    if (w != NULL) {
-        ((ArrayObject*)w)->readonly = ((ArrayObject*)a)->readonly || readonly;
-    }
-    return w;
 }
 
 static PyObject* m_ready(PyObject* self, PyObject* o) {
@@ -1971,10 +2216,13 @@ static PyMethodDef methods[] = {
      "scalar(a): NumPy's scalar of a's first element if a is ready (no wait), else None"},
     {"item", m_item, METH_VARARGS,
      "item(a, key): NumPy's scalar a[key] for an integer key if a is ready, else None"},
-    {"stand_in", m_stand_in, METH_O,
-     "stand_in(a): ndarray with a's layout over a dummy address (metadata-only NumPy code)"},
-    {"view_of", m_view_of, METH_VARARGS,
-     "view_of(a, stand_in, r): r (a view of stand_in) as a view of a, or None"},
+    {"basic_view", m_basic_view, METH_VARARGS,
+     "basic_view(a, key): a[key] for ints, slices, None, Ellipsis as a view, else None"},
+    {"transpose", m_transpose, METH_VARARGS, "transpose(a, axes): view, None if axes invalid"},
+    {"reshape", m_reshape, METH_VARARGS,
+     "reshape(a, shape, order): view as NumPy's reshape, None if NumPy would copy"},
+    {"broadcast_to", m_broadcast_to, METH_VARARGS,
+     "broadcast_to(a, shape): read-only broadcast view, None if not broadcastable"},
     {"gather", m_gather, METH_VARARGS,
      "gather(a, idx, idx_axes, result_axes, result_strides): a[idx...] (vp_gather)"},
     {"scatter", m_scatter, METH_VARARGS,
@@ -1984,7 +2232,7 @@ static PyMethodDef methods[] = {
     {"arg_reduce", m_arg_reduce, METH_VARARGS,
      "arg_reduce(argmax, a, out_shape): argmin/argmax along a's last axis (C-contiguous)"},
     {"astype", m_astype, METH_VARARGS,
-     "astype(a, code, order): async cast (order 'K' or 'C'), or None if unsupported"},
+     "astype(a, code, order): async cast (order 'K', 'C' or 'F'), or None if unsupported"},
     {"reduce", m_reduce, METH_VARARGS,
      "reduce(ufunc, a, axes, keepdims, dtype, initial): async reduction, or None if unsupported"},
     {NULL, NULL, 0, NULL},

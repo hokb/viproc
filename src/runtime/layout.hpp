@@ -54,12 +54,19 @@ struct Layout {
     // True if the elements lie C-contiguously (dimensions of extent 1 may
     // have any stride).
     bool c_contiguous() const;
+    // True if the elements lie F-contiguously (as c_contiguous()).
+    bool f_contiguous() const;
     // Bytes a buffer needs to hold this layout when it is contiguous.
     std::size_t nbytes() const;
     // True if the elements fill nbytes() bytes from offset 0, in some axis
     // order, with positive strides (extent-1 dimensions may have any stride).
     bool dense() const;
 };
+
+// NumPy's reshape of `in` to `dims` (all >= 0, same size) in `order` 'C' or
+// 'F' as a view (PyArray_Newshape: same shape, or contiguous in that order,
+// or _attempt_nocopy_reshape). False if NumPy would copy. Metadata only.
+bool reshape_view(const Layout& in, const Shape& dims, char order, Layout& out);
 
 // NumPy broadcasting of two shapes. Returns false if they are incompatible.
 bool broadcast_shapes(const Shape& a, const Shape& b, Shape& out);

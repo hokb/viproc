@@ -872,43 +872,11 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
     return kernel;
 }
 
-namespace {
-alignas(64) char g_stand_in_data[64];
-}
-
 PyObject* scalar_object(DType dtype, const void* data) {
     PyArray_Descr* descr = PyArray_DescrFromType(type_num(dtype));
     PyObject* r = PyArray_Scalar(const_cast<void*>(data), descr, nullptr);
     Py_DECREF(descr);
     return r;
-}
-
-PyObject* stand_in(const Layout& l) {
-    return reinterpret_cast<PyObject*>(template_array(l, g_stand_in_data, true));
-}
-
-bool view_of(PyObject* stand_in, PyObject* r, Layout& layout, bool& writable) {
-    if (!PyArray_Check(r)) {
-        return false;
-    }
-    PyObject* base = r;
-    while (base != stand_in && base != nullptr && PyArray_Check(base)) {
-        base = PyArray_BASE(reinterpret_cast<PyArrayObject*>(base));
-    }
-    if (base != stand_in) {
-        return false; // a copy, or unrelated
-    }
-    auto* arr = reinterpret_cast<PyArrayObject*>(r);
-    if (!dtype_of(PyArray_TYPE(arr), layout.dtype) || !PyArray_ISNOTSWAPPED(arr) ||
-        !PyArray_ISALIGNED(arr)) {
-        return false;
-    }
-    const int nd = PyArray_NDIM(arr);
-    layout.shape.assign(PyArray_DIMS(arr), PyArray_DIMS(arr) + nd);
-    layout.strides.assign(PyArray_STRIDES(arr), PyArray_STRIDES(arr) + nd);
-    layout.offset = PyArray_BYTES(arr) - PyArray_BYTES(reinterpret_cast<PyArrayObject*>(stand_in));
-    writable = PyArray_ISWRITEABLE(arr);
-    return true;
 }
 
 bool supported_ndarray(PyObject* obj) {

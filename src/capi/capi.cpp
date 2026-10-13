@@ -212,18 +212,14 @@ PyObject* vp_array_scalar(const vp_array* a) {
     return numpy::scalar_object(x.layout().dtype, x.buffer()->data() + x.layout().offset);
 }
 
-PyObject* vp_array_stand_in(const vp_array* a) { return numpy::stand_in(arr(a).layout()); }
-
-vp_array* vp_array_view_of(vp_runtime* rt, const vp_array* a, PyObject* stand_in, PyObject* r,
-                           int* readonly) {
-    Layout l;
-    bool writable = true;
-    if (!numpy::view_of(stand_in, r, l, writable)) {
+vp_array* vp_array_reshape(vp_runtime* rt, const vp_array* a, int ndim, const int64_t* shape,
+                           char order) {
+    const Layout& l = arr(a).layout();
+    Layout out;
+    if (!reshape_view(l, Shape(shape, shape + ndim), order, out)) {
         return nullptr;
     }
-    *readonly = writable ? 0 : 1;
-    l.offset += arr(a).layout().offset;
-    return hand_out(rt->rt->view(ref(a), std::move(l)));
+    return hand_out(rt->rt->view(ref(a), std::move(out)));
 }
 
 vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, vp_dtype dtype, int ndim,
@@ -497,7 +493,18 @@ int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array
     const Layout& l = arr(in).layout();
     const DType to = to_dtype(dtype);
     Layout out;
-    if (order == 'C' || l.c_contiguous() || l.shape.size() <= 1) {
+    if (order == 'F') {
+        out.dtype = to;
+        out.shape = l.shape;
+        out.strides.resize(l.shape.size());
+        std::int64_t step = static_cast<std::int64_t>(itemsize(to));
+        for (std::size_t i = 0; i < l.shape.size(); ++i) {
+            out.strides[i] = step;
+            if (l.shape[i] != 0) {
+                step *= l.shape[i];
+            }
+        }
+    } else if (order == 'C' || l.c_contiguous() || l.shape.size() <= 1) {
         out = Layout::contiguous(to, l.shape);
     } else if (order == 'K') {
         // PyArray_NewLikeArray(KEEPORDER): F order if `in` is F-contiguous,

@@ -166,13 +166,6 @@ std::shared_ptr<Kernel> make_cast_kernel(const Layout& in, const Layout& out, lo
 // NumPy's scalar of the element at `data` (dtype `dtype`). GIL held.
 PyObject* scalar_object(DType dtype, const void* data);
 
-// A writable ndarray with `l`'s dtype, shape and strides over a dummy
-// address (see vp_array_stand_in). New reference or nullptr. GIL held.
-PyObject* stand_in(const Layout& l);
-// If `r` is an ndarray view of `stand_in` with a supported dtype: its layout
-// (offset relative to the stand-in's first element) and writability.
-bool view_of(PyObject* stand_in, PyObject* r, Layout& layout, bool& writable);
-
 // Wraps the memory of a NumPy array as a ready runtime array without copying.
 // `owner` keeps the memory alive (e.g. holds a reference to `arr`); with a
 // null owner the caller keeps `arr` alive until no task reads it any more.

@@ -103,17 +103,11 @@ int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_arr
 /* [GIL, main thread] NumPy's scalar of the first element of `a`, which must
  * be ready (vp_array_ready). New reference. */
 PyObject* vp_array_scalar(const vp_array* a);
-/* [GIL] A stand-in for `a` in NumPy code that only rearranges metadata
- * (transpose, reshape without copy, real, ...): a writable ndarray with a's
- * dtype, shape and strides over a dummy address. Its data must never be
- * read or written. vp_array_view_of() maps a view NumPy derived from it back
- * onto `a`'s storage. New reference, or NULL with a Python error. */
-PyObject* vp_array_stand_in(const vp_array* a);
-/* [GIL] If `r` is an ndarray view of `stand_in` (from vp_array_stand_in(a))
- * with a viproc dtype, returns the same view of `a` (metadata only) and sets
- * *readonly if NumPy made `r` read-only; else NULL. */
-vp_array* vp_array_view_of(vp_runtime* rt, const vp_array* a, PyObject* stand_in, PyObject* r,
-                           int* readonly);
+/* [main thread] NumPy's a.reshape(shape, order) as a view of `a` (order 'C'
+ * or 'F'; `shape` without -1, same size as `a`), or NULL if NumPy would
+ * copy. Metadata only, computed as NumPy computes it (PyArray_Newshape). */
+vp_array* vp_array_reshape(vp_runtime* rt, const vp_array* a, int ndim, const int64_t* shape,
+                           char order);
 /* [GIL] A view of `base` sharing its storage. `offset` is in bytes, relative
  * to base's first element; strides are in bytes. Metadata only. */
 vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, vp_dtype dtype, int ndim,
@@ -190,7 +184,7 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
 /* Issues a cast of `in` to `dtype` (NumPy's a.astype(dtype, order)) with
  * NumPy's cast functions. `order` 'K' gives the result NumPy's layout for
  * astype (PyArray_NewLikeArray: C or F if `in` is, else its axis order),
- * 'C' C order. Returns VP_UNSUPPORTED if NumPy cannot cast without the
+ * 'C' C order, 'F' F order. Returns VP_UNSUPPORTED if NumPy cannot cast without the
  * Python API or the cast is empty. NumPy's warnings (ComplexWarning) are
  * issued during the call, as by NumPy (VP_UNSUPPORTED if a warning filter
  * turns one into an error: NumPy raises it in the fallback). */

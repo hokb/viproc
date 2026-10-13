@@ -122,6 +122,94 @@ bool Layout::c_contiguous() const {
     return true;
 }
 
+bool Layout::f_contiguous() const {
+    std::int64_t stride = static_cast<std::int64_t>(itemsize(dtype));
+    for (std::size_t i = 0; i < shape.size(); ++i) {
+        if (shape[i] == 0) {
+            return true;
+        }
+        if (shape[i] != 1 && strides[i] != stride) {
+            return false;
+        }
+        stride *= shape[i];
+    }
+    return true;
+}
+
+bool reshape_view(const Layout& in, const Shape& dims, char order, Layout& out) {
+    out.dtype = in.dtype;
+    out.offset = in.offset;
+    out.shape = dims;
+    const std::size_t nd = dims.size();
+    out.strides.assign(nd, 0);
+    if (dims == in.shape) {
+        out.strides = in.strides; // PyArray_View: the same strides
+        return true;
+    }
+    const bool f = order == 'F';
+    const auto isz = static_cast<std::int64_t>(itemsize(in.dtype));
+    if (in.size() == 0 || (f ? in.f_contiguous() : in.c_contiguous())) {
+        // NumPy's default strides of a contiguous array (_array_fill_strides).
+        std::int64_t step = isz;
+        for (std::size_t k = 0; k < nd; ++k) {
+            const std::size_t i = f ? k : nd - 1 - k;
+            out.strides[i] = step;
+            if (dims[i] != 0) {
+                step *= dims[i];
+            }
+        }
+        return true;
+    }
+    // _attempt_nocopy_reshape (numpy/_core/src/multiarray/shape.c).
+    SmallVector<std::int64_t, kInlineRank> od;
+    SmallVector<std::int64_t, kInlineRank> os;
+    for (std::size_t i = 0; i < in.shape.size(); ++i) {
+        if (in.shape[i] != 1) {
+            od.push_back(in.shape[i]);
+            os.push_back(in.strides[i]);
+        }
+    }
+    const std::size_t oldnd = od.size();
+    std::size_t oi = 0, oj = 1, ni = 0, nj = 1;
+    while (ni < nd && oi < oldnd) {
+        std::int64_t np = dims[ni];
+        std::int64_t op = od[oi];
+        while (np != op) {
+            if (np < op) {
+                np *= dims[nj++];
+            } else {
+                op *= od[oj++];
+            }
+        }
+        for (std::size_t ok = oi; ok + 1 < oj; ++ok) {
+            if (f ? os[ok + 1] != od[ok] * os[ok] : os[ok] != od[ok + 1] * os[ok + 1]) {
+                return false; // not contiguous enough
+            }
+        }
+        if (f) {
+            out.strides[ni] = os[oi];
+            for (std::size_t nk = ni + 1; nk < nj; ++nk) {
+                out.strides[nk] = out.strides[nk - 1] * dims[nk - 1];
+            }
+        } else {
+            out.strides[nj - 1] = os[oj - 1];
+            for (std::size_t nk = nj - 1; nk > ni; --nk) {
+                out.strides[nk - 1] = out.strides[nk] * dims[nk];
+            }
+        }
+        ni = nj++;
+        oi = oj++;
+    }
+    std::int64_t last = ni >= 1 ? out.strides[ni - 1] : isz;
+    if (f && ni >= 1) {
+        last *= dims[ni - 1];
+    }
+    for (std::size_t nk = ni; nk < nd; ++nk) {
+        out.strides[nk] = last;
+    }
+    return true;
+}
+
 std::int64_t Layout::size() const {
     std::int64_t n = 1;
     for (std::int64_t d : shape) {
