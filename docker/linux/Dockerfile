@@ -18,6 +18,10 @@ RUN --mount=type=secret,id=ca,required=false \
     && pip install --no-cache-dir "cmake>=3.24" ninja "numpy==${NUMPY_VERSION}" pytest
 
 COPY . /src
+# The command line, with LF line endings even from a Windows checkout made
+# before .gitattributes (CRLF breaks the "#!/bin/bash" line).
+RUN sed 's/\r$//' /src/docker/entrypoint.sh > /usr/local/bin/viproc \
+    && chmod 755 /usr/local/bin/viproc
 RUN cmake -S /src -B /build -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
     && cmake --build /build
 
@@ -28,5 +32,5 @@ ENV VIPROC_PLATFORM=linux \
     PYTHONPYCACHEPREFIX=/tmp/pycache \
     OPENBLAS_NUM_THREADS=1
 WORKDIR /work
-ENTRYPOINT ["/src/docker/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/viproc"]
 CMD ["test"]

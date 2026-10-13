@@ -91,6 +91,13 @@ docker run --rm -v "$PWD:/src" viproc:wine
 
 Notes:
 
+- Windows checkouts: `.gitattributes` keeps shell scripts, Dockerfiles
+  and CMake files at LF line endings even with `core.autocrlf=true`, and
+  the images install their command line with CRLF stripped. A checkout
+  made before that fix still builds working images; to normalize it
+  anyway: `git rm --cached -r . && git reset --hard` (discards local
+  changes) or a fresh clone.
+
 - Bytecode caches go to `PYTHONPYCACHEPREFIX` (`/tmp/pycache`), not into
   `__pycache__` of the sources: caches a mounted checkout brings from the
   host name the host's paths.
