@@ -40,7 +40,10 @@ to plain sequential NumPy execution.
   For an in/out array this is the **last** task that writes it.
 - Arrays do **not** reference the tasks that consume them as inputs.
 - A pending array may have no element memory yet; the producer allocates
-  it.
+  it. (Decided, not implemented yet: element memory comes from viproc's
+  pool and is taken by the main thread at issue time; pool allocations
+  happen on the main thread only, releases on any thread. See
+  `docs/design/memory-management.md`, D3 and D10.)
 - **Views share a storage.** A base array and all its views refer to one
   shared *storage*, which holds the current buffer (data version) and the
   last task writing it. Readiness, the producer and `async_reads` belong

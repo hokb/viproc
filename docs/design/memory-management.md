@@ -25,6 +25,7 @@ Status labels:
 | D7 | Array conversions viproc ↔ ndarray: copy-free in both directions | Decided (rule proposed) |
 | D8 | Write-after-read safety by copy-on-write, not by locking | Implemented |
 | D9 | `viproc.ndarray` is a wrapper, not a subclass of `numpy.ndarray` | Decided, implemented |
+| D10 | Access model: pool allocations on the main thread only, releases from any thread | Decided |
 
 ## Background: the ILNumerics model
 
@@ -118,16 +119,14 @@ limit strong scaling for large arrays. Measured, chain
 
 **Design (to be implemented in `src/runtime/`):**
 
-- **Where it plugs in.** `Buffer::ensure_allocated()` takes memory from the
-  pool; `Buffer::~Buffer()` returns it. Buffers wrapping foreign memory
-  (NumPy arrays) are not pooled. Element memory up to 128 bytes stays
-  inline in the `Buffer` object (already implemented, `buffer.hpp`).
-- **Threads.** Memory is allocated by the producing task (any worker or the
-  main thread) and released by whichever thread drops the last reference.
-  The pool is therefore thread-safe: one free list per size class with its
-  own lock (an allocation of this size costs far more than an uncontended
-  lock). A per-thread cache in front is an option if measurements show
-  contention.
+- **Where it plugs in.** The main thread takes a block from the pool when
+  it issues the op that creates the buffer (D10); `Buffer::~Buffer()`
+  returns it, on whatever thread. Buffers wrapping foreign memory (NumPy
+  arrays) are not pooled. Element memory up to 128 bytes stays inline in
+  the `Buffer` object (already implemented, `buffer.hpp`).
+- **Threads.** See D10: allocation on the main thread only, release from
+  any thread. The pool's index is owned by the main thread and needs no
+  lock.
 - **Matching: equal or larger, bounded excess.** The pool hands out the
   smallest cached block whose capacity is at least the requested size and
   at most `request · (1 + max_excess)`. Nothing is rounded up on a miss:
@@ -154,7 +153,7 @@ limit strong scaling for large arrays. Measured, chain
   releases everything cached.
 - **Determinism is kept.** Release into the pool happens at the same moment
   as before; only *where* the memory goes changes. Peak memory equals the
-  live data plus the pool bound.
+  live data, the memory reserved by issued ops (D10) and the pool bound.
 - **Debugging.** A build option disables the pool (direct allocation), so
   AddressSanitizer keeps catching use-after-free in element memory.
 
@@ -351,9 +350,81 @@ directly, bypassing every sync point:
   arrays passed to it: their `np.sin(x)` and `x * 2` dispatch through the
   protocols.
 
+## D10 — Access model: allocate on the main thread, release anywhere
+
+**Decided.** viproc enforces one access model for all its pools (element
+memory, D3; runtime objects, D4):
+
+- **Allocations from a pool happen only on the main thread** — the thread
+  that issues ops.
+- **Releases back into a pool may happen on any thread** — whichever thread
+  drops the last reference (a worker finishing the last reader of a
+  buffer, the main thread dropping a Python object).
+
+**Pool structure that follows from it.**
+
+- The pool's free index (ordered by capacity, D3) belongs to the main
+  thread: lookups, inserts, eviction and the pool bound need no lock and
+  no atomics.
+- A release on the main thread inserts into the index directly.
+- A release on another thread pushes the block onto a lock-free
+  multi-producer stack (one CAS). The main thread takes the whole stack
+  over with one exchange (no ABA) and merges it into its index — before an
+  allocation that misses the index, and at sync points. The same pattern as
+  the object pools of D4 (`src/runtime/pool.hpp`).
+- Released memory is therefore reusable at the next main-thread pool
+  operation, not necessarily at the exact moment of release; *when* it is
+  released (D2) does not change.
+
+**Consequences for the execution model.**
+
+- **Element memory is taken at issue time.** In phase 1 every output shape
+  is known when the op is issued, so the main thread takes the output's
+  block from the pool right there, and the task reaches the `allocated`
+  stage at issue (it passes `size_completed` and `allocated` on the main
+  thread). Kernels never allocate; `Task::execute()` finds its outputs
+  allocated. This replaces the current lazy allocation by the producing
+  task (`Buffer::ensure_allocated()` on the worker). The copy-on-write
+  paths (consolidated new buffer, copy task) and scalar inputs are issued
+  on the main thread already.
+- **Peak memory.** A pending output holds its memory from issue on instead
+  of from the moment its producer starts. The look-ahead limit (1000 active
+  tasks) bounds this; a memory-based look-ahead limit (bytes reserved by
+  pending outputs, known exactly to the main thread) becomes the natural
+  complement and is cheap to keep, since only the main thread allocates.
+- **Interaction with D5.** Reusing a temporary's buffer is decided at issue
+  time on the main thread as well; it simply skips the pool.
+- **Data-dependent output sizes** (`nonzero`, boolean indexing, `unique`;
+  eager NumPy fallbacks in the MVP): when such ops become asynchronous, the
+  producer learns its output size only while running and cannot take from
+  the pool. It then allocates from the system allocator; the block enters
+  the pool on release like any other (releases are allowed on any thread).
+  The main thread stays the only thread that ever takes from the pool.
+- **Devices (future).** Device selection precedes allocation in the task
+  stages; with allocation on the main thread, device selection for an op
+  must happen at issue time as well, or device memory gets pools of its
+  own with the same access model.
+
+**Why.**
+
+- The allocating side is the hot path (one allocation per op); making it
+  single-threaded removes all synchronization from it and keeps every
+  pool decision (matching, eviction, the bound, D5) deterministic and in
+  one place, in line with "local decisions on the main thread".
+- Releases cannot be confined to one thread without delaying them: the
+  last reader of a buffer is often a worker. A push onto a lock-free stack
+  keeps them immediate and cheap.
+- It matches the thread rules already in place: only the main thread
+  creates tasks and arrays; workers only advance and complete them.
+
 ## Open questions
 
 - Pool bound default (fraction of RAM vs. fixed) and the eviction order.
+- When the main thread merges the remote-release stack besides misses and
+  sync points (e.g. every N issued ops), so released memory counts toward
+  the pool bound promptly.
+- `FixedPool` (D4) still lets any thread allocate; tighten it to the D10
+  model (main-thread allocation, assertion in debug builds).
 - `max_excess` default for "equal or larger" matching; whether small
   blocks (a few KiB) warrant a tighter bound than large ones.
 - Per-thread caches in front of the element pool: only if contention shows
