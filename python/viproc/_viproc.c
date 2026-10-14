@@ -537,7 +537,7 @@ static int chain_starts_with(const call_chain* c, const call_chain* prefix) {
  * and is dropped. Recorded addresses
  * also survive the BOLT/PGO layout of distribution builds, where symbol
  * ranges do not. */
-#define MAX_CHAINS 32
+#define MAX_CHAINS 64
 static call_chain g_chains[MAX_CHAINS];
 static int g_chains_n = -1;     /* -1: not calibrated yet */
 static call_chain* g_recording; /* where probe_record writes, or NULL */
@@ -578,26 +578,80 @@ static PyTypeObject ProbeType = {
     .tp_new = PyType_GenericNew,
 };
 
+/* The probe statements: every binary operator with operands of the same type,
+ * with a scalar on the right and with a scalar on the left (reflected), then
+ * the unary ones. Each records one chain. The three binary forms take
+ * different paths through the runtime's dispatch (binary_op1: slotw unset,
+ * slotv then slotw, slotw only), and an optimized build (PGO) may give each
+ * path its own call site (seen with GitHub's actions/setup-python CPython). */
+static const char* const probe_binops[] = {"+",  "-",  "*", "/", "//", "%",
+                                           "<<", ">>", "&", "|", "^",  "@"};
+static const char* const probe_opfuncs[] = {"add",      "sub", "mul",    "truediv",
+                                            "floordiv", "mod", "lshift", "rshift",
+                                            "and_",     "or_", "xor",    "matmul"};
+#define N_PROBE_BINOPS 12
+#define N_PROBES (3 * N_PROBE_BINOPS + 3)
+
+static int append(char* buf, size_t size, size_t* len, const char* text) {
+    const size_t n = strlen(text);
+    if (*len + n + 1 > size) {
+        return -1;
+    }
+    memcpy(buf + *len, text, n + 1);
+    *len += n;
+    return 0;
+}
+
+/* Appends the probe statements as interpreter code (`p + p`, ...) or, with
+ * `as_calls`, as calls from C (`o.add(p, p)`, ...), one per line, in the order
+ * of N_PROBES. */
+static int probe_source(char* buf, size_t size, size_t* len, const char* indent, int as_calls) {
+    static const char* const forms[3][2] = {
+        {"p %s p", "o.%s(p, p)"}, {"p %s 1.0", "o.%s(p, 1.0)"}, {"1.0 %s p", "o.%s(1.0, p)"}};
+    static const char* const unary[3][2] = {
+        {"-p", "o.neg(p)"}, {"+p", "o.pos(p)"}, {"~p", "o.invert(p)"}};
+    char line[64];
+    for (int f = 0; f < 3; ++f) {
+        for (int k = 0; k < N_PROBE_BINOPS; ++k) {
+            snprintf(line, sizeof line, forms[f][as_calls],
+                     as_calls ? probe_opfuncs[k] : probe_binops[k]);
+            if (append(buf, size, len, indent) || append(buf, size, len, line) ||
+                append(buf, size, len, "\n")) {
+                return -1;
+            }
+        }
+    }
+    for (int k = 0; k < 3; ++k) {
+        if (append(buf, size, len, indent) || append(buf, size, len, unary[k][as_calls]) ||
+            append(buf, size, len, "\n")) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static void calibrate_operator_chains(void) {
     g_chains_n = 0;
     call_chain run1[MAX_CHAINS], run2[MAX_CHAINS], run3[MAX_CHAINS];
     int n1 = 0, n2 = 0, n3 = 0;
+    /* module code, then the same in a function; the operator module's calls */
+    char code[4096], calls[2048];
+    size_t code_len = 0, calls_len = 0;
+    if (probe_source(code, sizeof code, &code_len, "", 0) ||
+        append(code, sizeof code, &code_len, "def f(p):\n") ||
+        probe_source(code, sizeof code, &code_len, "    ", 0) ||
+        append(calls, sizeof calls, &calls_len, "import operator as o\n") ||
+        probe_source(calls, sizeof calls, &calls_len, "", 1)) {
+        return; /* never elide */
+    }
     PyObject* globals = PyDict_New();
     PyObject* probe =
         PyType_Ready(&ProbeType) == 0 ? PyObject_CallNoArgs((PyObject*)&ProbeType) : NULL;
     if (globals != NULL && probe != NULL && PyDict_SetItemString(globals, "p", probe) == 0 &&
         PyDict_SetItemString(globals, "__builtins__", PyEval_GetBuiltins()) == 0) {
-#define VP_PROBE_OPS                                                                               \
-    "p + p; p - p; p * p; p / p; p // p; p % p\n"                                                  \
-    "p << p; p >> p; p & p; p | p; p ^ p; p @ p\n"                                                 \
-    "-p; +p; ~p\n"
         g_recording = run1; /* entered through module code (PyEval_EvalCode) */
         g_recorded = 0;
-        PyObject* r = PyRun_String(VP_PROBE_OPS "def f(p):\n"
-                                                "    p + p; p - p; p * p; p / p; p // p; p % p\n"
-                                                "    p << p; p >> p; p & p; p | p; p ^ p; p @ p\n"
-                                                "    -p; +p; ~p\n",
-                                   Py_file_input, globals, globals);
+        PyObject* r = PyRun_String(code, Py_file_input, globals, globals);
         n1 = g_recorded;
         Py_XDECREF(r);
         PyObject* f = PyDict_GetItemString(globals, "f"); /* borrowed */
@@ -610,21 +664,15 @@ static void calibrate_operator_chains(void) {
         }
         g_recording = run3; /* called from C: the operator module */
         g_recorded = 0;
-        r = PyRun_String("import operator as o\n"
-                         "o.add(p, p); o.sub(p, p); o.mul(p, p); o.truediv(p, p)\n"
-                         "o.floordiv(p, p); o.mod(p, p); o.lshift(p, p); o.rshift(p, p)\n"
-                         "o.and_(p, p); o.or_(p, p); o.xor(p, p); o.matmul(p, p)\n"
-                         "o.neg(p); o.pos(p); o.invert(p)\n",
-                         Py_file_input, globals, globals);
+        r = PyRun_String(calls, Py_file_input, globals, globals);
         n3 = g_recorded;
         Py_XDECREF(r);
         g_recording = NULL;
-#undef VP_PROBE_OPS
     }
     PyErr_Clear();
     Py_XDECREF(probe);
     Py_XDECREF(globals);
-    if (n1 != n2 || n3 != n1) {
+    if (n1 != N_PROBES || n2 != N_PROBES || n3 != N_PROBES) {
         return; /* not the expected probes: never elide */
     }
     for (int k = 0; k < n1; ++k) {

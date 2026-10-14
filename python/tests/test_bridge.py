@@ -337,9 +337,10 @@ def test_temporary_elision_is_available_on_linux_and_windows():
         assert _ELISION == "exact"
     elif sys.platform == "win32" or (sys.platform == "linux" and platform.libc_ver()[0] == "glibc"):
         assert _ELISION == "backtrace"
-        # every operator (12 binary, 3 unary) calibrated to a chain that
-        # reaches the interpreter's call site
-        assert len(viproc._viproc.elision_chains()) == 15
+        # every operator calibrated to a chain that reaches the interpreter's
+        # call site: 12 binary ones in three forms (p + p, p + 1.0, 1.0 + p:
+        # different dispatch paths), 3 unary ones
+        assert len(viproc._viproc.elision_chains()) == 39
 
 
 @pytest.mark.skipif(_ELISION == "off", reason="no safe temporary test on this platform")

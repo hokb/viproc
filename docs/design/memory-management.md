@@ -275,8 +275,13 @@ An operand qualifies when, at issue time on the main thread:
      lies outside its symbol's range. Stricter than NumPy: builtins in the
      runtime (`sum()`, `operator.add`) do not elide either. Only for
      buffers ≥ 256 KiB (a backtrace costs ~1–2 µs), as NumPy.
-     `_viproc.elision_chains()` lists the calibrated chain lengths (one
-     per operator, 15).
+     Each binary operator is calibrated in three forms, `p + p`,
+     `p + 1.0` and `1.0 + p`: they take different paths through the
+     runtime's dispatch (`binary_op1`), and a PGO build (e.g. GitHub's
+     `actions/setup-python` CPython, `--enable-optimizations`) gives
+     each path its own call site; calibrated with `p + p` only, `x + 1.0`
+     never elided there. `_viproc.elision_chains()` lists the calibrated
+     chain lengths (39: 12 binary operators x 3 forms, 3 unary).
    - Otherwise (other C libraries, macOS with CPython < 3.14): off (mode
      `"off"`).
    `viproc._viproc.elision_mode()` reports the mode, `_viproc.elided()`
