@@ -10,8 +10,20 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Everything ends up in the Python extension module.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    message(FATAL_ERROR "viproc needs a 64-bit build, but the compiler targets 32 bit. On Windows "
+                        "use dev.cmd (it builds for the interpreter's architecture), or the \"x64 "
+                        "Native Tools Command Prompt\" (vcvarsall.bat x64). pip install . from a "
+                        "32-bit developer prompt builds 32 bit too (VSCMD_ARG_TGT_ARCH=x86).")
+endif()
+
 option(VIPROC_BUILD_TESTS "Build viproc tests" ON)
-find_package(Python3 3.12 REQUIRED COMPONENTS Interpreter Development.Module Development.Embed NumPy)
+# Test executables embed Python; the extension module itself must not link libpython.
+set(VIPROC_PYTHON_COMPONENTS Interpreter Development.Module NumPy)
+if(VIPROC_BUILD_TESTS)
+    list(APPEND VIPROC_PYTHON_COMPONENTS Development.Embed)
+endif()
+find_package(Python3 3.12 REQUIRED COMPONENTS ${VIPROC_PYTHON_COMPONENTS})
 
 option(VIPROC_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(VIPROC_ELEMENT_POOL "Cache element memory in viproc's pool (OFF for AddressSanitizer runs)" ON)
@@ -80,6 +92,13 @@ add_custom_target(viproc_python ALL
     DEPENDS ${VIPROC_PY_SOURCES}
     COMMENT "Copying the viproc Python package")
 add_dependencies(_viproc viproc_python)
+
+# Wheel contents (pip install . via scikit-build-core, pyproject.toml): the
+# package as assembled above.
+if(SKBUILD)
+    install(TARGETS _viproc LIBRARY DESTINATION viproc RUNTIME DESTINATION viproc)
+    install(FILES ${VIPROC_PY_SOURCES} DESTINATION viproc)
+endif()
 
 if(VIPROC_BUILD_TESTS)
     enable_testing()

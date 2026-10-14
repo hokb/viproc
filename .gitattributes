@@ -4,5 +4,6 @@
 *.sh                text eol=lf
 Dockerfile          text eol=lf
 *.cmake             text eol=lf
-# PowerShell runs in Windows containers.
+# PowerShell and batch files run on Windows.
 *.ps1               text eol=crlf
+*.cmd               text eol=crlf

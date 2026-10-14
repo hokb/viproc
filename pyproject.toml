@@ -1,0 +1,35 @@
+# pip install . builds viproc with CMake (scikit-build-core) and installs the
+# package. Development loop: dev.cmd (Windows) / ./dev.sh (Linux): pull,
+# build into .venv, test.
+[build-system]
+requires = ["scikit-build-core>=0.10", "numpy>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "viproc"
+dynamic = ["version"]
+description = "Instruction-level parallelism for the array instructions of NumPy programs"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["numpy>=2.0"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.24"
+cmake.build-type = "Release"
+# Persistent build directory: rebuilds after a pull are incremental.
+build-dir = "build/pip-{wheel_tag}"
+# The package is installed by CMake (install() rules for SKBUILD).
+wheel.packages = []
+sdist.exclude = ["build*", "reports", ".venv"]
+
+[tool.scikit-build.cmake.define]
+VIPROC_BUILD_TESTS = "OFF"
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "CMakeLists.txt"
+regex = 'project\(viproc VERSION (?P<value>[0-9.]+)'

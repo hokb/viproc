@@ -293,10 +293,16 @@ python/viproc/         Python package
                        indexing, sync points; registers hooks with setup()
   __init__.py          module API (asarray, zeros, …; other names from NumPy)
 python/tests/          pytest tests of the bridge (bit-identical to NumPy)
-python/benchmarks/     strong_scaling.py, sync_latency.py
+python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
+                       (per-op issue times: main-thread stalls, pool misses)
   suite.py             benchmark suite: runner, machine detection, score
   suite_cases.py       its cases (plain NumPy programs, width P, variants)
   suite_report.py      its Markdown / HTML reports, multi-run comparison
+pyproject.toml         pip build (scikit-build-core; CMake installs the package
+                       only for SKBUILD), version from CMakeLists.txt
+dev.cmd, dev.sh        one-click dev loop (tools/dev.ps1 on Windows): pull,
+                       build into .venv, test
+.github/workflows/ci.yml  pip build + pytest, Linux (GCC) and Windows (MSVC)
 docker/                images that build, test and run viproc (README.md):
   entrypoint.sh        command line of the Linux and Wine images
   linux/               GCC, CPython (python:<ver>-bookworm)
@@ -324,6 +330,10 @@ Rules:
 ## Commands
 
 ```bash
+./dev.sh  |  dev.cmd      # one click: git pull, pip-build Release into .venv, pytest
+                          # (--no-pull/--no-test, -NoPull/-NoTest); the maintainer's
+                          # way to try a merged change on Windows
+pip install .             # scikit-build-core (pyproject.toml), VIPROC_BUILD_TESTS=OFF
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug   # configure
 cmake --build build                                     # build
 ctest --test-dir build --output-on-failure              # run tests
@@ -364,7 +374,8 @@ docker run --rm -v "$PWD:/src" viproc:linux         # test this checkout (increm
 ```
 
 Linux and Windows must behave identically: same results, same features
-(temporary elision, element pool, huge/large pages where the OS allows).
+(temporary elision, element pool, huge pages where the OS allows; Windows
+large pages are opt-in, `VIPROC_LARGE_PAGES=1`, see design doc).
 Platform-specific code stays behind small functions with one
 implementation per platform (`capture_stack`/`module_base` in
 `_viproc.c`, `system_allocate` in `element_pool.cpp`), and both builds run

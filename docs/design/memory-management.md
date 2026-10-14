@@ -158,11 +158,16 @@ advantage.)
   huge pages can back all of them.
 - **Large blocks.** `MADV_HUGEPAGE` from 2 MiB (Linux; a hint). Windows:
   blocks from 2 MiB come from `VirtualAlloc` (page-aligned, lazily
-  committed like on Linux) and use large pages (`MEM_LARGE_PAGES`) when
-  the process holds the "Lock pages in memory" privilege
-  (`SeLockMemoryPrivilege`, enabled once at first use) and the block is a
-  whole number of large pages (always from 16 MiB on). Without the
-  privilege, which Windows does not grant by default, plain pages.
+  committed like on Linux). Large pages (`MEM_LARGE_PAGES`) are opt-in,
+  `VIPROC_LARGE_PAGES=1`: used when the process holds the "Lock pages in
+  memory" privilege (`SeLockMemoryPrivilege`, enabled once at first use)
+  and the block is a whole number of large pages (always from 16 MiB on).
+  Not by default: Windows commits and zeroes a large-page block inside
+  `VirtualAlloc`, i.e. on the main thread that issues the op, ~30 ms per
+  24 MB block (i7-12700K, Windows 11). Every pool miss stalled the
+  run-ahead (`test_main_thread_runs_ahead`: 60 ops issued in ~100 ms
+  instead of < 1 ms, 3 misses). Linux's huge pages fault in on the
+  worker that first writes the block instead.
 - **Bound.** At most a configured number of cached bytes (counted in
   capacity; default: half the physical memory, as ONAL; `VIPROC_POOL_LIMIT`
   — bytes, `K`/`M`/`G` suffix — to override; `viproc.set_pool_limit()`).
@@ -275,8 +280,13 @@ An operand qualifies when, at issue time on the main thread:
      lies outside its symbol's range. Stricter than NumPy: builtins in the
      runtime (`sum()`, `operator.add`) do not elide either. Only for
      buffers ≥ 256 KiB (a backtrace costs ~1–2 µs), as NumPy.
-     `_viproc.elision_chains()` lists the calibrated chain lengths (one
-     per operator, 15).
+     Each binary operator is calibrated in three forms, `p + p`,
+     `p + 1.0` and `1.0 + p`: they take different paths through the
+     runtime's dispatch (`binary_op1`), and a PGO build (e.g. GitHub's
+     `actions/setup-python` CPython, `--enable-optimizations`) gives
+     each path its own call site; calibrated with `p + p` only, `x + 1.0`
+     never elided there. `_viproc.elision_chains()` lists the calibrated
+     chain lengths (39: 12 binary operators x 3 forms, 3 unary).
    - Otherwise (other C libraries, macOS with CPython < 3.14): off (mode
      `"off"`).
    `viproc._viproc.elision_mode()` reports the mode, `_viproc.elided()`
@@ -599,8 +609,10 @@ memory, D3; runtime objects, D4):
   the pool at all (very small blocks could stay with malloc).
 - Per-thread caches in front of the element pool: only if contention shows
   up in `strong_scaling.py` with large arrays.
-- Huge-page threshold. Windows large pages are not swappable and need a
-  privilege; measure whether they pay off before recommending it.
+- Huge-page threshold. Windows large pages are not swappable, need a
+  privilege and are expensive to allocate (opt-in, see "Large blocks");
+  measure whether they pay off with a warm pool before recommending them,
+  or allocate them off the main thread.
 - Memory-based look-ahead limit (bytes held by pending outputs) instead of,
   or in addition to, 1000 active tasks.
 - D5's interpreter check: how to tell "called from the interpreter" cheaply
