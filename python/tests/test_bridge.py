@@ -135,17 +135,25 @@ def test_fallback_functions_and_reductions():
 
 
 def test_main_thread_runs_ahead():
+    # Best of three: one stall of the main thread on a shared CI machine
+    # (seen once on a Windows runner) must not fail it; a stall on every
+    # pool miss (Windows large pages, ~30 ms each) fails every attempt.
     x = viproc.asarray(rng.standard_normal(3_000_000))
-    viproc.wait_all()
-    t0 = time.perf_counter()
-    y = x
-    for _ in range(20):
-        y = np.sqrt(y * y + 1.0)
-    issue_time = time.perf_counter() - t0
-    t1 = time.perf_counter()
-    y.wait()
-    compute_time = time.perf_counter() - t1
-    assert issue_time < compute_time, (issue_time, compute_time)
+    times = []
+    for _ in range(3):
+        viproc.wait_all()
+        t0 = time.perf_counter()
+        y = x
+        for _ in range(20):
+            y = np.sqrt(y * y + 1.0)
+        issue_time = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        y.wait()
+        compute_time = time.perf_counter() - t1
+        times.append((issue_time, compute_time))
+        if issue_time < compute_time:
+            break
+    assert any(i < c for i, c in times), times
 
 
 def test_import_viproc_as_np():

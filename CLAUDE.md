@@ -293,7 +293,8 @@ python/viproc/         Python package
                        indexing, sync points; registers hooks with setup()
   __init__.py          module API (asarray, zeros, …; other names from NumPy)
 python/tests/          pytest tests of the bridge (bit-identical to NumPy)
-python/benchmarks/     strong_scaling.py, sync_latency.py
+python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
+                       (per-op issue times: main-thread stalls, pool misses)
   suite.py             benchmark suite: runner, machine detection, score
   suite_cases.py       its cases (plain NumPy programs, width P, variants)
   suite_report.py      its Markdown / HTML reports, multi-run comparison
