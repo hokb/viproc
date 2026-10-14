@@ -260,6 +260,8 @@ execution.
 ```
 docs/design/           Design documents (decisions with rationale)
   memory-management.md ownership, release, pools, NumPy interop, COW
+docs/benchmarks.md     benchmark results: current breakdown per category and
+                       case, progress per change, external machines
 include/viproc/        Public C ABI (viproc.h). The only interface bridges may use.
 src/runtime/           Runtime core, no Python dependency (library `viproc`)
   layout.*             DType, Layout (shape, byte strides, offset), broadcasting
@@ -331,7 +333,8 @@ clang-format -i <files>                                 # format
 PYTHONPATH=build/python python3 -m pytest -q python/tests
 PYTHONPATH=build/python python3 python/benchmarks/strong_scaling.py   # use a Release build
 PYTHONPATH=build/python python3 python/benchmarks/suite.py [--quick]   # all cases, score, report
-docker/benchmark.sh [--quick]     # suite on Linux + Windows (Wine), reports copied to ./reports
+docker/benchmark.sh [--quick]     # (re)build images, suite on Linux + Windows (Wine),
+                                  # reports copied to ./reports (old ones deleted first)
 ```
 
 `ctest` also runs the pytest suite. Tests need `pytest`
@@ -342,8 +345,16 @@ Python installation; the extension module is written to
 `build/python/viproc` for every configuration (`ctest -C Debug`).
 
 Docker (`docker/README.md`): each image builds this checkout and runs all
-suites by default; `python`, `pytest`, `benchmark`, `info` make it a
-command line. The Wine image tests the Windows build on a Linux host.
+test suites by default (`test`, ctest only: no benchmark); `python`,
+`pytest`, `benchmark`, `info` make it a command line. The Wine image tests
+the Windows build on a Linux host. Benchmark reports: use
+`docker/benchmark.sh` / `docker\benchmark.ps1` (they build both images
+from the checkout every time, cached; delete old report files; copy the
+new ones out with `docker cp <id>:/work/reports/<x>/.`: without the `/.`
+an existing target directory gets the copy one level deeper and the old
+report stays, which looked like "unchanged results"). Every report header
+names its build (`build <time> #<fingerprint>`, `suite.build_stamp`);
+check it before comparing runs.
 
 ```bash
 docker build -f docker/linux/Dockerfile -t viproc:linux .
@@ -749,23 +760,17 @@ Rules:
   released them later on the main thread, which kept that memory cold). Casts happen in the
   iterator's buffers, or, for 0-d and short 1-d inputs, as a separate cast
   task first (NumPy's `check_for_trivial_loop` copies those).
-- Measured (4 CPUs, `strong_scaling.py`, 8 chains, Release build, speedup
-  vs. NumPy with 4 workers): 1e7 elements ~7.5x (pool + temporary elision;
-  NumPy pays page faults for its temporaries); 1e6 ~4.5x; 1e5 3.0x; 1e4 ~3x;
-  3e3 ~2.5x, 1e3 ~0.9x (noisy).
-- Benchmark suite (4 CPUs, full run): exact NumPy iteration, casts,
-  views, async indexing and `np.where`, direct path and scalar shortcut:
-  score 52 → 69 (chains 78 → 87, indexing 42 → 52, algorithms 41 → 64,
-  dtypes 47 → 58, scalars 42 → 89); 97/97 bit-identical; remaining
-  fallbacks only `matmul` and int16/float16. Small ready ops (Release):
-  `x * y` (8 elements) 0.63 µs (NumPy 0.35), ops on scalars as NumPy
-  (0.06 µs), `a[i, j]` 0.20 µs (NumPy 0.07), `a.T` ~0.8 µs, `x[idx]`
-  (1,000 elements) 2.9 µs (NumPy 0.7).
-- Async reductions (benchmark suite, 4 CPUs, full run): score 44.7 → 52.2,
-  category `reductions` 31 → 75; `reduce_full` medium 1.0x → 5.3x,
-  `softmax_rows` medium 1.0x → 3.7x vs NumPy. A small `np.sum` (1,000
-  elements) costs ~2.8 µs vs NumPy's ~1.5–2 µs (NumPy's own
-  `__array_function__` dispatch is most of the difference).
+- **Measurements live in `docs/benchmarks.md`** (suite scores per change,
+  per-category and per-case breakdown, micro benchmarks, external
+  machines). Headline (4 CPUs, Release): suite score 43 → 69 over this
+  phase, all results bit-identical; `strong_scaling.py` 8 chains vs. NumPy
+  with 4 workers: 1e7 ~7.5x, 1e6 ~4.5x, 1e4 ~3x, 1e3 ~0.9x. Small ready
+  ops: `x * y` (8 elements) 0.63 µs (NumPy 0.35), ops on scalars as NumPy
+  (0.06 µs), `a[1:3]` 0.12 µs (NumPy 0.10), `a.T` 0.11 µs (NumPy 0.08),
+  `a[i, j]` 0.20 µs (NumPy 0.07), `x[idx]` (1,000 elements) 2.9 µs (NumPy
+  0.7), `a.reshape(-1)` 0.6 µs (NumPy 0.15; Python handler), small
+  `np.sum` ~2.8 µs (NumPy 1.5–2; NumPy's own `__array_function__`
+  dispatch is most of it).
 - "Issue an op, read the result right away" (`sync_latency.py`): 8 elements
   8.1 → 1.4–2.4 µs (NumPy 0.5–0.9), 1e3 5.1 → 1.6–2.7 µs (NumPy 0.8–1.6),
   1e4 ~NumPy (4.3–6.9 vs. 6.1–6.9 µs), 1e5 faster than NumPy, thanks to
@@ -848,6 +853,12 @@ Rules:
   reductions, int16/float16, advanced indexing) should show up as fewer
   fallbacks and higher category scores. Cases are plain NumPy code and
   must stay bit-identical; add a case for every new kind of program.
+  Record every full run that a change is judged by in
+  `docs/benchmarks.md` (progress table: commit, build stamp, machine,
+  score, categories, size classes). Compare runs only on the same
+  machine; `--quick` runs are noisier and not comparable to full runs.
+  Note: data-dependent functions that sync by design (`nonzero`, ...)
+  count as fallbacks (`kmeans_points`: one per cluster and round).
 
 ## Licensing
 
@@ -887,6 +898,30 @@ functions.
   back to eager NumPy.
 - **Shapes:** full NumPy broadcasting; true 0-d scalars.
 
+## Status and next steps
+
+Where development stands (branch `claude/clever-johnson-nqs2hl`, PR
+hokb/viproc#1). The maintainer writes in German; answer in German, keep
+code, comments, docs and commit messages in English.
+
+- Done in phase 1: runtime (tasks, stage events, trampoline, pools,
+  copy-on-write, back-pressure with hysteresis), element memory pool and
+  temporary elision, copy-free NumPy interop, eager fallbacks with NumPy
+  semantics, Windows parity (Wine image), Docker images, benchmark suite;
+  asynchronous element-wise ufuncs (exact NumPy iteration, casts),
+  reductions (incl. casts, strided, `mean`/`var`/`std`,
+  `argmin`/`argmax`), advanced indexing (gather/scatter/masks), `np.where`,
+  views computed in C/Python without any ndarray, `a[key]` in the C slot,
+  direct path and scalar shortcut for small ready data, adaptive dispatch.
+- Last suite results: `docs/benchmarks.md` (4 CPUs: score 69 with 97
+  cases, 68 with 100 cases incl. `kmeans_points`).
+- ILNumerics' k-means program (`kmeans_points`, from
+  github.com/hokb/decentralized-array-execution-artifacts2026): 3.9x vs.
+  NumPy on 4 cores (1203 x 1203, k = 50), bit-identical.
+- Next, by expected gain: async `matmul`/gufuncs; scaling analysis on many
+  cores; per-op overhead of the remaining Python paths (see open
+  questions).
+
 ## Open questions
 
 - [x] Spike: NumPy loops from a worker thread without the GIL work for
@@ -895,8 +930,18 @@ functions.
       (`tests/test_numpy_loops.cpp`, NumPy 2.5.3).
 - [x] `should_offload`: hybrid N_min + adaptive per-site policy (see
       "Dispatch decision").
-- [ ] Dispatch: op cost classes for N_min; main thread runs a queued, not
-      yet started task itself when it has to wait for it.
+- [ ] Dispatch: op cost classes for N_min (a waiting main thread running a
+      queued task itself was decided against, see "Dispatch decision").
+- [ ] `matmul`/`dot` and the other gufuncs (linalg, fft) asynchronously:
+      the largest remaining fallback (`matmul_batch`).
+- [ ] Scaling beyond 4 cores: on a 20-core i7-12700K (8 P + 4 E cores,
+      HT) the suite scores 22 with medium/large at 11 (`chains_wide`
+      medium 6.2x of ideal 20x, large 1.2–3.9x): find out whether memory
+      bandwidth, the main thread's issue rate or worker wake-ups limit it.
+- [ ] Remaining per-op overhead on small data: views still handled in
+      Python (`reshape` 0.6 µs, `swapaxes` ~1 µs via NumPy's
+      `__array_function__`), index parsing for advanced indexing (3–10 µs
+      small), direct-path result objects (~0.25 µs over NumPy).
 - [x] Per-op overhead of the bridge: hot path moved to C (~35 µs → ~3–7 µs).
 - [ ] Evaluate a generic path under free-threaded CPython: workers call the
       regular NumPy entry (no reimplementation of NumPy semantics).
