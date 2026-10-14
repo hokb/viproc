@@ -220,8 +220,17 @@ compare directly.
 | 10-13 | `e1e3857` | async reductions with NumPy's loops (2.10) | 97 | 52 | 1.40x | 0.83x | 78 | 42 | 75 | 41 | 47 | 42 | 13 | 62 | 54 | 48 | 69 |
 | 10-13 | `bc07d90` | exact NumPy iteration, casts, astype, views, mean/var/std, argmin/argmax, advanced indexing, direct path, scalar shortcut, `np.where` (`1d42f0f`..`bc07d90`) (2.10) | 97 | 69 | 1.74x | 0.84x | 87 | 52 | 74 | 64 | 58 | 89 | 106 | 70 | 67 | 55 | 85 |
 | 10-13 | `2f7cac1` | `kmeans_points` case; back-pressure hysteresis, pooled iterators, faster `a[:, idx]` (2.10) | 100 | 68 | 1.68x | 0.87x | 85 | 52 | 80 | 56 | 56 | 91 | 101 | 71 | 69 | 52 | 81 |
-<!-- AB -->
+| 10-14 | `3111820` | same-VM baseline for the view changes: state before them (2.80) | 100 | 64 | 1.60x | 0.87x | 82 | 48 | 79 | 54 | 53 | 77 | 73 | 68 | 71 | 48 | 77 |
 | 10-14 | `5db8972` | views computed without ndarrays, `a[key]` in the C slot (2.80) | 100 | 64 | 1.62x | 0.87x | 85 | 49 | 78 | 55 | 53 | 71 | 96 | 62 | 72 | 48 | 79 |
+
+View changes, same VM (`3111820` → `5db8972`): score 64.0 → 63.7,
+unchanged within noise; the programs dominated by slicing gained:
+`stencil_1d` small 0.40x → 0.78x, large 4.45x → 5.81x, `strided_views`
+medium 1.88x → 2.40x. The same pair of runs shows the noise of single
+configurations: up to ±25-30% (`dtype_chains` float16, which runs
+entirely in NumPy, 1.27x → 1.00x). Judge a change by the cases it
+targets and by repeated runs, not by one score difference of a few
+points.
 
 The Windows build (Wine image) scored 46 (Linux 41 in the same Docker
 run) at `7b2846f` and 48 (Linux 42) with 89 cases: it tracks the Linux
