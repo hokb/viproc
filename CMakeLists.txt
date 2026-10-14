@@ -12,8 +12,9 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     message(FATAL_ERROR "viproc needs a 64-bit build, but the compiler targets 32 bit. On Windows "
-                        "use the \"x64 Native Tools Command Prompt\" (or vcvarsall.bat x64), or "
-                        "let pip pick the compiler: dev.cmd / pip install .")
+                        "use dev.cmd (it builds for the interpreter's architecture), or the \"x64 "
+                        "Native Tools Command Prompt\" (vcvarsall.bat x64). pip install . from a "
+                        "32-bit developer prompt builds 32 bit too (VSCMD_ARG_TGT_ARCH=x86).")
 endif()
 
 option(VIPROC_BUILD_TESTS "Build viproc tests" ON)
