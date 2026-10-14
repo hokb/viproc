@@ -373,7 +373,8 @@ docker run --rm -v "$PWD:/src" viproc:linux         # test this checkout (increm
 ```
 
 Linux and Windows must behave identically: same results, same features
-(temporary elision, element pool, huge/large pages where the OS allows).
+(temporary elision, element pool, huge pages where the OS allows; Windows
+large pages are opt-in, `VIPROC_LARGE_PAGES=1`, see design doc).
 Platform-specific code stays behind small functions with one
 implementation per platform (`capture_stack`/`module_base` in
 `_viproc.c`, `system_allocate` in `element_pool.cpp`), and both builds run

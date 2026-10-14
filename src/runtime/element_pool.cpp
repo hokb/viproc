@@ -54,10 +54,18 @@ std::align_val_t alignment_for(std::size_t capacity) {
 
 #if defined(_WIN32)
 // Windows counterpart of transparent huge pages: large pages need the
-// "Lock pages in memory" privilege (SeLockMemoryPrivilege). Enabled once if
-// the account holds it; 0 otherwise.
+// "Lock pages in memory" privilege (SeLockMemoryPrivilege). Opt-in with
+// VIPROC_LARGE_PAGES=1: Windows commits and zeroes a large-page block in
+// VirtualAlloc, on the issuing main thread (measured ~30 ms per 24 MB block,
+// i7-12700K), where Linux's huge pages fault in on the worker that first
+// writes them. Enabled once if requested and the account holds the
+// privilege; 0 otherwise.
 std::size_t large_page_size() {
     static const std::size_t size = [] {
+        const char* env = std::getenv("VIPROC_LARGE_PAGES");
+        if (env == nullptr || env[0] == '\0' || env[0] == '0') {
+            return std::size_t{0};
+        }
         HANDLE token = nullptr;
         if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
             return std::size_t{0};
