@@ -60,18 +60,58 @@ def _wrap_numpy(arr):
     return _viproc.from_ndarray(arr)
 
 
-def asarray(obj, dtype=None):
-    """viproc array from `obj` (copies NumPy data; viproc arrays pass through)."""
-    if isinstance(obj, ndarray) and (dtype is None or obj.dtype == np.dtype(dtype)):
+# viproc on/off for code that creates arrays (viproc.enable, viproc.disabled):
+# off, the creation functions return NumPy's own arrays, so the same program
+# runs as plain NumPy (benchmarking, debugging).
+_enabled = [True]
+
+
+def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0, like=None):
+    """Like numpy.array, returning a viproc array.
+
+    NumPy data is always copied (the caller keeps its ndarray and may write
+    it later; design doc D7), also with copy=False. Dtypes viproc does not
+    support (object, str, float16, ...) give NumPy's array, as do all calls
+    while viproc is disabled."""
+    if not _enabled[0] or like is not None:
+        return np.array(obj, dtype, copy=copy, order=order, subok=subok, ndmin=ndmin, like=like)
+    if isinstance(obj, ndarray) and order in ("K", "A"):
+        r = obj
+        if dtype is not None and np.dtype(dtype) != obj.dtype:
+            r = obj.astype(dtype)
+        if copy and r is obj:
+            r = obj.copy()
+        if ndmin > r.ndim:
+            r = r.reshape((1,) * (ndmin - r.ndim) + r.shape)
+        return r
+    arr = np.array(obj, dtype, copy=True, order=order, ndmin=ndmin)
+    return _adopt(arr)
+
+
+def asarray(obj, dtype=None, order=None, *, copy=None, like=None, **kwargs):
+    """Like numpy.asarray, returning a viproc array (viproc arrays of the
+    requested dtype pass through; NumPy data is copied, see array())."""
+    if not _enabled[0] or like is not None or kwargs:
+        return np.asarray(obj, dtype, order, copy=copy, like=like, **kwargs)
+    if isinstance(obj, ndarray) and (dtype is None or obj.dtype == np.dtype(dtype)) and not copy:
         return obj
-    arr = np.array(obj, dtype=dtype, copy=True)
-    wrapped = _wrap_numpy(arr)
-    if wrapped is None:
-        raise TypeError(f"viproc: unsupported dtype {arr.dtype}")
-    return wrapped
+    return array(obj, dtype, copy=True, order=order or "K")
 
 
-array = asarray
+def fresh(r, args=(), kwargs=None):
+    """Result `r` of a NumPy function as viproc array: fresh memory is adopted
+    without a copy, a view of other memory is copied first. Returned as is:
+    anything but a plain ndarray, an argument of the call (out=), dtypes
+    viproc does not support, and everything while viproc is disabled."""
+    if not _enabled[0] or type(r) is not np.ndarray:
+        return r
+    if any(r is a for a in args) or (kwargs and any(r is v for v in kwargs.values())):
+        return r
+    if r.dtype not in _CODES:
+        return r
+    if not r.flags.owndata:
+        r = r.copy()
+    return _adopt(r)
 
 
 def _to_numpy(x):
