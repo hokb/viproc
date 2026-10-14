@@ -1,0 +1,10 @@
+# Build trees and caches stay out of the image build context.
+.git
+build*/
+out/
+install/
+.cache/
+**/__pycache__
+**/*.py[cod]
+**/*.so
+**/*.pyd

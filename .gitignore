@@ -1,0 +1,22 @@
+# Build output
+/reports/
+/viproc-benchmark/
+/build*/
+/out/
+/install/
+compile_commands.json
+.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+dist/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

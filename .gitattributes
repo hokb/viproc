@@ -1,0 +1,8 @@
+# Files that run inside Linux containers keep LF line endings on every
+# checkout, also on Windows with core.autocrlf=true: a shell script with
+# CRLF fails with "no such file or directory" (its interpreter is "bash\r").
+*.sh                text eol=lf
+Dockerfile          text eol=lf
+*.cmake             text eol=lf
+# PowerShell runs in Windows containers.
+*.ps1               text eol=crlf

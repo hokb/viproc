@@ -1,0 +1,109 @@
+#!/bin/bash
+# Command line of the viproc Linux and Wine images (docker/README.md).
+#
+# The image holds the sources in $VIPROC_SRC and a configured build in
+# $VIPROC_BUILD. Every command first brings the build up to date, so a
+# checkout mounted over $VIPROC_SRC (docker run -v "$PWD:/src" ...) is
+# rebuilt incrementally before it runs.
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+usage: docker run [--rm -it] [-v DIR:/work -w /work] IMAGE [COMMAND [ARGS...]]
+
+commands:
+  test [CTEST_ARGS...]     build, then run all test suites with ctest (default)
+  pytest [PYTEST_ARGS...]  build, then run the Python bridge tests
+  python [ARGS...]         Python with viproc importable (interactive with -it)
+  benchmark [NAME [ARGS]]  run python/benchmarks/NAME.py (default: suite, the full
+                           benchmark suite; reports go to /work/reports/<platform>:
+                           mount a directory on /work to keep them)
+  build                    bring the build up to date
+  info                     platform, Python, NumPy and viproc configuration
+  help                     this text
+  anything else            executed as a command (e.g. bash)
+
+image: $VIPROC_PLATFORM, build type $(build_type), sources $VIPROC_SRC, build $VIPROC_BUILD
+EOF
+}
+
+build_type() {
+    sed -n 's/^CMAKE_BUILD_TYPE:STRING=//p' "$VIPROC_BUILD/CMakeCache.txt" 2>/dev/null || true
+}
+
+build() {
+    local log
+    log=$(mktemp)
+    if ! cmake --build "$VIPROC_BUILD" >"$log" 2>&1; then
+        cat "$log" >&2
+        rm -f "$log"
+        exit 1
+    fi
+    rm -f "$log"
+}
+
+cmd=${1:-test}
+[[ $# -gt 0 ]] && shift
+
+case "$cmd" in
+test)
+    build
+    status=0
+    ctest --test-dir "$VIPROC_BUILD" --output-on-failure "$@" || status=$?
+    echo "note: 'test' (the default command) runs the test suites only; the benchmark" \
+         "suite is 'benchmark' (docker/benchmark.sh runs it and copies the reports out)" >&2
+    exit $status
+    ;;
+pytest)
+    build
+    exec python -m pytest "$VIPROC_SRC/python/tests" "$@"
+    ;;
+python)
+    build
+    exec python "$@"
+    ;;
+benchmark)
+    build
+    name=suite # "benchmark --quick" runs the suite with --quick
+    if [[ $# -gt 0 && $1 != -* ]]; then
+        name=$1
+        shift
+    fi
+    if [[ $name == suite && " $* " != *" --out "* && " $* " != *" --merge "* ]]; then
+        set -- --out "/work/reports/$VIPROC_PLATFORM" "$@"
+    fi
+    python "$VIPROC_SRC/python/benchmarks/$name.py" "$@"
+    if [[ $name == suite && -z ${VIPROC_REPORTS_COPIED:-} ]] && ! mountpoint -q /work 2>/dev/null; then
+        # The host name is the container's ID unless --hostname was given.
+        cat >&2 <<NOTE
+note: /work is not mounted, the reports are only inside this container.
+  Copy them out (impossible after 'docker run --rm', which deletes the container):
+    docker cp $(hostname):/work/reports/. ./reports
+  Or mount the current directory, so they land in ./reports:
+    bash, zsh:   docker run --rm -v "\$PWD:/work" IMAGE benchmark ...
+    PowerShell:  docker run --rm -v "\${PWD}:/work" IMAGE benchmark ...
+    cmd.exe:     docker run --rm -v "%cd%:/work" IMAGE benchmark ...
+  docker/benchmark.sh and docker\benchmark.ps1 copy the reports out themselves.
+NOTE
+    fi
+    ;;
+build)
+    build
+    ;;
+info)
+    build
+    echo "image: $VIPROC_PLATFORM, build type $(build_type)"
+    exec python -c '
+import platform, sys
+import numpy, viproc
+print("platform:", platform.platform())
+print("python:", sys.version.split()[0], "numpy:", numpy.__version__)
+print("temporary elision:", viproc._viproc.elision_mode())'
+    ;;
+help | -h | --help)
+    usage
+    ;;
+*)
+    exec "$cmd" "$@"
+    ;;
+esac
