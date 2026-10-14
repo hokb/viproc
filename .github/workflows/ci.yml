@@ -38,3 +38,10 @@ jobs:
           python-version: "3.13"
       - name: tools/dev.ps1
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tools\dev.ps1 -NoPull -Python python
+      - name: issue stalls (diagnostic)
+        if: always()
+        shell: cmd
+        run: |
+          .venv\Scripts\python python\benchmarks\issue_stalls.py
+          set VIPROC_WORKERS=2
+          .venv\Scripts\python python\benchmarks\issue_stalls.py
