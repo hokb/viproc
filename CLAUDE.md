@@ -297,6 +297,11 @@ python/benchmarks/     strong_scaling.py, sync_latency.py
   suite.py             benchmark suite: runner, machine detection, score
   suite_cases.py       its cases (plain NumPy programs, width P, variants)
   suite_report.py      its Markdown / HTML reports, multi-run comparison
+pyproject.toml         pip build (scikit-build-core; CMake installs the package
+                       only for SKBUILD), version from CMakeLists.txt
+dev.cmd, dev.sh        one-click dev loop (tools/dev.ps1 on Windows): pull,
+                       build into .venv, test
+.github/workflows/ci.yml  pip build + pytest, Linux (GCC) and Windows (MSVC)
 docker/                images that build, test and run viproc (README.md):
   entrypoint.sh        command line of the Linux and Wine images
   linux/               GCC, CPython (python:<ver>-bookworm)
@@ -324,6 +329,10 @@ Rules:
 ## Commands
 
 ```bash
+./dev.sh  |  dev.cmd      # one click: git pull, pip-build Release into .venv, pytest
+                          # (--no-pull/--no-test, -NoPull/-NoTest); the maintainer's
+                          # way to try a merged change on Windows
+pip install .             # scikit-build-core (pyproject.toml), VIPROC_BUILD_TESTS=OFF
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug   # configure
 cmake --build build                                     # build
 ctest --test-dir build --output-on-failure              # run tests

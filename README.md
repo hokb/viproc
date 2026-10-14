@@ -21,7 +21,30 @@ d = np.cos(b) - a            # independent of c: runs in parallel
 print((c + d)[:5])           # sync point
 ```
 
-## Build
+## Try it
+
+viproc is a regular Python package: one extension module (`_viproc.*.pyd` / `.so`, runtime
+linked in statically) plus Python files. It needs Python >= 3.12 (64 bit), NumPy >= 2.0 and,
+until there are prebuilt wheels, a C++20 compiler (Visual Studio with the C++ workload on
+Windows, GCC or Clang on Linux). NumPy itself is not modified: viproc arrays take part through
+NumPy's array protocols.
+
+One click, after every commit (pull, build into `.venv`, run the tests):
+
+```bat
+dev.cmd                 :: Windows: double-click, or dev.cmd -NoPull -NoTest -Python <python.exe>
+```
+```bash
+./dev.sh                # Linux: ./dev.sh --no-pull --no-test, PYTHON=python3.13 ./dev.sh
+```
+
+Then run programs with `.venv\Scripts\python prog.py` (Linux: `.venv/bin/python prog.py`). The first
+run takes a minute; later ones rebuild incrementally (`build/pip-<tag>`). No developer prompt is
+needed on Windows: the build picks Visual Studio for the interpreter's architecture.
+
+Into any environment: `pip install .` (or `pip install git+https://github.com/hokb/viproc`).
+
+## Build (development, CMake)
 
 ```bash
 cmake -S . -B build -G Ninja
