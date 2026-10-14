@@ -857,6 +857,9 @@ Rules:
   `docs/benchmarks.md` (progress table: commit, build stamp, machine,
   score, categories, size classes). Compare runs only on the same
   machine; `--quick` runs are noisier and not comparable to full runs.
+  Single configurations vary by ±25-30% between full runs, the score by a
+  few points: judge a change by the cases it targets (same-machine
+  before/after, e.g. the previous commit in a git worktree).
   Note: data-dependent functions that sync by design (`nonzero`, ...)
   count as fallbacks (`kmeans_points`: one per cluster and round).
 
