@@ -402,6 +402,41 @@ Independent small iterator reductions (8 x 8) issue faster too: `int32`
 `sum(axis=1)` 7.7 → 4.3 µs per op, `x.T[::2].max(axis=1)` 6.8 → 3.4 µs
 (NumPy 1.3 and 1.6–2.6 µs). The fast path (dense, no cast) is unchanged.
 
+### Tiny ops: reductions and methods in C, NumPy delegate
+
+Reductions, `mean`/`var`/`std`, `argmax`/`argmin`, `copy`, `astype`,
+`reshape` and `swapaxes` as C methods; small ready data runs in NumPy on a
+borrowed view of the buffer; direct path trimmed. Same 4-CPU VM, back to
+back against `main` (`7c77eda`), best of 5, µs per op (100 float64
+elements unless noted, ready):
+
+| op | NumPy | before | after |
+|---|---:|---:|---:|
+| `x * y` (8) | 0.41 | 0.73 | 0.52 |
+| `x + 1.0` | 0.66 | 1.06 | 0.87 |
+| `x.sum()` | 0.54 | 2.57 | 0.69–0.76 |
+| `np.sum(x)` | 1.45 | 2.37 | 1.78 |
+| `x.max()` | 0.53 | 2.28 | 0.68–0.74 |
+| `x.mean()` | 1.74 | 4.98 | 1.92 |
+| `x2.sum(axis=0)` (10 x 10) | 1.2 | 3.02 | 1.11 |
+| `np.max(x2, axis=1)` (10 x 10) | 2.55 | 2.34 | 1.24 |
+| `(x > 0.5).any()` | 1.18 | 4.01 | 1.62 |
+| `x2.reshape(-1)` | 0.14 | 0.55 | 0.12 |
+| `x2.swapaxes(0, 1)` | 0.12 | 0.51 | 0.11 |
+| `x.copy()` | 0.20 | 2.04 | 0.57–0.61 |
+| `x.astype(np.float32)` | 0.36 | 2.00 | 0.73 |
+| `x.argmax()` | 0.26 | 1.68 | 0.44–0.60 |
+
+`x * y`: callgrind 5,250 → 4,000 instructions (operator and result
+release, without the interpreter). `np.abs(x)` stays at ~0.8 µs (NumPy
+0.4): NumPy's override dispatch (`PyUFunc_CheckOverride`, ~1,800
+instructions) runs before viproc sees the call.
+
+Suite `--quick`, 4 workers, back to back (`#fcebb840` main, `#bd9f3351`
+this change): score 69 → 73; tiny 60 → 80, small 76 → 82, reductions 81 →
+96, scalars 69 → 75 (large 73 → 66, medium 62 → 67: noise of quick runs
+on this VM); 91/91 bit-identical.
+
 ## Other machines
 
 **i7-12700K, 20 logical cores (8 P-cores with HT + 4 E-cores), 31 GiB,
