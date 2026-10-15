@@ -885,7 +885,9 @@ Rules:
   100 x geomean over categories of geomean(efficiency), efficiency =
   speedup vs NumPy / ideal, ideal = min(cores, P) for medium and large
   data and 1 (parity) for scalar, tiny and small data; P is the case's
-  parallel width; `large` scales with RAM per core. New op paths (casting,
+  parallel width, cores are physical cores (SMT siblings once; `max`
+  workers = cores, `threads` = hardware threads); `large` scales with RAM
+  per core. New op paths (casting,
   reductions, int16/float16, advanced indexing) should show up as fewer
   fallbacks and higher category scores. Cases are plain NumPy code and
   must stay bit-identical; add a case for every new kind of program.
@@ -978,9 +980,10 @@ code, comments, docs and commit messages in English.
       HT) the suite scores 22 with medium/large at 11 (`chains_wide`
       medium 6.2x of ideal 20x, large 1.2–3.9x): find out whether memory
       bandwidth, the main thread's issue rate or worker wake-ups limit it.
-      The default worker count is now one per physical core (12 there, was
-      20 = hardware threads); compare with `suite.py --workers 1,default,max`
-      (same run, same ideal).
+      The default worker count and the suite's cores are now physical cores
+      (12 there, were 20 = hardware threads); that score of 22 was against
+      ideal 20 and is not comparable. `suite.py --workers 1,max,threads`
+      measures 12 and 20 workers in one run.
 - [ ] Remaining per-op overhead on small data: views still handled in
       Python (`reshape` 0.6 µs, `swapaxes` ~1 µs via NumPy's
       `__array_function__`), index parsing for advanced indexing (3–10 µs

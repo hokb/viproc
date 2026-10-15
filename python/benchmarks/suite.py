@@ -7,7 +7,9 @@ efficiency score* (0..100, 100 = ideal), normalized to the machine:
 
 - **Cores.** A case of parallel width P (independent instruction streams)
   ideally runs min(cores, P) times faster than NumPy on medium and large
-  data. Tiny data cannot amortize a hand-off, so there the ideal is parity
+  data. Cores are physical cores (SMT siblings count once, as viproc's
+  default worker count): a second hardware thread shares its core's
+  execution units, so it is no second core for the ideal. Tiny data cannot amortize a hand-off, so there the ideal is parity
   with NumPy (1x). Efficiency = speedup / ideal; this divides out the core
   count, so the score is comparable between a laptop and a server.
 - **RAM.** The `large` size class is scaled to the memory per core
@@ -49,7 +51,20 @@ import suite_report  # noqa: E402
 
 
 def usable_cores():
-    """CPUs this process may use: affinity and a cgroup CPU quota count."""
+    """Physical cores this process may use: viproc's default worker count
+    (affinity counts, SMT siblings once), at most the hardware threads it
+    may use (a cgroup CPU quota counts)."""
+    import viproc
+
+    viproc.init()
+    physical = viproc.workers()
+    viproc.shutdown()
+    return min(physical, usable_threads())
+
+
+def usable_threads():
+    """Hardware threads this process may use: affinity and a cgroup CPU
+    quota count."""
     if hasattr(os, "process_cpu_count"):
         n = os.process_cpu_count() or 1
     elif hasattr(os, "sched_getaffinity"):
@@ -146,6 +161,7 @@ def machine_info(cores, ram):
         "os": platform.platform(),
         "cpu": cpu_model(),
         "cores": cores,
+        "hardware_threads": usable_threads(),
         "logical_cpus": os.cpu_count(),
         "ram_bytes": ram,
         "python": sys.version.split()[0],
@@ -336,7 +352,8 @@ def run_suite(args):
     viproc.init()  # the runtime's default worker count (one per physical core)
     default = viproc.workers()
     viproc.shutdown()
-    spec = args.workers.replace("max", str(cores)).replace("default", str(default))
+    spec = (args.workers.replace("max", str(cores)).replace("default", str(default))
+            .replace("threads", str(usable_threads())))
     workers = sorted({int(w) for w in spec.split(",")})
     wmax = max(workers)
     target = 0.02 if args.quick else 0.04
@@ -414,9 +431,10 @@ def main():
     p.add_argument("--quick", action="store_true", help="shorter runs, fewer large cases")
     p.add_argument("--filter", help="regular expression on case/size/layout")
     p.add_argument("--workers", default="1,max",
-                   help="viproc worker counts, 'max' = cores, 'default' = viproc's default "
-                        "(one per physical core) (default 1,max)")
-    p.add_argument("--cores", type=int, help="override the detected core count")
+                   help="viproc worker counts, 'max' = cores (physical), 'default' = viproc's "
+                        "default (one per physical core), 'threads' = hardware threads "
+                        "(default 1,max)")
+    p.add_argument("--cores", type=int, help="override the detected physical core count")
     p.add_argument("--repeat", type=int, help="timed runs per measurement (best of)")
     p.add_argument("--merge", nargs="+", metavar="RESULTS_JSON",
                    help="combine results of several machines/platforms into one report")
