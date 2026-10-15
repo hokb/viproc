@@ -305,11 +305,11 @@ def measure_viproc(case, bases, lay, base_shape, reps, repeat, expected, workers
     def convert(a):
         # A dtype viproc does not support (int16, float16) stays a NumPy
         # array, as in a viproc program: those ops run in plain NumPy.
-        try:
-            return viproc.asarray(a)
-        except TypeError:
+        v = viproc.asarray(a)
+        if not isinstance(v, viproc.ndarray):
             unsupported.append(str(a.dtype))
             return a
+        return v
 
     vdata = apply_layout(bases, lay, base_shape, convert)
     viproc.wait_all()

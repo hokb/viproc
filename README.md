@@ -10,6 +10,21 @@ See [CLAUDE.md](CLAUDE.md) for architecture and build instructions.
 
 ## Usage
 
+Run an unchanged NumPy program with viproc:
+
+```bash
+python -m viproc prog.py [args]       # also: -m module, -c "code"; no arguments: console
+VIPROC=1 python prog.py               # the same, for a pip-installed viproc (viproc.pth)
+```
+
+`import numpy` in the program's own code then imports viproc: creation functions
+(`np.zeros`, `np.arange`, `np.loadtxt`, `np.random.*`, `default_rng()`, ...) return viproc
+arrays, and NumPy functions on them run asynchronously. The standard library and installed
+packages (SciPy, pandas, ...) keep the real NumPy; viproc arrays they receive are synced and
+read through NumPy's array protocols. Results are bit-identical to plain NumPy.
+
+Or opt in explicitly:
+
 ```python
 import numpy as np
 import viproc
@@ -20,6 +35,32 @@ c = np.sin(a) * b + 1.0      # returns immediately, computed in the background
 d = np.cos(b) - a            # independent of c: runs in parallel
 print((c + d)[:5])           # sync point
 ```
+
+### Benchmarking: the same code with and without viproc
+
+```python
+import time
+import numpy as np            # viproc under python -m viproc
+import viproc
+
+def program():
+    x = np.random.default_rng(0).standard_normal((2000, 2000))
+    return float((np.sin(x) * np.cos(x)).sum())
+
+t0 = time.perf_counter(); program(); t_viproc = time.perf_counter() - t0
+with viproc.disabled():       # creation functions return NumPy arrays: plain NumPy
+    t0 = time.perf_counter(); program(); t_numpy = time.perf_counter() - t0
+```
+
+`viproc.enable(False)` / `viproc.enable(True)` switch it for longer stretches. Arrays created
+while viproc was on stay viproc arrays; convert them with `np.asarray(x)` (copy-free,
+read-only) if the NumPy part should not touch them. Whole programs: `python prog.py` vs.
+`python -m viproc prog.py`.
+
+Differences from NumPy under `python -m viproc`: `isinstance(x, np.ndarray)` in user code
+tests for viproc arrays; `np.array(nd)`/`np.asarray(nd)` of a NumPy array always copy it into
+viproc (also with `copy=False`); dtypes viproc does not run (object, str, float16, ...) give
+NumPy arrays, as NumPy does.
 
 ## Try it
 

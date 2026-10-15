@@ -86,10 +86,15 @@ set_target_properties(_viproc PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY $<1:${VIPROC_PYTHON_DIR}/viproc>
     RUNTIME_OUTPUT_DIRECTORY $<1:${VIPROC_PYTHON_DIR}/viproc>)
 file(GLOB VIPROC_PY_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/python/viproc/*.py)
+# _viproc_hook.py (import numpy -> viproc for python -m viproc and VIPROC=1)
+# sits next to the package: viproc.pth imports it at every interpreter start,
+# without importing viproc.
+set(VIPROC_HOOK ${CMAKE_SOURCE_DIR}/python/_viproc_hook.py)
 add_custom_target(viproc_python ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory ${VIPROC_PYTHON_DIR}/viproc
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${VIPROC_PY_SOURCES} ${VIPROC_PYTHON_DIR}/viproc
-    DEPENDS ${VIPROC_PY_SOURCES}
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${VIPROC_HOOK} ${VIPROC_PYTHON_DIR}
+    DEPENDS ${VIPROC_PY_SOURCES} ${VIPROC_HOOK}
     COMMENT "Copying the viproc Python package")
 add_dependencies(_viproc viproc_python)
 
@@ -98,6 +103,7 @@ add_dependencies(_viproc viproc_python)
 if(SKBUILD)
     install(TARGETS _viproc LIBRARY DESTINATION viproc RUNTIME DESTINATION viproc)
     install(FILES ${VIPROC_PY_SOURCES} DESTINATION viproc)
+    install(FILES ${VIPROC_HOOK} python/viproc.pth DESTINATION .)
 endif()
 
 if(VIPROC_BUILD_TESTS)

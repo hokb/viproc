@@ -291,7 +291,11 @@ python/viproc/         Python package
                        cache, scalars, broadcasting, issue sites)
   _ndarray.py          viproc.ndarray(_Array): fallbacks, __array_function__,
                        indexing, sync points; registers hooks with setup()
-  __init__.py          module API (asarray, zeros, …; other names from NumPy)
+  __init__.py          module API (asarray, zeros, …, random, enable/disabled;
+                       other names from NumPy)
+  __main__.py          python -m viproc prog.py | -m mod | -c code
+python/_viproc_hook.py import numpy -> viproc for user code (python -m viproc,
+                       VIPROC=1 via viproc.pth, installed by pip next to it)
 python/tests/          pytest tests of the bridge (bit-identical to NumPy)
 python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
                        (per-op issue times: main-thread stalls, pool misses)
@@ -693,6 +697,25 @@ Rules:
   `np.copyto(dst, src)` maps to assignment.
 - **Read-only viproc arrays** (`_readonly`, e.g. from `broadcast_to`):
   writes raise NumPy's errors; never reused by temporary elision.
+- **Entry: `python -m viproc prog.py`** (`__main__.py`, also `-m mod`, `-c
+  code`, console) **or `VIPROC=1`** (pip installs `viproc.pth`, which calls
+  `_viproc_hook.autoload()` at every interpreter start; light: NumPy and
+  viproc are imported on first use). `_viproc_hook` replaces
+  `builtins.__import__`: `import numpy` / `numpy.<sub>` from *user code*
+  gives viproc (`viproc.random` for `numpy.random`, NumPy's submodules
+  otherwise); the standard library, site-/dist-packages, NumPy and viproc
+  keep the real NumPy (libraries use NumPy internals; viproc arrays reach
+  them through the protocols). User code = a file outside those
+  directories, or `__main__` without a file. Creation functions
+  (`zeros`, `arange`, `loadtxt`, `frombuffer`, …, `viproc.random.*` and
+  generators from `default_rng`/`RandomState`/`Generator`) return viproc
+  arrays: fresh memory adopted, views of other memory copied, `out=`
+  arguments and unsupported dtypes returned as NumPy made them.
+  `asarray`/`array` take NumPy's signatures; unsupported dtypes give
+  NumPy arrays (no TypeError). **`viproc.enable(False)` /
+  `with viproc.disabled():`** make all of these return NumPy's arrays:
+  the same code runs as plain NumPy (benchmarking); existing viproc
+  arrays stay viproc arrays.
 - **Sync points:** `np.asarray(x)`, `x.numpy()`, printing, `float(x)`,
   `bool(x)`, scalar indexing, iteration, `x.wait()`, `viproc.wait_all()`.
 - **Conversions (design doc D7):** exports (`np.asarray(x)`, `x.numpy()`,
@@ -839,7 +862,7 @@ Rules:
   the object in a graveyard drained at the next C ABI call.
 - Not implemented yet: casting into `out=` of another dtype, gufuncs
   (linalg, fft, matmul), FP-flag reporting to
-  Python (NumPy warnings / `np.errstate`), `python -m viproc`.
+  Python (NumPy warnings / `np.errstate`).
 
 ## Conventions
 
@@ -914,8 +937,9 @@ functions.
 
 ## Status and next steps
 
-Where development stands (branch `claude/clever-johnson-nqs2hl`, PR
-hokb/viproc#1). The maintainer writes in German; answer in German, keep
+Where development stands: one PR per session, merged into `main` (PR
+hokb/viproc#1: phase 1 core; hokb/viproc#2: pip build, dev.cmd/dev.sh, CI;
+then `python -m viproc`). The maintainer writes in German; answer in German, keep
 code, comments, docs and commit messages in English.
 
 - Done in phase 1: runtime (tasks, stage events, trampoline, pools,
