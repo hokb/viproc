@@ -26,6 +26,9 @@ compiles `Cases.cs`; `Program.cs`, the harness, is excluded with
 `//ILN(enabled=false)`), writes the plan (`ilnumerics_plan.json`: case,
 shape, reps, input shapes per point), runs it, checks every point against
 NumPy and writes the reports. `--iln ilnumerics_raw.json` only redraws.
+A point without a result after `--timeout` seconds (default 60) is recorded
+as not measured and the program restarts after it; such points are listed
+in the reports and left out of the medians.
 
 ## License
 
@@ -35,7 +38,11 @@ this comparison. Build once on a licensed seat: the build writes
 `ILNumerics_deploy/net8.0/ilnumerics.lic`, a runtime license for this
 assembly (`ShapeMapILNumerics`). With that file in the source tree the
 unchanged project can be rebuilt and run on other machines (Linux too),
-as in hokb/decentralized-array-execution-artifacts2026.
+as in hokb/decentralized-array-execution-artifacts2026. The license is bound
+to the configuration it was made for (`Release|x64`); the project builds x64
+by default, so `dotnet build -c Release` embeds it (output in
+`bin/x64/Release/net8.0`). A build that does not embed it runs throttled and
+fails with a `LicenseException` after a while.
 
 ## What is compared
 

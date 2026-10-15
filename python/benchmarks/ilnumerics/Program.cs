@@ -3,9 +3,11 @@
 // shape_map_cases.py (Cases.cs) on ILNumerics arrays, at the grid points,
 // step counts (reps) and input shapes of a plan written by
 // python/benchmarks/shape_map_ilnumerics.py, and writes the times and a
-// result check per point as JSON. See README.md.
+// result check per point as JSON lines: first {"machine": ...}, then one
+// result per point, flushed at once, so the driver sees progress, can stop
+// a point that hangs and resume after it. See README.md.
 //
-//   dotnet run -c Release -- PLAN.json OUT.json [--threads N]
+//   dotnet run -c Release -- PLAN.json OUT.jsonl [--threads N]
 //
 // Timing follows shape_map.py: one warm-up run, then the best of `repeat`
 // timed runs (2 for runs slower than 0.3 s); every run ends with Finish() on
@@ -23,7 +25,7 @@ using ShapeMap;
 using static ILNumerics.ILMath;
 
 if (args.Length < 2) {
-    Console.Error.WriteLine("usage: ShapeMapILNumerics PLAN.json OUT.json [--threads N]");
+    Console.Error.WriteLine("usage: ShapeMapILNumerics PLAN.json OUT.jsonl [--threads N]");
     return 2;
 }
 string planPath = args[0], outPath = args[1];
@@ -52,7 +54,9 @@ var machine = new JsonObject {
 Console.WriteLine($"ILNumerics shape map: {points.Count} measurements, ILNumerics {machine["ilnumerics"]}, "
                   + $"accelerator {machine["accelerator"]}, {machine["ilnumerics_threads"]} threads");
 
-var results = new JsonArray();
+using var output = new StreamWriter(outPath, append: false);
+output.WriteLine(new JsonObject { ["machine"] = machine }.ToJsonString());
+output.Flush();
 var total = Stopwatch.StartNew();
 for (int pi = 0; pi < points.Count; pi++) {
     var p = points[pi]!.AsObject();
@@ -92,14 +96,11 @@ for (int pi = 0; pi < points.Count; pi++) {
         res["error"] = $"{e.GetType().Name}: {e.Message}" + (inner != e ? $" <- {inner.GetType().Name}: {inner.Message}" : "");
         if (Environment.GetEnvironmentVariable("SHAPE_MAP_TRACE") == "1") Console.Error.WriteLine(e);
     }
-    results.Add(res);
+    output.WriteLine(res.ToJsonString());
+    output.Flush();
     Console.WriteLine($"[{pi + 1,5}/{points.Count}] {name,-17} {string.Join("x", p["shape"]!.AsArray()),11} "
                       + (res["error"] is null ? $"{(double)res["iln_s"]! * 1e3,10:F3} ms" : $"ERROR {res["error"]}")
                       + $"   ({total.Elapsed.TotalSeconds:F0} s)");
-    if (pi % 50 == 49 || pi == points.Count - 1) {
-        var doc = new JsonObject { ["machine"] = machine.DeepClone(), ["results"] = results.DeepClone() };
-        File.WriteAllText(outPath, doc.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-    }
 }
 Console.WriteLine($"written: {outPath}");
 return 0;

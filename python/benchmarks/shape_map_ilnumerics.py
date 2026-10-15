@@ -42,6 +42,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import warnings
 
 import numpy as np
@@ -53,7 +54,7 @@ import shape_map  # noqa: E402
 import shape_map_cases  # noqa: E402
 
 PROJECT = os.path.join(HERE, "ilnumerics")
-DLL = os.path.join(PROJECT, "bin", "Release", "net8.0", "ShapeMapILNumerics.dll")
+DLL = os.path.join(PROJECT, "bin", "x64", "Release", "net8.0", "ShapeMapILNumerics.dll")
 ILN = "ILNumerics Accelerator"
 
 
@@ -112,15 +113,56 @@ def make_plan(vrun, args):
             "check_reps": args.check_reps, "samples": 16, "points": points}
 
 
-def run_csharp(plan_path, raw_path, threads):
+def _complete_lines(path):
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return []
+    return [json.loads(line) for line in text.split("\n")[:-1] if line.strip()]
+
+
+def run_csharp(plan, plan_path, raw_path, threads, timeout):
+    """Runs the plan; a point without a result after `timeout` seconds is
+    recorded as an error and the program restarted after it (a hung point
+    must not stop the map)."""
     env = dict(os.environ, DOTNET_CLI_TELEMETRY_OPTOUT="1", DOTNET_NOLOGO="1")
     print("building", PROJECT, "(Release: ILNumerics Accelerator)", flush=True)
     subprocess.run(["dotnet", "build", "-c", "Release", "-nologo", "-v", "q"], cwd=PROJECT,
                    env=env, check=True)
-    cmd = ["dotnet", DLL, plan_path, raw_path]
-    if threads:
-        cmd += ["--threads", str(threads)]
-    subprocess.run(cmd, env=env, check=True)
+    points, results, machine, part = plan["points"], [], None, 0
+    while len(results) < len(points):
+        sub_plan, out = f"{plan_path}.part{part}", f"{raw_path}.part{part}.jsonl"
+        with open(sub_plan, "w") as f:
+            json.dump(dict(plan, points=points[len(results):]), f)
+        cmd = ["dotnet", DLL, sub_plan, out] + (["--threads", str(threads)] if threads else [])
+        proc = subprocess.Popen(cmd, env=env)
+        seen, last, hung = 0, time.monotonic(), False
+        while proc.poll() is None:
+            time.sleep(0.5)
+            n = len(_complete_lines(out))
+            if n > seen:
+                seen, last = n, time.monotonic()
+            elif time.monotonic() - last > timeout:
+                proc.kill()
+                proc.wait()
+                hung = True
+        lines = _complete_lines(out)
+        if lines and "machine" in lines[0]:
+            machine = machine or lines[0]["machine"]
+            results += lines[1:]
+        if len(results) < len(points):
+            p = points[len(results)]
+            reason = (f"timeout: no result after {timeout:g} s" if hung
+                      else f"program exited with code {proc.returncode}")
+            print(f"{p['case']} {p['shape']}: {reason}; continuing after it", flush=True)
+            results.append({"case": p["case"], "shape": p["shape"], "reps": p["reps"],
+                             "error": reason})
+        for path in (sub_plan, out):
+            os.remove(path)
+        part += 1
+    with open(raw_path, "w") as f:
+        json.dump({"machine": machine, "results": results}, f, indent=1)
 
 
 def as2d(shape):
@@ -193,6 +235,11 @@ def build_runs(vrun, raw, plan, check_reps):
     note = ("ILNumerics has no 0-d arrays: the 0-d point runs on [1, 1] arrays. "
             "Same programs, reps and grid as the viproc run; inputs generated identically "
             "on both sides.")
+    errors = [f"{r['case']} {'x'.join(map(str, r['shape'])) or '0-d'} ({r['error']})"
+              for r in raw["results"] if "error" in r]
+    if errors:
+        note += (f" Not measured, so not in the medians ({len(errors)}): "
+                 + "; ".join(errors) + ".")
     iln = derived_run(vrun, raw, iln_results, {
         "subject": "ILNumerics", "baseline": "NumPy", "title": f"{ILN} shape map",
         "prefix": "shape_map_ilnumerics",
@@ -229,6 +276,8 @@ def main():
     p.add_argument("--threads", type=int, help="ILNumerics threads (default: its own)")
     p.add_argument("--repeat", type=int, help="timed runs per measurement (default: as viproc)")
     p.add_argument("--check-reps", type=int, default=3, help="steps of the result check")
+    p.add_argument("--timeout", type=float, default=60,
+                   help="seconds without a new result before a point counts as hung")
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -244,7 +293,7 @@ def main():
         json.dump(plan, f)
     raw_path = args.iln or os.path.join(args.out, "ilnumerics_raw.json")
     if not args.iln:
-        run_csharp(plan_path, raw_path, args.threads)
+        run_csharp(plan, plan_path, raw_path, args.threads, args.timeout)
     raw = json.load(open(raw_path))
     if not raw["machine"].get("accelerator"):
         print("WARNING: the ILNumerics build did not run through the Accelerator")
