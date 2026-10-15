@@ -225,4 +225,14 @@ bool scalar_bytes(PyObject* value, DType dtype, std::vector<std::byte>& out);
 // Main thread, with the GIL.
 PyObject* export_ndarray(const Array& a, bool writable);
 
+// A NumPy array over `a`'s data without an owner, for a NumPy call the
+// bridge makes right away on ready data that only reads it (reductions; no
+// export bookkeeping): valid while the caller keeps `a` and issues nothing
+// that writes it. Flagged writable as NumPy's own arrays are (NumPy copies
+// read-only inputs in some reductions); the callee must not write. If it is
+// still referenced after the call, pin_borrowed() turns it into a read-only
+// export. Main thread, with the GIL.
+PyObject* borrow_ndarray(const Array& a);
+bool pin_borrowed(const Array& a, PyObject* view);
+
 } // namespace viproc::numpy

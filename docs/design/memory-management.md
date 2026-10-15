@@ -384,6 +384,35 @@ views are not (only the user can drop them). Hence:
 Measured (1e7 float64): `np.asarray(v)` 18.8 ms → 0.001 ms; `np.sum(v)`
 (eager fallback) 25 ms → 3.5 ms.
 
+### Borrowed view: NumPy computes small ready ops on the buffer
+
+Reductions, `mean`/`var`/`std`, `argmax`/`argmin`, `copy` and `astype` of
+**small ready** data (at most `sync_below` elements, the direct path's
+bound) have nothing to run asynchronously. `_Array`'s C methods and its
+`__array_function__` hand them to NumPy itself: `vp_array_borrow(a)` is an
+ndarray over the buffer with `a`'s layout and **no owner and no export
+bookkeeping**, and NumPy's own method (`view.sum(...)`) or NumPy's
+implementation of the function (`np.sum._implementation`) runs on it with
+the caller's arguments. Results, errors and warnings are NumPy's by
+construction, at NumPy's cost plus the borrow.
+
+- Safe without counting a reader: the main thread holds the GIL and issues
+  nothing while NumPy runs, and `a` is ready, so no task writes the buffer
+  (thread rules: ready stays ready until the main thread issues a writer).
+- The view is flagged writable, as NumPy's own arrays are: NumPy copies
+  read-only inputs in some calls (`argmax` through `PyArray_FromArray`).
+  The callee only reads; calls with an `out=` or `where=` of viproc arrays
+  are not delegated.
+- After the call: a view NumPy still references (refcount > 1, e.g. kept
+  in a result's base) is **pinned** (`vp_array_pin`): made read-only and
+  turned into a regular export (`host_views`). A result that is the view
+  itself (`astype(copy=False)` of the same dtype) maps to `a`; an ndarray
+  result is fresh memory and adopted (Import).
+- Not delegated: reductions with an axis or keepdims that `vp_reduce`
+  covers (its direct path is cheaper than NumPy's call plus adopting the
+  result array), and larger or pending inputs (`vp_reduce`
+  asynchronously, else the Python handlers).
+
 ### Eager fallbacks: NumPy code on viproc memory, NumPy's semantics
 
 Everything viproc does not run asynchronously (reductions, `np.*`

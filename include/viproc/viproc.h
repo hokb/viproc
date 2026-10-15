@@ -143,6 +143,16 @@ int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen);
  * vp_array_prepare_write(), for NumPy code run synchronously on the main
  * thread (docs/design/memory-management.md, D7). */
 PyObject* vp_array_export(const vp_array* a, int writable);
+/* [GIL, main thread] A NumPy array over `a`'s data without an owner, for a
+ * NumPy call made right away on ready data that only reads it (reductions):
+ * valid while the caller keeps `a` and issues nothing that writes it.
+ * Flagged writable as NumPy's own arrays are (NumPy copies read-only inputs
+ * in some reductions); the callee must not write. If the array is still
+ * referenced after the call, vp_array_pin() makes it a read-only export (it
+ * then keeps the buffer alive and counts as a reader). `a` must be ready.
+ * NULL with a Python error on failure. */
+PyObject* vp_array_borrow(const vp_array* a);
+int vp_array_pin(const vp_array* a, PyObject* view);
 /* [no GIL, main thread] Sync point before NumPy code writes `a`'s buffer
  * directly: waits for its producer, copies-on-write if NumPy views of the
  * buffer are alive, waits until no task reads it. */
@@ -211,8 +221,8 @@ int vp_scatter(vp_runtime* rt, vp_array* dst, int nidx, vp_array* const* idx, co
                size_t errlen);
 /* dst[mask] = value: `value` 0-d with dst's dtype, `mask` bool broadcastable
  * to dst. */
-int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* value,
-                   const char* site, char* err, size_t errlen);
+int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* value, const char* site,
+                   char* err, size_t errlen);
 
 /* np.where(cond, x, y) with `cond` bool and x, y already of the result's
  * dtype (the caller casts as NumPy does); all three broadcast. The result
