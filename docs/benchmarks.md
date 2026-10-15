@@ -303,6 +303,51 @@ float64 18.8 → 0.001 ms (`e0732f4`); ILNumerics' k-means program
 (`kmeans_points`, 1203 x 1203, k = 50) 3.9x vs. NumPy on 4 cores
 (`2f7cac1`).
 
+## Shape map
+
+`python/benchmarks/shape_map.py` maps viproc's speedup vs. NumPy (NumPy
+time / viproc time, one worker per core) over the 2-d problem size: rows
+x columns, both log-spaced in half decades from 1 to 10,000 (rows stop at
+5,000 when 10,000 x 10,000 does not fit into RAM with the largest case),
+plus 0-d scalars. Each grid point runs 19 plain NumPy programs
+(`shape_map_cases.py`) in five groups: dependent chains of 1, 2 and 3
+unary ops, 2 to 8 independent chains (float64 and float32, cheap and
+expensive ops), mixed unary/binary expressions (P = 2 and 8, in-place
+updates, row/column broadcasting, a slice stencil), axis and full
+reductions feeding back into element-wise ops, and programs with a sync
+point (a Python float read) after every step. Per point: the **median**
+over the cases (on the log scale) as the representative value, the
+**interquartile range** (25th..75th percentile, as factor q75/q25) as the
+spread. `--plot shape_map.json` redraws the images; `--quick` uses whole
+decades.
+
+Full run, 2026-10-15, code of `937393a`, build `2026-10-15T07:43:29
+#8788db05`; Linux, Intel Xeon @ 2.10 GHz, 4 cores, 15.7 GiB, Python
+3.13.16, NumPy 2.5.3, Release, 4 workers; 1,552 measurements, all
+bit-identical, no fallbacks; 2 skipped (8-chain cases at 5,000 x 10,000,
+RAM). Runtime ~35 minutes, two thirds of it in the points above 10
+million elements.
+
+![median speedup and spread over rows x columns](benchmarks/shape_map.png)
+
+![median speedup per case group](benchmarks/shape_map_groups.png)
+
+- **Below ~30,000 elements viproc is slower than NumPy:** median
+  0.55-0.9x (scalar-like 1 x 1 to 32 x 32: ~0.55-0.65x). 0-d scalars run
+  at parity (0.98x, scalar shortcut). Per-op overhead of the task and
+  bridge, not parallelism, decides this region.
+- **Parity at ~100,000 elements, gains from ~1 million:** median 1.1-1.3x
+  at 1e5-3e6 elements, 1.5-1.8x from 1e7 on, with an IQR of up to
+  1.5-3.4x: the gain is concentrated in the parallel cases.
+- **By group** (largest points): independent chains 2.8-4.7x (ideal 4,
+  above it where temporary reuse saves NumPy's page faults), mixed
+  expressions 1.7-2.8x, reductions 1.5-2.2x, dependent chains ~1.5x
+  (no parallelism: element pool and temporary reuse), programs that sync
+  after every step 1.1-1.4x.
+- **Shape matters at equal size:** single rows (1 x n) stay below 1x up
+  to 10,000 columns; tall thin arrays (n x 1) behave like vectors; the
+  sync group stays below parity up to ~1 million elements.
+
 ## Other machines
 
 **i7-12700K, 20 logical cores (8 P-cores with HT + 4 E-cores), 31 GiB,

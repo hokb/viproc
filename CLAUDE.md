@@ -261,7 +261,8 @@ execution.
 docs/design/           Design documents (decisions with rationale)
   memory-management.md ownership, release, pools, NumPy interop, COW
 docs/benchmarks.md     benchmark results: current breakdown per category and
-                       case, progress per change, external machines
+                       case, progress per change, external machines,
+                       shape map (images in docs/benchmarks/)
 include/viproc/        Public C ABI (viproc.h). The only interface bridges may use.
 src/runtime/           Runtime core, no Python dependency (library `viproc`)
   layout.*             DType, Layout (shape, byte strides, offset), broadcasting
@@ -304,6 +305,9 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
   suite.py             benchmark suite: runner, machine detection, score
   suite_cases.py       its cases (plain NumPy programs, width P, variants)
   suite_report.py      its Markdown / HTML reports, multi-run comparison
+  shape_map.py         speedup vs. NumPy over rows x cols (2-d, log grid):
+                       median + IQR over cases per point, heatmap images
+  shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync)
 pyproject.toml         pip build (scikit-build-core; CMake installs the package
                        only for SKBUILD), version from CMakeLists.txt
 dev.cmd, dev.sh        one-click dev loop (tools/dev.ps1 on Windows): pull,
@@ -349,6 +353,7 @@ clang-format -i <files>                                 # format
 PYTHONPATH=build/python python3 -m pytest -q python/tests
 PYTHONPATH=build/python python3 python/benchmarks/strong_scaling.py   # use a Release build
 PYTHONPATH=build/python python3 python/benchmarks/suite.py [--quick]   # all cases, score, report
+PYTHONPATH=build/python python3 python/benchmarks/shape_map.py [--quick]  # rows x cols heatmap
 docker/benchmark.sh [--quick]     # (re)build images, suite on Linux + Windows (Wine),
                                   # reports copied to ./reports (old ones deleted first)
 ```
