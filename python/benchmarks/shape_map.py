@@ -11,10 +11,11 @@ checks that the results are identical and condenses the per-case speedups
 - the **interquartile range** (25th..75th percentile) as its spread, given
   as the factor q75 / q25.
 
-Grid: columns 1 .. 10,000 and rows 1 .. 10,000 in half decades (1, 3, 10,
-32, 100, ...); the rows stop at 5,000 when 10,000 x 10,000 does not fit
-into RAM with the largest case. `--quick` uses whole decades. A 0-d point
-(true NumPy scalars) is measured as well and reported next to the grid.
+Grid: rows and columns 1 .. 1,000 in half decades (1, 3, 10, 32, 100, 316,
+1,000); beyond 1,000 per dimension the data leaves the caches and the map
+shows nothing new (--max-rows / --max-cols extend it). `--quick` uses whole
+decades. A 0-d point (true NumPy scalars) is measured as well and reported
+next to the grid.
 
 Usage:
     PYTHONPATH=build/python python3 python/benchmarks/shape_map.py [--quick] [--out DIR]
@@ -60,11 +61,6 @@ def grid_axis(top, quick):
 
 def fits(case, elements, ram, itemsize=8):
     return elements * itemsize * case.mem <= MEM_BUDGET * ram
-
-
-def max_rows(ram):
-    biggest = max(c.mem for c in shape_map_cases.CASES)
-    return 10_000 if 10_000 * 10_000 * 8 * biggest <= MEM_BUDGET * ram else 5_000
 
 
 def measure(case, shape, cores, workers, target, repeat, seed):
@@ -137,9 +133,8 @@ def run_map(args):
     workers = args.workers or cores
     target = 0.02 if args.quick else 0.04
     repeat = args.repeat or 3
-    top_rows = args.max_rows or max_rows(ram)
     cols = grid_axis(args.max_cols, args.quick)
-    rows = grid_axis(top_rows, args.quick)
+    rows = grid_axis(args.max_rows, args.quick)
     shapes = [()] + [(r, c) for r in rows for c in cols]
     cases = [c for c in shape_map_cases.CASES
              if not args.filter or re.search(args.filter, c.name)]
@@ -179,20 +174,37 @@ def run_map(args):
 # --- reports -----------------------------------------------------------------------------
 
 
+def labels(run):
+    """What a run compares: `subject` vs. `baseline`, speedup = baseline time /
+    subject time. Runs of this script compare viproc with NumPy; other
+    comparisons (shape_map_ilnumerics.py) store their own labels in the run."""
+    out = {"subject": "viproc", "baseline": "NumPy", "title": "viproc shape map",
+           "prefix": "shape_map", "check": "Bit-identical to NumPy", "header": None,
+           "note": None}
+    out.update(run.get("labels") or {})
+    if out["header"] is None:
+        m = run["machine"]
+        out["header"] = (f"{m['cpu']}, {m['cores']} cores, {m['workers']} workers, "
+                         f"NumPy {m['numpy']}, build {m['build']}")
+    return out
+
+
 def write_markdown(run, path):
     m = run["machine"]
+    lb = labels(run)
+    sub_, base = lb["subject"], lb["baseline"]
     pts = {p["shape"] and tuple(p["shape"]) or (): p for p in run["points"]}
     rows, cols = m["rows"], m["cols"]
     lines = [
-        "# viproc shape map",
+        f"# {lb['title']}",
         "",
-        f"{m['cpu']}, {m['cores']} cores, {m['workers']} workers, Python {m['python']}, "
-        f"NumPy {m['numpy']}, build {m['build']}, {m['date']}.",
+        f"{lb['header']}, Python {m['python']}, {m['date']}.",
         "",
-        "Median speedup of viproc vs. NumPy over all cases (NumPy time / viproc time; "
-        "> 1: viproc faster), and in brackets the interquartile range "
+        f"Median speedup of {sub_} vs. {base} over all cases ({base} time / {sub_} time; "
+        f"> 1: {sub_} faster), and in brackets the interquartile range "
         f"(25th..75th percentile) over the {m['cases']} cases. Rows down, columns across.",
         "",
+    ] + ([lb["note"], ""] if lb["note"] else []) + [
         "| rows \\ cols | " + " | ".join(f"{c:,}" for c in cols) + " |",
         "|---:|" + "---:|" * len(cols),
     ]
@@ -209,7 +221,7 @@ def write_markdown(run, path):
                       f"({s['q25']:.2f}–{s['q75']:.2f}, {s['cases']} cases)."]
     total = len(run["results"])
     same = sum(r["identical"] for r in run["results"])
-    lines += ["", f"Bit-identical to NumPy: {same} / {total} measurements."]
+    lines += ["", f"{lb['check']}: {same} / {total} measurements."]
     if run["skipped"]:
         lines.append(f"Skipped (would not fit into RAM): {len(run['skipped'])} measurements.")
     lines += ["", "## Median per case group", ""]
@@ -226,7 +238,7 @@ def write_markdown(run, path):
     lines += ["## Cases", "", "| case | group | P | program |", "|---|---|---:|---|"]
     for c in shape_map_cases.CASES:
         lines.append(f"| {c.name} | {c.group} | {c.width} | {c.description} |")
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
 
@@ -308,15 +320,16 @@ def plot(run, out_dir):
     q25, q75 = _grid(run, lambda p: p["q25"]), _grid(run, lambda p: p["q75"])
     spread = q75 / q25
     scalar = next((p for p in run["points"] if not p["shape"]), None)
-    header = (f"viproc vs. NumPy: {m['cpu']}, {m['cores']} cores, {m['workers']} workers, "
-              f"NumPy {m['numpy']}, build {m['build']}")
+    lb = labels(run)
+    sub_, base = lb["subject"], lb["baseline"]
+    header = f"{sub_} vs. {base}: {lb['header']}"
 
     files = []
     fig, axs = plt.subplots(1, 2, figsize=(17, 7.8), facecolor="white",
                             gridspec_kw={"width_ratios": [1.25, 1]})
     ax = axs[0]
     mesh = ax.pcolormesh(xe, ye, np.log10(med), cmap=cmap, norm=norm)
-    _axes(ax, run, f"Median speedup over {m['cases']} cases (NumPy time / viproc time), "
+    _axes(ax, run, f"Median speedup over {m['cases']} cases ({base} time / {sub_} time), "
                    "IQR below")
     _annotate(ax, run, np.log10(med),
               lambda i, j: f"{med[i, j]:.2f}x\n{q25[i, j]:.1f}–{q75[i, j]:.1f}", cmap, norm,
@@ -326,7 +339,7 @@ def plot(run, out_dir):
     cb = fig.colorbar(mesh, ax=ax, ticks=[math.log10(t) for t in ticks], shrink=0.85)
     cb.ax.set_yticklabels([f"{t:g}x" for t in ticks], fontsize=8)
     cb.outline.set_visible(False)
-    cb.set_label("faster than NumPy  ↑   ·   ↓  slower", color=MUTED, fontsize=8)
+    cb.set_label(f"{sub_} faster than {base}  ↑   ·   ↓  slower", color=MUTED, fontsize=8)
 
     ax = axs[1]
     seq = LinearSegmentedColormap.from_list("spread", ["#f4f3f0", "#5b5b57"])
@@ -348,7 +361,7 @@ def plot(run, out_dir):
                  f"(IQR {scalar['q25']:.2f}–{scalar['q75']:.2f})")
     fig.text(0.01, 0.01, foot, color=MUTED, fontsize=8)
     fig.tight_layout(rect=(0, 0.03, 1, 1))
-    path = os.path.join(out_dir, "shape_map.png")
+    path = os.path.join(out_dir, f"{lb['prefix']}.png")
     fig.savefig(path, dpi=130)
     plt.close(fig)
     files.append(path)
@@ -367,16 +380,17 @@ def plot(run, out_dir):
     ax.axis("off")
     text = "\n".join(f"{g}: " + ", ".join(names[g]) for g in groups)
     ax.text(0, 0.62, "Cases per group\n\n" + text.replace(", ", ",\n    ")
-            + "\n\n" + header.replace(", NumPy", ",\nNumPy").replace(": ", ":\n", 1),
+            + "\n\n" + header.replace(", NumPy", ",\nNumPy").replace(": ", ":\n", 1)
+            + (f"\n\n{lb['note']}" if lb["note"] else ""),
             va="top", fontsize=8, color=INK)
     cax = ax.inset_axes([0.0, 0.8, 0.9, 0.05])
     cb = fig.colorbar(mesh, cax=cax, orientation="horizontal",
                       ticks=[math.log10(t) for t in ticks])
     cb.ax.set_xticklabels([f"{t:g}x" for t in ticks], fontsize=8)
     cb.outline.set_visible(False)
-    cb.set_label("median speedup vs. NumPy (red: slower, blue: faster)", color=MUTED,
+    cb.set_label(f"median speedup of {sub_} vs. {base} (red: slower, blue: faster)", color=MUTED,
                  fontsize=8)
-    path = os.path.join(out_dir, "shape_map_groups.png")
+    path = os.path.join(out_dir, f"{lb['prefix']}_groups.png")
     fig.savefig(path, dpi=110)
     plt.close(fig)
     files.append(path)
@@ -393,16 +407,16 @@ def main():
     p.add_argument("--workers", type=int, help="viproc workers (default: cores)")
     p.add_argument("--cores", type=int, help="override the detected core count")
     p.add_argument("--repeat", type=int, help="timed runs per measurement (best of, default 3)")
-    p.add_argument("--max-cols", type=int, default=10_000)
-    p.add_argument("--max-rows", type=int, help="default 10,000, or 5,000 if RAM is short")
+    p.add_argument("--max-cols", type=int, default=1_000)
+    p.add_argument("--max-rows", type=int, default=1_000)
     p.add_argument("--plot", metavar="SHAPE_MAP_JSON", help="only redraw the reports of a run")
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
     if args.plot:
-        run = json.load(open(args.plot))
+        run = json.load(open(args.plot, encoding="utf-8"))
     else:
         run = run_map(args)
-        with open(os.path.join(args.out, "shape_map.json"), "w") as f:
+        with open(os.path.join(args.out, "shape_map.json"), "w", encoding="utf-8") as f:
             json.dump(run, f, indent=1)
     write_markdown(run, os.path.join(args.out, "shape_map.md"))
     files = plot(run, args.out)
