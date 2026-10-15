@@ -11,10 +11,11 @@ checks that the results are identical and condenses the per-case speedups
 - the **interquartile range** (25th..75th percentile) as its spread, given
   as the factor q75 / q25.
 
-Grid: columns 1 .. 10,000 and rows 1 .. 10,000 in half decades (1, 3, 10,
-32, 100, ...); the rows stop at 5,000 when 10,000 x 10,000 does not fit
-into RAM with the largest case. `--quick` uses whole decades. A 0-d point
-(true NumPy scalars) is measured as well and reported next to the grid.
+Grid: rows and columns 1 .. 1,000 in half decades (1, 3, 10, 32, 100, 316,
+1,000); beyond 1,000 per dimension the data leaves the caches and the map
+shows nothing new (--max-rows / --max-cols extend it). `--quick` uses whole
+decades. A 0-d point (true NumPy scalars) is measured as well and reported
+next to the grid.
 
 Usage:
     PYTHONPATH=build/python python3 python/benchmarks/shape_map.py [--quick] [--out DIR]
@@ -60,11 +61,6 @@ def grid_axis(top, quick):
 
 def fits(case, elements, ram, itemsize=8):
     return elements * itemsize * case.mem <= MEM_BUDGET * ram
-
-
-def max_rows(ram):
-    biggest = max(c.mem for c in shape_map_cases.CASES)
-    return 10_000 if 10_000 * 10_000 * 8 * biggest <= MEM_BUDGET * ram else 5_000
 
 
 def measure(case, shape, cores, workers, target, repeat, seed):
@@ -137,9 +133,8 @@ def run_map(args):
     workers = args.workers or cores
     target = 0.02 if args.quick else 0.04
     repeat = args.repeat or 3
-    top_rows = args.max_rows or max_rows(ram)
     cols = grid_axis(args.max_cols, args.quick)
-    rows = grid_axis(top_rows, args.quick)
+    rows = grid_axis(args.max_rows, args.quick)
     shapes = [()] + [(r, c) for r in rows for c in cols]
     cases = [c for c in shape_map_cases.CASES
              if not args.filter or re.search(args.filter, c.name)]
@@ -412,8 +407,8 @@ def main():
     p.add_argument("--workers", type=int, help="viproc workers (default: cores)")
     p.add_argument("--cores", type=int, help="override the detected core count")
     p.add_argument("--repeat", type=int, help="timed runs per measurement (best of, default 3)")
-    p.add_argument("--max-cols", type=int, default=10_000)
-    p.add_argument("--max-rows", type=int, help="default 10,000, or 5,000 if RAM is short")
+    p.add_argument("--max-cols", type=int, default=1_000)
+    p.add_argument("--max-rows", type=int, default=1_000)
     p.add_argument("--plot", metavar="SHAPE_MAP_JSON", help="only redraw the reports of a run")
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
