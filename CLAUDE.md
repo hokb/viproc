@@ -306,6 +306,9 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
   shape_map.py         speedup vs. NumPy over rows x cols (2-d, log grid):
                        median + IQR over cases per point, heatmap images
   shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync)
+  shape_map_ilnumerics.py  the same map for ILNumerics Accelerator (vs. NumPy)
+                       and viproc vs. ILNumerics, on the grid/reps of a viproc run
+  ilnumerics/          its C# side (.NET 8, needs a licensed ILNumerics build)
 pyproject.toml         pip build (scikit-build-core; CMake installs the package
                        only for SKBUILD), version from CMakeLists.txt
 dev.cmd, dev.sh        one-click dev loop (tools/dev.ps1 on Windows): pull,

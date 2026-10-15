@@ -179,20 +179,37 @@ def run_map(args):
 # --- reports -----------------------------------------------------------------------------
 
 
+def labels(run):
+    """What a run compares: `subject` vs. `baseline`, speedup = baseline time /
+    subject time. Runs of this script compare viproc with NumPy; other
+    comparisons (shape_map_ilnumerics.py) store their own labels in the run."""
+    out = {"subject": "viproc", "baseline": "NumPy", "title": "viproc shape map",
+           "prefix": "shape_map", "check": "Bit-identical to NumPy", "header": None,
+           "note": None}
+    out.update(run.get("labels") or {})
+    if out["header"] is None:
+        m = run["machine"]
+        out["header"] = (f"{m['cpu']}, {m['cores']} cores, {m['workers']} workers, "
+                         f"NumPy {m['numpy']}, build {m['build']}")
+    return out
+
+
 def write_markdown(run, path):
     m = run["machine"]
+    lb = labels(run)
+    sub_, base = lb["subject"], lb["baseline"]
     pts = {p["shape"] and tuple(p["shape"]) or (): p for p in run["points"]}
     rows, cols = m["rows"], m["cols"]
     lines = [
-        "# viproc shape map",
+        f"# {lb['title']}",
         "",
-        f"{m['cpu']}, {m['cores']} cores, {m['workers']} workers, Python {m['python']}, "
-        f"NumPy {m['numpy']}, build {m['build']}, {m['date']}.",
+        f"{lb['header']}, Python {m['python']}, {m['date']}.",
         "",
-        "Median speedup of viproc vs. NumPy over all cases (NumPy time / viproc time; "
-        "> 1: viproc faster), and in brackets the interquartile range "
+        f"Median speedup of {sub_} vs. {base} over all cases ({base} time / {sub_} time; "
+        f"> 1: {sub_} faster), and in brackets the interquartile range "
         f"(25th..75th percentile) over the {m['cases']} cases. Rows down, columns across.",
         "",
+    ] + ([lb["note"], ""] if lb["note"] else []) + [
         "| rows \\ cols | " + " | ".join(f"{c:,}" for c in cols) + " |",
         "|---:|" + "---:|" * len(cols),
     ]
@@ -209,7 +226,7 @@ def write_markdown(run, path):
                       f"({s['q25']:.2f}–{s['q75']:.2f}, {s['cases']} cases)."]
     total = len(run["results"])
     same = sum(r["identical"] for r in run["results"])
-    lines += ["", f"Bit-identical to NumPy: {same} / {total} measurements."]
+    lines += ["", f"{lb['check']}: {same} / {total} measurements."]
     if run["skipped"]:
         lines.append(f"Skipped (would not fit into RAM): {len(run['skipped'])} measurements.")
     lines += ["", "## Median per case group", ""]
@@ -308,15 +325,16 @@ def plot(run, out_dir):
     q25, q75 = _grid(run, lambda p: p["q25"]), _grid(run, lambda p: p["q75"])
     spread = q75 / q25
     scalar = next((p for p in run["points"] if not p["shape"]), None)
-    header = (f"viproc vs. NumPy: {m['cpu']}, {m['cores']} cores, {m['workers']} workers, "
-              f"NumPy {m['numpy']}, build {m['build']}")
+    lb = labels(run)
+    sub_, base = lb["subject"], lb["baseline"]
+    header = f"{sub_} vs. {base}: {lb['header']}"
 
     files = []
     fig, axs = plt.subplots(1, 2, figsize=(17, 7.8), facecolor="white",
                             gridspec_kw={"width_ratios": [1.25, 1]})
     ax = axs[0]
     mesh = ax.pcolormesh(xe, ye, np.log10(med), cmap=cmap, norm=norm)
-    _axes(ax, run, f"Median speedup over {m['cases']} cases (NumPy time / viproc time), "
+    _axes(ax, run, f"Median speedup over {m['cases']} cases ({base} time / {sub_} time), "
                    "IQR below")
     _annotate(ax, run, np.log10(med),
               lambda i, j: f"{med[i, j]:.2f}x\n{q25[i, j]:.1f}–{q75[i, j]:.1f}", cmap, norm,
@@ -326,7 +344,7 @@ def plot(run, out_dir):
     cb = fig.colorbar(mesh, ax=ax, ticks=[math.log10(t) for t in ticks], shrink=0.85)
     cb.ax.set_yticklabels([f"{t:g}x" for t in ticks], fontsize=8)
     cb.outline.set_visible(False)
-    cb.set_label("faster than NumPy  ↑   ·   ↓  slower", color=MUTED, fontsize=8)
+    cb.set_label(f"{sub_} faster than {base}  ↑   ·   ↓  slower", color=MUTED, fontsize=8)
 
     ax = axs[1]
     seq = LinearSegmentedColormap.from_list("spread", ["#f4f3f0", "#5b5b57"])
@@ -348,7 +366,7 @@ def plot(run, out_dir):
                  f"(IQR {scalar['q25']:.2f}–{scalar['q75']:.2f})")
     fig.text(0.01, 0.01, foot, color=MUTED, fontsize=8)
     fig.tight_layout(rect=(0, 0.03, 1, 1))
-    path = os.path.join(out_dir, "shape_map.png")
+    path = os.path.join(out_dir, f"{lb['prefix']}.png")
     fig.savefig(path, dpi=130)
     plt.close(fig)
     files.append(path)
@@ -367,16 +385,17 @@ def plot(run, out_dir):
     ax.axis("off")
     text = "\n".join(f"{g}: " + ", ".join(names[g]) for g in groups)
     ax.text(0, 0.62, "Cases per group\n\n" + text.replace(", ", ",\n    ")
-            + "\n\n" + header.replace(", NumPy", ",\nNumPy").replace(": ", ":\n", 1),
+            + "\n\n" + header.replace(", NumPy", ",\nNumPy").replace(": ", ":\n", 1)
+            + (f"\n\n{lb['note']}" if lb["note"] else ""),
             va="top", fontsize=8, color=INK)
     cax = ax.inset_axes([0.0, 0.8, 0.9, 0.05])
     cb = fig.colorbar(mesh, cax=cax, orientation="horizontal",
                       ticks=[math.log10(t) for t in ticks])
     cb.ax.set_xticklabels([f"{t:g}x" for t in ticks], fontsize=8)
     cb.outline.set_visible(False)
-    cb.set_label("median speedup vs. NumPy (red: slower, blue: faster)", color=MUTED,
+    cb.set_label(f"median speedup of {sub_} vs. {base} (red: slower, blue: faster)", color=MUTED,
                  fontsize=8)
-    path = os.path.join(out_dir, "shape_map_groups.png")
+    path = os.path.join(out_dir, f"{lb['prefix']}_groups.png")
     fig.savefig(path, dpi=110)
     plt.close(fig)
     files.append(path)
