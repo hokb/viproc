@@ -39,11 +39,18 @@ to plain sequential NumPy execution.
 - A pending array references **the task that computes it** (its producer).
   For an in/out array this is the **last** task that writes it.
 - Arrays do **not** reference the tasks that consume them as inputs.
-- Element memory comes from viproc's element pool and is taken by the main
-  thread when it issues the op that creates the array (phase 1: shapes are
-  known at issue), so tasks reach `allocated` at issue. Pool allocations
-  happen on the main thread only, releases on any thread
-  (`docs/design/memory-management.md`, D3 and D10).
+- Element memory comes from viproc's element pool and is taken **as late
+  as possible, by the task that produces it**: right before its kernel
+  runs, on the thread that runs it. It takes a dying input's block when it
+  holds the only reference to it and the layouts match (element-wise
+  kernels: NumPy's elision at run time), else a block from the pool (the
+  thread's own last-released block of the bin first: hot in cache). The
+  main thread creates the `Buffer` objects at issue (deferred, no memory);
+  tasks reach `size_completed` at issue and `allocated` when they run.
+  Pool allocations and releases happen on any thread
+  (`docs/design/memory-management.md`, D3 and D11; D10, main-thread
+  allocation at issue, made dependent chains 2-4x slower than NumPy: up to
+  1000 cold output blocks in flight).
 - **Views share a storage.** A base array and all its views refer to one
   shared *storage*, which holds the current buffer (data version) and the
   last task writing it. Readiness, the producer and `async_reads` belong
@@ -272,7 +279,8 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
   offload.*            OffloadPolicy: inline vs. worker for ready tasks
   element_pool.*       ElementPool: process-wide pool for element memory
                        (quantized bins, LIFO, bound, huge pages)
-  buffer.*             Buffer: element memory (inline ≤ 128 B, else pool); async_reads
+  buffer.*             Buffer: element memory (inline ≤ 128 B, else pool,
+                       deferred until the producing task runs); async_reads
   task.*               Task: stages, consumer callbacks, execute(); Kernel interface
   runtime.*            Array (main-thread view), Runtime: issue protocol,
                        worker pool, trampoline, look-ahead limit, wait
@@ -283,6 +291,8 @@ src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
                        element-wise kernel, wrap_ndarray / to_ndarray
   numpy_reduce.*       reduction kernel: NumPy's reduction loop, called in
                        NumPy's blocks (ReducePlan)
+  numpy_iter.hpp       iterator templates and their pools (shared by the
+                       element-wise and reduction kernels)
   numpy_matmul.*       matmul kernel: NumPy's matmul gufunc loop with the
                        strides NumPy's gufunc machinery passes
 src/capi/capi.cpp      Implementation of the C ABI (library `viproc_capi`)
@@ -576,14 +586,22 @@ Rules:
     the reduced axes, which the loop then skips (NumPy's first-visit skip).
   `ReducePlan` covers dense inputs (any axis order) without a cast whose
   reduced axes coalesce into one. **Everything else runs on NumPy's own
-  iterator** (`make_iter_reduction`, `IterReduceKernel`): casts (int32
-  sums accumulate in int64, `dtype=`), `initial=`, non-coalescing reduced
-  axes and strided inputs, which NumPy's iterator may copy into buffers
-  even without a cast (and a loop on a contiguous buffer can round
-  differently from the same loop on strided data). The iterator is built at
-  issue time with the GIL exactly as `PyUFunc_ReduceWrapper` builds it (it
-  also allocates the result in NumPy's layout); the kernel runs NumPy's
-  `reduce_loop` over it without the GIL (`NpyIter_Reset(iter, &errmsg)`).
+  iterator** (`LoopCache::iter_reduction`, `IterReduceKernel`): casts
+  (int32 sums accumulate in int64, `dtype=`), `initial=`, non-coalescing
+  reduced axes and strided inputs, which NumPy's iterator may copy into
+  buffers even without a cast (and a loop on a contiguous buffer can round
+  differently from the same loop on strided data). The iterator is built
+  exactly as `PyUFunc_ReduceWrapper` builds it, but **once per signature**
+  (ufunc, input layout, axes, keepdims, `dtype=`, initial or not, buffer
+  size) as a template over a dummy address (`ReduceTemplate`; the result
+  NumPy allocates there gives viproc's result layout). Per op the main
+  thread only looks the template up and takes a finished copy from its
+  pool (`NpyIter_Copy` on a miss): no element memory, no address. The
+  task fills the initial values, points the copy at its buffers
+  (`NpyIter_ResetBasePointers(iter, base, &errmsg)`, no GIL) and runs
+  NumPy's `reduce_loop`. 0-d inputs are iterated as 1-element 1-d ones:
+  NumPy casts a 0-d input into a copy when it builds the iterator, which a
+  template cannot reuse.
   Fuzzed against NumPy over shapes, axes, layouts and dtypes
   (`python/tests/test_reductions.py`, incl. signs of zeros and NaNs):
   bit-identical.
@@ -880,7 +898,8 @@ Rules:
   wake-up syscall per small task without taking cores from busy threads.
 - Per-op allocations: one pooled Task (operands inline up to 4), one
   pooled Buffer (element memory inline up to 128 bytes, larger from the
-  element pool: no page faults once warm), one pooled
+  element pool when the task runs: no page faults once warm, or the dying
+  input's block), one pooled
   `ArrayBlock` (Array and its Storage), the Python object. Shapes/strides
   inline (`SmallVector`), one shared kernel object per resolved loop,
   interned issue sites.

@@ -9,6 +9,8 @@
 #include <numpy/dtype_api.h>
 #include <numpy/ufuncobject.h>
 
+#include "kernels/numpy_iter.hpp"
+
 #include <cstring>
 #include <mutex>
 
@@ -32,18 +34,6 @@ int init_numpy_api() {
     import_array1(-1);
     import_umath1(-1);
     return 0;
-}
-
-std::string fetch_python_error() {
-    PyObject* exc = PyErr_GetRaisedException();
-    if (exc == nullptr) {
-        return "unknown error";
-    }
-    PyObject* s = PyObject_Str(exc);
-    std::string msg = s != nullptr ? PyUnicode_AsUTF8(s) : "unknown error";
-    Py_XDECREF(s);
-    Py_DECREF(exc);
-    return msg;
 }
 
 bool dtype_of(int type_num, DType& out) {
@@ -75,6 +65,18 @@ bool dtype_of(int type_num, DType& out) {
 }
 
 } // namespace
+
+std::string fetch_python_error() {
+    PyObject* exc = PyErr_GetRaisedException();
+    if (exc == nullptr) {
+        return "unknown error";
+    }
+    PyObject* s = PyObject_Str(exc);
+    std::string msg = s != nullptr ? PyUnicode_AsUTF8(s) : "unknown error";
+    Py_XDECREF(s);
+    Py_DECREF(exc);
+    return msg;
+}
 
 bool init() { return init_numpy_api() == 0; }
 
@@ -373,6 +375,10 @@ class ElementwiseKernel : public Kernel {
   public:
     explicit ElementwiseKernel(const UfuncLoop* loop) : loop_(loop) {}
 
+    // Element-wise loops read element i before writing it: an output may
+    // share an input's memory with the same layout (NumPy's out= / elision).
+    bool in_place_ok() const override { return true; }
+
     // Only the first nin() inputs go to the loop; further inputs are in/out
     // arrays the runtime lists as read (see Runtime::issue).
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
@@ -444,54 +450,7 @@ constexpr std::size_t kMaxOps = 32;
 // Iterator templates kept per LoopCache (all dropped when full).
 constexpr std::size_t kMaxIterTemplates = 1024;
 
-// Iterators of kernels that finished are kept per template and reused: a
-// new copy (NpyIter_Copy) per op would also allocate its buffers on the
-// worker at the first reset (DELAY_BUFALLOC), and freeing them later on the
-// main thread keeps that memory cold. Main thread pops, any thread returns.
-constexpr std::size_t kMaxPooledIters = 16;
-
 } // namespace
-
-struct IterTemplate {
-    NpyIter* templ = nullptr;
-    DeferRelease defer;
-    std::mutex mutex;
-    std::vector<NpyIter*> free; // finished iterators, ready for a reset
-
-    ~IterTemplate() {
-        std::vector<NpyIter*> all = std::move(free);
-        all.push_back(templ);
-        defer([all] {
-            for (NpyIter* it : all) {
-                NpyIter_Deallocate(it);
-            }
-        });
-    }
-
-    // A clean iterator to reuse, or nullptr. Main thread.
-    NpyIter* pop() {
-        std::lock_guard lock(mutex);
-        if (free.empty()) {
-            return nullptr;
-        }
-        NpyIter* it = free.back();
-        free.pop_back();
-        return it;
-    }
-
-    // Takes back an iterator after a complete iteration (nothing left in
-    // its buffers to write back); others are released. Any thread.
-    void give_back(NpyIter* it, bool clean) {
-        if (clean) {
-            std::lock_guard lock(mutex);
-            if (free.size() < kMaxPooledIters) {
-                free.push_back(it);
-                return;
-            }
-        }
-        defer([it] { NpyIter_Deallocate(it); });
-    }
-};
 
 namespace {
 
@@ -502,6 +461,8 @@ class IterElementwiseKernel : public Kernel {
         : loop_(loop), iter_(iter), pool_(std::move(pool)) {}
 
     ~IterElementwiseKernel() override { pool_->give_back(iter_, clean_); }
+
+    bool in_place_ok() const override { return true; }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const auto nin = static_cast<std::size_t>(loop_->nin());
@@ -538,21 +499,6 @@ class IterElementwiseKernel : public Kernel {
     bool clean_ = true; // a fresh copy has nothing in its buffers
 };
 
-// An array with `l`'s shape and strides over `data` (not owned, never read
-// or written: a template for the iterator's setup).
-PyArrayObject* template_array(const Layout& l, char* data, bool writable) {
-    npy_intp shape[NPY_MAXDIMS];
-    npy_intp strides[NPY_MAXDIMS];
-    for (std::size_t i = 0; i < l.shape.size(); ++i) {
-        shape[i] = static_cast<npy_intp>(l.shape[i]);
-        strides[i] = static_cast<npy_intp>(l.strides[i]);
-    }
-    PyArray_Descr* descr = PyArray_DescrFromType(type_num(l.dtype));
-    return reinterpret_cast<PyArrayObject*>(PyArray_NewFromDescr(
-        &PyArray_Type, descr, static_cast<int>(l.shape.size()), shape, strides, data,
-        NPY_ARRAY_ALIGNED | (writable ? NPY_ARRAY_WRITEABLE : 0), nullptr)); // steals descr
-}
-
 npy_intp numpy_buffersize() {
     npy_intp buffersize = 0;
     if (PyObject* np = PyImport_ImportModule("numpy")) {
@@ -567,6 +513,24 @@ npy_intp numpy_buffersize() {
 }
 
 } // namespace
+
+PyArrayObject* template_array(const Layout& l, char* data, bool writable) {
+    npy_intp shape[NPY_MAXDIMS];
+    npy_intp strides[NPY_MAXDIMS];
+    for (std::size_t i = 0; i < l.shape.size(); ++i) {
+        shape[i] = static_cast<npy_intp>(l.shape[i]);
+        strides[i] = static_cast<npy_intp>(l.strides[i]);
+    }
+    PyArray_Descr* descr = PyArray_DescrFromType(type_num(l.dtype));
+    return reinterpret_cast<PyArrayObject*>(PyArray_NewFromDescr(
+        &PyArray_Type, descr, static_cast<int>(l.shape.size()), shape, strides, data,
+        NPY_ARRAY_ALIGNED | (writable ? NPY_ARRAY_WRITEABLE : 0), nullptr)); // steals descr
+}
+
+char* template_address() {
+    alignas(64) static char dummy[64];
+    return dummy;
+}
 
 std::shared_ptr<Kernel> make_elementwise_kernel(const UfuncLoop* loop) {
     return std::make_shared<ElementwiseKernel>(loop);
@@ -683,7 +647,7 @@ Layout at_least_1d(Layout l) {
 
 std::shared_ptr<Kernel> make_cast_kernel(const Layout& in, const Layout& out, long buffersize,
                                          DeferRelease defer, std::string& error) {
-    alignas(64) static char dummy[64];
+    char* const dummy = template_address();
     PyArrayObject* op[2] = {template_array(at_least_1d(in), dummy, false),
                             template_array(at_least_1d(out), dummy, true)};
     PyArray_Descr* descr = PyArray_DescrFromType(type_num(out.dtype));
@@ -726,6 +690,7 @@ std::shared_ptr<Kernel> make_cast_kernel(const Layout& in, const Layout& out, lo
 
 LoopCache::~LoopCache() {
     iter_templates_.clear(); // kernels still holding one release it later
+    reduce_templates_.clear();
     Py_XDECREF(extobj_);
     Py_XDECREF(extobj_var_);
 }
@@ -795,7 +760,7 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
         // separated outputs from overlapping inputs). Alignment is the only
         // property of the address it uses: element-aligned, as viproc
         // buffers.
-        alignas(64) static char dummy[64];
+        char* const dummy = template_address();
         PyArrayObject* op[kMaxOps] = {};
         PyArray_Descr* descrs[kMaxOps] = {};
         npy_uint32 op_flags[kMaxOps];
@@ -852,10 +817,7 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
         pool->defer = std::move(defer);
         iter_templates_.emplace(std::move(key), pool);
     }
-    NpyIter* iter = pool->pop();
-    if (iter == nullptr) {
-        iter = NpyIter_Copy(pool->templ);
-    }
+    NpyIter* iter = pool->get();
     if (iter == nullptr) {
         error = fetch_python_error();
         return nullptr;

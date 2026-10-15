@@ -690,7 +690,11 @@ bool numpy_aligned(const Array& a) {
     const std::size_t align = l.dtype == DType::Complex64 || l.dtype == DType::Complex128
                                   ? itemsize(l.dtype) / 2
                                   : itemsize(l.dtype);
-    std::uintptr_t bits = reinterpret_cast<std::uintptr_t>(a.buffer()->data() + l.offset);
+    // A deferred buffer has no address yet; its pool block will be aligned
+    // (element_pool.cpp: alignment_for), so only the offset counts.
+    const std::byte* data = a.buffer()->data();
+    std::uintptr_t bits =
+        reinterpret_cast<std::uintptr_t>(data) + static_cast<std::uintptr_t>(l.offset);
     for (std::size_t i = 0; i < l.shape.size(); ++i) {
         if (l.shape[i] > 1) {
             bits |= static_cast<std::uintptr_t>(l.strides[i]);
@@ -800,28 +804,17 @@ int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char
             : nullptr;
     if (loop == nullptr) {
         PyErr_Clear();
-        numpy::IterReduction ir;
-        if (!numpy::make_iter_reduction(ufunc, l, arr(in).buffer(), reduced, keepdims != 0, dtype,
-                                        identity, rt->loops->buffersize(),
-                                        defer_release(rt->graveyard), ir, e)) {
+        Layout rl;
+        std::shared_ptr<Kernel> k = rt->loops->iter_reduction(
+            ufunc, l, reduced, keepdims != 0, dtype, identity, defer_release(rt->graveyard), rl, e);
+        if (!k) {
             PyErr_Clear();
             set_error(err, errlen, e);
             return VP_UNSUPPORTED;
         }
-        void* data = nullptr;
-        std::size_t nbytes = 0;
-        Layout rl;
-        if (!numpy::ndarray_layout(ir.result, rl, data, nbytes)) {
-            Py_DECREF(ir.result);
-            set_error(err, errlen, "unsupported result dtype");
-            return VP_UNSUPPORTED;
-        }
-        auto buffer =
-            std::make_shared<Buffer>(data, nbytes, python_owner(rt->graveyard, ir.result));
         const ArrayPtr ins[] = {ref(in)};
         ArrayPtr res;
-        rt->rt->issue(ir.kernel, ins, {}, std::span(&rl, 1), site, std::span(&res, 1), l.size(),
-                      std::span(&buffer, 1));
+        rt->rt->issue(k, ins, {}, std::span(&rl, 1), site, std::span(&res, 1), l.size());
         *result = hand_out(std::move(res));
         return VP_OK;
     }

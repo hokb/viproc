@@ -7,10 +7,12 @@
 // Each bin is a LIFO free list (the most recently released block is the most
 // likely to be in cache and mapped).
 //
-// Access model (D10): blocks are taken by the issuing (main) thread; they are
-// released on any thread. A thread that allocates keeps private free lists
-// (no atomics). Other threads push released blocks onto a per-bin lock-free
-// stack that an allocating thread takes over as a whole (exchange: no ABA).
+// Access model (D11): blocks are taken by the thread that runs the task
+// producing them (a worker, or the main thread for ops it runs itself) and
+// released on any thread. A thread that allocates keeps a few released blocks
+// per bin in private free lists (no atomics, LIFO: hot in its cache); the
+// rest goes onto a per-bin lock-free stack that an allocating thread takes
+// over as a whole when its own list is empty (exchange: no ABA).
 //
 // Released blocks are not zeroed. A release that would grow the cached bytes
 // beyond the bound goes straight back to the system.
@@ -23,6 +25,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <vector>
 
 namespace viproc {
 
@@ -32,15 +36,18 @@ class ElementPool {
     static ElementPool& instance();
 
     // A block of at least `nbytes` bytes (> 0); `capacity` receives its size.
-    // Called by the issuing thread. On failure: empties the pool, retries,
-    // then throws std::bad_alloc.
+    // Any thread. On failure: empties the pool, retries, then throws
+    // std::bad_alloc.
     void* allocate(std::size_t nbytes, std::size_t& capacity);
     // Returns a block obtained from allocate(). Any thread.
     void release(void* block, std::size_t capacity);
 
-    // Returns every cached block to the system: the calling thread's lists and
-    // the blocks other threads released. Other allocating threads' private
-    // lists are left alone.
+    // Hands the calling thread's private blocks to the shared stacks and
+    // unregisters it (runs at the exit of every allocating thread).
+    void flush_thread();
+
+    // Returns every cached block to the system: every thread's lists and the
+    // shared stacks. Any thread.
     void trim();
 
     // Upper bound for cached bytes (default: half the physical memory, or
@@ -71,8 +78,12 @@ class ElementPool {
     static int bin_of(std::size_t capacity);
     static void* system_allocate(std::size_t capacity);
     static void system_release(void* block, std::size_t capacity);
+    void push_remote(int b, Node* first, Node* last);
 
     std::atomic<Node*> remote_[kBins] = {};
+    // Threads with private free lists (they allocate), for trim().
+    std::mutex registry_mutex_;
+    std::vector<Local*> registry_;
     std::atomic<std::size_t> limit_;
     std::atomic<std::int64_t> cached_{0};
     std::atomic<std::uint64_t> hits_{0};

@@ -348,6 +348,60 @@ million elements.
   to 10,000 columns; tall thin arrays (n x 1) behave like vectors; the
   sync group stays below parity up to ~1 million elements.
 
+### After D11: tasks allocate their output memory
+
+Same machine, full run each, back to back: `main` (`33d373b`) vs. the
+branch with D11 (element memory taken by the producing task when it runs,
+from a dying input or the pool; `docs/design/memory-management.md`),
+build `2026-10-15T11:21:27 #38e22687`. All 1,552 measurements
+bit-identical in both runs.
+
+| | main | D11 |
+|---|---:|---:|
+| median over the 81 grid points | 0.85x | 1.06x |
+| points below 0.95x / below 0.8x | 51 / 32 | 36 / 22 |
+| 0-d scalars | 0.88x | 1.01x |
+| dependent (median over points) | 0.70x | 1.05x |
+| independent | 1.18x | 1.10x |
+| mixed | 0.82x | 1.18x |
+| reductions | 0.84x | 1.29x |
+| sync | 0.83x | 0.82x |
+
+![median speedup after D11](benchmarks/shape_map_d11.png)
+
+![median speedup per case group after D11](benchmarks/shape_map_d11_groups.png)
+
+- Parity moves down from ~100,000 to ~10,000-30,000 elements; dependent
+  chains, which had no point above 1.5x and many at 0.4-0.7x from 10,000
+  elements on, run at or above NumPy there (`x = abs(x)` at 316 x 316,
+  µs per op: NumPy 28, main 64, D11 21: the chain runs in place in one
+  hot block).
+- Unchanged: the region below ~10,000 elements (direct path and Python
+  paths: per-op overhead), and programs that sync after every step.
+- Independent chains' median is within run-to-run noise (±25-30 % per
+  configuration on this VM).
+
+### Reduction iterators built once per signature
+
+Reductions on NumPy's iterator (casts, strided inputs, `initial=`) used to
+build their iterator per op on the main thread, over the input's real
+address (which also took a pending input's memory early). Now a template
+per signature is built once and the task points a copy at its buffers.
+Same 4-CPU VM, back to back against the previous commit, best of 3,
+bit-identical (`int32` matrix, per step `x = -x; x.sum(axis=1);
+x[:, ::2].max(axis=0)`, all three ops dependent on the last step):
+
+| side | NumPy µs/step | before | after |
+|---:|---:|---:|---:|
+| 32 | 5.5–6.2 | 18–21 | 10–11 |
+| 100 | 14–17 | 39–59 | 20–39 |
+| 316 | 81–85 | 61–62 | 57–60 |
+| 1000 | 970–990 | 640–1150 | 470–500 |
+
+Independent small iterator reductions (8 x 8) issue faster too: `int32`
+`sum(axis=1)` 7.7 → 4.3 µs per op, `x.T[::2].max(axis=1)` 6.8 → 3.4 µs
+(NumPy 1.3 and 1.6–2.6 µs). The fast path (dense, no cast) is unchanged.
+
 ## Other machines
 
 **i7-12700K, 20 logical cores (8 P-cores with HT + 4 E-cores), 31 GiB,

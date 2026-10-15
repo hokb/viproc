@@ -58,6 +58,11 @@ class Kernel {
   public:
     virtual ~Kernel() = default;
     virtual KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) = 0;
+    // True if the kernel gives the same result when an output shares its
+    // memory with an input of the same layout (element-wise loops, as NumPy's
+    // `out=` and temporary elision). The task may then hand a dying input's
+    // block to the output (Task::execute, design doc D11).
+    virtual bool in_place_ok() const { return false; }
 };
 
 struct TaskError {
@@ -123,6 +128,10 @@ class Task {
     std::vector<std::shared_ptr<Task>> execute();
 
   private:
+    // Gives every output without memory its block: a dying input's (same
+    // layout, in_place_ok kernels) or one from the element pool.
+    void allocate_outputs();
+
     // Called once per producer when it completes (and once for the issue
     // guard with nullptr). Returns true when the last one arrives.
     bool input_done(const Task* producer);
