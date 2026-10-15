@@ -26,9 +26,10 @@ compiles `Cases.cs`; `Program.cs`, the harness, is excluded with
 `//ILN(enabled=false)`), writes the plan (`ilnumerics_plan.json`: case,
 shape, reps, input shapes per point), runs it, checks every point against
 NumPy and writes the reports. `--iln ilnumerics_raw.json` only redraws.
-A point without a result after `--timeout` seconds (default 60) is recorded
-as not measured and the program restarts after it; such points are listed
-in the reports and left out of the medians.
+One program start runs all points. Only if a point gives no result for
+`--timeout` seconds (default 300) is it recorded as not measured and the
+program restarted after it; such points are listed in the reports and left
+out of the medians.
 
 ## License
 
@@ -58,6 +59,14 @@ conditions"): throttled, with runtime and data size limits, and later
 - Timing as in `shape_map.py`: warm-up run, best of 3 (2 for runs over
   0.3 s), each run ends when all outputs are finished (`Finish()`, the
   counterpart of `viproc.wait_all()`).
+- Kernel compilation: the Accelerator compiles its kernels at runtime and by
+  default runs the regular ILNumerics functions until a kernel is ready.
+  The harness sets `ExecutionContext.Default.AllowLegacyFallback = false`:
+  the first run of a segment waits for its kernel, so compilation falls into
+  the warm-up run and the timed runs use compiled kernels
+  (`--legacy-fallback` keeps ILNumerics' default). The setting, the build
+  configuration and whether a debugger was attached are recorded in the raw
+  results (`machine`).
 - Arrays are ILNumerics' default (column-major) arrays holding the same
   elements as the NumPy arrays; 0-d data are `[1, 1]` arrays.
 - ILNumerics runs with its own thread settings (`Settings.MaxNumberThreads`,

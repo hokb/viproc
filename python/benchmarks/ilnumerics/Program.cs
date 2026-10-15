@@ -5,7 +5,15 @@
 // python/benchmarks/shape_map_ilnumerics.py, and writes the times and a
 // result check per point as JSON. See README.md.
 //
-//   dotnet run -c Release -- PLAN.json OUT.json [--threads N]
+//   dotnet run -c Release -- PLAN.json OUT.json [--threads N] [--legacy-fallback]
+//
+// One program start runs all points of the plan. The Accelerator compiles
+// its kernels at runtime; by default it runs the regular (not accelerated)
+// ILNumerics functions until a kernel is ready. The harness sets
+// ExecutionContext.Default.AllowLegacyFallback = false, so the first run of
+// a segment waits for its kernel: kernel compilation lands in the warm-up
+// run and every timed run uses the compiled kernels (--legacy-fallback keeps
+// ILNumerics' default).
 //
 // Timing follows shape_map.py: one warm-up run, then the best of `repeat`
 // timed runs (2 for runs slower than 0.3 s); every run ends with Finish() on
@@ -23,15 +31,20 @@ using ShapeMap;
 using static ILNumerics.ILMath;
 
 if (args.Length < 2) {
-    Console.Error.WriteLine("usage: ShapeMapILNumerics PLAN.json OUT.json [--threads N]");
+    Console.Error.WriteLine("usage: ShapeMapILNumerics PLAN.json OUT.json [--threads N] [--legacy-fallback]");
     return 2;
 }
 string planPath = args[0], outPath = args[1];
+bool legacyFallback = false;
 for (int i = 2; i < args.Length; i++) {
     if (args[i] == "--threads" && i + 1 < args.Length) {
         Settings.MaxNumberThreads = uint.Parse(args[++i]);
+    } else if (args[i] == "--legacy-fallback") {
+        legacyFallback = true;
     }
 }
+// Wait for kernel compilation instead of running the regular functions meanwhile.
+ILNumerics.Core.Segments.ExecutionContext.Default.AllowLegacyFallback = legacyFallback;
 
 var plan = JsonNode.Parse(File.ReadAllText(planPath))!.AsObject();
 var points = plan["points"]!.AsArray();
@@ -47,10 +60,15 @@ var machine = new JsonObject {
     ["ilnumerics"] = typeof(BaseArray).Assembly.GetName().Version?.ToString(),
     ["ilnumerics_threads"] = Settings.MaxNumberThreads,
     ["accelerator"] = AcceleratorEnabled(),
+    ["allow_legacy_fallback"] = ILNumerics.Core.Segments.ExecutionContext.Default.AllowLegacyFallback,
+    ["configuration"] = Configuration(),
+    ["debugger_attached"] = Debugger.IsAttached,
     ["date"] = DateTime.Now.ToString("s"),
 };
 Console.WriteLine($"ILNumerics shape map: {points.Count} measurements, ILNumerics {machine["ilnumerics"]}, "
-                  + $"accelerator {machine["accelerator"]}, {machine["ilnumerics_threads"]} threads");
+                  + $"accelerator {machine["accelerator"]}, legacy fallback {machine["allow_legacy_fallback"]}, "
+                  + $"{machine["configuration"]}, {machine["ilnumerics_threads"]} threads"
+                  + (Debugger.IsAttached ? ", DEBUGGER ATTACHED" : ""));
 
 var results = new JsonArray();
 var total = Stopwatch.StartNew();
@@ -206,6 +224,14 @@ static string CpuName() {
     } catch {
         return "?";
     }
+}
+
+static string Configuration() {
+#if DEBUG
+    return "Debug";
+#else
+    return "Release";
+#endif
 }
 
 // Whether this build ran through the Accelerator: its output embeds the

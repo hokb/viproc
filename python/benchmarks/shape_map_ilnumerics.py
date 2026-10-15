@@ -286,7 +286,7 @@ def main():
     p.add_argument("--threads", type=int, help="ILNumerics threads (default: its own)")
     p.add_argument("--repeat", type=int, help="timed runs per measurement (default: as viproc)")
     p.add_argument("--check-reps", type=int, default=3, help="steps of the result check")
-    p.add_argument("--timeout", type=float, default=60,
+    p.add_argument("--timeout", type=float, default=300,
                    help="seconds without a new result before a point counts as hung")
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
