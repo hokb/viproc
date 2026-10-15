@@ -40,8 +40,10 @@ import argparse
 import copy
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 import warnings
 
@@ -54,7 +56,11 @@ import shape_map  # noqa: E402
 import shape_map_cases  # noqa: E402
 
 PROJECT = os.path.join(HERE, "ilnumerics")
-DLL = os.path.join(PROJECT, "bin", "x64", "Release", "net8.0", "ShapeMapILNumerics.dll")
+# The committed runtime license (ilnumerics/ILNumerics_deploy) was made for
+# Release|x64 of exactly these sources: build that configuration, and any
+# change to the C# sources needs a new license from a licensed seat.
+PLATFORM = "x64"
+DLL = os.path.join(PROJECT, "bin", PLATFORM, "Release", "net8.0", "ShapeMapILNumerics.dll")
 ILN = "ILNumerics Accelerator"
 
 
@@ -113,53 +119,56 @@ def make_plan(vrun, args):
             "check_reps": args.check_reps, "samples": 16, "points": points}
 
 
-def _complete_lines(path):
-    try:
-        with open(path) as f:
-            text = f.read()
-    except OSError:
-        return []
-    return [json.loads(line) for line in text.split("\n")[:-1] if line.strip()]
-
-
 def run_csharp(plan, plan_path, raw_path, threads, timeout):
-    """Runs the plan; a point without a result after `timeout` seconds is
-    recorded as an error and the program restarted after it (a hung point
-    must not stop the map)."""
+    """Runs the plan. The program prints one progress line per point and
+    saves its results every 50 points; a point without a progress line after
+    `timeout` seconds is recorded as an error, the program is stopped and
+    restarted with the points after it (and those it had not saved yet), so
+    a hung point does not stop the map."""
     env = dict(os.environ, DOTNET_CLI_TELEMETRY_OPTOUT="1", DOTNET_NOLOGO="1")
-    print("building", PROJECT, "(Release: ILNumerics Accelerator)", flush=True)
-    subprocess.run(["dotnet", "build", "-c", "Release", "-nologo", "-v", "q"], cwd=PROJECT,
-                   env=env, check=True)
-    points, results, machine, part = plan["points"], [], None, 0
-    while len(results) < len(points):
-        sub_plan, out = f"{plan_path}.part{part}", f"{raw_path}.part{part}.jsonl"
+    print("building", PROJECT, "(Release|x64: ILNumerics Accelerator)", flush=True)
+    subprocess.run(["dotnet", "build", "-c", "Release", f"-p:Platform={PLATFORM}", "-nologo",
+                    "-v", "q"], cwd=PROJECT, env=env, check=True)
+    points = plan["points"]
+    results, machine, todo, part = [None] * len(points), None, list(range(len(points))), 0
+    while todo:
+        sub_plan, out = f"{plan_path}.part{part}", f"{raw_path}.part{part}"
         with open(sub_plan, "w") as f:
-            json.dump(dict(plan, points=points[len(results):]), f)
+            json.dump(dict(plan, points=[points[i] for i in todo]), f)
         cmd = ["dotnet", DLL, sub_plan, out] + (["--threads", str(threads)] if threads else [])
-        proc = subprocess.Popen(cmd, env=env)
-        seen, last, hung = 0, time.monotonic(), False
-        while proc.poll() is None:
-            time.sleep(0.5)
-            n = len(_complete_lines(out))
-            if n > seen:
-                seen, last = n, time.monotonic()
-            elif time.monotonic() - last > timeout:
-                proc.kill()
-                proc.wait()
-                hung = True
-        lines = _complete_lines(out)
-        if lines and "machine" in lines[0]:
-            machine = machine or lines[0]["machine"]
-            results += lines[1:]
-        if len(results) < len(points):
-            p = points[len(results)]
-            reason = (f"timeout: no result after {timeout:g} s" if hung
-                      else f"program exited with code {proc.returncode}")
-            print(f"{p['case']} {p['shape']}: {reason}; continuing after it", flush=True)
-            results.append({"case": p["case"], "shape": p["shape"], "reps": p["reps"],
-                             "error": reason})
-        for path in (sub_plan, out):
-            os.remove(path)
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, text=True, bufsize=1)
+        lines = queue.Queue()
+        threading.Thread(target=lambda: [lines.put(x) for x in proc.stdout], daemon=True).start()
+        done, last, hung = 0, time.monotonic(), False
+        while proc.poll() is None or not lines.empty():
+            try:
+                line = lines.get(timeout=0.5)
+                print(line, end="", flush=True)
+                if line.startswith("["):
+                    done, last = done + 1, time.monotonic()
+            except queue.Empty:
+                if proc.poll() is None and time.monotonic() - last > timeout:
+                    proc.kill()
+                    proc.wait()
+                    hung = True
+        saved = []
+        if os.path.exists(out):
+            raw = json.load(open(out))
+            machine, saved = machine or raw["machine"], raw["results"]
+            os.remove(out)
+        os.remove(sub_plan)
+        for i, r in zip(todo, saved):
+            results[i] = r
+        if len(saved) == len(todo):
+            break
+        bad = todo[min(done, len(todo) - 1)]
+        p = points[bad]
+        reason = (f"timeout: no result after {timeout:g} s" if hung
+                  else f"program exited with code {proc.returncode}")
+        print(f"{p['case']} {p['shape']}: {reason}; continuing after it", flush=True)
+        results[bad] = {"case": p["case"], "shape": p["shape"], "reps": p["reps"],
+                        "error": reason}
+        todo = [i for i in todo[len(saved):] if i != bad]
         part += 1
     with open(raw_path, "w") as f:
         json.dump({"machine": machine, "results": results}, f, indent=1)

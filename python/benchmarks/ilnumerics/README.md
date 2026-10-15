@@ -39,10 +39,13 @@ this comparison. Build once on a licensed seat: the build writes
 assembly (`ShapeMapILNumerics`). With that file in the source tree the
 unchanged project can be rebuilt and run on other machines (Linux too),
 as in hokb/decentralized-array-execution-artifacts2026. The license is bound
-to the configuration it was made for (`Release|x64`); the project builds x64
-by default, so `dotnet build -c Release` embeds it (output in
-`bin/x64/Release/net8.0`). A build that does not embed it runs throttled and
-fails with a `LicenseException` after a while.
+to these sources (any change to the C# files needs a new license) and to
+the configuration it was made for (`Release|x64`, the driver builds that:
+`dotnet build -c Release -p:Platform=x64`, output in `bin/x64/Release/net8.0`).
+A build whose license does not verify runs under ILNumerics' Starter plan
+(the build log says so: "Perform checks failed ... 'Starter' plan
+conditions"): throttled, with runtime and data size limits, and later
+`LicenseException`s. Such times must not go into the maps.
 
 ## What is compared
 
