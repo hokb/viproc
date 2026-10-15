@@ -64,7 +64,8 @@ endif()
 # Kernel adapters that run tasks with NumPy's loops (needs CPython + NumPy).
 # Links only Python's headers (Python3::Module): an extension module must not
 # link libpython; test executables that embed Python add Python3::Python.
-add_library(viproc_numpy src/kernels/numpy_ufunc.cpp src/kernels/numpy_reduce.cpp)
+add_library(viproc_numpy src/kernels/numpy_ufunc.cpp src/kernels/numpy_reduce.cpp
+                         src/kernels/numpy_matmul.cpp)
 target_link_libraries(viproc_numpy PUBLIC viproc Python3::Module Python3::NumPy PRIVATE viproc_warnings)
 
 # Public C ABI (include/viproc/viproc.h).

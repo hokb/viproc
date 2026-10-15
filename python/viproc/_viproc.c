@@ -50,6 +50,7 @@ static PyObject* AsyncIndexError = NULL; /* AsyncError and IndexError */
 /* Registered by _ndarray.py via _viproc.setup(). */
 static PyTypeObject* g_array_cls = NULL; /* viproc.ndarray */
 static PyObject* g_dtypes[7];            /* np.dtype per vp_dtype code */
+static PyObject* g_matmul = NULL;        /* np.matmul */
 static PyObject* g_fallback = NULL;      /* fallback(ufunc, method, inputs, kwargs) */
 static PyObject* g_asarray = NULL;       /* asarray(ndarray) -> viproc.ndarray */
 static PyObject* g_internal_dirs = NULL; /* tuple of path prefixes skipped for issue sites */
@@ -990,6 +991,37 @@ static int broadcast_into(int64_t* shape, int* ndim, int nd, const int64_t* d) {
     return 0;
 }
 
+/* np.matmul(a, b) of two viproc arrays (vp_matmul). Returns 1 and sets
+ * *result (new reference), 0 if NumPy has to run it (fallback), -1 on a
+ * Python error. A 0-d result (vector @ vector) is NumPy's scalar if it is
+ * there already, else a pending 0-d array marked as a scalar. */
+static int fast_matmul(PyObject* ufunc, PyObject* a, PyObject* b, PyObject** result) {
+    vp_array* r = NULL;
+    char err[ERRLEN] = "";
+    int st = vp_matmul(g_rt, ufunc, ((ArrayObject*)a)->a, ((ArrayObject*)b)->a, &r, issue_site(),
+                       err, sizeof err);
+    if (st == VP_UNSUPPORTED) {
+        return 0;
+    }
+    if (raise_status(st, err) < 0) {
+        return -1;
+    }
+    if (vp_array_ndim(r) == 0 && vp_array_ready(r) &&
+        vp_array_wait(g_rt, r, err, sizeof err) == VP_OK) {
+        *result = vp_array_scalar(r);
+        vp_array_release(r);
+        return *result != NULL ? 1 : -1;
+    }
+    *result = wrap_array(r);
+    if (*result == NULL) {
+        return -1;
+    }
+    if (vp_array_ndim(r) == 0) {
+        ((ArrayObject*)*result)->scalar = 1;
+    }
+    return 1;
+}
+
 /* Issues ufunc(*inputs, out=out) asynchronously. Returns 1 and sets *result
  * (new reference), 0 if the fast path does not handle the call, -1 on a
  * Python error. `out` is NULL or a viproc array. */
@@ -998,6 +1030,11 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
     if (g_rt == NULL || g_array_cls == NULL || n > MAXIN ||
         PyThread_get_thread_ident() != g_main_thread) {
         return 0;
+    }
+    if (ufunc == g_matmul) {
+        return n == 2 && out == NULL && is_array(inputs[0]) && is_array(inputs[1])
+                   ? fast_matmul(ufunc, inputs[0], inputs[1], result)
+                   : 0;
     }
     int kinds[MAXIN];
     long long key = (long long)n << 24;
@@ -1449,6 +1486,7 @@ static PyObject* m_setup(PyObject* self, PyObject* args) {
     Py_XSETREF(g_asarray, Py_NewRef(asarray));
     Py_XSETREF(g_internal_dirs, Py_NewRef(dirs));
     Py_XSETREF(g_ops, Py_NewRef(ops));
+    Py_XSETREF(g_matmul, Py_XNewRef(PyDict_GetItemString(ops, "matmul")));
     Py_XSETREF(g_np_ndarray, Py_NewRef(ndarray));
     Py_XSETREF(g_np_generic, Py_NewRef(generic));
     Py_XSETREF(g_getitem, Py_NewRef(getitem));
@@ -2240,6 +2278,25 @@ static PyObject* m_scatter(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+/* matmul(a, b): np.matmul of two viproc arrays, or None if NumPy has to run
+ * it. */
+static PyObject* m_matmul(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *a, *b;
+    if (!PyArg_ParseTuple(args, "O!O!", &ArrayType, &a, &ArrayType, &b) || check_runtime() < 0) {
+        return NULL;
+    }
+    if (g_matmul == NULL) {
+        Py_RETURN_NONE;
+    }
+    PyObject* r = NULL;
+    const int st = fast_matmul(g_matmul, a, b, &r);
+    if (st == 0) {
+        Py_RETURN_NONE;
+    }
+    return st > 0 ? r : NULL;
+}
+
 static PyObject* m_select(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *c, *x, *y;
@@ -2335,6 +2392,8 @@ static PyMethodDef methods[] = {
      "scatter(a, idx, idx_axes, result_axes, values): a[idx...] = values (vp_scatter)"},
     {"select", m_select, METH_VARARGS, "select(cond, x, y): np.where(cond, x, y) (vp_select)"},
     {"mask_assign", m_mask_assign, METH_VARARGS, "mask_assign(a, mask, value): a[mask] = value"},
+    {"matmul", m_matmul, METH_VARARGS,
+     "matmul(a, b): np.matmul of two viproc arrays asynchronously, or None"},
     {"arg_reduce", m_arg_reduce, METH_VARARGS,
      "arg_reduce(argmax, a, out_shape): argmin/argmax along a's last axis (C-contiguous)"},
     {"astype", m_astype, METH_VARARGS,
