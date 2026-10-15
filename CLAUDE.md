@@ -283,6 +283,8 @@ src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
                        element-wise kernel, wrap_ndarray / to_ndarray
   numpy_reduce.*       reduction kernel: NumPy's reduction loop, called in
                        NumPy's blocks (ReducePlan)
+  numpy_matmul.*       matmul kernel: NumPy's matmul gufunc loop with the
+                       strides NumPy's gufunc machinery passes
 src/capi/capi.cpp      Implementation of the C ABI (library `viproc_capi`)
 src/viproc_python.h    the only way to include Python.h (MSVC debug fix)
 python/viproc/         Python package
@@ -596,8 +598,41 @@ Rules:
   and raise `LinAlgError` via an `errstate(invalid='call')` callback when
   the gufunc sets the invalid flag. We replicate those checks in the
   bridge and map the stored FP flags to `LinAlgError` at sync. Linalg
-  loops call BLAS/LAPACK, which may be multithreaded itself; limit BLAS
-  threads (e.g. 1 per worker) to avoid oversubscription.
+  loops call BLAS/LAPACK, which may be multithreaded itself.
+- **BLAS threads decide BLAS results.** OpenBLAS (NumPy's wheels, 0.3.34)
+  splits large products differently with 1, 2 or 4 threads, and the values
+  differ (`a @ b` of 513 x 513 float64: three different results for
+  `OPENBLAS_NUM_THREADS` 1, 2, 4). So viproc must not change BLAS
+  threading (no "1 BLAS thread per worker"): bit-identity with NumPy means
+  the same BLAS configuration. Concurrent calls from several threads give
+  the values of the same calls made one after the other (checked: 4 threads,
+  sizes 513–1000, gemm/syrk/gemv). Measured on 4 cores: overlapping
+  products that OpenBLAS already threads (side >= ~300) gains little
+  (BLAS already uses the cores); serializing them with a lock did not
+  help either. Small products (side < ~200, single-threaded inside BLAS)
+  overlap well.
+- **`matmul`** (`src/kernels/numpy_matmul.*`, `vp_matmul`): NumPy's matmul
+  gufunc loop `(m?,n),(n,p?)->(m?,p?)`, called as
+  `PyUFunc_GeneralizedFunctionInternal` calls it: no buffering, one call
+  per inner batch row with `dims = {count, m, n, p}` and the core strides
+  of the operands (0 for a missing dimension or one of extent 1). The loop
+  picks gemm/syrk/gemv/dot or a copy into a BLAS-able buffer from those
+  strides and pointers; every outer index is computed on its own, so the
+  split of the batch into calls does not matter. Result layout: batch axes
+  in order K over the inputs' batch strides, core axes C-contiguous
+  innermost (the inputs have zero strides along the output's core axes in
+  NumPy's iterator). Async only where NumPy takes the operands as they
+  are: same dtype (else NumPy's iterator casts into a copy), aligned, no
+  `out=`. **`np.dot`** of vectors and matrices goes through the same
+  kernel where it makes the same loop calls (`_dot` in `_ndarray.py`):
+  integers and bool always (exact sums), floating point when every extent
+  is >= 2 (dot's scalar/row/column special cases excluded), with operands
+  prepared as `cblas_matrixproduct` prepares them (C copy if the strides
+  are not BLAS-able or a matrix is neither C- nor F-contiguous): then dot's
+  gemm/syrk, gemv and dot calls are matmul's (gemv with row-/column-major
+  swapped, which CBLAS maps onto the same kernel). Fuzzed in
+  `python/tests/test_matmul.py` (dtypes, broadcasting, 1-d operands,
+  transposed/stepped/reversed/broadcast operands, sizes OpenBLAS threads).
 - **FFT:** the Python wrappers in `numpy/fft/_pocketfft.py` handle `n`
   (padding/truncation), `axis`, `norm` (passed as the scalar `fct`
   argument) and the choice between `rfft_n_even`/`rfft_n_odd`. We port that
@@ -624,7 +659,9 @@ Rules:
 - **Supported asynchronously:** element-wise ufunc calls (`ufunc.signature
   is None`, one output) with NumPy's own dtype resolution
   (`ufunc.resolve_dtypes`, NEP 50 weak Python scalars), incl. casts of
-  inputs, `out=` and in-place operators; `astype` (NumPy's cast functions,
+  inputs, `out=` and in-place operators; `matmul` / `@` and `np.dot` /
+  `a.dot` of vectors and matrices (NumPy's matmul loop, see "Calling NumPy
+  kernels"); `astype` (NumPy's cast functions,
   NumPy's result layout); basic indexing as views (no sync); metadata-only
   NumPy functions as views without a sync (`.T`, `transpose`, `swapaxes`,
   `moveaxis`, `squeeze`, `expand_dims`, `flip`, `rot90`, `broadcast_to`,
@@ -689,7 +726,8 @@ Rules:
   else (`nonzero`, `flatnonzero`, `argwhere`, `count_nonzero` sync on their
   argument and run in NumPy on a read-only export, without the general
   fallback's wait for readers): other reductions (`out=`, `where=`), gufuncs
-  (`matmul`), empty advanced-index results, 0-d boolean indices,
+  (linalg, fft; `matmul` with mixed dtypes or `out=`), `np.dot` of n-d
+  operands, empty advanced-index results, 0-d boolean indices,
   `ufunc.at`, other NumPy functions. NumPy's semantics exactly (design doc
   D7, "Eager fallbacks"): each viproc argument becomes a writable NumPy
   view after `vp_array_prepare_write` (wait for producer and task readers,
@@ -866,7 +904,7 @@ Rules:
   main thread with the GIL: a worker dropping the last reference parks
   the object in a graveyard drained at the next C ABI call.
 - Not implemented yet: casting into `out=` of another dtype, gufuncs
-  (linalg, fft, matmul), FP-flag reporting to
+  (linalg, fft; matmul with casts or `out=`), FP-flag reporting to
   Python (NumPy warnings / `np.errstate`).
 
 ## Conventions
@@ -955,13 +993,14 @@ code, comments, docs and commit messages in English.
   reductions (incl. casts, strided, `mean`/`var`/`std`,
   `argmin`/`argmax`), advanced indexing (gather/scatter/masks), `np.where`,
   views computed in C/Python without any ndarray, `a[key]` in the C slot,
-  direct path and scalar shortcut for small ready data, adaptive dispatch.
+  direct path and scalar shortcut for small ready data, adaptive dispatch,
+  `matmul`/`@`/`np.dot` with NumPy's matmul loop.
 - Last suite results: `docs/benchmarks.md` (4 CPUs: score 69 with 97
   cases, 68 with 100 cases incl. `kmeans_points`).
 - ILNumerics' k-means program (`kmeans_points`, from
   github.com/hokb/decentralized-array-execution-artifacts2026): 3.9x vs.
   NumPy on 4 cores (1203 x 1203, k = 50), bit-identical.
-- Next, by expected gain: async `matmul`/gufuncs; scaling analysis on many
+- Next, by expected gain: scaling analysis on many
   cores; per-op overhead of the remaining Python paths (see open
   questions).
 
@@ -975,8 +1014,9 @@ code, comments, docs and commit messages in English.
       "Dispatch decision").
 - [ ] Dispatch: op cost classes for N_min (a waiting main thread running a
       queued task itself was decided against, see "Dispatch decision").
-- [ ] `matmul`/`dot` and the other gufuncs (linalg, fft) asynchronously:
-      the largest remaining fallback (`matmul_batch`).
+- [x] `matmul`/`dot` asynchronously (NumPy's matmul loop; `matmul_batch`
+      has no fallbacks left).
+- [ ] The other gufuncs (linalg, fft) and `matmul` with casts or `out=`.
 - [ ] Scaling beyond 4 cores: on a 20-core i7-12700K (8 P + 4 E cores,
       HT) the suite scores 22 with medium/large at 11 (`chains_wide`
       medium 6.2x of ideal 20x, large 1.2–3.9x): find out whether memory

@@ -2,6 +2,7 @@
 
 #include "viproc/viproc.h"
 
+#include "kernels/numpy_matmul.hpp"
 #include "kernels/numpy_reduce.hpp"
 #include "kernels/numpy_ufunc.hpp"
 #include "runtime/assign.hpp"
@@ -109,6 +110,8 @@ struct vp_runtime {
     // One handle per resolved loop (node-based: stable addresses).
     std::unordered_map<const numpy::UfuncLoop*, vp_loop> handles;
     std::shared_ptr<Graveyard> graveyard = std::make_shared<Graveyard>();
+    // One matmul kernel per resolved loop.
+    std::unordered_map<const numpy::UfuncLoop*, std::shared_ptr<Kernel>> matmul_kernels;
 };
 
 // A vp_array* is an Array* holding one reference (no wrapper allocation).
@@ -675,6 +678,59 @@ int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* valu
     const ArrayPtr io[] = {ref(dst)};
     static const std::shared_ptr<Kernel> kernel = make_mask_assign_kernel();
     rt->rt->issue(kernel, ins, io, {}, site);
+    return VP_OK;
+}
+
+namespace {
+// True if NumPy's gufunc iterator would take `a` as it is (NPY_ITER_ALIGNED):
+// the first element and every stride along an axis of extent > 1 are
+// multiples of the dtype's alignment.
+bool numpy_aligned(const Array& a) {
+    const Layout& l = a.layout();
+    const std::size_t align = l.dtype == DType::Complex64 || l.dtype == DType::Complex128
+                                  ? itemsize(l.dtype) / 2
+                                  : itemsize(l.dtype);
+    std::uintptr_t bits = reinterpret_cast<std::uintptr_t>(a.buffer()->data() + l.offset);
+    for (std::size_t i = 0; i < l.shape.size(); ++i) {
+        if (l.shape[i] > 1) {
+            bits |= static_cast<std::uintptr_t>(l.strides[i]);
+        }
+    }
+    return bits % align == 0;
+}
+} // namespace
+
+int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_array** result,
+              const char* site, char* err, size_t errlen) {
+    rt->graveyard->drain();
+    const Layout& la = arr(a).layout();
+    const Layout& lb = arr(b).layout();
+    Layout out;
+    std::int64_t work = 0;
+    if (!numpy::matmul_layout(la, lb, out, work)) {
+        set_error(err, errlen, "matmul: dtypes or shapes NumPy does not take as they are");
+        return VP_UNSUPPORTED;
+    }
+    if (!numpy_aligned(arr(a)) || !numpy_aligned(arr(b))) {
+        set_error(err, errlen, "matmul: misaligned operand (NumPy copies it)");
+        return VP_UNSUPPORTED;
+    }
+    std::string e;
+    const DType d[] = {la.dtype, la.dtype, la.dtype};
+    const numpy::UfuncLoop* loop = rt->loops->get(ufunc, d, e);
+    if (loop == nullptr) {
+        PyErr_Clear();
+        set_error(err, errlen, e);
+        return VP_UNSUPPORTED;
+    }
+    std::shared_ptr<Kernel>& kernel = rt->matmul_kernels[loop];
+    if (!kernel) {
+        kernel = numpy::make_matmul_kernel(loop);
+    }
+    const ArrayPtr ins[] = {ref(a), ref(b)};
+    ArrayPtr res;
+    rt->rt->issue(kernel, ins, {}, std::span(&out, 1), site, std::span(&res, 1), work);
+    *result = hand_out(std::move(res));
     return VP_OK;
 }
 

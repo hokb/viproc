@@ -248,6 +248,18 @@ int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char
               int keepdims, PyObject* dtype, PyObject* identity, vp_array** result,
               const char* site, char* err, size_t errlen);
 
+/* Issues np.matmul(a, b) (the `@` operator) with NumPy's matmul gufunc loop
+ * for (t, t) -> t, where t is the dtype of both operands; the loop is
+ * called with the strides NumPy's gufunc machinery passes, so it makes the
+ * same BLAS calls (src/kernels/numpy_matmul.hpp). The result has NumPy's
+ * shape and layout. Returns VP_UNSUPPORTED (reason in `err`) where NumPy
+ * would cast or copy an operand (different dtypes, misaligned data), the
+ * loop needs the Python API, or NumPy raises (0-d operands, mismatching
+ * core dimensions, batch shapes that do not broadcast); the caller then
+ * falls back to NumPy. */
+int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_array** result,
+              const char* site, char* err, size_t errlen);
+
 /* Issues dst[...] = src (src broadcasts to dst's shape; another dtype is
  * cast as NumPy's assignment casts, VP_UNSUPPORTED if NumPy cannot). `site`
  * comes from vp_intern. */

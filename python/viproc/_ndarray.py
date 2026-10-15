@@ -1194,7 +1194,7 @@ class ndarray(_viproc._Array):
         if func is np.copyto and len(args) >= 2 and isinstance(args[0], ndarray) and not kwargs:
             args[0][...] = args[1]
             return None
-        handler = _REDUCTIONS.get(func) or _VIEW_HANDLERS.get(func)
+        handler = _REDUCTIONS.get(func) or _VIEW_HANDLERS.get(func) or _PRODUCTS.get(func)
         if handler is not None:
             try:
                 r = handler(*args, **kwargs)
@@ -1310,6 +1310,9 @@ class ndarray(_viproc._Array):
     def argmax(self, *a, **k):
         return np.argmax(self, *a, **k)
 
+    def dot(self, b, out=None):
+        return np.dot(self, b, out=out)
+
 
 def _ufunc_reduce(ufunc, a, axis=0, dtype=None, out=None, keepdims=False, initial=_NV,
                   where=True):
@@ -1318,9 +1321,64 @@ def _ufunc_reduce(ufunc, a, axis=0, dtype=None, out=None, keepdims=False, initia
     return _reduce(ufunc, a, axis, keepdims, dtype, initial)
 
 
+def _product_operands(inputs):
+    """Both operands of a matrix product as viproc arrays (NumPy arrays are
+    imported), or None if NumPy has to run it."""
+    if len(inputs) != 2 or not all(isinstance(x, (ndarray, np.ndarray)) for x in inputs):
+        return None
+    ops = tuple(x if isinstance(x, ndarray) else asarray(x) for x in inputs)
+    if not all(isinstance(x, ndarray) for x in ops) or ops[0].dtype != ops[1].dtype:
+        return None  # unsupported dtype, or a cast (NumPy's iterator copies)
+    return ops
+
+
+def _matmul(a, b):
+    ops = _product_operands((a, b))
+    return _viproc.matmul(*ops) if ops is not None else None
+
+
+def _dot_operand(x):
+    """x as NumPy's dot passes it to BLAS (cblas_matrixproduct): copied to C
+    order if its strides are not BLAS-able (negative, zero, not a multiple
+    of the item size) or, for a matrix, if it is neither C- nor
+    F-contiguous."""
+    st, n = x.strides, x.itemsize
+    bad = any(s <= 0 or s % n for s in st)
+    if x.ndim == 2 and not bad:
+        c = st[1] == n and st[0] == x.shape[1] * n
+        f = st[0] == n and st[1] == x.shape[0] * n
+        bad = not (c or f)
+    return x.astype(x.dtype, order="C") if bad else x
+
+
+def _dot(a, b, out=None):
+    """np.dot of vectors and matrices as matmul where both make the same loop
+    calls: NumPy's dot gives integers and bool the values of matmul (exact
+    sums), and for floating-point matrices and vectors with every extent >= 2
+    makes the BLAS call matmul makes (gemm/syrk, gemv, dot), once its
+    operands are prepared as dot prepares them. Everything else (0-d and
+    n-d operands, extents of 1, out=) runs in NumPy."""
+    ops = _product_operands((a, b)) if out is None else None
+    if ops is None or not all(1 <= x.ndim <= 2 for x in ops):
+        return _NOPE
+    if ops[0].dtype.kind in "fc":
+        if any(e < 2 for x in ops for e in x.shape):
+            return _NOPE  # dot's scalar/row/column special cases
+        ops = tuple(_dot_operand(x) for x in ops)
+    r = _viproc.matmul(*ops)
+    return _NOPE if r is None else r
+
+
+_PRODUCTS = {np.dot: _dot}
+
+
 def _fallback_ufunc(ufunc, method, inputs, kwargs):
-    """ufunc.reduce asynchronously where possible; anything else syncs and
-    runs eagerly in NumPy (in place for out= and ufunc.at)."""
+    """ufunc.reduce and matmul asynchronously where possible; anything else
+    syncs and runs eagerly in NumPy (in place for out= and ufunc.at)."""
+    if method == "__call__" and ufunc is np.matmul and not kwargs:
+        r = _matmul(*inputs) if len(inputs) == 2 else None
+        if r is not None:
+            return r
     if method == "reduce" and len(inputs) == 1:
         try:
             r = _ufunc_reduce(ufunc, *inputs, **kwargs)
