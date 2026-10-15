@@ -1190,7 +1190,9 @@ class ndarray(_viproc._Array):
             _viproc.assign(target, asarray(np.asarray(src).astype(self.dtype, copy=False)))
 
     # --- NumPy protocols -------------------------------------------------------
-    def __array_function__(self, func, types, args, kwargs):
+    # __array_function__ is _Array's (C): reductions there, everything else
+    # here.
+    def _array_function(self, func, types, args, kwargs):
         if func is np.copyto and len(args) >= 2 and isinstance(args[0], ndarray) and not kwargs:
             args[0][...] = args[1]
             return None
@@ -1205,7 +1207,10 @@ class ndarray(_viproc._Array):
         return _host_call(func, args, kwargs)
 
     # --- common methods (NumPy semantics via the protocols) -------------------
-    def astype(self, dtype, order="K", casting="unsafe", subok=True, copy=True):
+    # sum, prod, max, min, any, all, mean, var, std, argmax, argmin, copy and
+    # astype are _Array's C methods (setup_reductions below); these are the
+    # Python paths behind copy and astype.
+    def _astype_py(self, dtype, order="K", casting="unsafe", subok=True, copy=True):
         dtype = np.dtype(dtype)
         if dtype == self.dtype and not copy:
             return self
@@ -1217,12 +1222,14 @@ class ndarray(_viproc._Array):
                 return r
         return _host_call(lambda a: a.astype(dtype, order, casting, subok, copy), (self,), {})
 
-    def copy(self):
+    def _copy_py(self, order="C"):
+        if order != "C":
+            return _host_call(lambda a: a.copy(order), (self,), {})
         out = _wrap_numpy(np.empty(self.shape, self.dtype))
         _viproc.assign(out, self)
         return out
 
-    def reshape(self, *shape, **kwargs):
+    def _reshape_py(self, *shape, **kwargs):  # behind _Array.reshape (C)
         shape = shape[0] if len(shape) == 1 else shape
         r = _reshape(self, shape, **kwargs) if not kwargs else _NOPE
         return np.reshape(self, shape, **kwargs) if r is _NOPE else r
@@ -1248,7 +1255,7 @@ class ndarray(_viproc._Array):
             axes = axes[0]
         return _transpose(self, axes if axes != () else None)
 
-    def swapaxes(self, axis1, axis2):
+    def _swapaxes_py(self, axis1, axis2):  # behind _Array.swapaxes (C)
         return _swapaxes(self, axis1, axis2)
 
     def squeeze(self, axis=None):
@@ -1277,38 +1284,8 @@ class ndarray(_viproc._Array):
         return _host_call(lambda a: a.view(dtype) if type is None else a.view(dtype, type),
                           (self,), {})
 
-    def sum(self, *a, **k):
-        return np.sum(self, *a, **k)
-
-    def prod(self, *a, **k):
-        return np.prod(self, *a, **k)
-
-    def min(self, *a, **k):
-        return np.min(self, *a, **k)
-
-    def max(self, *a, **k):
-        return np.max(self, *a, **k)
-
-    def mean(self, *a, **k):
-        return np.mean(self, *a, **k)
-
-    def std(self, *a, **k):
-        return np.std(self, *a, **k)
-
-    def var(self, *a, **k):
-        return np.var(self, *a, **k)
-
-    def any(self, *a, **k):
-        return np.any(self, *a, **k)
-
-    def all(self, *a, **k):
-        return np.all(self, *a, **k)
-
-    def argmin(self, *a, **k):
-        return np.argmin(self, *a, **k)
-
-    def argmax(self, *a, **k):
-        return np.argmax(self, *a, **k)
+    # sum, prod, min, max, mean, std, var, any, all, argmin, argmax: _Array's
+    # (C), with _reduction_fallback below for what C does not handle.
 
     def dot(self, b, out=None):
         return np.dot(self, b, out=out)
@@ -1427,6 +1404,45 @@ def _getitem(self, key):
             return r
     return _host_call(lambda a, k: a[k], (self, key), {})
 
+
+def _reduction_fallback(func, args, kwargs):
+    """np.<reduction>(*args, **kwargs) beyond the C path (_Array's methods and
+    __array_function__): the asynchronous handlers, else NumPy."""
+    handler = _REDUCTIONS[func]
+    try:
+        r = handler(*args, **kwargs)
+    except TypeError:  # unexpected arguments: NumPy reports them
+        r = _NOPE
+    return _host_call(func, args, kwargs) if r is _NOPE else r
+
+
+_viproc.setup_reductions(
+    tuple(
+        (f, m, k, u, lambda args, kwargs, f=f: _reduction_fallback(f, args, kwargs))
+        for f, m, k, u in (
+            (np.sum, "sum", 0, np.add),
+            (np.prod, "prod", 0, np.multiply),
+            (np.max, "max", 1, np.maximum),
+            (np.min, "min", 1, np.minimum),
+            (np.amax, None, 1, np.maximum),
+            (np.amin, None, 1, np.minimum),
+            (np.any, "any", 2, np.logical_or),
+            (np.all, "all", 2, np.logical_and),
+            (np.mean, "mean", 3, None),
+            (np.var, "var", 3, None),
+            (np.std, "std", 3, None),
+            (np.argmax, "argmax", 3, None),
+            (np.argmin, "argmin", 3, None),
+        )
+    )
+    + (
+        (None, "copy", 3, None, lambda args, kwargs: ndarray._copy_py(*args, **kwargs)),
+        (None, "astype", 3, None, lambda args, kwargs: ndarray._astype_py(*args, **kwargs)),
+    ),
+    ndarray._array_function,
+    np._NoValue,
+    _REDUCE_ASYNC,
+)
 
 _viproc.setup(
     ndarray,

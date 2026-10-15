@@ -269,6 +269,12 @@ PyObject* vp_array_export(const vp_array* a, int writable) {
     return numpy::export_ndarray(arr(a), writable != 0);
 }
 
+PyObject* vp_array_borrow(const vp_array* a) { return numpy::borrow_ndarray(arr(a)); }
+
+int vp_array_pin(const vp_array* a, PyObject* view) {
+    return numpy::pin_borrowed(arr(a), view) ? VP_OK : VP_PYERR;
+}
+
 int vp_array_prepare_write(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
     std::optional<TaskError> e = rt->rt->prepare_host_write(arr(a));
     if (e) {

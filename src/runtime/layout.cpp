@@ -91,6 +91,9 @@ bool Layout::dense() const {
     if (offset != 0) {
         return false;
     }
+    if (c_contiguous()) {
+        return true; // the common case, without sorting
+    }
     std::vector<std::pair<std::int64_t, std::int64_t>> axes; // (stride, extent)
     for (std::size_t i = 0; i < shape.size(); ++i) {
         if (shape[i] == 0) {

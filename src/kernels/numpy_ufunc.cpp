@@ -947,31 +947,61 @@ void release_export(PyObject* capsule) {
 
 } // namespace
 
-PyObject* export_ndarray(const Array& a, bool writable) {
+namespace {
+
+PyObject* ndarray_over(const Array& a, bool writable) {
     const Layout& l = a.layout();
-    std::vector<npy_intp> shape(l.shape.begin(), l.shape.end());
-    std::vector<npy_intp> strides(l.strides.begin(), l.strides.end());
+    npy_intp shape[NPY_MAXDIMS];
+    npy_intp strides[NPY_MAXDIMS];
+    for (std::size_t i = 0; i < l.shape.size(); ++i) {
+        shape[i] = static_cast<npy_intp>(l.shape[i]);
+        strides[i] = static_cast<npy_intp>(l.strides[i]);
+    }
+    // Read-only unless the caller prepared the buffer for writing (see header).
+    const int flags = writable ? NPY_ARRAY_ALIGNED | NPY_ARRAY_WRITEABLE : NPY_ARRAY_ALIGNED;
+    return PyArray_New(&PyArray_Type, static_cast<int>(l.shape.size()), shape, type_num(l.dtype),
+                       strides, a.buffer()->data() + l.offset, 0, flags, nullptr);
+}
+
+// Makes `view` (over a's buffer, no base yet) an export: its base keeps the
+// buffer alive and, read-only, counts as a reader. Returns false (view
+// untouched, Python error set) on failure.
+bool attach_export(const Array& a, PyObject* view, bool writable) {
     auto hold = std::make_unique<ExportHold>(ExportHold{a.buffer(), !writable});
     PyObject* capsule = PyCapsule_New(hold.get(), kExportCapsule, release_export);
     if (capsule == nullptr) {
-        return nullptr;
+        return false;
     }
     if (hold->counted) {
         ++hold->buffer->host_views;
     }
     hold.release(); // owned by the capsule now
-    // Read-only unless the caller prepared the buffer for writing (see header).
-    const int flags = writable ? NPY_ARRAY_ALIGNED | NPY_ARRAY_WRITEABLE : NPY_ARRAY_ALIGNED;
-    PyObject* view =
-        PyArray_New(&PyArray_Type, static_cast<int>(shape.size()), shape.data(), type_num(l.dtype),
-                    strides.data(), a.buffer()->data() + l.offset, 0, flags, nullptr);
-    if (view == nullptr ||
-        PyArray_SetBaseObject(reinterpret_cast<PyArrayObject*>(view), capsule) < 0) {
-        Py_XDECREF(view);
+    if (PyArray_SetBaseObject(reinterpret_cast<PyArrayObject*>(view), capsule) < 0) {
         Py_DECREF(capsule);
+        return false;
+    }
+    return true; // the capsule reference went to the view
+}
+
+} // namespace
+
+PyObject* export_ndarray(const Array& a, bool writable) {
+    PyObject* view = ndarray_over(a, writable);
+    if (view == nullptr || !attach_export(a, view, writable)) {
+        Py_XDECREF(view);
         return nullptr;
     }
-    return view; // the capsule reference went to the view
+    return view;
+}
+
+// Writable as NumPy's own arrays are (NumPy copies read-only inputs in some
+// reductions, e.g. argmax), for the reductions the bridge calls: they read
+// it only. Read-only once pinned.
+PyObject* borrow_ndarray(const Array& a) { return ndarray_over(a, true); }
+
+bool pin_borrowed(const Array& a, PyObject* view) {
+    PyArray_CLEARFLAGS(reinterpret_cast<PyArrayObject*>(view), NPY_ARRAY_WRITEABLE);
+    return attach_export(a, view, false);
 }
 
 } // namespace viproc::numpy

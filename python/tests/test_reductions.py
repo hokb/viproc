@@ -19,6 +19,21 @@ UFUNCS = {
 }
 
 
+@pytest.fixture(autouse=True, params=["direct", "async"])
+def schedule(request):
+    """Every test twice: with the default policy (small ready inputs are
+    computed by NumPy itself, on a borrowed view) and with every op issued
+    as a task (sync_below=0), so the asynchronous kernels see small data
+    too."""
+    if request.param == "async":
+        viproc.init(sync_below=0, adaptive=False)
+    try:
+        yield request.param
+    finally:
+        if request.param == "async":
+            viproc.init()
+
+
 def fallbacks():
     return viproc._ndarray.fallback_calls
 

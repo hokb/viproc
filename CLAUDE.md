@@ -301,7 +301,9 @@ python/viproc/         Python package
   _viproc.c            CPython extension (C only, uses viproc.h): base class
                        _Array with the per-op hot path (__array_ufunc__ for
                        element-wise ufuncs, all operators, dtype-resolution
-                       cache, scalars, broadcasting, issue sites)
+                       cache, scalars, broadcasting, issue sites;
+                       reductions, copy, astype, reshape, swapaxes as C
+                       methods, NumPy delegate for small ready data)
   _ndarray.py          viproc.ndarray(_Array): fallbacks, __array_function__,
                        indexing, sync points; registers hooks with setup()
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
@@ -730,6 +732,25 @@ Rules:
   C-contiguous copy with the axis last, as `PyArray_ArgMax`). Per-call
   preparation is cached per (ufunc, dtype, ndim, axis, keepdims)
   (`_reduce_plans`).
+- **Reductions and methods in C, NumPy delegate for small ready data.**
+  `sum prod max min any all mean var std argmax argmin copy astype` are
+  C methods of `_Array`, and `_Array.__array_function__` takes the
+  matching `np.*` functions (`setup_reductions`: entries with their
+  Python fallbacks); every other function goes to `_ndarray.py`. Per
+  call, in order: (1) sum/prod/max/min/any(bool)/all(bool) with an axis
+  or keepdims and no other arguments: `vp_reduce` (run directly for small
+  ready data, async otherwise); (2) **small ready data** (≤ `sync_below`
+  elements, no viproc `out=`/`where=`): NumPy computes it on a borrowed
+  view of the buffer (`vp_array_borrow`, design doc D7): NumPy's method
+  (`view.sum(...)`) or `np.sum._implementation`, with the caller's
+  arguments, so results, errors and warnings are NumPy's; a fresh ndarray
+  result is adopted, a view NumPy keeps is pinned as a read-only export
+  (`vp_array_pin`); (3) full reductions of larger or pending data:
+  `vp_reduce`; (4) the Python handlers. A full reduction of small ready
+  data costs NumPy's call plus ~0.15 µs (the borrow); `vp_reduce`'s
+  direct path would cost ~0.9 µs. `reshape(shape)` / `swapaxes(i, j)` with
+  exact ints are C methods too (views, `reshape_view`); orders, copies
+  and other argument types go to `_reshape_py` / `_swapaxes_py`.
 - **0-d results and the scalar shortcut.** Where NumPy returns a scalar
   (full reductions, `a[i, j]`, ufuncs on 0-d operands), viproc returns
   NumPy's scalar if the data is there already (the op ran directly), else
@@ -863,12 +884,13 @@ Rules:
   machines). Headline (4 CPUs, Release): suite score 43 → 69 over this
   phase, all results bit-identical; `strong_scaling.py` 8 chains vs. NumPy
   with 4 workers: 1e7 ~7.5x, 1e6 ~4.5x, 1e4 ~3x, 1e3 ~0.9x. Small ready
-  ops: `x * y` (8 elements) 0.63 µs (NumPy 0.35), ops on scalars as NumPy
+  ops: `x * y` (8 elements) 0.52 µs (NumPy 0.41), ops on scalars as NumPy
   (0.06 µs), `a[1:3]` 0.12 µs (NumPy 0.10), `a.T` 0.11 µs (NumPy 0.08),
   `a[i, j]` 0.20 µs (NumPy 0.07), `x[idx]` (1,000 elements) 2.9 µs (NumPy
-  0.7), `a.reshape(-1)` 0.6 µs (NumPy 0.15; Python handler), small
-  `np.sum` ~2.8 µs (NumPy 1.5–2; NumPy's own `__array_function__`
-  dispatch is most of it).
+  0.7), `a.reshape(-1)` 0.12 µs (NumPy 0.14), `a.swapaxes(0, 1)` 0.11 µs
+  (NumPy 0.12), 100 elements: `x.sum()` 0.7 µs (NumPy 0.54), `np.sum(x)`
+  1.8 µs (NumPy 1.45), `x.sum(axis=0)` 1.1 µs (NumPy 1.2), `x.copy()`
+  0.6 µs (NumPy 0.2), `x.astype(np.float32)` 0.73 µs (NumPy 0.36).
 - "Issue an op, read the result right away" (`sync_latency.py`): 8 elements
   8.1 → 1.4–2.4 µs (NumPy 0.5–0.9), 1e3 5.1 → 1.6–2.7 µs (NumPy 0.8–1.6),
   1e4 ~NumPy (4.3–6.9 vs. 6.1–6.9 µs), 1e5 faster than NumPy, thanks to
@@ -1043,10 +1065,12 @@ code, comments, docs and commit messages in English.
       HT) the suite scores 22 with medium/large at 11 (`chains_wide`
       medium 6.2x of ideal 20x, large 1.2–3.9x): find out whether memory
       bandwidth, the main thread's issue rate or worker wake-ups limit it.
-- [ ] Remaining per-op overhead on small data: views still handled in
-      Python (`reshape` 0.6 µs, `swapaxes` ~1 µs via NumPy's
-      `__array_function__`), index parsing for advanced indexing (3–10 µs
-      small), direct-path result objects (~0.25 µs over NumPy).
+- [ ] Remaining per-op overhead on small data (design guideline: never
+      slower than NumPy): `np.abs(x)` and other ufunc calls pay NumPy's
+      override dispatch (~0.4 µs over NumPy), `copy`/`astype` the borrow
+      and adoption (~0.4 µs), `np.transpose`/`np.moveaxis` still via
+      NumPy's `__array_function__` into Python, index parsing for
+      advanced indexing (3–10 µs small).
 - [x] Per-op overhead of the bridge: hot path moved to C (~35 µs → ~3–7 µs).
 - [ ] Evaluate a generic path under free-threaded CPython: workers call the
       regular NumPy entry (no reimplementation of NumPy semantics).
