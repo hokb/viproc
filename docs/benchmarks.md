@@ -222,6 +222,8 @@ compare directly.
 | 10-13 | `2f7cac1` | `kmeans_points` case; back-pressure hysteresis, pooled iterators, faster `a[:, idx]` (2.10) | 100 | 68 | 1.68x | 0.87x | 85 | 52 | 80 | 56 | 56 | 91 | 101 | 71 | 69 | 52 | 81 |
 | 10-14 | `3111820` | same-VM baseline for the view changes: state before them (2.80) | 100 | 64 | 1.60x | 0.87x | 82 | 48 | 79 | 54 | 53 | 77 | 73 | 68 | 71 | 48 | 77 |
 | 10-14 | `5db8972` | views computed without ndarrays, `a[key]` in the C slot (2.80) | 100 | 64 | 1.62x | 0.87x | 85 | 49 | 78 | 55 | 53 | 71 | 96 | 62 | 72 | 48 | 79 |
+| 10-15 | `937393a` | same-VM baseline for matmul: state before it (2.10) | 100 | 72 | 1.77x | 0.90x | 87 | 58 | 87 | 58 | 59 | 93 | 117 | 71 | 74 | 57 | 80 |
+| 10-15 | `233fe84` | async `matmul` / `@` / `np.dot` with NumPy's matmul loop (2.10) | 100 | 68 | 1.73x | 0.90x | 89 | 52 | 78 | 61 | 58 | 76 | 80 | 64 | 72 | 56 | 79 |
 
 View changes, same VM (`3111820` → `5db8972`): score 64.0 → 63.7,
 unchanged within noise; the programs dominated by slicing gained:
@@ -231,6 +233,16 @@ configurations: up to ±25-30% (`dtype_chains` float16, which runs
 entirely in NumPy, 1.27x → 1.00x). Judge a change by the cases it
 targets and by repeated runs, not by one score difference of a few
 points.
+
+matmul, same VM (`937393a` → `233fe84`, builds `#8788db05` / `#f4ae3e57`):
+`matmul_batch` has no fallbacks left (11,540 and 48 before); small
+0.48x → 1.04x, medium 0.67x → 0.90x (separate filtered runs: small
+0.32x → 0.85-1.24x, medium ~1.0x). Medium products (316 x 316) are
+already threaded by OpenBLAS in NumPy, so overlapping four of them gains
+little. The score difference (72 → 68) is noise: the cases that moved
+most do not use matmul, and repeated runs of the scalar cases swing in
+both builds alike (`chain_serial` scalar: base 1.76x, 0.86x, 1.00x; new
+0.97x, 1.06x, 0.96x).
 
 The Windows build (Wine image) scored 46 (Linux 41 in the same Docker
 run) at `7b2846f` and 48 (Linux 42) with 89 cases: it tracks the Linux
