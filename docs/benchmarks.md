@@ -437,6 +437,25 @@ this change): score 69 → 73; tiny 60 → 80, small 76 → 82, reductions 81 �
 96, scalars 69 → 75 (large 73 → 66, medium 62 → 67: noise of quick runs
 on this VM); 91/91 bit-identical.
 
+### Element pool: shared LIFO per bin instead of per-thread caches
+
+Same 4-vCPU VM, back to back against `main` (`1adc652`), two rounds each,
+µs per op (8 independent chains, every op allocates: `y = x + y * 0.5`
+with the previous `y` still referenced) and `strong_scaling.py --workers 4
+--length 40`:
+
+| case | main | shared LIFO |
+|---|---:|---:|
+| chains, 4,096 elements | 7.70 / 4.83 | 4.66 / 4.25 (NumPy 4.3–4.5) |
+| chains, 16,384 | 4.70 / 3.37 | 3.33 / 4.48 |
+| chains, 100,000 | 15.45 / 14.23 | 15.05 / 14.56 |
+| chains, 1,000,000 | 272.5 / 268.7 | 257.3 / 252.4 |
+| `strong_scaling` 1e4 | 3.70x / 3.80x | 3.43x / 3.78x |
+| `strong_scaling` 1e5 | 5.50x / 5.70x | 5.75x / 5.47x |
+
+Equal within noise; pool misses in the chains roughly halved (138 → 66
+over the run), the pool test's loop misses only on its first iteration.
+
 ## Other machines
 
 **i7-12700K, 20 logical cores (8 P-cores with HT + 4 E-cores), 31 GiB,

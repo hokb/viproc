@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -116,31 +117,6 @@ std::size_t default_limit() {
 
 } // namespace
 
-// Blocks a thread keeps per bin for its own next allocations. More go to
-// the shared stack, where any allocating thread finds them: a thread that
-// mostly releases (the main thread dropping arrays, a worker finishing reads)
-// must not hoard memory other threads then allocate anew. Two cover the hot
-// case: a task releases its input and takes its output's block of the bin.
-constexpr int kKeep = 2;
-
-// The free lists of one allocating thread. Only the owner pushes and pops;
-// trim() and flush_thread() take a whole list with one exchange, so the
-// heads are atomic (uncontended on the owner's hot path).
-struct ElementPool::Local {
-    std::atomic<Node*> free[kBins];
-    std::uint8_t count[kBins]; // blocks in free[b] (owner only; approximate
-                               // after taking over a shared stack or a trim)
-    bool allocator;            // registered: keeps released blocks itself
-};
-
-ElementPool::Local& ElementPool::local() {
-    // Trivially destructible on purpose, as in FixedPool: no destructor that
-    // could run after the thread's last release. An allocating thread hands
-    // its blocks to the shared stacks when it exits (allocate(): flush_thread).
-    thread_local Local l{};
-    return l;
-}
-
 ElementPool& ElementPool::instance() {
     static ElementPool* pool = new ElementPool(); // never destroyed: blocks may
     return *pool;                                 // be released at exit
@@ -209,34 +185,20 @@ void ElementPool::system_release(void* block, std::size_t capacity) {
 
 void* ElementPool::allocate(std::size_t nbytes, std::size_t& capacity) {
     capacity = capacity_for(nbytes);
-    const int b = bin_of(capacity);
-    Local& l = local();
-    if (!l.allocator) {
-        // Unregisters (and hands the thread's blocks to the shared stacks)
-        // when the thread exits; Local itself is never destroyed.
-        thread_local struct Exit {
-            ~Exit() { ElementPool::instance().flush_thread(); }
-        } exit_guard;
-        (void)exit_guard;
-        std::lock_guard lock(registry_mutex_);
-        registry_.push_back(&l);
-        l.allocator = true;
-    }
-    // Take the whole list (a concurrent trim() then finds it empty), put the
-    // rest back: nobody else stores a non-null head.
-    Node* n = l.free[b].exchange(nullptr, std::memory_order_acquire);
-    if (n == nullptr) {
-        n = remote_[b].exchange(nullptr, std::memory_order_acquire);
-        l.count[b] = kKeep;
+    Bin& bin = bins_[bin_of(capacity)];
+    Node* n = nullptr;
+    {
+        std::lock_guard lock(bin.mutex);
+        n = bin.head;
+        if (n != nullptr) {
+            bin.head = n->next;
+        }
     }
     if (n != nullptr) {
-        l.free[b].store(n->next, std::memory_order_release);
-        l.count[b] = n->next != nullptr && l.count[b] > 0 ? l.count[b] - 1 : 0;
         cached_.fetch_sub(static_cast<std::int64_t>(capacity), std::memory_order_relaxed);
         hits_.fetch_add(1, std::memory_order_relaxed);
         return n;
     }
-    l.count[b] = 0;
     misses_.fetch_add(1, std::memory_order_relaxed);
     try {
         return system_allocate(capacity);
@@ -256,77 +218,34 @@ void ElementPool::release(void* block, std::size_t capacity) {
     }
     cached_.fetch_add(c, std::memory_order_relaxed);
     Node* n = static_cast<Node*>(block);
-    const int b = bin_of(capacity);
-    Local& l = local();
-    if (l.allocator && l.count[b] < kKeep) {
-        // CAS: trim() may take the list meanwhile (it only stores null).
-        Node* head = l.free[b].load(std::memory_order_relaxed);
-        do {
-            n->next = head;
-        } while (!l.free[b].compare_exchange_weak(head, n, std::memory_order_release,
-                                                  std::memory_order_relaxed));
-        ++l.count[b];
-        return;
-    }
-    push_remote(b, n, n);
-}
-
-void ElementPool::push_remote(int b, Node* first, Node* last) {
-    Node* head = remote_[b].load(std::memory_order_relaxed);
-    do {
-        last->next = head;
-    } while (!remote_[b].compare_exchange_weak(head, first, std::memory_order_release,
-                                               std::memory_order_relaxed));
-}
-
-void ElementPool::flush_thread() {
-    Local& l = local();
-    if (!l.allocator) {
-        return;
-    }
-    {
-        std::lock_guard lock(registry_mutex_);
-        std::erase(registry_, &l);
-        l.allocator = false;
-    }
-    for (int b = 0; b < kBins; ++b) {
-        if (Node* first = l.free[b].exchange(nullptr, std::memory_order_acquire)) {
-            Node* last = first;
-            while (last->next != nullptr) {
-                last = last->next;
-            }
-            push_remote(b, first, last);
-        }
-        l.count[b] = 0;
-    }
+    Bin& bin = bins_[bin_of(capacity)];
+    std::lock_guard lock(bin.mutex);
+    n->next = bin.head;
+    bin.head = n;
 }
 
 void ElementPool::trim() {
-    // Every allocating thread's lists (taken whole, see Local) and the shared
-    // stacks.
-    std::lock_guard lock(registry_mutex_);
     for (int b = 0; b < kBins; ++b) {
-        std::vector<Node*> lists{remote_[b].exchange(nullptr, std::memory_order_acquire)};
-        for (Local* l : registry_) {
-            lists.push_back(l->free[b].exchange(nullptr, std::memory_order_acquire));
+        Node* n = nullptr;
+        {
+            std::lock_guard lock(bins_[b].mutex);
+            n = std::exchange(bins_[b].head, nullptr);
         }
-        for (Node* n : lists) {
-            while (n != nullptr) {
-                Node* next = n->next;
-                // Every block of a bin has the bin's capacity; recover it from
-                // the bin index.
-                std::size_t capacity = 0;
-                if (b < 8) {
-                    capacity = static_cast<std::size_t>(b + 1) * 16;
-                } else {
-                    const int g = (b - 8) / 8 + 7;
-                    const int j = (b - 8) % 8;
-                    capacity = static_cast<std::size_t>(8 + j + 1) << (g - 3);
-                }
-                cached_.fetch_sub(static_cast<std::int64_t>(capacity), std::memory_order_relaxed);
-                system_release(n, capacity);
-                n = next;
-            }
+        // Every block of a bin has the bin's capacity; recover it from the
+        // bin index.
+        std::size_t capacity = 0;
+        if (b < 8) {
+            capacity = static_cast<std::size_t>(b + 1) * 16;
+        } else {
+            const int g = (b - 8) / 8 + 7;
+            const int j = (b - 8) % 8;
+            capacity = static_cast<std::size_t>(8 + j + 1) << (g - 3);
+        }
+        while (n != nullptr) {
+            Node* next = n->next;
+            cached_.fetch_sub(static_cast<std::int64_t>(capacity), std::memory_order_relaxed);
+            system_release(n, capacity);
+            n = next;
         }
     }
 }

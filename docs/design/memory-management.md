@@ -650,9 +650,9 @@ the memory right before its kernel runs, on the thread that runs it:
    NumPy's temporary elision (D5), decided by the worker at run time
    instead of by the main thread at issue. `x = np.abs(x)` in a loop runs
    in place, in one hot block.
-2. **Else from the element pool**, on that thread: the thread's own
-   last-released block of the bin if it has one (LIFO, hot in its cache;
-   the input it just released is a candidate), else the shared stack.
+2. **Else from the element pool**, on that thread: the most recently
+   released block of the bin (one shared LIFO; often the input this thread
+   just released, hot in its cache).
 
 Inline buffers (≤ 128 bytes) have their memory at once. Ops the main thread
 runs directly (`Runtime::issue_direct`) allocate there, right before they
@@ -671,19 +671,23 @@ new memory) ran at 2.4 (1.6) and 17 (24). With D11: 2.3 (2.6) and 19.7
 
 **Pool access model that follows.**
 
-- Any thread may allocate and release. A thread that allocates registers
-  its free lists (`ElementPool::Local`) and keeps up to `kKeep` = 2
-  released blocks per bin itself (enough for "release the input, take the
-  output"); further releases go onto the per-bin lock-free shared stack, so
-  a thread that mostly releases (the main thread dropping arrays) does not
-  hoard memory other threads then allocate anew. A thread whose own list is
-  empty takes the whole shared stack over (exchange, no ABA).
-- The list heads are atomic only so that `trim()` (any thread) can take
-  every registered thread's lists with one exchange each; the owner pushes
-  with a CAS and pops by exchange (uncontended).
-- A thread hands its blocks to the shared stacks and unregisters when it
-  exits (a `thread_local` guard; `Local` itself stays trivially
-  destructible, as in D4).
+- Any thread may allocate and release. Each bin is **one shared LIFO
+  under its own small lock** (`ElementPool::Bin`, a cache line per bin),
+  held only to pop or push one block: uncontended ~20 ns, against
+  microseconds per op.
+- Replaced per-thread caches (a thread kept up to two released blocks per
+  bin, the rest went onto a lock-free shared stack that an allocating
+  thread took over whole). The takeover moved every shared block of a bin
+  into one thread's private list, where the other workers no longer found
+  them: they allocated anew (pool misses, more memory), and how often
+  depended on which worker ran which task. The shared LIFO keeps the hot
+  case (a task releases its input and takes the same bin's block for its
+  output: the block on top) and sees every cached block from every
+  thread. Measured, back to back on the 4-vCPU VM: 8 independent chains in
+  which every op allocates, `strong_scaling.py` at 1e4 and 1e5 elements,
+  `x = np.abs(x)` chains: equal within noise; misses in the chains
+  roughly halved, and the 20-iteration loop of `test_bridge.py` misses
+  only on its first iteration (before: 1–6 misses, depending on timing).
 
 **No memory needs an address at issue.** NumPy's reduction iterator used
 to be built per op at issue (it needs the GIL) over the input's real
@@ -724,8 +728,9 @@ buffer as aligned (pool blocks are at least 64-byte aligned).
   model (main-thread allocation, assertion in debug builds).
 - Bin granularity (8 vs. 4 per power of two) and the size range served by
   the pool at all (very small blocks could stay with malloc).
-- Per-thread caches in front of the element pool: only if contention shows
-  up in `strong_scaling.py` with large arrays.
+- Per-thread caches in front of the element pool: tried and replaced (D11,
+  "Pool access model"); reconsider only if lock contention shows up with
+  many cores.
 - Huge-page threshold. Windows large pages are not swappable, need a
   privilege and are expensive to allocate (opt-in, see "Large blocks");
   measure whether they pay off with a warm pool before recommending them,
