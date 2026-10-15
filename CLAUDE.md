@@ -39,11 +39,18 @@ to plain sequential NumPy execution.
 - A pending array references **the task that computes it** (its producer).
   For an in/out array this is the **last** task that writes it.
 - Arrays do **not** reference the tasks that consume them as inputs.
-- Element memory comes from viproc's element pool and is taken by the main
-  thread when it issues the op that creates the array (phase 1: shapes are
-  known at issue), so tasks reach `allocated` at issue. Pool allocations
-  happen on the main thread only, releases on any thread
-  (`docs/design/memory-management.md`, D3 and D10).
+- Element memory comes from viproc's element pool and is taken **as late
+  as possible, by the task that produces it**: right before its kernel
+  runs, on the thread that runs it. It takes a dying input's block when it
+  holds the only reference to it and the layouts match (element-wise
+  kernels: NumPy's elision at run time), else a block from the pool (the
+  thread's own last-released block of the bin first: hot in cache). The
+  main thread creates the `Buffer` objects at issue (deferred, no memory);
+  tasks reach `size_completed` at issue and `allocated` when they run.
+  Pool allocations and releases happen on any thread
+  (`docs/design/memory-management.md`, D3 and D11; D10, main-thread
+  allocation at issue, made dependent chains 2-4x slower than NumPy: up to
+  1000 cold output blocks in flight).
 - **Views share a storage.** A base array and all its views refer to one
   shared *storage*, which holds the current buffer (data version) and the
   last task writing it. Readiness, the producer and `async_reads` belong
@@ -272,7 +279,8 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
   offload.*            OffloadPolicy: inline vs. worker for ready tasks
   element_pool.*       ElementPool: process-wide pool for element memory
                        (quantized bins, LIFO, bound, huge pages)
-  buffer.*             Buffer: element memory (inline ≤ 128 B, else pool); async_reads
+  buffer.*             Buffer: element memory (inline ≤ 128 B, else pool,
+                       deferred until the producing task runs); async_reads
   task.*               Task: stages, consumer callbacks, execute(); Kernel interface
   runtime.*            Array (main-thread view), Runtime: issue protocol,
                        worker pool, trampoline, look-ahead limit, wait
@@ -877,7 +885,8 @@ Rules:
   wake-up syscall per small task without taking cores from busy threads.
 - Per-op allocations: one pooled Task (operands inline up to 4), one
   pooled Buffer (element memory inline up to 128 bytes, larger from the
-  element pool: no page faults once warm), one pooled
+  element pool when the task runs: no page faults once warm, or the dying
+  input's block), one pooled
   `ArrayBlock` (Array and its Storage), the Python object. Shapes/strides
   inline (`SmallVector`), one shared kernel object per resolved loop,
   interned issue sites.

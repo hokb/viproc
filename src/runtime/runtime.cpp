@@ -195,7 +195,7 @@ void Runtime::launch(const std::shared_ptr<Task>& task,
 
 void Runtime::issue_storage_copy(Storage& s) {
     std::shared_ptr<Buffer> old = s.buffer_;
-    auto fresh = make_pooled<Buffer>(old->nbytes());
+    auto fresh = make_pooled<Buffer>(old->nbytes(), Buffer::deferred); // the copy task allocates
     std::vector<std::shared_ptr<Task>> producers;
     std::optional<TaskError> failed;
     if (!s.ready()) {
@@ -216,7 +216,6 @@ void Runtime::issue_storage_copy(Storage& s) {
         task->add_upstream_error(*failed);
     }
     task->advance(TaskState::SizeCompleted);
-    task->advance(TaskState::Allocated); // buffers take their memory when created
     s.buffer_ = fresh;
     s.producer_ = task;
     launch(task, producers, static_cast<std::int64_t>(old->nbytes()));
@@ -299,7 +298,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
             // Consolidated: no copy task. The op reads the old buffer (step 1)
             // and writes a new one with the same layout (as NumPy, the array
             // keeps its strides; later reductions see NumPy's element order).
-            s.buffer_ = make_pooled<Buffer>(s.buffer_->nbytes());
+            s.buffer_ = make_pooled<Buffer>(s.buffer_->nbytes(), Buffer::deferred);
         } else {
             // Views share the storage (or the op writes only part of it):
             // copy the whole buffer first, views keep their layouts.
@@ -339,7 +338,8 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         // Dense layouts (C, F, any axis order) are kept: ufunc results follow
         // NumPy's order (Layout::keep_order).
         Layout contiguous = l.dense() ? l : Layout::contiguous(l.dtype, l.shape);
-        auto buffer = make_pooled<Buffer>(contiguous.nbytes());
+        // The task takes the memory when it runs (D11).
+        auto buffer = make_pooled<Buffer>(contiguous.nbytes(), Buffer::deferred);
         in_ops.push_back({buffer, contiguous});
         results[i] = new_array(std::move(contiguous), std::move(buffer), task);
     }
@@ -348,10 +348,10 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     if (failed_input) {
         task->add_upstream_error(*failed_input);
     }
-    // Phase 1: shapes are known at issue time, and the main thread takes the
-    // output memory from the pool right here (memory-management.md, D10).
+    // Phase 1: shapes are known at issue time. The output memory is taken by
+    // the task itself, right before its kernel runs (memory-management.md,
+    // D11): from a dying input or from the pool, while it is hot in cache.
     task->advance(TaskState::SizeCompleted);
-    task->advance(TaskState::Allocated);
     launch(task, producers, elements);
 }
 

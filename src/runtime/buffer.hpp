@@ -7,19 +7,29 @@
 
 namespace viproc {
 
-// A block of element memory, taken when the buffer is created: up to
-// kInlineBytes inside the Buffer object, larger ones from the element pool
-// (docs/design/memory-management.md, D3/D10). Buffers are created by the main
-// thread only (at issue); the last reference may go on any thread, which
-// returns the block to the pool.
+// A block of element memory: up to kInlineBytes inside the Buffer object,
+// larger ones from the element pool (docs/design/memory-management.md, D3,
+// D10, D11). Buffer objects are created by the main thread only (at issue);
+// the last reference may go on any thread, which returns the block to the
+// pool.
+//
+// A deferred buffer (`Buffer(nbytes, Buffer::deferred)`) takes its block as
+// late as possible: the task producing it calls `ensure_allocated()` or
+// `take_block()` right before its kernel runs, on whatever thread runs it.
 //
 // Thread safety: the producing task writes `data()` after all tasks it depends
 // on completed; consumers read it only after the producer completed (acquire
-// on the producer's state).
+// on the producer's state). `ensure_allocated()` may race with itself (the
+// main thread pinning the memory of a pending buffer, D11): one block wins.
 class Buffer {
   public:
-    // A buffer of `nbytes` with uninitialized element memory.
+    // A buffer of `nbytes` with uninitialized element memory, taken now.
     explicit Buffer(std::size_t nbytes);
+    // A buffer of `nbytes` whose memory is taken later (ensure_allocated(),
+    // take_block()). Small buffers (inline) have their memory right away.
+    struct Deferred {};
+    static constexpr Deferred deferred{};
+    Buffer(std::size_t nbytes, Deferred);
     // Wraps memory owned elsewhere (e.g. by a NumPy array); `owner` keeps it alive.
     Buffer(void* data, std::size_t nbytes, std::shared_ptr<void> owner);
     ~Buffer();
@@ -27,7 +37,21 @@ class Buffer {
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
 
-    std::byte* data() const { return data_; }
+    // Null for a deferred buffer whose memory was not taken yet.
+    std::byte* data() const { return data_.load(std::memory_order_acquire); }
+    bool allocated() const { return data() != nullptr; }
+    // Element memory from the element pool (now or, deferred, later): a block
+    // of capacity_for(nbytes) bytes, reusable by another buffer of the bin.
+    bool pooled() const { return capacity_ != 0; }
+
+    // Takes the memory of a deferred buffer from the pool if it has none yet
+    // (any thread; concurrent calls agree on one block). Returns data().
+    std::byte* ensure_allocated();
+    // Moves `src`'s pool block into this deferred, unallocated buffer, if the
+    // block has this buffer's capacity. The caller must hold the only
+    // reference to `src` (nobody else can read it); `src` is left without
+    // memory. Any thread. False if nothing was moved.
+    bool take_block(Buffer& src);
     // Logical size: the bytes the arrays on this buffer cover.
     std::size_t nbytes() const { return nbytes_; }
     // Size of the pool block behind the buffer (0: inline or foreign memory).
@@ -78,9 +102,9 @@ class Buffer {
   private:
     std::atomic<int> read_waiters_{0};
     alignas(64) std::byte inline_[kInlineBytes];
-    std::byte* data_ = nullptr;
+    std::atomic<std::byte*> data_{nullptr};
     std::size_t nbytes_;
-    std::size_t capacity_ = 0; // > 0: data_ is a pool block
+    std::size_t capacity_ = 0; // > 0: data_ is (or will be) a pool block
     std::shared_ptr<void> owner_;
 };
 

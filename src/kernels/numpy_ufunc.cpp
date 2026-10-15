@@ -373,6 +373,10 @@ class ElementwiseKernel : public Kernel {
   public:
     explicit ElementwiseKernel(const UfuncLoop* loop) : loop_(loop) {}
 
+    // Element-wise loops read element i before writing it: an output may
+    // share an input's memory with the same layout (NumPy's out= / elision).
+    bool in_place_ok() const override { return true; }
+
     // Only the first nin() inputs go to the loop; further inputs are in/out
     // arrays the runtime lists as read (see Runtime::issue).
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
@@ -502,6 +506,8 @@ class IterElementwiseKernel : public Kernel {
         : loop_(loop), iter_(iter), pool_(std::move(pool)) {}
 
     ~IterElementwiseKernel() override { pool_->give_back(iter_, clean_); }
+
+    bool in_place_ok() const override { return true; }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const auto nin = static_cast<std::size_t>(loop_->nin());

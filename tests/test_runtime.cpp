@@ -1,5 +1,5 @@
 // Tests of the runtime core (no Python): ordering, parallelism, continuations,
-// copy-on-write, error propagation and the look-ahead limit.
+// copy-on-write, error propagation, the look-ahead limit, deferred allocation.
 
 #include "runtime/element_pool.hpp"
 #include "runtime/runtime.hpp"
@@ -35,13 +35,15 @@ void check(bool ok, const char* what) {
 class FnKernel : public Kernel {
   public:
     using Fn = std::function<KernelResult(std::span<const Operand>, std::span<const Operand>)>;
-    explicit FnKernel(Fn fn) : fn_(std::move(fn)) {}
+    explicit FnKernel(Fn fn, bool in_place = false) : fn_(std::move(fn)), in_place_(in_place) {}
     KernelResult run(std::span<const Operand> in, std::span<const Operand> out) override {
         return fn_(in, out);
     }
+    bool in_place_ok() const override { return in_place_; }
 
   private:
     Fn fn_;
+    bool in_place_;
 };
 
 // Plain asynchronous dispatch (no inline execution) for the scheduling tests.
@@ -70,31 +72,37 @@ ArrayPtr make_ready(Runtime& rt, std::int64_t n, double value) {
     return rt.wrap(l, b);
 }
 
-// out = in0 + c (elementwise), optionally sleeping first.
-std::shared_ptr<Kernel> add_const(double c, std::chrono::milliseconds delay = 0ms) {
-    return std::make_shared<FnKernel>([c, delay](auto in, auto out) {
-        std::this_thread::sleep_for(delay);
-        const std::int64_t n = out[0].layout.size();
-        for (std::int64_t i = 0; i < n; ++i) {
-            at(out[0], i) = at(in[0], i) + c;
-        }
-        return KernelResult{};
-    });
+// out = in0 + c (elementwise), optionally sleeping first. `in_place`: the
+// output may take a dying input's memory (Kernel::in_place_ok).
+std::shared_ptr<Kernel> add_const(double c, std::chrono::milliseconds delay = 0ms,
+                                  bool in_place = false) {
+    return std::make_shared<FnKernel>(
+        [c, delay](auto in, auto out) {
+            std::this_thread::sleep_for(delay);
+            const std::int64_t n = out[0].layout.size();
+            for (std::int64_t i = 0; i < n; ++i) {
+                at(out[0], i) = at(in[0], i) + c;
+            }
+            return KernelResult{};
+        },
+        in_place);
 }
 
 // out = sum of all inputs (elementwise).
-std::shared_ptr<Kernel> add_all() {
-    return std::make_shared<FnKernel>([](auto in, auto out) {
-        const std::int64_t n = out[0].layout.size();
-        for (std::int64_t i = 0; i < n; ++i) {
-            double s = 0;
-            for (const Operand& op : in) {
-                s += at(op, i);
+std::shared_ptr<Kernel> add_all(bool in_place = false) {
+    return std::make_shared<FnKernel>(
+        [](auto in, auto out) {
+            const std::int64_t n = out[0].layout.size();
+            for (std::int64_t i = 0; i < n; ++i) {
+                double s = 0;
+                for (const Operand& op : in) {
+                    s += at(op, i);
+                }
+                at(out[0], i) = s;
             }
-            at(out[0], i) = s;
-        }
-        return KernelResult{};
-    });
+            return KernelResult{};
+        },
+        in_place);
 }
 
 ArrayPtr issue1(Runtime& rt, std::shared_ptr<Kernel> k, std::initializer_list<ArrayPtr> in,
@@ -401,15 +409,17 @@ void test_active_limit() {
     check(rt.active_tasks() == 0, "all tasks finished");
 }
 
-void test_random_programs() {
-    // Random op sequences against a sequential reference evaluation.
+void test_random_programs(std::int64_t n, bool in_place) {
+    // Random op sequences against a sequential reference evaluation. With
+    // n > 16 the buffers are deferred (pool memory taken by the tasks), with
+    // in_place the outputs may take dying inputs' memory.
     std::mt19937 rng(1);
     for (int round = 0; round < 20; ++round) {
         Runtime rt(opts(4));
         std::vector<ArrayPtr> arrays;
         std::vector<double> ref;
         for (int i = 0; i < 4; ++i) {
-            arrays.push_back(make_ready(rt, 3, i));
+            arrays.push_back(make_ready(rt, n, i));
             ref.push_back(i);
         }
         for (int step = 0; step < 2000; ++step) {
@@ -417,19 +427,19 @@ void test_random_programs() {
             const std::size_t j = rng() % arrays.size();
             switch (rng() % 3) {
             case 0: { // new array
-                arrays.push_back(issue1(rt, add_all(), {arrays[i], arrays[j]}, 3));
+                arrays.push_back(issue1(rt, add_all(in_place), {arrays[i], arrays[j]}, n));
                 ref.push_back(ref[i] + ref[j]);
                 break;
             }
             case 1: { // in/out: arrays[i] += arrays[j]
                 std::vector<ArrayPtr> in{arrays[j]};
                 std::vector<ArrayPtr> io{arrays[i]};
-                rt.issue(add_all(), in, io, {}, "inout");
+                rt.issue(add_all(in_place), in, io, {}, "inout");
                 ref[i] += ref[j];
                 break;
             }
             default: { // new array = arrays[i] + 1
-                arrays.push_back(issue1(rt, add_const(1.0), {arrays[i]}, 3));
+                arrays.push_back(issue1(rt, add_const(1.0, 0ms, in_place), {arrays[i]}, n));
                 ref.push_back(ref[i] + 1);
                 break;
             }
@@ -442,7 +452,7 @@ void test_random_programs() {
                     rt.wait(*a);
                 }
                 for (std::size_t k = 0; k < arrays.size(); ++k) {
-                    arrays[k] = make_ready(rt, 3, ref[k]);
+                    arrays[k] = make_ready(rt, n, ref[k]);
                 }
                 arrays.resize(8);
                 ref.resize(8);
@@ -450,14 +460,19 @@ void test_random_programs() {
         }
         bool ok = true;
         for (std::size_t k = 0; k < arrays.size(); ++k) {
-            ok = ok && value(rt, arrays[k], 2) == ref[k];
+            ok = ok && value(rt, arrays[k], 0) == ref[k] && value(rt, arrays[k], n - 1) == ref[k];
         }
         if (!ok) {
             check(false, "random program matches sequential reference");
             return;
         }
     }
-    check(true, "20 random programs (2000 ops each, with in/out) match sequential reference");
+    char what[160];
+    std::snprintf(what, sizeof what,
+                  "20 random programs (2000 ops each, with in/out, %lld elements%s) match "
+                  "sequential reference",
+                  static_cast<long long>(n), in_place ? ", in-place kernels" : "");
+    check(true, what);
 }
 
 void test_random_view_programs() {
@@ -613,6 +628,47 @@ void test_offload_adaptive_per_site() {
 
 } // namespace
 
+void test_deferred_allocation() {
+    Runtime rt(opts(2));
+    const std::int64_t n = 1000;
+    std::atomic<bool> open{false};
+    auto gate = std::make_shared<FnKernel>([&open](auto in, auto out) {
+        while (!open.load()) {
+            std::this_thread::sleep_for(1ms);
+        }
+        for (std::int64_t i = 0; i < out[0].layout.size(); ++i) {
+            at(out[0], i) = at(in[0], i);
+        }
+        return KernelResult{};
+    });
+    std::atomic<std::byte*> a_memory{nullptr};
+    auto record = std::make_shared<FnKernel>(
+        [&a_memory](auto in, auto out) {
+            a_memory = out[0].buffer->data();
+            for (std::int64_t i = 0; i < out[0].layout.size(); ++i) {
+                at(out[0], i) = at(in[0], i) + 1;
+            }
+            return KernelResult{};
+        },
+        true);
+    ArrayPtr x = make_ready(rt, n, 1.0);
+    ArrayPtr g = issue1(rt, gate, {x}, n);
+    ArrayPtr a = issue1(rt, record, {g}, n);
+    ArrayPtr b = issue1(rt, add_const(1.0, 0ms, true), {a}, n);
+    check(!a->buffer()->allocated() && !b->buffer()->allocated(),
+          "deferred: pending outputs take no memory at issue");
+    a.reset(); // b's task now holds the only reference to a's buffer
+    open = true;
+    check(value(rt, b, 0) == 3 && value(rt, b, n - 1) == 3 && g->buffer()->allocated(),
+          "deferred: tasks allocate their outputs when they run");
+    check(b->buffer()->data() == a_memory.load(),
+          "deferred: an output takes the memory of a dying input (same layout)");
+    ArrayPtr c = issue1(rt, add_const(1.0, 0ms, true), {b}, n);
+    check(value(rt, c, 0) == 4 && value(rt, b, 0) == 3 &&
+              c->buffer()->data() != b->buffer()->data(),
+          "deferred: an input still referenced keeps its memory");
+}
+
 void test_element_pool() {
     ElementPool& pool = ElementPool::instance();
     const std::size_t saved_limit = pool.limit();
@@ -657,6 +713,40 @@ void test_element_pool() {
     pool.trim();
     check(pool.stats().cached == 0, "element pool: trim empties the pool");
 
+    // Blocks another allocating thread keeps: trim() reaches them, and the
+    // thread hands them to the shared stacks when it exits.
+    pool.set_limit(std::size_t{1} << 30);
+    pool.trim();
+    std::atomic<int> step{0};
+    std::thread keeper([&] {
+        std::size_t ck = 0;
+        void* block = pool.allocate(100000, ck);
+        pool.release(block, ck); // kept by this thread
+        step = 1;
+        while (step.load() != 2) {
+            std::this_thread::yield();
+        }
+    });
+    while (step.load() != 1) {
+        std::this_thread::yield();
+    }
+    const bool kept = pool.stats().cached > 0;
+    pool.trim();
+    check(kept && pool.stats().cached == 0, "element pool: trim takes other threads' blocks");
+    step = 2;
+    keeper.join();
+    void* kept_block = nullptr;
+    std::thread([&] {
+        std::size_t ck = 0;
+        kept_block = pool.allocate(100000, ck);
+        pool.release(kept_block, ck);
+    }).join();
+    std::size_t c5 = 0;
+    void* again = pool.allocate(100000, c5);
+    check(again == kept_block, "element pool: an exiting thread hands its blocks back");
+    pool.release(again, c5);
+    pool.trim();
+
     // Buffers take pool memory at creation and return it on release.
     pool.set_limit(std::size_t{1} << 30);
     void* first = nullptr;
@@ -692,7 +782,10 @@ int main() {
     test_overlapping_inplace();
     test_error_propagation();
     test_active_limit();
-    test_random_programs();
+    test_random_programs(3, false);
+    test_random_programs(64, false);
+    test_random_programs(64, true);
+    test_deferred_allocation();
     test_offload_small_ops_run_inline();
     test_offload_adaptive_per_site();
     test_random_view_programs();

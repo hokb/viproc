@@ -348,6 +348,39 @@ million elements.
   to 10,000 columns; tall thin arrays (n x 1) behave like vectors; the
   sync group stays below parity up to ~1 million elements.
 
+### After D11: tasks allocate their output memory
+
+Same machine, full run each, back to back: `main` (`33d373b`) vs. the
+branch with D11 (element memory taken by the producing task when it runs,
+from a dying input or the pool; `docs/design/memory-management.md`),
+build `2026-10-15T11:21:27 #38e22687`. All 1,552 measurements
+bit-identical in both runs.
+
+| | main | D11 |
+|---|---:|---:|
+| median over the 81 grid points | 0.85x | 1.06x |
+| points below 0.95x / below 0.8x | 51 / 32 | 36 / 22 |
+| 0-d scalars | 0.88x | 1.01x |
+| dependent (median over points) | 0.70x | 1.05x |
+| independent | 1.18x | 1.10x |
+| mixed | 0.82x | 1.18x |
+| reductions | 0.84x | 1.29x |
+| sync | 0.83x | 0.82x |
+
+![median speedup after D11](benchmarks/shape_map_d11.png)
+
+![median speedup per case group after D11](benchmarks/shape_map_d11_groups.png)
+
+- Parity moves down from ~100,000 to ~10,000-30,000 elements; dependent
+  chains, which had no point above 1.5x and many at 0.4-0.7x from 10,000
+  elements on, run at or above NumPy there (`x = abs(x)` at 316 x 316,
+  µs per op: NumPy 28, main 64, D11 21: the chain runs in place in one
+  hot block).
+- Unchanged: the region below ~10,000 elements (direct path and Python
+  paths: per-op overhead), and programs that sync after every step.
+- Independent chains' median is within run-to-run noise (±25-30 % per
+  configuration on this VM).
+
 ## Other machines
 
 **i7-12700K, 20 logical cores (8 P-cores with HT + 4 E-cores), 31 GiB,

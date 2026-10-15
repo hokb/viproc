@@ -690,7 +690,11 @@ bool numpy_aligned(const Array& a) {
     const std::size_t align = l.dtype == DType::Complex64 || l.dtype == DType::Complex128
                                   ? itemsize(l.dtype) / 2
                                   : itemsize(l.dtype);
-    std::uintptr_t bits = reinterpret_cast<std::uintptr_t>(a.buffer()->data() + l.offset);
+    // A deferred buffer has no address yet; its pool block will be aligned
+    // (element_pool.cpp: alignment_for), so only the offset counts.
+    const std::byte* data = a.buffer()->data();
+    std::uintptr_t bits =
+        reinterpret_cast<std::uintptr_t>(data) + static_cast<std::uintptr_t>(l.offset);
     for (std::size_t i = 0; i < l.shape.size(); ++i) {
         if (l.shape[i] > 1) {
             bits |= static_cast<std::uintptr_t>(l.strides[i]);

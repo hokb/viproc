@@ -255,7 +255,9 @@ PyObject* operand_view(const Layout& layout, const std::shared_ptr<Buffer>& buff
     PyArray_Descr* descr = PyArray_DescrFromType(type_num(layout.dtype));
     PyObject* view = PyArray_NewFromDescr(
         &PyArray_Type, descr, static_cast<int>(shape.size()), shape.data(), strides.data(),
-        buffer->data() + layout.offset, NPY_ARRAY_ALIGNED, nullptr); // steals descr
+        // NumPy's iterator needs the address now: a pending input's memory is
+        // taken here, ahead of its producer (D11).
+        buffer->ensure_allocated() + layout.offset, NPY_ARRAY_ALIGNED, nullptr); // steals descr
     if (view == nullptr) {
         return nullptr;
     }
@@ -507,7 +509,7 @@ bool make_iter_reduction(PyObject* ufunc, const Layout& in, std::shared_ptr<Buff
             error = "a reduction without initial value that casts";
             return false;
         }
-        kernel->operand_data_ = reinterpret_cast<char*>(in_buffer->data() + in.offset);
+        kernel->operand_data_ = reinterpret_cast<char*>(in_buffer->ensure_allocated() + in.offset);
         int j = 0;
         for (int i = 0; i < nd; ++i) {
             if (!reduced[static_cast<std::size_t>(i)]) {
