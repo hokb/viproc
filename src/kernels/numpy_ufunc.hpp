@@ -80,6 +80,8 @@ using DeferRelease = std::function<void(std::function<void()>)>;
 // An element-wise iterator template and its pool of reusable copies
 // (numpy_ufunc.cpp).
 struct IterTemplate;
+// A reduction iterator template (numpy_reduce.cpp).
+struct ReduceTemplate;
 
 // Caches resolved loops per (ufunc, dtype signature). Main thread with the GIL.
 // Must outlive every task that uses one of its loops (wait for the runtime
@@ -118,6 +120,23 @@ class LoopCache {
                                              bool out_given, DeferRelease defer,
                                              std::string& error);
 
+    // Reduction driven by NumPy's own iterator, for what ReducePlan does not
+    // cover (numpy_reduce.hpp): casts, initial=, reduced axes that do not
+    // coalesce, strided inputs. The iterator is set up as
+    // PyUFunc_ReduceWrapper sets it up, once per (ufunc, input layout, axes,
+    // keepdims, dtype, initial or not, buffer size) over template arrays;
+    // `result` receives the result's layout (NumPy's, as the iterator
+    // allocates it). Each kernel gets a copy of the template and points it
+    // at the real buffers when it runs: per op the main thread only looks up
+    // the template (and converts a new `initial`). `dtype`: dtype= or
+    // Py_None; `initial`: the start value or Py_None (start at the first
+    // elements). Returns nullptr (reason in `error`, Python error cleared)
+    // if NumPy cannot run it this way. Main thread with the GIL.
+    std::shared_ptr<Kernel> iter_reduction(PyObject* ufunc, const Layout& in,
+                                           std::span<const bool> reduced, bool keepdims,
+                                           PyObject* dtype, PyObject* initial, DeferRelease defer,
+                                           Layout& result, std::string& error);
+
     LoopCache() = default;
     LoopCache(const LoopCache&) = delete;
     LoopCache& operator=(const LoopCache&) = delete;
@@ -131,6 +150,7 @@ class LoopCache {
     std::map<std::tuple<PyObject*, DType, std::array<std::intptr_t, 3>>, std::unique_ptr<UfuncLoop>>
         reduction_loops_;
     std::unordered_map<std::string, std::shared_ptr<IterTemplate>> iter_templates_;
+    std::unordered_map<std::string, std::shared_ptr<ReduceTemplate>> reduce_templates_;
     PyObject* extobj_var_ = nullptr; // NumPy's extobj context variable
     PyObject* extobj_ = nullptr;     // its value at the last read
     long buffersize_ = 0;

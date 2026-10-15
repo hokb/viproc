@@ -656,13 +656,17 @@ new memory) ran at 2.4 (1.6) and 17 (24). With D11: 2.3 (2.6) and 19.7
   exits (a `thread_local` guard; `Local` itself stays trivially
   destructible, as in D4).
 
-**Memory that must have an address at issue.** NumPy's reduction iterator
-(`make_iter_reduction`, built at issue with the GIL) needs the input's
-address: it pins a pending input's memory on the main thread
-(`Buffer::ensure_allocated()`); the producer then finds its output
-allocated. `ensure_allocated` and `take_block` agree on one block by CAS
-on the data pointer. The alignment check for async `matmul` treats a
-deferred buffer as aligned (pool blocks are at least 64-byte aligned).
+**No memory needs an address at issue.** NumPy's reduction iterator used
+to be built per op at issue (it needs the GIL) over the input's real
+address, which pinned a pending input's memory on the main thread. It is
+now built once per signature over a dummy address (`ReduceTemplate`, as
+the element-wise iterator templates) and the task points its copy at the
+buffers when it runs (`NpyIter_ResetBasePointers`); the result is a
+regular deferred output in the layout NumPy allocated for the template.
+`ensure_allocated` and `take_block` still agree on one block by CAS on
+the data pointer (the direct path allocates on the main thread right
+before it runs). The alignment check for async `matmul` treats a deferred
+buffer as aligned (pool blocks are at least 64-byte aligned).
 
 **Consequences.**
 

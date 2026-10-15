@@ -291,6 +291,8 @@ src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
                        element-wise kernel, wrap_ndarray / to_ndarray
   numpy_reduce.*       reduction kernel: NumPy's reduction loop, called in
                        NumPy's blocks (ReducePlan)
+  numpy_iter.hpp       iterator templates and their pools (shared by the
+                       element-wise and reduction kernels)
   numpy_matmul.*       matmul kernel: NumPy's matmul gufunc loop with the
                        strides NumPy's gufunc machinery passes
 src/capi/capi.cpp      Implementation of the C ABI (library `viproc_capi`)
@@ -581,14 +583,22 @@ Rules:
     the reduced axes, which the loop then skips (NumPy's first-visit skip).
   `ReducePlan` covers dense inputs (any axis order) without a cast whose
   reduced axes coalesce into one. **Everything else runs on NumPy's own
-  iterator** (`make_iter_reduction`, `IterReduceKernel`): casts (int32
-  sums accumulate in int64, `dtype=`), `initial=`, non-coalescing reduced
-  axes and strided inputs, which NumPy's iterator may copy into buffers
-  even without a cast (and a loop on a contiguous buffer can round
-  differently from the same loop on strided data). The iterator is built at
-  issue time with the GIL exactly as `PyUFunc_ReduceWrapper` builds it (it
-  also allocates the result in NumPy's layout); the kernel runs NumPy's
-  `reduce_loop` over it without the GIL (`NpyIter_Reset(iter, &errmsg)`).
+  iterator** (`LoopCache::iter_reduction`, `IterReduceKernel`): casts
+  (int32 sums accumulate in int64, `dtype=`), `initial=`, non-coalescing
+  reduced axes and strided inputs, which NumPy's iterator may copy into
+  buffers even without a cast (and a loop on a contiguous buffer can round
+  differently from the same loop on strided data). The iterator is built
+  exactly as `PyUFunc_ReduceWrapper` builds it, but **once per signature**
+  (ufunc, input layout, axes, keepdims, `dtype=`, initial or not, buffer
+  size) as a template over a dummy address (`ReduceTemplate`; the result
+  NumPy allocates there gives viproc's result layout). Per op the main
+  thread only looks the template up and takes a finished copy from its
+  pool (`NpyIter_Copy` on a miss): no element memory, no address. The
+  task fills the initial values, points the copy at its buffers
+  (`NpyIter_ResetBasePointers(iter, base, &errmsg)`, no GIL) and runs
+  NumPy's `reduce_loop`. 0-d inputs are iterated as 1-element 1-d ones:
+  NumPy casts a 0-d input into a copy when it builds the iterator, which a
+  template cannot reuse.
   Fuzzed against NumPy over shapes, axes, layouts and dtypes
   (`python/tests/test_reductions.py`, incl. signs of zeros and NaNs):
   bit-identical.

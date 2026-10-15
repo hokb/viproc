@@ -8,6 +8,8 @@
 #include <numpy/arrayobject.h>
 #include <numpy/ufuncobject.h>
 
+#include "kernels/numpy_iter.hpp"
+
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -230,118 +232,115 @@ namespace {
 // its public headers do not export; the encoding is part of the nditer API).
 constexpr int reduction_axis(int axis) { return axis + (1 << (NPY_BITSOF_INT - 2)); }
 
-std::string fetch_error() {
-    PyObject* exc = PyErr_GetRaisedException();
-    if (exc == nullptr) {
-        return "unknown error";
-    }
-    PyObject* str = PyObject_Str(exc);
-    std::string msg = str != nullptr ? PyUnicode_AsUTF8(str) : "unknown error";
-    Py_XDECREF(str);
-    Py_DECREF(exc);
-    return msg;
+// Reduction templates kept per LoopCache (all dropped when full).
+constexpr std::size_t kMaxReduceTemplates = 1024;
+// Largest itemsize of a viproc dtype (complex128).
+constexpr std::size_t kMaxItemsize = 16;
+
+// Start values converted once per object: immutable ones only (a 0-d array
+// passed as initial= could change between calls).
+bool immutable_scalar(PyObject* v) {
+    return PyLong_CheckExact(v) || PyFloat_CheckExact(v) || PyBool_Check(v) ||
+           PyComplex_CheckExact(v) || PyArray_IsScalar(v, Generic);
 }
 
-constexpr const char* kOperandCapsule = "viproc.operand";
+} // namespace
 
-void release_operand(PyObject* capsule) {
-    delete static_cast<std::shared_ptr<Buffer>*>(PyCapsule_GetPointer(capsule, kOperandCapsule));
-}
+struct ReduceTemplate {
+    std::shared_ptr<IterTemplate> iters;
+    std::unique_ptr<UfuncLoop> loop; // for the template's inner strides
+    DeferRelease defer;
+    PyObject* dtype = nullptr;        // dtype= of the key (owned: keeps its address)
+    PyArray_Descr* descr0 = nullptr;  // the accumulator's descriptor (owned)
+    PyObject* last_initial = nullptr; // owned; its bytes in initial_bytes
+    std::array<std::byte, kMaxItemsize> initial_bytes{};
+    Layout result; // NumPy's result layout (offset 0)
+    npy_intp result_size = 0;
+    npy_intp itemsize = 0;
+    bool has_initial = false;
+    // First-element copy (no initial): kept input axes (shape, input stride,
+    // result stride).
+    std::vector<std::array<npy_intp, 3>> kept;
 
-// A read-only NumPy view of `layout` in `buffer` (kept alive by the view).
-PyObject* operand_view(const Layout& layout, const std::shared_ptr<Buffer>& buffer) {
-    std::vector<npy_intp> shape(layout.shape.begin(), layout.shape.end());
-    std::vector<npy_intp> strides(layout.strides.begin(), layout.strides.end());
-    PyArray_Descr* descr = PyArray_DescrFromType(type_num(layout.dtype));
-    PyObject* view = PyArray_NewFromDescr(
-        &PyArray_Type, descr, static_cast<int>(shape.size()), shape.data(), strides.data(),
-        // NumPy's iterator needs the address now: a pending input's memory is
-        // taken here, ahead of its producer (D11).
-        buffer->ensure_allocated() + layout.offset, NPY_ARRAY_ALIGNED, nullptr); // steals descr
-    if (view == nullptr) {
-        return nullptr;
-    }
-    auto* hold = new std::shared_ptr<Buffer>(buffer);
-    PyObject* capsule = PyCapsule_New(hold, kOperandCapsule, release_operand);
-    if (capsule == nullptr) {
-        delete hold;
-        Py_DECREF(view);
-        return nullptr;
-    }
-    if (PyArray_SetBaseObject(reinterpret_cast<PyArrayObject*>(view), capsule) < 0) {
-        Py_DECREF(capsule);
-        Py_DECREF(view);
-        return nullptr;
-    }
-    return view;
-}
-
-class IterReduceKernel : public Kernel {
-  public:
-    IterReduceKernel(NpyIter* iter, std::unique_ptr<UfuncLoop> loop, DeferRelease defer)
-        : iter_(iter), loop_(std::move(loop)), defer_(std::move(defer)) {}
-
-    ~IterReduceKernel() override {
-        NpyIter* iter = iter_;
-        UfuncLoop* loop = loop_.release();
-        defer_([iter, loop] {
-            NpyIter_Deallocate(iter); // releases the operand view and the result
-            delete loop;              // releases the call info capsule
+    ~ReduceTemplate() {
+        PyObject* objs[3] = {dtype, reinterpret_cast<PyObject*>(descr0), last_initial};
+        UfuncLoop* l = loop.release();
+        defer([objs, l] {
+            for (PyObject* o : objs) {
+                Py_XDECREF(o);
+            }
+            delete l; // releases the call info capsule
         });
     }
+};
 
-    KernelResult run(std::span<const Operand>, std::span<const Operand>) override {
-        // Initial values (PyUFunc_ReduceWrapper): the identity everywhere, or
-        // the first elements along the reduced axes.
-        if (!initial_.empty()) {
-            for (npy_intp i = 0; i < result_size_; ++i) {
-                std::memcpy(result_data_ + i * itemsize_, initial_.data(), itemsize_);
+namespace {
+
+// NumPy's reduction over a copy of a template iterator: initial values as
+// PyUFunc_ReduceWrapper sets them, then NumPy's reduce_loop over the
+// iterator's blocks (casts happen in its buffer copies). Runs without the
+// GIL.
+class IterReduceKernel : public Kernel {
+  public:
+    IterReduceKernel(std::shared_ptr<ReduceTemplate> t, NpyIter* iter)
+        : t_(std::move(t)), iter_(iter) {}
+
+    ~IterReduceKernel() override { t_->iters->give_back(iter_, clean_); }
+
+    KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
+        char* const in = reinterpret_cast<char*>(inputs[0].first());
+        char* const out = reinterpret_cast<char*>(outputs[0].first());
+        const npy_intp isz = t_->itemsize;
+        if (t_->has_initial) {
+            for (npy_intp i = 0; i < t_->result_size; ++i) {
+                std::memcpy(out + i * isz, initial_.data(), static_cast<std::size_t>(isz));
             }
         } else {
-            copy_first();
+            copy_first(in, out);
         }
+        char* base[2] = {out, in};
         char* errmsg = nullptr;
-        if (!NpyIter_Reset(iter_, &errmsg)) { // no GIL: errmsg variant
-            return {1, errmsg != nullptr ? errmsg : "NpyIter_Reset failed", 0};
+        clean_ = false;
+        // Points the iterator at the buffers (no GIL: errmsg variant); with
+        // buffering it also copies the first block.
+        if (NpyIter_ResetBasePointers(iter_, base, &errmsg) != NPY_SUCCEED) {
+            return {1, errmsg != nullptr ? errmsg : "NpyIter_ResetBasePointers failed", 0};
         }
-        return reduce_loop() ? KernelResult{} : KernelResult{1, "NumPy reduction loop failed", 0};
+        if (!reduce_loop()) {
+            return {1, "NumPy reduction loop failed", 0};
+        }
+        clean_ = true;
+        return {};
     }
 
-    // Set up by make_iter_reduction().
+    // Set up by LoopCache::iter_reduction().
     NpyIter_IterNextFunc* iternext_ = nullptr;
     char** dataptr_ = nullptr;
     npy_intp* strideptr_ = nullptr;
     npy_intp* countptr_ = nullptr;
-    std::vector<std::byte> initial_; // empty: start at the first elements
-    char* result_data_ = nullptr;
-    npy_intp result_size_ = 0;
-    npy_intp itemsize_ = 0;
-    npy_intp skip_first_count_ = 0;
-    // First-element copy: kept input axes (shape, input stride, result stride).
-    char* operand_data_ = nullptr;
-    std::vector<std::array<npy_intp, 3>> kept_;
+    std::array<std::byte, kMaxItemsize> initial_{};
 
   private:
-    void copy_first() const {
-        const std::size_t n = kept_.size();
-        std::vector<npy_intp> idx(n, 0);
-        char* in = operand_data_;
-        char* out = result_data_;
+    void copy_first(char* in, char* out) const {
+        const auto& kept = t_->kept;
+        const auto isz = static_cast<std::size_t>(t_->itemsize);
+        const std::size_t n = kept.size();
+        SmallVector<npy_intp, kInlineRank> idx(n, 0);
         for (;;) {
-            std::memcpy(out, in, static_cast<std::size_t>(itemsize_));
+            std::memcpy(out, in, isz);
             std::size_t k = n;
             for (;;) {
                 if (k == 0) {
                     return;
                 }
                 --k;
-                if (++idx[k] < kept_[k][0]) {
-                    in += kept_[k][1];
-                    out += kept_[k][2];
+                if (++idx[k] < kept[k][0]) {
+                    in += kept[k][1];
+                    out += kept[k][2];
                     break;
                 }
-                in -= (kept_[k][0] - 1) * kept_[k][1];
-                out -= (kept_[k][0] - 1) * kept_[k][2];
+                in -= (kept[k][0] - 1) * kept[k][1];
+                out -= (kept[k][0] - 1) * kept[k][2];
                 idx[k] = 0;
             }
         }
@@ -349,7 +348,8 @@ class IterReduceKernel : public Kernel {
 
     // NumPy's reduce_loop (ufunc_object.c), unmasked.
     bool reduce_loop() {
-        npy_intp skip = skip_first_count_;
+        const UfuncLoop* loop = t_->loop.get();
+        npy_intp skip = t_->has_initial ? 0 : t_->result_size;
         char* data[3];
         npy_intp strides[3];
         if (skip > 0) {
@@ -373,7 +373,7 @@ class IterReduceKernel : public Kernel {
                     strides[0] = strideptr_[0];
                     strides[1] = strideptr_[1];
                     strides[2] = strideptr_[0];
-                    if (loop_->call(data, &count, strides) < 0) {
+                    if (loop->call(data, &count, strides) < 0) {
                         return false;
                     }
                 }
@@ -392,47 +392,45 @@ class IterReduceKernel : public Kernel {
             strides[0] = strideptr_[0];
             strides[1] = strideptr_[1];
             strides[2] = strideptr_[0];
-            if (loop_->call(data, countptr_, strides) < 0) {
+            if (loop->call(data, countptr_, strides) < 0) {
                 return false;
             }
         } while (iternext_(iter_));
         return true;
     }
 
+    std::shared_ptr<ReduceTemplate> t_;
     NpyIter* iter_;
-    std::unique_ptr<UfuncLoop> loop_;
-    DeferRelease defer_;
+    bool clean_ = true; // a fresh copy has nothing in its buffers
 };
 
-} // namespace
-
-bool make_iter_reduction(PyObject* ufunc, const Layout& in, std::shared_ptr<Buffer> in_buffer,
-                         std::span<const bool> reduced, bool keepdims, PyObject* dtype,
-                         PyObject* initial, long buffersize, DeferRelease defer, IterReduction& out,
-                         std::string& error) {
+// Builds the template of a reduction (see LoopCache::iter_reduction()).
+std::shared_ptr<ReduceTemplate> build_reduce_template(PyObject* ufunc, const Layout& in,
+                                                      std::span<const bool> reduced, bool keepdims,
+                                                      PyObject* dtype, bool has_initial,
+                                                      long buffersize, DeferRelease defer,
+                                                      std::string& error) {
     const int nd = static_cast<int>(in.shape.size());
-    if (in.size() == 0) {
-        error = "empty reduction";
-        return false;
-    }
-    PyObject* operand = operand_view(in, in_buffer);
+    PyArrayObject* operand = template_array(in, template_address(), false);
     if (operand == nullptr) {
-        error = fetch_error();
-        return false;
+        error = fetch_python_error();
+        return nullptr;
     }
-    PyObject* in_descr =
-        reinterpret_cast<PyObject*>(PyArray_DESCR(reinterpret_cast<PyArrayObject*>(operand)));
+    PyObject* in_descr = reinterpret_cast<PyObject*>(PyArray_DESCR(operand));
     PyObject* info = resolve_reduction_info(ufunc, in_descr, dtype, error);
     if (info == nullptr) {
         Py_DECREF(operand);
-        return false;
+        return nullptr;
     }
     PyObject* descrs = PyTuple_GetItem(info, 0);
     PyObject* capsule = PyTuple_GetItem(info, 1);
     auto* descr0 = reinterpret_cast<PyArray_Descr*>(PyTuple_GetItem(descrs, 0));
     auto* descr1 = reinterpret_cast<PyArray_Descr*>(PyTuple_GetItem(descrs, 1));
 
-    // The iterator, as PyUFunc_ReduceWrapper sets it up.
+    // The iterator, as PyUFunc_ReduceWrapper sets it up, without
+    // COPY_IF_OVERLAP: the template's operands live at a dummy address, and
+    // viproc's result never overlaps the input. NumPy allocates the
+    // template's result; its layout is the one viproc gives its result.
     int result_axes[NPY_MAXDIMS];
     int curr = 0;
     for (int i = 0; i < nd; ++i) {
@@ -443,90 +441,181 @@ bool make_iter_reduction(PyObject* ufunc, const Layout& in, std::shared_ptr<Buff
         }
     }
     int* op_axes[2] = {result_axes, nullptr};
-    PyArrayObject* op[2] = {nullptr, reinterpret_cast<PyArrayObject*>(operand)};
+    PyArrayObject* op[2] = {nullptr, operand};
     PyArray_Descr* op_dtypes[2] = {descr0, descr1};
     npy_uint32 op_flags[2] = {NPY_ITER_READWRITE | NPY_ITER_ALIGNED | NPY_ITER_ALLOCATE |
                                   NPY_ITER_NO_SUBTYPE,
                               NPY_ITER_READONLY | NPY_ITER_ALIGNED | NPY_ITER_NO_BROADCAST};
     const npy_uint32 flags = NPY_ITER_BUFFERED | NPY_ITER_EXTERNAL_LOOP | NPY_ITER_GROWINNER |
                              NPY_ITER_ZEROSIZE_OK | NPY_ITER_REFS_OK | NPY_ITER_DELAY_BUFALLOC |
-                             NPY_ITER_DONT_NEGATE_STRIDES | NPY_ITER_COPY_IF_OVERLAP;
+                             NPY_ITER_DONT_NEGATE_STRIDES;
     NpyIter* iter =
         NpyIter_AdvancedNew(2, op, flags, NPY_KEEPORDER, NPY_UNSAFE_CASTING, op_flags, op_dtypes,
                             nd, op_axes, nullptr, static_cast<npy_intp>(buffersize));
     Py_DECREF(operand); // the iterator holds it
     if (iter == nullptr) {
-        error = fetch_error();
+        error = fetch_python_error();
         Py_DECREF(info);
-        return false;
+        return nullptr;
     }
-    auto fail = [&](const std::string& why) {
+    auto t = std::make_shared<ReduceTemplate>();
+    t->defer = defer;
+    t->iters = std::make_shared<IterTemplate>();
+    t->iters->templ = iter;
+    t->iters->defer = std::move(defer);
+    auto fail = [&](const char* why) {
         error = why;
         PyErr_Clear();
-        NpyIter_Deallocate(iter);
         Py_DECREF(info);
-        return false;
+        return nullptr;
     };
     if (NpyIter_GetIterSize(iter) == 0) {
         return fail("empty reduction");
     }
+    if (NpyIter_GetOperandArray(iter)[1] != operand) {
+        // NumPy cast the input into a copy at construction (it does so for
+        // 0-d inputs): the copy, not the input, would be read.
+        return fail("the iterator copies the input");
+    }
+    if (NpyIter_IterationNeedsAPI(iter)) {
+        return fail("iteration needs the Python API");
+    }
+    if (!has_initial &&
+        (descr0->type_num != type_num(in.dtype) || descr1->type_num != type_num(in.dtype))) {
+        // First elements are copied as they are: only without a cast.
+        return fail("a reduction without initial value that casts");
+    }
     PyArrayObject* result = NpyIter_GetOperandArray(iter)[0];
+    void* data = nullptr;
+    std::size_t nbytes = 0;
+    if (!ndarray_layout(reinterpret_cast<PyObject*>(result), t->result, data, nbytes) ||
+        t->result.offset != 0 || PyArray_ITEMSIZE(result) > static_cast<npy_intp>(kMaxItemsize)) {
+        return fail("unsupported result dtype");
+    }
+    t->result_size = PyArray_SIZE(result);
+    t->itemsize = PyArray_ITEMSIZE(result);
     npy_intp* strideptr = NpyIter_GetInnerStrideArray(iter);
     const std::intptr_t fixed[3] = {strideptr[0], strideptr[1], strideptr[0]};
-    std::unique_ptr<UfuncLoop> loop = UfuncLoop::from_call_info(ufunc, capsule, fixed, error);
-    Py_DECREF(info);
-    if (!loop) {
+    t->loop = UfuncLoop::from_call_info(ufunc, capsule, fixed, error);
+    if (!t->loop) {
         PyErr_Clear();
-        NpyIter_Deallocate(iter);
-        return false;
+        Py_DECREF(info);
+        return nullptr;
     }
-    auto kernel = std::make_shared<IterReduceKernel>(iter, std::move(loop), std::move(defer));
-    kernel->iternext_ = NpyIter_GetIterNext(iter, nullptr);
-    kernel->dataptr_ = NpyIter_GetDataPtrArray(iter);
-    kernel->strideptr_ = strideptr;
-    kernel->countptr_ = NpyIter_GetInnerLoopSizePtr(iter);
-    kernel->result_data_ = PyArray_BYTES(result);
-    kernel->result_size_ = PyArray_SIZE(result);
-    kernel->itemsize_ = PyArray_ITEMSIZE(result);
-    if (kernel->iternext_ == nullptr) {
-        error = fetch_error();
-        return false; // the kernel releases the iterator
-    }
-    if (initial != Py_None) {
-        Py_INCREF(descr0);
-        PyObject* v = PyArray_FromAny(initial, descr0, 0, 0, 0, nullptr); // steals descr0
-        if (v == nullptr) {
-            error = fetch_error();
-            return false;
-        }
-        const auto* p =
-            static_cast<const std::byte*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(v)));
-        kernel->initial_.assign(p, p + kernel->itemsize_);
-        Py_DECREF(v);
-    } else {
-        // First elements copied as they are: only without a cast.
-        if (descr0->type_num != type_num(in.dtype) || descr1->type_num != type_num(in.dtype)) {
-            error = "a reduction without initial value that casts";
-            return false;
-        }
-        kernel->operand_data_ = reinterpret_cast<char*>(in_buffer->ensure_allocated() + in.offset);
+    Py_INCREF(descr0);
+    t->descr0 = descr0;
+    Py_DECREF(info);
+    t->has_initial = has_initial;
+    if (!has_initial) {
         int j = 0;
         for (int i = 0; i < nd; ++i) {
             if (!reduced[static_cast<std::size_t>(i)]) {
-                kernel->kept_.push_back({in.shape[static_cast<std::size_t>(i)],
-                                         in.strides[static_cast<std::size_t>(i)],
-                                         PyArray_STRIDES(result)[j]});
+                t->kept.push_back({in.shape[static_cast<std::size_t>(i)],
+                                   in.strides[static_cast<std::size_t>(i)],
+                                   PyArray_STRIDES(result)[j]});
                 ++j;
             } else if (keepdims) {
                 ++j;
             }
         }
-        kernel->skip_first_count_ = kernel->result_size_;
     }
-    Py_INCREF(result);
-    out.result = reinterpret_cast<PyObject*>(result);
-    out.kernel = std::move(kernel);
-    return true;
+    Py_INCREF(dtype);
+    t->dtype = dtype;
+    return t;
+}
+
+} // namespace
+
+std::shared_ptr<Kernel> LoopCache::iter_reduction(PyObject* ufunc, const Layout& in,
+                                                  std::span<const bool> reduced, bool keepdims,
+                                                  PyObject* dtype, PyObject* initial,
+                                                  DeferRelease defer, Layout& result,
+                                                  std::string& error) {
+    if (in.size() == 0) {
+        error = "empty reduction";
+        return nullptr;
+    }
+    const bool has_initial = initial != Py_None;
+    const long bufsize = buffersize();
+    std::string key;
+    auto put = [&key](std::int64_t v) { key.append(reinterpret_cast<const char*>(&v), sizeof v); };
+    put(reinterpret_cast<std::intptr_t>(ufunc));
+    put(reinterpret_cast<std::intptr_t>(dtype));
+    put((has_initial ? 1 : 0) | (keepdims ? 2 : 0));
+    put(bufsize);
+    put(static_cast<std::int64_t>(in.dtype));
+    put(static_cast<std::int64_t>(in.shape.size()));
+    for (std::size_t d = 0; d < in.shape.size(); ++d) {
+        put(in.shape[d]);
+        put(in.strides[d]);
+        put(reduced[d] ? 1 : 0);
+    }
+    std::shared_ptr<ReduceTemplate> t;
+    if (auto it = reduce_templates_.find(key); it != reduce_templates_.end()) {
+        t = it->second;
+    } else {
+        if (in.shape.empty()) {
+            // NumPy casts a 0-d input into a copy when it builds the
+            // iterator (not in its buffers), which a template cannot reuse.
+            // The same iteration over a 1-element 1-d input buffers it; the
+            // result is that one element either way.
+            Layout in1 = in;
+            in1.shape = {1};
+            in1.strides = {static_cast<std::int64_t>(itemsize(in.dtype))};
+            const bool kept[1] = {false};
+            t = build_reduce_template(ufunc, in1, kept, false, dtype, has_initial, bufsize,
+                                      std::move(defer), error);
+            if (t) {
+                t->result.shape.clear();
+                t->result.strides.clear();
+            }
+        } else {
+            t = build_reduce_template(ufunc, in, reduced, keepdims, dtype, has_initial, bufsize,
+                                      std::move(defer), error);
+        }
+        if (!t) {
+            return nullptr;
+        }
+        if (reduce_templates_.size() >= kMaxReduceTemplates) {
+            reduce_templates_.clear();
+        }
+        reduce_templates_.emplace(std::move(key), t);
+    }
+    // The start value in the accumulator's dtype, converted by NumPy.
+    if (has_initial && initial != t->last_initial) {
+        Py_INCREF(t->descr0);
+        PyObject* v = PyArray_FromAny(initial, t->descr0, 0, 0, 0, nullptr); // steals descr0
+        if (v == nullptr) {
+            error = fetch_python_error();
+            return nullptr;
+        }
+        std::memcpy(t->initial_bytes.data(), PyArray_DATA(reinterpret_cast<PyArrayObject*>(v)),
+                    static_cast<std::size_t>(t->itemsize));
+        Py_DECREF(v);
+        Py_XDECREF(t->last_initial);
+        t->last_initial = nullptr;
+        if (immutable_scalar(initial)) {
+            Py_INCREF(initial);
+            t->last_initial = initial;
+        }
+    }
+    NpyIter* iter = t->iters->get();
+    if (iter == nullptr) {
+        error = fetch_python_error();
+        return nullptr;
+    }
+    auto kernel = std::make_shared<IterReduceKernel>(t, iter);
+    kernel->iternext_ = NpyIter_GetIterNext(iter, nullptr);
+    if (kernel->iternext_ == nullptr) {
+        error = fetch_python_error();
+        return nullptr; // the kernel releases the iterator
+    }
+    kernel->dataptr_ = NpyIter_GetDataPtrArray(iter);
+    kernel->strideptr_ = NpyIter_GetInnerStrideArray(iter);
+    kernel->countptr_ = NpyIter_GetInnerLoopSizePtr(iter);
+    kernel->initial_ = t->initial_bytes;
+    result = t->result;
+    return kernel;
 }
 
 namespace {

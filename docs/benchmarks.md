@@ -381,6 +381,27 @@ bit-identical in both runs.
 - Independent chains' median is within run-to-run noise (±25-30 % per
   configuration on this VM).
 
+### Reduction iterators built once per signature
+
+Reductions on NumPy's iterator (casts, strided inputs, `initial=`) used to
+build their iterator per op on the main thread, over the input's real
+address (which also took a pending input's memory early). Now a template
+per signature is built once and the task points a copy at its buffers.
+Same 4-CPU VM, back to back against the previous commit, best of 3,
+bit-identical (`int32` matrix, per step `x = -x; x.sum(axis=1);
+x[:, ::2].max(axis=0)`, all three ops dependent on the last step):
+
+| side | NumPy µs/step | before | after |
+|---:|---:|---:|---:|
+| 32 | 5.5–6.2 | 18–21 | 10–11 |
+| 100 | 14–17 | 39–59 | 20–39 |
+| 316 | 81–85 | 61–62 | 57–60 |
+| 1000 | 970–990 | 640–1150 | 470–500 |
+
+Independent small iterator reductions (8 x 8) issue faster too: `int32`
+`sum(axis=1)` 7.7 → 4.3 µs per op, `x.T[::2].max(axis=1)` 6.8 → 3.4 µs
+(NumPy 1.3 and 1.6–2.6 µs). The fast path (dense, no cast) is unchanged.
+
 ## Other machines
 
 **i7-12700K, 20 logical cores (8 P-cores with HT + 4 E-cores), 31 GiB,
