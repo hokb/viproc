@@ -1,5 +1,6 @@
 #include "runtime.hpp"
 
+#include "cpu.hpp"
 #include "pool.hpp"
 
 #include <algorithm>
@@ -37,7 +38,7 @@ inline void cpu_relax() {
 Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_(options_.offload) {
     std::size_t n = options_.workers;
     if (n == 0) {
-        n = std::max(1u, std::thread::hardware_concurrency());
+        n = physical_core_count();
     }
     if (options_.max_active_tasks == 0) {
         options_.max_active_tasks = 1;

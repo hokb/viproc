@@ -333,12 +333,16 @@ def run_suite(args):
 
     cores = args.cores or usable_cores()
     ram = physical_memory()
-    workers = sorted({int(w) for w in args.workers.replace("max", str(cores)).split(",")})
+    viproc.init()  # the runtime's default worker count (one per physical core)
+    default = viproc.workers()
+    viproc.shutdown()
+    spec = args.workers.replace("max", str(cores)).replace("default", str(default))
+    workers = sorted({int(w) for w in spec.split(",")})
     wmax = max(workers)
     target = 0.02 if args.quick else 0.04
     repeat = args.repeat or (3 if args.quick else 5)
     info = machine_info(cores, ram)
-    info.update({"workers": workers, "repeat": repeat, "target_s": target,
+    info.update({"workers": workers, "default_workers": default, "repeat": repeat, "target_s": target,
                  "large_elements": size_elements("large", cores, ram)})
 
     configs = []
@@ -410,7 +414,8 @@ def main():
     p.add_argument("--quick", action="store_true", help="shorter runs, fewer large cases")
     p.add_argument("--filter", help="regular expression on case/size/layout")
     p.add_argument("--workers", default="1,max",
-                   help="viproc worker counts, 'max' = cores (default 1,max)")
+                   help="viproc worker counts, 'max' = cores, 'default' = viproc's default "
+                        "(one per physical core) (default 1,max)")
     p.add_argument("--cores", type=int, help="override the detected core count")
     p.add_argument("--repeat", type=int, help="timed runs per measurement (best of)")
     p.add_argument("--merge", nargs="+", metavar="RESULTS_JSON",

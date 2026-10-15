@@ -269,6 +269,8 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
   ref.hpp              Ref<T>: non-atomic intrusive refcount (Array, Storage)
   pool.hpp             FixedPool / make_pooled: per-thread pools (Task, Buffer, …)
   offload.*            OffloadPolicy: inline vs. worker for ready tasks
+  cpu.*                physical_core_count(): default worker count (one
+                       per physical core, SMT siblings once, affinity)
   element_pool.*       ElementPool: process-wide pool for element memory
                        (quantized bins, LIFO, bound, huge pages)
   buffer.*             Buffer: element memory (inline ≤ 128 B, else pool); async_reads
@@ -976,6 +978,9 @@ code, comments, docs and commit messages in English.
       HT) the suite scores 22 with medium/large at 11 (`chains_wide`
       medium 6.2x of ideal 20x, large 1.2–3.9x): find out whether memory
       bandwidth, the main thread's issue rate or worker wake-ups limit it.
+      The default worker count is now one per physical core (12 there, was
+      20 = hardware threads); compare with `suite.py --workers 1,default,max`
+      (same run, same ideal).
 - [ ] Remaining per-op overhead on small data: views still handled in
       Python (`reshape` 0.6 µs, `swapaxes` ~1 µs via NumPy's
       `__array_function__`), index parsing for advanced indexing (3–10 µs

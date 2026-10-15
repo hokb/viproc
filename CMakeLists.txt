@@ -38,6 +38,7 @@ add_library(viproc
     src/runtime/version.cpp
     src/runtime/layout.cpp
     src/runtime/buffer.cpp
+    src/runtime/cpu.cpp
     src/runtime/element_pool.cpp
     src/runtime/task.cpp
     src/runtime/runtime.cpp
