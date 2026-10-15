@@ -133,10 +133,11 @@ def run_csharp(plan, plan_path, raw_path, threads, timeout):
     results, machine, todo, part = [None] * len(points), None, list(range(len(points))), 0
     while todo:
         sub_plan, out = f"{plan_path}.part{part}", f"{raw_path}.part{part}"
-        with open(sub_plan, "w") as f:
+        with open(sub_plan, "w", encoding="utf-8") as f:
             json.dump(dict(plan, points=[points[i] for i in todo]), f)
         cmd = ["dotnet", DLL, sub_plan, out] + (["--threads", str(threads)] if threads else [])
-        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, text=True, bufsize=1)
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, text=True,
+                                encoding="utf-8", errors="replace", bufsize=1)
         lines = queue.Queue()
         threading.Thread(target=lambda: [lines.put(x) for x in proc.stdout], daemon=True).start()
         done, last, hung = 0, time.monotonic(), False
@@ -153,7 +154,7 @@ def run_csharp(plan, plan_path, raw_path, threads, timeout):
                     hung = True
         saved = []
         if os.path.exists(out):
-            raw = json.load(open(out))
+            raw = json.load(open(out, encoding="utf-8"))
             machine, saved = machine or raw["machine"], raw["results"]
             os.remove(out)
         os.remove(sub_plan)
@@ -170,7 +171,7 @@ def run_csharp(plan, plan_path, raw_path, threads, timeout):
                         "error": reason}
         todo = [i for i in todo[len(saved):] if i != bad]
         part += 1
-    with open(raw_path, "w") as f:
+    with open(raw_path, "w", encoding="utf-8") as f:
         json.dump({"machine": machine, "results": results}, f, indent=1)
 
 
@@ -267,7 +268,7 @@ def build_runs(vrun, raw, plan, check_reps):
 
 def report(run, out_dir):
     prefix = run["labels"]["prefix"]
-    with open(os.path.join(out_dir, f"{prefix}.json"), "w") as f:
+    with open(os.path.join(out_dir, f"{prefix}.json"), "w", encoding="utf-8") as f:
         json.dump(run, f, indent=1)
     shape_map.write_markdown(run, os.path.join(out_dir, f"{prefix}.md"))
     return [os.path.join(out_dir, f"{prefix}.md")] + shape_map.plot(run, out_dir)
@@ -290,7 +291,7 @@ def main():
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
-    vrun = json.load(open(args.viproc))
+    vrun = json.load(open(args.viproc, encoding="utf-8"))
     if args.filter:
         import re
 
@@ -298,12 +299,12 @@ def main():
         vrun["machine"]["cases"] = len({r["case"] for r in vrun["results"]})
     plan = make_plan(vrun, args)
     plan_path = os.path.join(args.out, "ilnumerics_plan.json")
-    with open(plan_path, "w") as f:
+    with open(plan_path, "w", encoding="utf-8") as f:
         json.dump(plan, f)
     raw_path = args.iln or os.path.join(args.out, "ilnumerics_raw.json")
     if not args.iln:
         run_csharp(plan, plan_path, raw_path, args.threads, args.timeout)
-    raw = json.load(open(raw_path))
+    raw = json.load(open(raw_path, encoding="utf-8"))
     if not raw["machine"].get("accelerator"):
         print("WARNING: the ILNumerics build did not run through the Accelerator")
 

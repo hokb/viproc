@@ -238,7 +238,7 @@ def write_markdown(run, path):
     lines += ["## Cases", "", "| case | group | P | program |", "|---|---|---:|---|"]
     for c in shape_map_cases.CASES:
         lines.append(f"| {c.name} | {c.group} | {c.width} | {c.description} |")
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
 
@@ -413,10 +413,10 @@ def main():
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
     if args.plot:
-        run = json.load(open(args.plot))
+        run = json.load(open(args.plot, encoding="utf-8"))
     else:
         run = run_map(args)
-        with open(os.path.join(args.out, "shape_map.json"), "w") as f:
+        with open(os.path.join(args.out, "shape_map.json"), "w", encoding="utf-8") as f:
             json.dump(run, f, indent=1)
     write_markdown(run, os.path.join(args.out, "shape_map.md"))
     files = plot(run, args.out)
