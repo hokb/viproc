@@ -519,6 +519,18 @@ module returned NumPy's objects). Remaining gap of ufunc calls: the direct
 path (operand vector, buffer refcounts, result release), ~800-1,000
 instructions over NumPy's own call; scalar operands ~1,500.
 
+Shape map after this change (full run, build `2026-10-16T17:30:05
+#e0ed6617`, same 4-CPU VM, 4 workers, all 1,688 results bit-identical, no
+fallbacks), median speedup of the groups on small data (<= 2,048
+elements), before (build `#f5e952ad`) / after / after with `--module`:
+dependent 0.58 / 0.58 / 0.77, independent 0.70 / 0.71 / 0.77, expressions
+0.71 / 0.71 / 0.75, loops 0.64 / 0.67 / 0.68; `expr_where` 0.49 / 0.72 /
+0.74, `dep1_abs` 0.54 / 0.53 / 0.73. `loop_scan` from 100,000 elements on:
+0.02-0.22x -> 0.65-1.06x (copy-on-write inside the writing task, first
+measured here). Cells below 0.95x: 36 of 49 in all three runs (below 0.8x:
+22 -> 21 / 21): the small-data gap of sync, loops and control (0.64-0.74x)
+is the direct path itself (P4), not the dispatch.
+
 ### Element pool: shared LIFO per bin instead of per-thread caches
 
 Same 4-vCPU VM, back to back against `main` (`1adc652`), two rounds each,
