@@ -1,13 +1,59 @@
 # viproc
-A virtual processor, executing serial array instruction streams on parallel, heterogeneous hardware.
 
-viproc adds instruction-level parallelism for array instructions to regular NumPy programs:
-instructions of a sequentially written program run in parallel whenever their inputs are ready.
-Dependencies are resolved at runtime by local decisions, without a DAG or ahead-of-time analysis.
-The goal is strong scaling of whole array programs; the actual computation is delegated to
-NumPy's own inner loops.
-See [docs/design/goals.md](docs/design/goals.md) for goals and non-goals and
-[CLAUDE.md](CLAUDE.md) for architecture and build instructions.
+**Array instruction-level parallelism for NumPy programs.** viproc, a virtual processor for
+serial array instruction streams, finds the parallel
+potential between the array instructions of a regular, sequentially written NumPy program,
+automatically and without annotations, and runs it on parallel hardware.
+
+## What viproc does
+
+- **Finds parallel potential automatically, across large parts of a program.** viproc looks
+  at the stream of array instructions a NumPy program issues (`c = a + b`, `m = c.max()`,
+  `s = c.sum(axis=0)`, ...) and runs every instruction as soon as its inputs are ready.
+  Independent instructions run at the same time, dependent ones keep only the order their
+  data needs. The program is not rewritten and carries no annotations, decorators or
+  parallel loops: viproc is switched on from outside (`python -m viproc prog.py`).
+- **Puts that potential to work on the available parallel resources, dynamically.** Work is
+  handed to compute resources at runtime, as instructions become ready, and small
+  instructions whose result is needed right away stay on the calling thread. Today the
+  resources are the cores of a multi-core CPU; the execution model is meant for
+  heterogeneous hardware.
+
+## What makes it different
+
+- **Array ILP instead of data parallelism.** viproc does not split single operations across
+  threads. It overlaps whole array instructions, the way a superscalar CPU overlaps machine
+  instructions. The parallelism is found while the program runs, from the sequential stream
+  of array operations alone: the Python thread only issues instructions and races far
+  ahead of the computation, and every decision is local (is this input ready or still being
+  computed?). There is no dependency graph and no ahead-of-time analysis, so loops, branches
+  and data-dependent control flow are no obstacle. The execution model follows the
+  ILNumerics Accelerator.
+- **Identical results.** Every instruction is computed by NumPy's own inner loops (including
+  their SIMD paths), called exactly as NumPy calls them. Results are bit-identical to plain
+  NumPy; whatever viproc cannot run asynchronously with NumPy's semantics falls back to
+  NumPy itself.
+- **Never slower than NumPy.** viproc must not make any expression slower than NumPy
+  (hard limit 0.95x; where there is nothing to overlap, at most 3% slower by design).
+
+The goal is strong scaling: a fixed program with a fixed problem size gets faster with more
+cores. Goals, non-goals and rules are in [docs/design/goals.md](docs/design/goals.md),
+measurements in [docs/benchmarks.md](docs/benchmarks.md), architecture and build details in
+[CLAUDE.md](CLAUDE.md).
+
+## Where it helps, and where it does not (yet)
+
+viproc gains where a program issues many array instructions that do not all depend on each
+other: several independent expressions, chains over different arrays, reductions next to
+element-wise work, iterative algorithms over arrays (k-means, simulations, image and signal
+pipelines), on medium and large data.
+
+Programs that spend their time in long algorithms or loops over **scalar** data, one element
+at a time, offer little array-level parallelism and gain little from viproc today (they must
+not get slower either). For them the manual options remain: vectorizing the loop into array
+operations, or parallelizing it explicitly (`multiprocessing`, `concurrent.futures`, Numba's
+`prange`, ...). Overlapping consecutive loop iterations automatically (instruction
+pipelining) is on the roadmap.
 
 ## Usage
 
