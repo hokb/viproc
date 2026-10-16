@@ -1,6 +1,6 @@
 # viproc
 
-**viproc aims to strongly scale regular NumPy programs for any data on common (parallel)
+**viproc strongly scales regular NumPy programs for any data on common (parallel)
 hardware without code changes.**
 
 Array instruction-level parallelism for NumPy programs: viproc, a virtual processor for
@@ -29,9 +29,9 @@ own scheduling at runtime, in parallel and autonomously. There is no central sch
 
 All array instructions are first freed from the sequential order the program text gives
 them. When they run, their order is decided strictly and only by their input data and its
-availability: an instruction runs as soon as its inputs are computed, independent
+availability: an instruction runs as soon as its inputs are completed, independent
 instructions run at the same time, dependent ones keep only the order their data needs.
-Local availability (is this input ready, or still being computed?) replaces any global
+Local decisions (is this input ready, or still being computed?) replace any global
 program or dependency analysis.
 
 - **Granularity: the array operation.** One instruction is one NumPy operation (`a + b`,
