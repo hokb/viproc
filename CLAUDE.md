@@ -43,8 +43,9 @@ to plain sequential NumPy execution.
   as possible, by the task that produces it**: right before its kernel
   runs, on the thread that runs it. It takes a dying input's block when it
   holds the only reference to it and the layouts match (element-wise
-  kernels: NumPy's elision at run time), else a block from the pool (the
-  thread's own last-released block of the bin first: hot in cache). The
+  kernels: NumPy's elision at run time), else a block from the pool (one
+  shared LIFO per size bin under a small lock: the most recently released
+  block first, hot in cache; no per-thread caches). The
   main thread creates the `Buffer` objects at issue (deferred, no memory);
   tasks reach `size_completed` at issue and `allocated` when they run.
   Pool allocations and releases happen on any thread

@@ -1,7 +1,6 @@
 """Python bridge: viproc arrays must behave like NumPy arrays (bit-identical
 results), with supported ops running asynchronously."""
 
-import os
 import platform
 import sys
 import time
@@ -319,12 +318,11 @@ def test_element_pool_reuses_memory_and_trims():
         assert same(r, expected)
     after = viproc.pool_stats()
     # x + 1 takes a buffer each time; the other two ops may write into the
-    # temporary instead (D5, D11). Once warm, every block comes from the
-    # pool, except where the allocating worker differs from the thread that
-    # released the last ones: each thread keeps up to two blocks per bin for
-    # itself (kKeep in element_pool.cpp), so up to two misses per thread.
+    # temporary instead (D5, D11). Every block released before the next
+    # allocation is found again (one shared LIFO per bin): misses only for
+    # the first iteration and blocks still held when the next op allocates.
     misses = after["misses"] - before["misses"]
-    assert misses <= 1 + 2 * ((os.cpu_count() or 1) + 1)
+    assert misses <= 3
     assert after["hits"] - before["hits"] >= 20 - misses
     assert after["cached"] <= after["limit"]
     viproc.trim()
