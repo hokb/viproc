@@ -1,6 +1,7 @@
 // Tests of the runtime core (no Python): ordering, parallelism, continuations,
 // copy-on-write, error propagation, the look-ahead limit, deferred allocation.
 
+#include "runtime/cpu.hpp"
 #include "runtime/element_pool.hpp"
 #include "runtime/runtime.hpp"
 
@@ -763,7 +764,19 @@ void test_element_pool() {
     pool.set_limit(saved_limit);
 }
 
+// The default worker count is one per physical core: at least 1, at most one
+// per hardware thread.
+void test_default_workers() {
+    const std::size_t cores = physical_core_count();
+    const std::size_t logical = std::max(1u, std::thread::hardware_concurrency());
+    std::printf("physical cores %zu, hardware threads %zu\n", cores, logical);
+    check(cores >= 1 && cores <= logical, "physical cores within [1, hardware threads]");
+    Runtime rt{RuntimeOptions{}};
+    check(rt.worker_count() == cores, "default runtime has one worker per physical core");
+}
+
 int main() {
+    test_default_workers();
     test_element_pool();
     test_chain();
     test_diamond();

@@ -98,11 +98,11 @@ n-body; scalar to large data; vector, row/column-major, strided, (n,1)/(1,n)
 layouts; float64, float32, int32, int16, complex128, float16 and mixed
 types) as plain NumPy and on viproc (1 worker, one worker per core), checks
 that every result is bit-identical, and reports the **parallel efficiency
-score** (0-100, normalized to the machine's cores and RAM; how it is
+score** (0-100, normalized to the machine's physical cores and RAM; how it is
 computed is in the report). Full run: ~4 minutes per platform on 4 cores
 (wider machines get wider programs, so somewhat longer); `--quick`: about
 half. `--filter REGEX` selects configurations, `--workers 1,2,4,max` adds
-scaling columns.
+scaling columns (`max` = physical cores, `threads` = hardware threads).
 
 ## Command line
 

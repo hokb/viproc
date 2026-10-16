@@ -522,6 +522,8 @@ over the run), the pool test's loop misses only on its first iteration.
 **i7-12700K, 20 logical cores (8 P-cores with HT + 4 E-cores), 31 GiB,
 NumPy 2.5.4, Docker Linux image, 97 cases (state of `2d4c915`):** score
 22, 1.40x with 20 workers, 0.76x with 1 worker, 97/97 bit-identical.
+(Cores were hardware threads then: ideal up to 20. The suite now counts
+physical cores, 12 on this CPU, so later scores are not comparable.)
 
 | category | score | | size class | score |
 |---|---:|---|---|---:|

@@ -11,9 +11,10 @@ SIZE_ORDER = ["scalar", "tiny", "small", "medium", "large"]
 
 SCORE_EXPLAINED = """\
 **How the score works.** Each configuration runs as plain NumPy and on viproc
-(one worker per core). *Speedup* = NumPy time / viproc time. Its *ideal* is
-min(cores, P) for medium and large data, where P is the program's parallel
-width (independent instruction streams), and 1x (parity with NumPy) for
+(one worker per physical core). *Speedup* = NumPy time / viproc time. Its
+*ideal* is min(cores, P) for medium and large data, where cores are physical
+cores (SMT siblings count once) and P is the program's parallel width
+(independent instruction streams), and 1x (parity with NumPy) for
 scalar, tiny and small data, where no hand-off can pay off. *Efficiency* =
 speedup / ideal: dividing by the cores makes it comparable across machines.
 The `large` size class scales with RAM per core. **Score** = 100 x geometric
@@ -92,7 +93,7 @@ def report_markdown(run):
     wmax = max(m["workers"])
     out = ["# viproc benchmark suite", "", summary_markdown(run), "", "## Machine", "",
            "| | |", "|---|---|"]
-    for k, label in [("os", "OS"), ("cpu", "CPU"), ("cores", "cores used"),
+    for k, label in [("os", "OS"), ("cpu", "CPU"), ("cores", "physical cores used"),
                      ("logical_cpus", "logical CPUs"), ("python", "Python"),
                      ("numpy", "NumPy"), ("viproc", "viproc"), ("build_type", "build type"),
                      ("elision", "temporary elision"), ("blas_threads", "BLAS threads"),
@@ -308,7 +309,7 @@ def report_html(run):
     machine = "".join(
         f"<tr><td>{html.escape(a)}</td><td>{html.escape(str(b))}</td></tr>" for a, b in [
             ("platform", m["label"]), ("OS", m["os"]), ("CPU", m["cpu"]),
-            ("cores used", m["cores"]), ("logical CPUs", m["logical_cpus"]),
+            ("physical cores used", m["cores"]), ("logical CPUs", m["logical_cpus"]),
             ("RAM", _gib(m["ram_bytes"])), ("Python", m["python"]), ("NumPy", m["numpy"]),
             ("viproc", m["viproc"]), ("build type", m.get("build_type") or "–"),
             ("temporary elision", m["elision"]), ("BLAS threads", m["blas_threads"]),

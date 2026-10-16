@@ -1475,7 +1475,7 @@ def wait_all():
 def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
     """(Re)starts the runtime.
 
-    workers: worker threads (0: one per CPU).
+    workers: worker threads (0: one per physical core).
     sync_below: ops whose inputs are ready and that produce fewer elements run
         inline on the calling thread (default 2048, env VIPROC_SYNC_BELOW).
     adaptive: let each issue site switch to inline execution while its results

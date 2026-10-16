@@ -107,7 +107,7 @@ using ArrayPtr = Ref<Array>;
 using ShouldOffload = std::function<bool(const Task&)>;
 
 struct RuntimeOptions {
-    std::size_t workers = 0; // 0: std::thread::hardware_concurrency()
+    std::size_t workers = 0; // 0: one per physical core (physical_core_count())
     std::size_t max_active_tasks = kDefaultMaxActiveTasks;
     // Dispatch policy for tasks whose inputs are all ready (see offload.hpp).
     OffloadOptions offload;
