@@ -155,3 +155,25 @@ def test_small_ready_assignment_runs_in_numpy_without_tasks():
         e[i] = i
         e[i:i + 2] = 0.5 * i
     assert np.array_equal(np.asarray(a), e)
+
+
+def test_recurrence_in_place_with_pending_readers_matches_numpy():
+    # x[i] = f(x[i-1], x[i]) on a pending array: every write meets pending
+    # readers (copy-on-write); the readers feed the write, so the copy takes
+    # the old buffer over. Readers that do not feed it keep the old data.
+    d = np.random.default_rng(3).random((200, 3000))
+    for keep_reader in (False, True):
+        x, xn = viproc.asarray(d).copy(), d.copy()
+        kept, kept_n = [], []
+        for i in range(1, x.shape[0]):
+            if keep_reader and i % 7 == 0:
+                kept.append(x * 1.0)  # an independent reader of the old data
+                kept_n.append(xn * 1.0)
+            x[i] = np.cos(x[i - 1]) * 0.5 + x[i] * 0.5
+            xn[i] = np.cos(xn[i - 1]) * 0.5 + xn[i] * 0.5
+        assert np.array_equal(np.asarray(x), xn)
+        for k, kn in zip(kept, kept_n):
+            assert np.array_equal(np.asarray(k), kn)
+        e = np.asarray(x)  # an export keeps its values over later writes
+        x[0] = -1.0
+        assert np.array_equal(e, xn) and np.asarray(x)[0, 0] == -1.0

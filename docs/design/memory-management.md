@@ -515,9 +515,37 @@ the array's layout, no copy) when the op writes every element
 (`Kernel::writes_all`); storages with views, and ops that write only some
 elements (scatter, masked assignment), get a copy task first (without it,
 `x[x > 1.4] = 0.6` on an `x` with pending readers left the other elements
-as fresh memory). An op's reads
+as fresh memory).
+
+The copy is made **as late as possible, by the writing task itself**
+(`Task::add_copy_on_write`, `Task::copy_on_write`): issue time only
+switches the storage to a new deferred buffer and counts the writer's read
+of the old one; right before its kernel, the writer either takes the old
+block over or copies it, and reads its in/out from the new buffer. By then
+the writer's inputs are complete. In a recurrence (`x[i] = cos(x[i-1]) *
+0.5 + x[i] * 0.5` on a pending `x`) the readers of the old buffer are
+exactly the ops that compute the written value, so they are done: the
+writer's reference is the only one and its read the only read, and the new
+buffer takes the old block (`take_block`, the same check as temporary
+elision, D5). No reader is tracked; the decision uses only the buffer's
+own counters. Measured (4-vCPU VM, 1000 x 1000 float64, pending start):
+717 ms (one 8 MB copy per row, then as a separate task) -> 13-15 ms
+(NumPy 11-19). Cost: when it does copy, the copy no longer overlaps the
+computation of the written value. Rejected alternative: ordering the
+writer after the old buffer's readers (needs every reader tracked per
+buffer and a choice among several; arrays only know their producer).
+`prepare_host_write` (eager fallbacks) still issues a copy task and waits.
+
+**Open (TODO):** programs that alternate *independent* asynchronous
+readers and partial writers of one array still copy the whole buffer once
+per write: `acc.append(x.sum(axis=1)); x[i] = f(x[i-1])` over 300 x 1000
+takes 75.6 ms vs. NumPy 40.1 ms (0.53x). Candidates: copy only the region
+the pending readers can see; or a heuristic on buffer size vs. written
+part and number of readers. Needs a case in the shape map first.
+
+An op's reads
 of the buffer it writes in place are not counted (D5): later writers wait
-for it as the producer anyway. Decided at
+for it as the producer anyway. Whether the storage switches is decided at
 issue time on the main thread, so layouts never change after they were
 communicated. Arrays keep their strides, as in NumPy: until reductions ran
 asynchronously, consolidation switched to a C-contiguous layout, which made

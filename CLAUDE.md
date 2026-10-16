@@ -196,10 +196,18 @@ ownership, release or reuse of memory.
       false for scatter and masked assignment): no copy at all. The op reads the old buffer and writes
       the new one, with the **same layout** (as in NumPy, the array keeps
       its strides).
-    - **With views or partial writes:** a copy task copies the whole old
-      buffer into the new one first; the op then writes its part. Views
-      keep their layouts (offsets and strides stay valid in the new
-      buffer).
+    - **With views or partial writes:** the whole old buffer goes into
+      the new one first, then the op writes its part (and reads its
+      in/out from the new buffer). Views keep their layouts (offsets and
+      strides stay valid in the new buffer). The copy is no task of its
+      own: the writing task does it right before its kernel
+      (`Task::copy_on_write`), when its inputs are done, so readers that
+      feed the write (`x[i] = f(x[i-1])`) have finished; if nothing reads
+      the old buffer any more, the new buffer takes its block over
+      instead of copying (the elision check of `Task::allocate_outputs`).
+      Issue time decides only *that* the storage switches; the task
+      decides *how*. Independent readers alternating with writes still
+      cost one copy per write (open, design doc D8).
 - **Consolidation is decided at issue time, on the main thread.** Layout
   and size, once communicated (`size_completed`), never change. Tasks
   already issued captured (buffer, layout) pairs and are unaffected; only

@@ -113,6 +113,14 @@ class Task {
     // Marks an input as failed (its producer completed with an error before
     // this task was issued). The task then skips its kernel and fails too.
     void add_upstream_error(const TaskError& error);
+    // Copy-on-write inside this task: before its kernel runs, `to` (one of
+    // its deferred output buffers) gets the old data of `from`, whose read
+    // the caller counted. Decided as late as possible, right before the
+    // kernel: if nothing else reads `from` any more, `to` takes its block
+    // over instead of copying (design doc D8).
+    void add_copy_on_write(std::shared_ptr<Buffer> from, std::shared_ptr<Buffer> to) {
+        copies_.push_back({std::move(from), std::move(to)});
+    }
 
     // Dispatch statistics this task's work is attributed to: the site whose
     // main-thread decision started it (inherited by consumers issued while it
@@ -136,6 +144,8 @@ class Task {
     // Gives every output without memory its block: a dying input's (same
     // layout, in_place_ok kernels) or one from the element pool.
     void allocate_outputs();
+    // Runs the copies of add_copy_on_write (take the block or copy).
+    void copy_on_write();
 
     // Called once per producer when it completes (and once for the issue
     // guard with nullptr). Returns true when the last one arrives.
@@ -150,6 +160,10 @@ class Task {
     Operands operands_; // inputs, then outputs
     std::size_t ninputs_ = 0;
     const char* issue_site_;
+    struct Copy {
+        std::shared_ptr<Buffer> from, to;
+    };
+    std::vector<Copy> copies_; // copy-on-write, empty for most tasks
 
     // Guards consumers_, upstream_error_, waiters_ and the switch to Completed.
     mutable std::mutex mutex_;

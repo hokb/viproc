@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cassert>
 #include <cfenv>
+#include <cstring>
 #include <exception>
 
 namespace viproc {
@@ -83,6 +84,25 @@ bool same_layout(const Layout& a, const Layout& b) {
 
 } // namespace
 
+void Task::copy_on_write() {
+    for (Copy& c : copies_) {
+        // The only reference to the old buffer is ours and so is the only
+        // read (same check as in allocate_outputs): every other reader is
+        // done, nobody can read it again, so no copy is needed.
+        bool taken =
+            c.from.use_count() == 1 && c.from->async_reads.load(std::memory_order_acquire) == 1;
+        if (taken) {
+            acquire_fence();
+            taken = c.to->take_block(*c.from);
+        }
+        if (!taken) {
+            std::memcpy(c.to->ensure_allocated(), c.from->data(), c.from->nbytes());
+        }
+        c.from->release_read();
+    }
+    copies_.clear();
+}
+
 void Task::allocate_outputs() {
     const bool reuse = !error_ && kernel_->in_place_ok();
     for (std::size_t o = ninputs_; o < operands_.size(); ++o) {
@@ -131,6 +151,7 @@ std::vector<std::shared_ptr<Task>> Task::execute() {
     // Output memory as late as possible (design doc D11): here, right before
     // the kernel, on the thread that runs it. Also on errors: readers of an
     // output never see a buffer without memory.
+    copy_on_write();
     allocate_outputs();
     advance(TaskState::Allocated);
     if (!error_) {

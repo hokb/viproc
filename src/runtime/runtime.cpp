@@ -302,9 +302,21 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
             s.buffer_ = make_pooled<Buffer>(s.buffer_->nbytes(), Buffer::deferred);
         } else {
             // Views share the storage (or the op writes only part of it, or
-            // only some of its elements): copy the whole buffer first, views
-            // keep their layouts.
-            issue_storage_copy(s);
+            // only some of its elements): the whole old data goes into the new
+            // buffer first, views keep their layouts. Not a task of its own:
+            // this op does it right before its kernel, when its inputs (the
+            // readers that feed it, as in x[i] = f(x[i-1])) are done; a buffer
+            // nobody reads any more is then taken over, not copied. Its own
+            // read of the in/outs on `s` (step 1) moves to the new buffer.
+            std::shared_ptr<Buffer> old = s.buffer_;
+            s.buffer_ = make_pooled<Buffer>(old->nbytes(), Buffer::deferred);
+            old->async_reads.fetch_add(1, std::memory_order_relaxed);
+            task->add_copy_on_write(old, s.buffer_);
+            for (std::size_t j = 0; j < inouts.size(); ++j) {
+                if (inouts[j]->storage_ == a.storage_) {
+                    in_ops[inputs.size() + j].buffer = s.buffer_;
+                }
+            }
         }
     }
 
