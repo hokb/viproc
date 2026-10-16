@@ -19,7 +19,7 @@ next to the grid.
 
 Usage:
     PYTHONPATH=build/python python3 python/benchmarks/shape_map.py [--quick] [--out DIR]
-    python3 python/benchmarks/shape_map.py --plot DIR/shape_map.json [--out DIR]
+    python3 python/benchmarks/shape_map.py --plot DIR/shape_map.json [--out DIR] [--groups G,..]
 
 Writes DIR/shape_map.json, DIR/shape_map.md and, with matplotlib installed,
 DIR/shape_map.png (median and spread) and DIR/shape_map_groups.png (median
@@ -106,6 +106,23 @@ def quartiles(values):
     return tuple(float(np.exp(np.percentile(logs, q))) for q in (25, 50, 75))
 
 
+def run_groups(run):
+    """The case groups a run measured, in the order of shape_map_cases.GROUPS."""
+    have = {r["group"] for r in run["results"]}
+    return [g for g in shape_map_cases.GROUPS if g in have]
+
+
+def select_groups(run, groups):
+    """A run restricted to the cases of `groups` (points summarized again)."""
+    results = [r for r in run["results"] if r["group"] in groups]
+    machine = dict(run["machine"], cases=len({r["case"] for r in results}))
+    return dict(run, machine=machine, results=results,
+                skipped=[s for s in run["skipped"]
+                         if any(c.name == s["case"] and c.group in groups
+                                for c in shape_map_cases.CASES)],
+                points=summarize(results))
+
+
 def summarize(results):
     """Per grid point: median and quartiles over all cases and per group."""
     points = {}
@@ -137,7 +154,8 @@ def run_map(args):
     rows = grid_axis(args.max_rows, args.quick)
     shapes = [()] + [(r, c) for r in rows for c in cols]
     cases = [c for c in shape_map_cases.CASES
-             if not args.filter or re.search(args.filter, c.name)]
+             if (not args.filter or re.search(args.filter, c.name))
+             and (not args.groups or c.group in args.groups)]
     info = machine_info(cores, ram)
     info.update({"workers": workers, "repeat": repeat, "target_s": target,
                  "rows": rows, "cols": cols, "cases": len(cases)})
@@ -225,7 +243,7 @@ def write_markdown(run, path):
     if run["skipped"]:
         lines.append(f"Skipped (would not fit into RAM): {len(run['skipped'])} measurements.")
     lines += ["", "## Median per case group", ""]
-    for g in shape_map_cases.GROUPS:
+    for g in run_groups(run):
         lines += [f"### {g}", "", "| rows \\ cols | " + " | ".join(f"{c:,}" for c in cols)
                   + " |", "|---:|" + "---:|" * len(cols)]
         for r in rows:
@@ -237,6 +255,8 @@ def write_markdown(run, path):
         lines.append("")
     lines += ["## Cases", "", "| case | group | P | program |", "|---|---|---:|---|"]
     for c in shape_map_cases.CASES:
+        if c.group not in run_groups(run):
+            continue
         lines.append(f"| {c.name} | {c.group} | {c.width} | {c.description} |")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -366,8 +386,11 @@ def plot(run, out_dir):
     plt.close(fig)
     files.append(path)
 
-    groups = shape_map_cases.GROUPS
-    fig, axs = plt.subplots(2, 3, figsize=(19, 12), facecolor="white", layout="constrained")
+    groups = run_groups(run)
+    ncols = 3 if len(groups) <= 5 else 4 if len(groups) <= 7 else 3
+    nrows = -(-(len(groups) + 1) // ncols)
+    fig, axs = plt.subplots(nrows, ncols, figsize=(6.3 * ncols, 6 * nrows), facecolor="white",
+                            layout="constrained")
     axs = axs.ravel()
     names = {g: [c.name for c in shape_map_cases.CASES if c.group == g] for g in groups}
     for k, g in enumerate(groups):
@@ -376,8 +399,9 @@ def plot(run, out_dir):
         mesh = ax.pcolormesh(xe, ye, np.log10(z), cmap=cmap, norm=norm)
         _axes(ax, run, f"{g} ({len(names[g])} cases): median speedup")
         _annotate(ax, run, np.log10(z), lambda i, j, z=z: f"{z[i, j]:.2f}", cmap, norm)
-    ax = axs[-1]
-    ax.axis("off")
+    for ax in axs[len(groups):]:
+        ax.axis("off")
+    ax = axs[len(groups)]
     text = "\n".join(f"{g}: " + ", ".join(names[g]) for g in groups)
     ax.text(0, 0.62, "Cases per group\n\n" + text.replace(", ", ",\n    ")
             + "\n\n" + header.replace(", NumPy", ",\nNumPy").replace(": ", ":\n", 1)
@@ -409,11 +433,16 @@ def main():
     p.add_argument("--repeat", type=int, help="timed runs per measurement (best of, default 3)")
     p.add_argument("--max-cols", type=int, default=1_000)
     p.add_argument("--max-rows", type=int, default=1_000)
+    p.add_argument("--groups", type=lambda s: s.split(","),
+                   help="comma-separated case groups (default: all); with --plot: report "
+                        "only these groups of the run")
     p.add_argument("--plot", metavar="SHAPE_MAP_JSON", help="only redraw the reports of a run")
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
     if args.plot:
         run = json.load(open(args.plot, encoding="utf-8"))
+        if args.groups:
+            run = select_groups(run, args.groups)
     else:
         run = run_map(args)
         with open(os.path.join(args.out, "shape_map.json"), "w", encoding="utf-8") as f:

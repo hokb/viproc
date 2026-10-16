@@ -153,6 +153,32 @@ def test_mask_assignment_of_a_scalar_needs_no_sync():
     assert np.array_equal(np.asarray(y), e)
 
 
+def test_partial_writes_after_copy_on_write_keep_the_other_elements():
+    # A live export (or a pending reader) makes the write copy-on-write. The
+    # array is the only view of its storage, but masked assignment and
+    # scatter write only some elements: the others must come from the old
+    # buffer (they were left as fresh memory before).
+    rng = np.random.default_rng(8)
+    x = rng.uniform(0.5, 1.5, size=(300, 100))  # large: tasks, not the direct path
+    idx = np.arange(0, 300, 3)
+    for write in (lambda a: a.__setitem__(a > 1.4, 0.6),
+                  lambda a: a.__setitem__(idx, -1.0),
+                  lambda a: a.__setitem__((idx, slice(None, None, 2)), a[idx, ::2] * 2.0)):
+        e = x * 1.07
+        before = e.copy()
+        write(e)
+        y = viproc.asarray(x) * 1.07
+        exported = np.asarray(y)  # a reader of y's buffer while it lives
+        write(y)
+        assert np.array_equal(np.asarray(y), e)
+        assert np.array_equal(exported, before)
+        y = viproc.asarray(x) * 1.07
+        t = y + 0.0  # a (possibly still pending) task reader
+        write(y)
+        assert np.array_equal(np.asarray(y), e)
+        assert np.array_equal(np.asarray(t), before)
+
+
 def test_boolean_mask_indexing():
     rng = np.random.default_rng(7)
     x = rng.standard_normal((20, 7))

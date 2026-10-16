@@ -214,12 +214,16 @@ class ScatterKernel : public Kernel {
         return e.empty() ? KernelResult{} : KernelResult{1, e, 0};
     }
 
+    bool writes_all() const override { return false; }
+
   private:
     IndexSpec spec_;
 };
 
 class MaskAssignKernel : public Kernel {
   public:
+    bool writes_all() const override { return false; }
+
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Layout& dst = outputs[0].layout;
         const std::size_t item = itemsize(dst.dtype);

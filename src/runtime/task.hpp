@@ -63,6 +63,11 @@ class Kernel {
     // `out=` and temporary elision). The task may then hand a dying input's
     // block to the output (Task::execute, design doc D11).
     virtual bool in_place_ok() const { return false; }
+    // True if the kernel writes every element of its in/out operands. Only
+    // then may copy-on-write give a consolidated in/out array a fresh buffer
+    // without copying the old data into it (Runtime::issue, step 2); kernels
+    // that write a subset (scatter, masked assignment) keep the others.
+    virtual bool writes_all() const { return true; }
 };
 
 struct TaskError {
