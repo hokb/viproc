@@ -1,9 +1,9 @@
 # viproc
 
 **Array instruction-level parallelism for NumPy programs.** viproc, a virtual processor for
-serial array instruction streams, finds the parallel
-potential between the array instructions of a regular, sequentially written NumPy program,
-automatically and without annotations, and runs it on parallel hardware.
+serial array instruction streams, finds the parallel potential between the array instructions
+of a regular, sequentially written NumPy program, automatically and without annotations, and
+runs it on parallel hardware.
 
 ## What viproc does
 
