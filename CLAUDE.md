@@ -721,7 +721,7 @@ Rules:
   scalar indexing returns NumPy's scalar if the array is ready, else a 0-d
   copy (no sync); `np.where(cond, x, y)` as a select task (NumPy's result
   dtype, x and y cast to it, layout order K);
-  `__setitem__` with basic keys (assign kernel); **reductions** (NumPy ≥
+  index assignment with basic keys (assign kernel, see below); **reductions** (NumPy ≥
   2.3): `ufunc.reduce` of reorderable ufuncs (add, multiply, minimum,
   maximum, fmin, fmax, logical and/or/xor, bitwise and/or/xor) and
   `np.sum/prod/min/max/amin/amax/any/all` (also as methods) without
@@ -753,6 +753,20 @@ Rules:
   direct path would cost ~0.9 µs. `reshape(shape)` / `swapaxes(i, j)` with
   exact ints are C methods too (views, `reshape_view`); orders, copies
   and other argument types go to `_reshape_py` / `_swapaxes_py`.
+- **Index assignment in C** (`_Array.mp_ass_subscript`, `a[key] = value`):
+  every array involved (target, viproc arrays in the key, the value)
+  ready, nothing reading the target's buffer (`vp_array_host_writable`)
+  and the target (or the written view of a basic key) at most `sync_below`
+  elements: NumPy's own slot (`PyArray_Type.tp_as_mapping->
+  mp_ass_subscript`) runs on a borrowed writable view, key arrays and the
+  value borrowed too (design doc D7), so values, casts and errors are
+  NumPy's for every key kind. Otherwise basic keys issue an assignment:
+  the target is a view, the value a viproc array (`vp_assign` casts) or a
+  Python/NumPy scalar converted at issue with `PyArray_Pack`
+  (`vp_array_from_item`, NumPy's conversion and errors); the task only
+  copies. Advanced keys, sequences as values and errors of `vp_assign` go
+  to the hook `_setitem` (scatter / masked assignment tasks, fallback).
+  `out[3] = s` 0.22 µs (NumPy 0.16; it was 3.1 µs in Python).
 - **0-d results and the scalar shortcut.** Where NumPy returns a scalar
   (full reductions, `a[i, j]`, ufuncs on 0-d operands), viproc returns
   NumPy's scalar if the data is there already (the op ran directly), else

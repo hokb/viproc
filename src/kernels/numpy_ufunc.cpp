@@ -3,6 +3,8 @@
 #include "runtime/pool.hpp"
 
 #define NPY_NO_DEPRECATED_API NPY_2_0_API_VERSION
+// NumPy >= 2.0 is required anyway; 2.0 adds PyArray_Pack to the C API.
+#define NPY_TARGET_VERSION NPY_2_0_API_VERSION
 #define PY_ARRAY_UNIQUE_SYMBOL viproc_ARRAY_API
 #define PY_UFUNC_UNIQUE_SYMBOL viproc_UFUNC_API
 #include <numpy/arrayobject.h>
@@ -909,6 +911,18 @@ ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype) {
     auto buffer = make_pooled<Buffer>(l.nbytes());
     std::memcpy(buffer->data(), PyArray_DATA(reinterpret_cast<PyArrayObject*>(arr)), l.nbytes());
     Py_DECREF(arr);
+    return rt.wrap(std::move(l), std::move(buffer));
+}
+
+ArrayPtr item_array(Runtime& rt, PyObject* value, DType dtype) {
+    PyArray_Descr* descr = PyArray_DescrFromType(type_num(dtype));
+    Layout l = Layout::contiguous(dtype, {});
+    auto buffer = make_pooled<Buffer>(l.nbytes());
+    const int status = PyArray_Pack(descr, buffer->data(), value);
+    Py_DECREF(descr);
+    if (status < 0) {
+        return nullptr;
+    }
     return rt.wrap(std::move(l), std::move(buffer));
 }
 

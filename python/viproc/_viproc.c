@@ -60,6 +60,7 @@ static PyObject* g_np_generic = NULL;    /* numpy.generic */
 static PyObject* g_np_integer = NULL;    /* numpy.integer */
 static PyObject* g_ops = NULL;           /* dict: operator name -> ufunc */
 static PyObject* g_getitem = NULL;       /* getitem(a, key): a[key] beyond the C fast path */
+static PyObject* g_setitem = NULL;       /* setitem(a, key, v): a[key] = v beyond C */
 
 /* Caches (main thread only). */
 
@@ -1510,8 +1511,193 @@ static PyObject* Array_subscript(PyObject* self, PyObject* key) {
     return PyObject_CallFunctionObjArgs(g_getitem, self, key, NULL);
 }
 
+static int64_t array_size(vp_array* a);
+
+/* Viproc arrays in an index key (the key or the items of a key tuple):
+ * *found counts them, *pending those not ready. */
+static void key_arrays(PyObject* key, int* found, int* pending) {
+    PyObject* const* items = PyTuple_Check(key) ? &PyTuple_GET_ITEM(key, 0) : &key;
+    const Py_ssize_t n = PyTuple_Check(key) ? PyTuple_GET_SIZE(key) : 1;
+    *found = *pending = 0;
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        if (is_array(items[i])) {
+            ++*found;
+            *pending += !vp_array_ready(((ArrayObject*)items[i])->a);
+        }
+    }
+}
+
+/* Ends a borrow (vp_array_borrow): a view NumPy kept a reference to becomes a
+ * read-only export. */
+static int end_borrow(vp_array* a, PyObject* view) {
+    int r = 0;
+    if (Py_REFCNT(view) > 1 && vp_array_pin(a, view) != VP_OK) {
+        r = -1;
+    }
+    Py_DECREF(view);
+    return r;
+}
+
+/* The key with its (ready) viproc arrays replaced by borrowed NumPy views;
+ * the views are appended to `borrowed` (pairs of array object and view). */
+static PyObject* borrow_key(PyObject* key, PyObject* borrowed) {
+    if (is_array(key)) {
+        PyObject* v = vp_array_borrow(((ArrayObject*)key)->a);
+        if (v == NULL || PyList_Append(borrowed, key) < 0 || PyList_Append(borrowed, v) < 0) {
+            Py_XDECREF(v);
+            return NULL;
+        }
+        return v; /* the list holds one reference, the caller this one */
+    }
+    if (!PyTuple_Check(key)) {
+        return Py_NewRef(key);
+    }
+    const Py_ssize_t n = PyTuple_GET_SIZE(key);
+    PyObject* t = PyTuple_New(n);
+    for (Py_ssize_t i = 0; t != NULL && i < n; ++i) {
+        PyObject* k = borrow_key(PyTuple_GET_ITEM(key, i), borrowed);
+        if (k == NULL) {
+            Py_CLEAR(t);
+            break;
+        }
+        PyTuple_SET_ITEM(t, i, k);
+    }
+    return t;
+}
+
+/* a[key] = value by NumPy itself: its mapping slot (array_assign_subscript)
+ * called on a borrowed, writable view of a's buffer, viproc arrays in the key
+ * and the value as borrowed views too. Only when NumPy may write the buffer
+ * right now (vp_array_host_writable) and every viproc array involved is
+ * ready: then no task touches the memory during the call, and the view never
+ * reaches user code (design doc D7). Values, casts, errors: NumPy's. */
+static int numpy_setitem(PyObject* self, PyObject* key, PyObject* value, int nkey) {
+    vp_array* x = ((ArrayObject*)self)->a;
+    PyObject* borrowed = PyList_New(0);
+    PyObject* view = borrowed != NULL ? vp_array_borrow(x) : NULL;
+    PyObject* k = view == NULL ? NULL : nkey ? borrow_key(key, borrowed) : Py_NewRef(key);
+    PyObject* v = NULL;
+    if (k != NULL) {
+        v = is_array(value) ? vp_array_borrow(((ArrayObject*)value)->a) : Py_NewRef(value);
+    }
+    int r = -1;
+    if (v != NULL) {
+        r = ((PyTypeObject*)g_np_ndarray)->tp_as_mapping->mp_ass_subscript(view, k, v);
+    }
+    if (v != NULL && is_array(value) && end_borrow(((ArrayObject*)value)->a, v) < 0) {
+        r = -1;
+    } else if (v != NULL && !is_array(value)) {
+        Py_DECREF(v);
+    }
+    Py_XDECREF(k);
+    for (Py_ssize_t i = 0; borrowed != NULL && i + 1 < PyList_GET_SIZE(borrowed); i += 2) {
+        PyObject* bv = PyList_GET_ITEM(borrowed, i + 1); /* the list's reference only */
+        if (Py_REFCNT(bv) > 1 &&
+            vp_array_pin(((ArrayObject*)PyList_GET_ITEM(borrowed, i))->a, bv) != VP_OK) {
+            r = -1;
+        }
+    }
+    Py_XDECREF(borrowed);
+    if (view != NULL && end_borrow(x, view) < 0) {
+        r = -1;
+    }
+    return r;
+}
+
+/* True for the values NumPy's a[i] = value converts with PyArray_Pack
+ * without a sequence: Python and NumPy scalars. */
+static int is_scalar_value(PyObject* v) {
+    return PyFloat_Check(v) || PyLong_Check(v) || PyComplex_Check(v) ||
+           PyObject_TypeCheck(v, (PyTypeObject*)g_np_generic);
+}
+
+static int call_setitem_hook(PyObject* self, PyObject* key, PyObject* value) {
+    if (g_setitem == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "viproc: setup() was not called");
+        return -1;
+    }
+    PyObject* r = PyObject_CallFunctionObjArgs(g_setitem, self, key, value, NULL);
+    Py_XDECREF(r);
+    return r == NULL ? -1 : 0;
+}
+
+/* a[key] = value. Small work on ready data (every array involved ready, the
+ * written part at most sync_below elements, nothing reading a's buffer): NumPy
+ * assigns, synchronously, as in a NumPy program. Otherwise basic keys are
+ * issued as an assignment: the value is converted now (scalars as NumPy's
+ * a[i] = value converts them), the target is a view, the task copies.
+ * Everything else (advanced keys, sequences as values, errors of the async
+ * path) goes to the Python hook, which keeps NumPy's semantics. */
+static int Array_ass_subscript(PyObject* self, PyObject* key, PyObject* value) {
+    if (value == NULL) {
+        PyErr_SetString(PyExc_ValueError, "cannot delete array elements");
+        return -1;
+    }
+    if (check_runtime() < 0) {
+        return -1;
+    }
+    if (((ArrayObject*)self)->readonly) {
+        PyErr_SetString(PyExc_ValueError, "assignment destination is read-only");
+        return -1;
+    }
+    vp_array* x = ((ArrayObject*)self)->a;
+    int nkey, kpending;
+    key_arrays(key, &nkey, &kpending);
+    const int val_array = is_array(value);
+    const int all_ready = !kpending && (!val_array || vp_array_ready(((ArrayObject*)value)->a));
+    const int writable = all_ready && vp_array_host_writable(x);
+    if (writable && array_size(x) <= g_small) {
+        return numpy_setitem(self, key, value, nkey);
+    }
+    PyObject* target = NULL;
+    if (nkey == 0) {
+        PyObject* args[2] = {self, key};
+        target = m_basic_view(NULL, args, 2);
+        if (target == NULL) {
+            PyErr_Clear(); /* the hook raises NumPy's error */
+        } else if (target == Py_None) {
+            Py_CLEAR(target);
+        }
+    }
+    if (target == NULL) { /* advanced key: scatter / masked assignment tasks */
+        return call_setitem_hook(self, key, value);
+    }
+    vp_array* t = ((ArrayObject*)target)->a;
+    if (writable && array_size(t) <= g_small) {
+        Py_DECREF(target);
+        return numpy_setitem(self, key, value, nkey);
+    }
+    PyObject* src = NULL;
+    if (val_array) {
+        src = Py_NewRef(value); /* another dtype: vp_assign casts */
+    } else if (is_scalar_value(value)) {
+        vp_array* s = NULL;
+        if (vp_array_from_item(g_rt, value, vp_array_dtype(x), &s) != VP_OK) {
+            Py_DECREF(target);
+            return -1; /* NumPy's conversion error, as a[i] = value raises it */
+        }
+        src = wrap_array(s);
+    }
+    if (src == NULL) {
+        Py_DECREF(target);
+        return PyErr_Occurred() ? -1 : call_setitem_hook(self, key, value);
+    }
+    char err[ERRLEN] = "";
+    const int status = vp_assign(g_rt, t, ((ArrayObject*)src)->a, issue_site(), err, sizeof err);
+    Py_DECREF(src);
+    Py_DECREF(target);
+    if (status == VP_OK) {
+        return 0;
+    }
+    if (status == VP_INVALID || status == VP_UNSUPPORTED) {
+        return call_setitem_hook(self, key, value); /* NumPy's error or cast */
+    }
+    return raise_status(status, err);
+}
+
 static PyMappingMethods Array_as_mapping = {
     .mp_subscript = Array_subscript,
+    .mp_ass_subscript = Array_ass_subscript,
 };
 
 static PyTypeObject ArrayType = {
@@ -1532,10 +1718,11 @@ static PyTypeObject ArrayType = {
 
 static PyObject* m_setup(PyObject* self, PyObject* args) {
     (void)self;
-    PyObject *cls, *dtypes, *fallback, *asarray, *dirs, *ops, *ndarray, *generic, *getitem;
-    if (!PyArg_ParseTuple(args, "O!O!OOO!O!OOO", &PyType_Type, &cls, &PyTuple_Type, &dtypes,
+    PyObject *cls, *dtypes, *fallback, *asarray, *dirs, *ops, *ndarray, *generic, *getitem,
+        *setitem;
+    if (!PyArg_ParseTuple(args, "O!O!OOO!O!OOOO", &PyType_Type, &cls, &PyTuple_Type, &dtypes,
                           &fallback, &asarray, &PyTuple_Type, &dirs, &PyDict_Type, &ops, &ndarray,
-                          &generic, &getitem)) {
+                          &generic, &getitem, &setitem)) {
         return NULL;
     }
     if (!PyType_IsSubtype((PyTypeObject*)cls, &ArrayType) || PyTuple_GET_SIZE(dtypes) != 7) {
@@ -1555,6 +1742,7 @@ static PyObject* m_setup(PyObject* self, PyObject* args) {
     Py_XSETREF(g_np_ndarray, Py_NewRef(ndarray));
     Py_XSETREF(g_np_generic, Py_NewRef(generic));
     Py_XSETREF(g_getitem, Py_NewRef(getitem));
+    Py_XSETREF(g_setitem, Py_NewRef(setitem));
     PyObject* np = PyImport_ImportModule("numpy");
     Py_XSETREF(g_np_integer, np != NULL ? PyObject_GetAttrString(np, "integer") : NULL);
     Py_XDECREF(np);

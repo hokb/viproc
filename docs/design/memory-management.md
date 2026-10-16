@@ -408,6 +408,14 @@ construction, at NumPy's cost plus the borrow.
   turned into a regular export (`host_views`). A result that is the view
   itself (`astype(copy=False)` of the same dtype) maps to `a`; an ndarray
   result is fresh memory and adopted (Import).
+- **Index assignment** (`a[key] = value`, small ready target) writes
+  through the borrow: NumPy's mapping slot runs on the borrowed view. This
+  needs more than readiness: no task may still read the buffer and no
+  export may be alive (`vp_array_host_writable`: ready, no stored error,
+  no `async_reads`, no `host_views`), else a reader would see the new
+  values. Key arrays and the value are borrowed in the same
+  call and pinned afterwards if NumPy kept them. Otherwise the assignment
+  is a task (copy-on-write as for any in/out op).
 - Not delegated: reductions with an axis or keepdims that `vp_reduce`
   covers (its direct path is cheaper than NumPy's call plus adopting the
   result array), and larger or pending inputs (`vp_reduce`

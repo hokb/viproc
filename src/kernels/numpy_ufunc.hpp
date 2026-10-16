@@ -200,6 +200,10 @@ bool ndarray_layout(PyObject* arr, Layout& layout, void*& data, std::size_t& nby
 // A ready 0-d array holding `value` converted to `dtype` by NumPy (nullptr
 // with a Python exception set on failure).
 ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype);
+// A ready 0-d array holding `value` converted as NumPy's a[i] = value
+// converts it (PyArray_Pack: dtype discovery, the dtype's setitem, a cast),
+// so values and errors are NumPy's. nullptr with the Python error set.
+ArrayPtr item_array(Runtime& rt, PyObject* value, DType dtype);
 
 // NumPy's resolution of a reduction of `in_descr` with the binary `ufunc`
 // (ufunc._resolve_dtypes_and_context((None, in_descr, None), signature=

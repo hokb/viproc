@@ -484,6 +484,20 @@ same change.
   0.7) still go through Python at small sizes; their kernels are at
   parity on one worker.
 
+**Index assignment in C** (`_Array.mp_ass_subscript`, build
+`2026-10-16T11:39:22 #f5e952ad`, same VM, all results bit-identical):
+small ready assignments run in NumPy's own slot on a borrowed view, the
+rest as assign tasks with the value converted at issue. Micro (10 x 10,
+ready, µs incl. call overhead, NumPy / viproc): `out[3] = s` 0.16 / 0.22
+(was 3.1), `out[:4] = s` 0.65 / 0.51, `x[3] = r` 0.41 / 0.38,
+`x[m] = 0.6` 0.77 / 0.96 (was 5.2), loop body
+`out[3] = np.sum(np.abs(np.sin(a[:, 3])))` 2.3 / 3.9 (was 8.5). Map
+medians (<= 2,048 / >= 100,000 elements): loops 0.55 / 0.66 -> 0.65 /
+0.72, expressions 0.64 -> 0.73 (small); `loop_cols` 0.38-0.64x ->
+0.60-0.84x. Cells below 0.95x unchanged (35 -> 36, noise): what remains
+is the tiny-ufunc overhead (P4), pending chains and the full-buffer
+copy-on-write of `loop_scan` (0.02x at 1000 x 1000).
+
 ## Other machines
 
 **i7-12700K, 20 logical cores (8 P-cores with HT + 4 E-cores), 31 GiB,
