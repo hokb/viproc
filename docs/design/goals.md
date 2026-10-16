@@ -9,13 +9,14 @@ of the maintainer.
 ## G1 — Main goal (central claim)
 
 **viproc automatically identifies the parallel potential within and
-throughout large sections of regular, annotated NumPy programs and uses it
+throughout large sections of regular, un-annotated NumPy programs and uses it
 to feed parallel hardware efficiently.**
 
 - The program stays a regular, sequentially written NumPy program
   (`c = a + b`, `m = max(c)`, `s = sum(c, axis=0)`, …). It is not rewritten
-  for parallelism; at most it is annotated (`import viproc as np`,
-  `python -m viproc prog.py`, `VIPROC=1`).
+  for parallelism and carries no annotations; viproc is switched on from
+  outside (`python -m viproc prog.py`, `VIPROC=1`) or by the import
+  (`import viproc as np`).
 - The parallelism is **instruction-level parallelism for array
   instructions (array ILP)**: independent array instructions run
   concurrently, dependent ones keep only the local order needed for correct
@@ -47,8 +48,8 @@ any expression.** This is a hard rule: it holds for every expression,
 program, data size, shape and dtype, not only on average. A measurement
 below 0.95x is a defect, not an accepted cost of the asynchronous model.
 
-**Soft rule, no parallel potential: no slow-down beyond 3%.** Where a
-measurement has no parallel potential (for example a simple expression on
+**Soft rule, no sufficient parallel potential: no slow-down beyond 3%.**
+Where a measurement has no sufficient parallel potential (for example a simple expression on
 small data), no speed-up is expected, but viproc must not slow it down
 significantly either: the design target is at most 3% slower than NumPy.
 This is a soft design rule (a target that designs are judged by, within
@@ -96,7 +97,7 @@ before calling a result a violation or a fix.
 
 - **Instruction pipelining** (known from the ILNumerics Accelerator):
   overlapping consecutive iterations of a loop, so that even a loop body
-  without parallel potential of its own (`x = a[x + 1]` repeated) can run
+  without sufficient parallel potential of its own (`x = a[x + 1]` repeated) can run
   faster than NumPy.
 - Scaling beyond 4 cores, the remaining gufuncs (linalg, fft), per-op
   overhead on small data (G3): see `CLAUDE.md`, "Status and next steps"

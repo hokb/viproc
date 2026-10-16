@@ -220,10 +220,11 @@ ownership, release or reuse of memory.
 **`docs/design/goals.md`** collects the goals, non-goals and rules every
 change is judged by; read it before design decisions. In short: G1, the
 central claim, is to find the parallel potential within and throughout
-large sections of regular NumPy programs automatically and feed parallel
-hardware with it (strong scaling, array ILP only); G2, results identical
+large sections of regular, un-annotated NumPy programs automatically and
+feed parallel hardware with it (strong scaling, array ILP only); G2, results identical
 to NumPy; G3, **never slower than NumPy** (hard: never below 0.95x for any
-expression; soft: at most 3% slower where there is no parallel potential).
+expression; soft: at most 3% slower where there is no sufficient
+parallel potential).
 
 ### Phase 1 (current): MVP on CPUs
 
@@ -1066,8 +1067,8 @@ code, comments, docs and commit messages in English.
       medium 6.2x of ideal 20x, large 1.2–3.9x): find out whether memory
       bandwidth, the main thread's issue rate or worker wake-ups limit it.
 - [ ] Remaining per-op overhead on small data (`docs/design/goals.md`,
-      G3: never below 0.95x of NumPy, at most 3% slower without parallel
-      potential): `np.abs(x)` and other ufunc calls pay NumPy's
+      G3: never below 0.95x of NumPy, at most 3% slower without
+      sufficient parallel potential): `np.abs(x)` and other ufunc calls pay NumPy's
       override dispatch (~0.4 µs over NumPy), `copy`/`astype` the borrow
       and adoption (~0.4 µs), `np.transpose`/`np.moveaxis` still via
       NumPy's `__array_function__` into Python, index parsing for
