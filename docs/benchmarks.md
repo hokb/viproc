@@ -498,6 +498,27 @@ medians (<= 2,048 / >= 100,000 elements): loops 0.55 / 0.66 -> 0.65 /
 is the tiny-ufunc overhead (P4), pending chains and the full-buffer
 copy-on-write of `loop_scan` (0.02x at 1000 x 1000).
 
+**`np.where` in C, ufunc proxies, shorter single-call check**
+(callgrind, instructions per call incl. the Python loop around it, 10 x 10
+float64, ready, `OPENBLAS_NUM_THREADS=1`; NumPy / viproc before / after):
+
+| call | NumPy | before | after |
+|---|---:|---:|---:|
+| `np.where(m, x, y)` | 10,100 | 30,300 | 12,000 |
+| `np.where(m, x, 0.0)` | 11,300 | 47,300 | 12,700 |
+| `viproc.where(m, x, y)` (module mode) | 9,800 | - | 10,500 |
+| `viproc.where(m, x, 0.0)` (module mode) | 11,500 | - | 11,100 |
+| `viproc.abs(c)` (module mode) | 4,500 | 7,900 | 5,400 |
+| `viproc.add(c, y)` (module mode) | 5,500 | 8,200 | 6,200 |
+| `viproc.sin(c)` (module mode) | 12,500 | 15,900 | 13,000 |
+| `viproc.maximum(c, 0.5)` (module mode) | 7,600 | 11,400 | 9,300 |
+| `c * y` | 4,900 | 5,750 | 5,600 |
+
+"before" for module mode is the same call through NumPy's ufunc (the
+module returned NumPy's objects). Remaining gap of ufunc calls: the direct
+path (operand vector, buffer refcounts, result release), ~800-1,000
+instructions over NumPy's own call; scalar operands ~1,500.
+
 ### Element pool: shared LIFO per bin instead of per-thread caches
 
 Same 4-vCPU VM, back to back against `main` (`1adc652`), two rounds each,
