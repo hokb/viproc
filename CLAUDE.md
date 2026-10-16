@@ -777,6 +777,23 @@ Rules:
   copies. Advanced keys, sequences as values and errors of `vp_assign` go
   to the hook `_setitem` (scatter / masked assignment tasks, fallback).
   `out[3] = s` 0.22 µs (NumPy 0.16; it was 3.1 µs in Python).
+- **`np.where` in C** (`_Array.__array_function__`, `where_select` /
+  `where_delegate` in `_viproc.c`): a bool viproc condition with x and y
+  of one dtype, or one of them a Python scalar NEP 50 promotes weakly to
+  the other's dtype (converted with `PyArray_Pack`), is a select
+  (`vp_select`: direct for small ready data, else a task); other small
+  ready calls run NumPy's own `where` on borrowed views, its result
+  adopted; the rest goes to `_where` in Python. 100 elements: ~12,000
+  instructions (NumPy ~10,100; it was ~30,000 in Python).
+- **Module mode without NumPy's dispatch** (`import viproc as np`,
+  `python -m viproc`): `viproc.<ufunc>` for every element-wise NumPy ufunc
+  is a `_viproc.ufunc_proxy`: a call with a viproc argument goes straight
+  to `fast_ufunc`, skipping `PyUFunc_CheckOverride` (argument tuple,
+  kwargs dict, `__array_ufunc__` call: ~2,000 instructions); other calls
+  and every attribute (`reduce`, `outer`, `at`, `nin`, ...) are the
+  ufunc's, `__class__` is `numpy.ufunc` (isinstance holds), equality and
+  hash are the ufunc's, pickling gives `numpy.<name>`. `viproc.where` is
+  the same for `np.where`. `shape_map.py --module` measures this mode.
 - **0-d results and the scalar shortcut.** Where NumPy returns a scalar
   (full reductions, `a[i, j]`, ufuncs on 0-d operands), viproc returns
   NumPy's scalar if the data is there already (the op ran directly), else
@@ -1100,8 +1117,11 @@ code, comments, docs and commit messages in English.
       measures 12 and 20 workers in one run.
 - [ ] Remaining per-op overhead on small data (`docs/design/goals.md`,
       G3: never below 0.95x of NumPy, at most 3% slower without
-      sufficient parallel potential): `np.abs(x)` and other ufunc calls pay NumPy's
-      override dispatch (~0.4 µs over NumPy), `copy`/`astype` the borrow
+      sufficient parallel potential): `np.abs(x)` and other ufunc calls
+      on real NumPy pay NumPy's override dispatch (~2,000 instructions;
+      module mode skips it), the direct path itself ~800 over NumPy's
+      ufunc call (P4: operand vector, buffer refcounts), masked
+      assignment of small data ~2,500 over NumPy (borrows), `copy`/`astype` the borrow
       and adoption (~0.4 µs), `np.transpose`/`np.moveaxis` still via
       NumPy's `__array_function__` into Python, index parsing for
       advanced indexing (3–10 µs small).

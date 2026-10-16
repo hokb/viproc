@@ -13,6 +13,7 @@
 
 #include "kernels/numpy_iter.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 
@@ -544,6 +545,22 @@ bool single_call(std::span<const Layout* const> inputs, const Layout& out, std::
     // NumPy's trivial loop (try_trivial_single_output_loop): 0-d inputs with
     // stride 0; all other operands with the output's shape, either 1-d (with
     // their own strides) or all with the same C/F contiguity flags.
+    // The common case first: n-d operands of the output's shape, all C- and
+    // none F-contiguous (no extent-1 dimension): the trivial loop with
+    // stride = itemsize, as below, without the contiguity flags.
+    if (out.shape.size() >= 2 &&
+        std::find(out.shape.begin(), out.shape.end(), 1) == out.shape.end()) {
+        bool c_all = out.c_contiguous();
+        for (std::size_t i = 0; i < nin && c_all; ++i) {
+            c_all = inputs[i]->shape == out.shape && inputs[i]->c_contiguous();
+        }
+        if (c_all) {
+            for (std::size_t i = 0; i <= nin; ++i) {
+                strides[i] = isz(i < nin ? *inputs[i] : out);
+            }
+            return true;
+        }
+    }
     bool trivial = true;
     int order = -1;
     const bool one_d = out.shape.size() == 1;

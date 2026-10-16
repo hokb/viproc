@@ -63,8 +63,10 @@ def fits(case, elements, ram, itemsize=8):
     return elements * itemsize * case.mem <= MEM_BUDGET * ram
 
 
-def measure(case, shape, cores, workers, target, repeat, seed):
-    """NumPy and viproc time of one case at one shape (best of `repeat`)."""
+def measure(case, shape, cores, workers, target, repeat, seed, module=False):
+    """NumPy and viproc time of one case at one shape (best of `repeat`).
+    module: the viproc run calls the cases' `np.*` through the viproc module,
+    as `python -m viproc` / `import viproc as np` do (ufunc proxies, where)."""
     import viproc
 
     width = cores if case.width == "cores" else case.width
@@ -81,7 +83,12 @@ def measure(case, shape, cores, workers, target, repeat, seed):
     viproc.wait_all()
 
     def run():
-        out = case.run(vdata, reps)
+        if module:
+            shape_map_cases.np = viproc
+        try:
+            out = case.run(vdata, reps)
+        finally:
+            shape_map_cases.np = np
         viproc.wait_all()
         return out
 
@@ -158,7 +165,7 @@ def run_map(args):
              and (not args.groups or c.group in args.groups)]
     info = machine_info(cores, ram)
     info.update({"workers": workers, "repeat": repeat, "target_s": target,
-                 "rows": rows, "cols": cols, "cases": len(cases)})
+                 "rows": rows, "cols": cols, "cases": len(cases), "module": args.module})
     print(f"viproc shape map: {len(rows)} x {len(cols)} shapes + 0-d, {len(cases)} cases, "
           f"{cores} cores, {workers} workers, build {info['build']}", flush=True)
 
@@ -173,7 +180,8 @@ def run_map(args):
             if not fits(case, elements, ram):
                 skipped.append({"case": case.name, "shape": list(shape)})
                 continue
-            r = measure(case, shape, cores, workers, target, repeat, seed=si * 100 + ci)
+            r = measure(case, shape, cores, workers, target, repeat, seed=si * 100 + ci,
+                        module=args.module)
             r.update({"shape": list(shape), "shape_key": "x".join(map(str, shape)) or "0-d",
                       "elements": elements})
             point.append(r)
@@ -436,6 +444,8 @@ def main():
     p.add_argument("--groups", type=lambda s: s.split(","),
                    help="comma-separated case groups (default: all); with --plot: report "
                         "only these groups of the run")
+    p.add_argument("--module", action="store_true",
+                   help="viproc runs call np.* through the viproc module (python -m viproc)")
     p.add_argument("--plot", metavar="SHAPE_MAP_JSON", help="only redraw the reports of a run")
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)

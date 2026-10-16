@@ -13,6 +13,7 @@ own code gives viproc); ``with viproc.disabled():`` runs code as plain NumPy.
 
 import atexit
 import contextlib as _contextlib
+import copyreg as _copyreg
 import types as _types
 
 import numpy as _np
@@ -141,6 +142,21 @@ def disabled():
         yield
     finally:
         _ndarray._enabled[0] = previous
+
+
+# Element-wise ufuncs and np.where without NumPy's dispatch when called
+# through this module (`import viproc as np`, python -m viproc): a viproc
+# argument takes the C hot path right away; everything else is NumPy's own
+# function (attributes, other arguments, `isinstance(np.add, np.ufunc)`).
+for _name in dir(_np):
+    _f = getattr(_np, _name)
+    if isinstance(_f, _np.ufunc) and _f.signature is None and _f.nout == 1:
+        globals()[_name] = _viproc.ufunc_proxy(_f)
+where = _viproc.where
+del _name, _f
+# Pickled as NumPy's ufunc: unpickling gives numpy.<name>, no viproc needed.
+_copyreg.pickle(_viproc.ufunc_proxy,
+                lambda p: (__import__("pydoc").locate, ("numpy." + p._ufunc.__name__,)))
 
 
 def __getattr__(name):

@@ -57,6 +57,8 @@ static PyObject* g_asarray = NULL;       /* asarray(ndarray) -> viproc.ndarray *
 static PyObject* g_internal_dirs = NULL; /* tuple of path prefixes skipped for issue sites */
 static PyObject* g_np_ndarray = NULL;    /* numpy.ndarray */
 static PyObject* g_np_generic = NULL;    /* numpy.generic */
+static PyObject* g_where_func = NULL;    /* numpy.where */
+static PyObject* g_where_impl = NULL;    /* numpy.where._implementation */
 static PyObject* g_np_integer = NULL;    /* numpy.integer */
 static PyObject* g_ops = NULL;           /* dict: operator name -> ufunc */
 static PyObject* g_getitem = NULL;       /* getitem(a, key): a[key] beyond the C fast path */
@@ -1745,8 +1747,12 @@ static PyObject* m_setup(PyObject* self, PyObject* args) {
     Py_XSETREF(g_setitem, Py_NewRef(setitem));
     PyObject* np = PyImport_ImportModule("numpy");
     Py_XSETREF(g_np_integer, np != NULL ? PyObject_GetAttrString(np, "integer") : NULL);
+    Py_XSETREF(g_where_func, np != NULL ? PyObject_GetAttrString(np, "where") : NULL);
+    Py_XSETREF(g_where_impl, g_where_func != NULL
+                                 ? PyObject_GetAttrString(g_where_func, "_implementation")
+                                 : NULL);
     Py_XDECREF(np);
-    if (g_np_integer == NULL) {
+    if (g_np_integer == NULL || g_where_func == NULL || g_where_impl == NULL) {
         return NULL;
     }
     Py_RETURN_NONE;
@@ -2826,8 +2832,175 @@ static PyObject* red_method(const char* name, int* cache, PyObject* self, PyObje
 RED_METHODS(X)
 #undef X
 
+/* Number of elements of a where() operand for the delegate's size check:
+ * viproc arrays (ready only), ndarrays and scalars; -1 for anything else
+ * (lists, pending arrays): the Python handler decides. *nd/shape get its
+ * shape (at most MAXDIMS dimensions). */
+static int where_operand(PyObject* x, int* nd, int64_t* shape) {
+    if (is_array(x)) {
+        vp_array* a = ((ArrayObject*)x)->a;
+        if (!vp_array_ready(a) || vp_array_ndim(a) > MAXDIMS) {
+            return -1;
+        }
+        *nd = vp_array_ndim(a);
+        memcpy(shape, vp_array_shape(a), sizeof(int64_t) * (size_t)*nd);
+        return 0;
+    }
+    if (PyFloat_Check(x) || PyLong_Check(x) || PyComplex_Check(x) ||
+        PyObject_TypeCheck(x, (PyTypeObject*)g_np_generic)) {
+        *nd = 0;
+        return 0;
+    }
+    if (Py_TYPE(x) == (PyTypeObject*)g_np_ndarray) {
+        PyObject* t = PyObject_GetAttrString(x, "shape");
+        if (t == NULL || !PyTuple_Check(t) || PyTuple_GET_SIZE(t) > MAXDIMS) {
+            Py_XDECREF(t);
+            PyErr_Clear();
+            return -1;
+        }
+        *nd = (int)PyTuple_GET_SIZE(t);
+        for (int i = 0; i < *nd; ++i) {
+            shape[i] = PyLong_AsLongLong(PyTuple_GET_ITEM(t, i));
+        }
+        Py_DECREF(t);
+        return 0;
+    }
+    return -1;
+}
+
+/* Kind of a dtype or Python scalar for NEP 50's weak promotion: bool 0,
+ * integer 1, floating 2, complex 3. */
+static int dtype_kind(vp_dtype d) {
+    return d == VP_BOOL ? 0 : d <= VP_INT64 ? 1 : d <= VP_FLOAT64 ? 2 : 3;
+}
+static int scalar_kind(PyObject* v) {
+    return PyBool_Check(v)           ? 0
+           : PyLong_CheckExact(v)    ? 1
+           : PyFloat_CheckExact(v)   ? 2
+           : PyComplex_CheckExact(v) ? 3
+                                     : -1;
+}
+
+/* np.where(cond, x, y) as a select (vp_select: run directly for small ready
+ * data, asynchronously otherwise) when NumPy's result dtype needs no cast:
+ * a bool viproc condition, x and y viproc arrays of one dtype, or one of
+ * them a Python scalar that NEP 50 promotes weakly to the other's dtype
+ * (converted now, as NumPy converts it). NULL without an error otherwise. */
+static PyObject* where_select(PyObject* fargs, PyObject* fkw) {
+    if (PyTuple_GET_SIZE(fargs) != 3 || PyDict_GET_SIZE(fkw) != 0) {
+        return NULL;
+    }
+    PyObject *c = PyTuple_GET_ITEM(fargs, 0), *x = PyTuple_GET_ITEM(fargs, 1),
+             *y = PyTuple_GET_ITEM(fargs, 2);
+    if (!is_array(c) || vp_array_dtype(((ArrayObject*)c)->a) != VP_BOOL) {
+        return NULL;
+    }
+    const int xa = is_array(x), ya = is_array(y);
+    vp_dtype d;
+    if (xa && ya) {
+        d = vp_array_dtype(((ArrayObject*)x)->a);
+        if (vp_array_dtype(((ArrayObject*)y)->a) != d) {
+            return NULL;
+        }
+    } else if (xa || ya) {
+        d = vp_array_dtype(((ArrayObject*)(xa ? x : y))->a);
+        const int k = scalar_kind(xa ? y : x);
+        if (k < 0 || k > dtype_kind(d)) {
+            return NULL;
+        }
+    } else {
+        return NULL;
+    }
+    vp_array* conv = NULL;
+    if (!(xa && ya) && vp_array_from_item(g_rt, xa ? y : x, d, &conv) != VP_OK) {
+        PyErr_Clear(); /* NumPy raises its own error */
+        return NULL;
+    }
+    vp_array* r = NULL;
+    char err[ERRLEN] = "";
+    const int status =
+        vp_select(g_rt, ((ArrayObject*)c)->a, xa ? ((ArrayObject*)x)->a : conv,
+                  ya ? ((ArrayObject*)y)->a : conv, &r, issue_site(), err, sizeof err);
+    if (conv != NULL) {
+        vp_array_release(conv);
+    }
+    if (status == VP_INVALID || status == VP_UNSUPPORTED) {
+        return NULL; /* broadcasting errors: NumPy's, from the handlers */
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    return wrap_array(r);
+}
+
+/* np.where(cond, x, y) of small ready data: NumPy's own where on borrowed
+ * views of the viproc operands (design doc D7), its fresh result adopted.
+ * Values, dtype, broadcasting and errors are NumPy's. NULL without an error
+ * when the call is not small and ready: the Python handler (a select task). */
+static PyObject* where_delegate(PyObject* fargs, PyObject* fkw) {
+    if (PyTuple_GET_SIZE(fargs) != 3 || PyDict_GET_SIZE(fkw) != 0) {
+        return NULL;
+    }
+    int out_nd = 0;
+    int64_t out_shape[MAXDIMS];
+    for (int i = 0; i < 3; ++i) {
+        int nd;
+        int64_t shape[MAXDIMS];
+        if (where_operand(PyTuple_GET_ITEM(fargs, i), &nd, shape) < 0) {
+            return NULL;
+        }
+        for (int k = 0; k < nd; ++k) { /* broadcast, right-aligned; NumPy checks */
+            const int o = MAXDIMS - nd + k;
+            const int64_t cur = o >= MAXDIMS - out_nd ? out_shape[o] : 1;
+            out_shape[o] = cur == 1 ? shape[k] : cur;
+        }
+        if (nd > out_nd) {
+            out_nd = nd;
+        }
+    }
+    int64_t size = 1;
+    for (int o = MAXDIMS - out_nd; o < MAXDIMS; ++o) {
+        size *= out_shape[o];
+    }
+    if (size > g_small) {
+        return NULL;
+    }
+    PyObject* t = PyTuple_New(3);
+    PyObject* views[3] = {NULL, NULL, NULL};
+    for (int i = 0; t != NULL && i < 3; ++i) {
+        PyObject* x = PyTuple_GET_ITEM(fargs, i);
+        if (is_array(x) && (views[i] = red_borrow(((ArrayObject*)x)->a)) == NULL) {
+            Py_CLEAR(t);
+            break;
+        }
+        PyTuple_SET_ITEM(t, i, Py_NewRef(views[i] != NULL ? views[i] : x));
+    }
+    PyObject* r = t != NULL ? PyObject_Call(g_where_impl, t, NULL) : NULL;
+    Py_XDECREF(t);
+    for (int i = 0; i < 3; ++i) {
+        if (views[i] != NULL &&
+            end_borrow(((ArrayObject*)PyTuple_GET_ITEM(fargs, i))->a, views[i]) < 0) {
+            Py_CLEAR(r);
+        }
+    }
+    if (r != NULL && Py_TYPE(r) == (PyTypeObject*)g_np_ndarray) {
+        vp_array* a = NULL;
+        char err[ERRLEN] = "";
+        if (vp_array_from_ndarray(g_rt, r, &a, err, sizeof err) == VP_OK) {
+            Py_DECREF(r);
+            return wrap_array(a);
+        }
+        /* a dtype viproc does not support: NumPy's array, as the fallback */
+    }
+    if (r == NULL && !PyErr_Occurred()) {
+        PyErr_SetString(PyExc_RuntimeError, "viproc: where failed");
+    }
+    return r;
+}
+
 /* _Array.__array_function__(self, func, types, args, kwargs): NumPy's
- * reductions as the methods above; every other function in _ndarray.py. */
+ * reductions as the methods above, np.where of small ready data by NumPy;
+ * every other function in _ndarray.py. */
 static PyObject* Array_array_function(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
     if (nargs != 4 || !PyTuple_Check(args[2]) || !PyDict_Check(args[3])) {
         PyErr_SetString(PyExc_TypeError, "__array_function__(func, types, args, kwargs)");
@@ -2837,6 +3010,15 @@ static PyObject* Array_array_function(PyObject* self, PyObject* const* args, Py_
         return NULL;
     }
     PyObject *func = args[0], *fargs = args[2], *fkw = args[3];
+    if (func == g_where_func) {
+        PyObject* r = where_select(fargs, fkw);
+        if (r == NULL && !PyErr_Occurred()) {
+            r = where_delegate(fargs, fkw);
+        }
+        if (r != NULL || PyErr_Occurred()) {
+            return r;
+        }
+    }
     const RedSpec* sp = NULL;
     for (int i = 0; i < g_nred && sp == NULL; ++i) {
         sp = g_red[i].func == func && func != Py_None ? &g_red[i] : NULL;
@@ -3164,6 +3346,147 @@ static PyObject* m_issue_site(PyObject* self, PyObject* noargs) {
     return PyUnicode_FromString(issue_site());
 }
 
+/* ---- Module-level ufuncs and np.where without NumPy's dispatch -------- */
+
+/* viproc.<ufunc> (module mode: `import viproc as np`, python -m viproc): a
+ * proxy of an element-wise NumPy ufunc whose call takes the C hot path
+ * (fast_ufunc) right away when an argument is a viproc array, instead of
+ * NumPy's override dispatch (PyUFunc_CheckOverride: argument tuple, kwargs
+ * dict, __array_ufunc__ call; ~2,000 instructions). Every other call and
+ * every attribute (reduce, outer, at, nin, types, ...) goes to the ufunc
+ * itself; __class__ is numpy.ufunc, so isinstance(viproc.add, np.ufunc)
+ * holds. */
+typedef struct {
+    PyObject_HEAD PyObject* ufunc;
+    vectorcallfunc vectorcall;
+} UfuncProxy;
+
+static PyTypeObject UfuncProxyType; /* forward */
+
+static PyObject* UfuncProxy_vectorcall(PyObject* self, PyObject* const* args, size_t nargsf,
+                                       PyObject* kwnames) {
+    PyObject* uf = ((UfuncProxy*)self)->ufunc;
+    const Py_ssize_t n = PyVectorcall_NARGS(nargsf);
+    if (kwnames == NULL && n >= 1 && n <= MAXIN && g_rt != NULL) {
+        int any = 0;
+        for (Py_ssize_t i = 0; i < n; ++i) {
+            any |= is_array(args[i]);
+        }
+        if (any) {
+            PyObject* sc[MAXIN];
+            const int k = scalars_of(args, n, sc);
+            if (k < 0) {
+                return NULL;
+            }
+            if (k > 0) {
+                PyObject* r = PyObject_Vectorcall(uf, sc, (size_t)n, NULL);
+                release_all(sc, n);
+                return r;
+            }
+            PyObject* result = NULL;
+            const int r = fast_ufunc(uf, args, n, NULL, 0, &result);
+            if (r != 0) {
+                return r > 0 ? result : NULL;
+            }
+        }
+    }
+    return PyObject_Vectorcall(uf, args, nargsf, kwnames);
+}
+
+static PyObject* UfuncProxy_new(PyTypeObject* type, PyObject* args, PyObject* kw) {
+    PyObject* uf;
+    if (kw != NULL || !PyArg_ParseTuple(args, "O", &uf)) {
+        PyErr_SetString(PyExc_TypeError, "ufunc_proxy(ufunc)");
+        return NULL;
+    }
+    UfuncProxy* p = (UfuncProxy*)type->tp_alloc(type, 0);
+    if (p != NULL) {
+        p->ufunc = Py_NewRef(uf);
+        p->vectorcall = UfuncProxy_vectorcall;
+    }
+    return (PyObject*)p;
+}
+
+static void UfuncProxy_dealloc(PyObject* self) {
+    Py_XDECREF(((UfuncProxy*)self)->ufunc);
+    Py_TYPE(self)->tp_free(self);
+}
+
+static PyObject* UfuncProxy_getattro(PyObject* self, PyObject* name) {
+    PyObject* uf = ((UfuncProxy*)self)->ufunc;
+    if (PyUnicode_Check(name) && PyUnicode_CompareWithASCIIString(name, "__class__") == 0) {
+        return Py_NewRef((PyObject*)Py_TYPE(uf));
+    }
+    if (PyUnicode_Check(name) && PyUnicode_CompareWithASCIIString(name, "_ufunc") == 0) {
+        return Py_NewRef(uf);
+    }
+    return PyObject_GetAttr(uf, name);
+}
+
+static PyObject* unproxy(PyObject* o) {
+    return Py_TYPE(o) == &UfuncProxyType ? ((UfuncProxy*)o)->ufunc : o;
+}
+
+/* Equal to (and hashed as) the wrapped ufunc. */
+static PyObject* UfuncProxy_richcompare(PyObject* a, PyObject* b, int op) {
+    return PyObject_RichCompare(unproxy(a), unproxy(b), op);
+}
+
+static Py_hash_t UfuncProxy_hash(PyObject* self) {
+    return PyObject_Hash(((UfuncProxy*)self)->ufunc);
+}
+
+static PyObject* UfuncProxy_repr(PyObject* self) {
+    return PyObject_Repr(((UfuncProxy*)self)->ufunc);
+}
+
+static PyTypeObject UfuncProxyType = {
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "viproc._viproc.ufunc_proxy",
+    .tp_basicsize = sizeof(UfuncProxy),
+    .tp_dealloc = UfuncProxy_dealloc,
+    .tp_vectorcall_offset = offsetof(UfuncProxy, vectorcall),
+    .tp_call = PyVectorcall_Call,
+    .tp_repr = UfuncProxy_repr,
+    .tp_getattro = UfuncProxy_getattro,
+    .tp_richcompare = UfuncProxy_richcompare,
+    .tp_hash = UfuncProxy_hash,
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_VECTORCALL,
+    .tp_new = UfuncProxy_new,
+};
+
+/* viproc.where (module mode): np.where(cond, x, y) without NumPy's
+ * __array_function__ dispatch when a viproc array is among the arguments;
+ * everything else is numpy.where itself. */
+static PyObject* m_where(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
+                         PyObject* kwnames) {
+    (void)self;
+    if (kwnames == NULL && nargs == 3 && g_rt != NULL && g_where_func != NULL &&
+        (is_array(args[0]) || is_array(args[1]) || is_array(args[2]))) {
+        PyObject* t = PyTuple_New(3);
+        PyObject* kw = t != NULL ? PyDict_New() : NULL;
+        PyObject* r = NULL;
+        if (kw != NULL) {
+            for (int i = 0; i < 3; ++i) {
+                PyTuple_SET_ITEM(t, i, Py_NewRef(args[i]));
+            }
+            r = where_select(t, kw);
+            if (r == NULL && !PyErr_Occurred()) {
+                r = where_delegate(t, kw);
+            }
+        }
+        Py_XDECREF(t);
+        Py_XDECREF(kw);
+        if (r != NULL || PyErr_Occurred()) {
+            return r;
+        }
+    }
+    if (g_where_func == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "viproc: setup() was not called");
+        return NULL;
+    }
+    return PyObject_Vectorcall(g_where_func, args, (size_t)nargs, kwnames);
+}
+
 static PyMethodDef methods[] = {
     {"_issue_site", m_issue_site, METH_NOARGS, "The issue site an op issued here would get."},
     {"setup", m_setup, METH_VARARGS,
@@ -3211,6 +3534,8 @@ static PyMethodDef methods[] = {
      "gather(a, idx, idx_axes, result_axes, result_strides): a[idx...] (vp_gather)"},
     {"scatter", m_scatter, METH_VARARGS,
      "scatter(a, idx, idx_axes, result_axes, values): a[idx...] = values (vp_scatter)"},
+    {"where", (PyCFunction)(void (*)(void))m_where, METH_FASTCALL | METH_KEYWORDS,
+     "where(condition, [x, y]): numpy.where without NumPy's dispatch for viproc arrays"},
     {"select", m_select, METH_VARARGS, "select(cond, x, y): np.where(cond, x, y) (vp_select)"},
     {"mask_assign", m_mask_assign, METH_VARARGS, "mask_assign(a, mask, value): a[mask] = value"},
     {"matmul", m_matmul, METH_VARARGS,
@@ -3239,7 +3564,7 @@ static struct PyModuleDef module = {
 };
 
 PyMODINIT_FUNC PyInit__viproc(void) {
-    if (PyType_Ready(&ArrayType) < 0) {
+    if (PyType_Ready(&ArrayType) < 0 || PyType_Ready(&UfuncProxyType) < 0) {
         return NULL;
     }
     PyObject* m = PyModule_Create(&module);
@@ -3265,6 +3590,7 @@ PyMODINIT_FUNC PyInit__viproc(void) {
         PyModule_AddObjectRef(m, "AsyncError", AsyncError) < 0 ||
         PyModule_AddObjectRef(m, "AsyncIndexError", AsyncIndexError) < 0 ||
         PyModule_AddObjectRef(m, "_Array", (PyObject*)&ArrayType) < 0 ||
+        PyModule_AddObjectRef(m, "ufunc_proxy", (PyObject*)&UfuncProxyType) < 0 ||
         PyModule_AddStringConstant(m, "version", vp_version()) < 0) {
         Py_DECREF(m);
         return NULL;
