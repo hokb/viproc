@@ -20,6 +20,10 @@ runs it on parallel hardware.
 
 ## How it works
 
+viproc is different in that it avoids the restrictions of existing approaches by not even
+attempting to analyse program dependencies globally. Instead, array operations decide their
+own scheduling at runtime, in parallel and autonomously. There is no central scheduler.
+
 All array instructions are first freed from the sequential order the program text gives
 them. When they run, their order is decided strictly and only by their input data and its
 availability: an instruction runs as soon as its inputs are computed, independent
