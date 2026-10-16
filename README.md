@@ -6,7 +6,8 @@ instructions of a sequentially written program run in parallel whenever their in
 Dependencies are resolved at runtime by local decisions, without a DAG or ahead-of-time analysis.
 The goal is strong scaling of whole array programs; the actual computation is delegated to
 NumPy's own inner loops.
-See [CLAUDE.md](CLAUDE.md) for architecture and build instructions.
+See [docs/design/goals.md](docs/design/goals.md) for goals and non-goals and
+[CLAUDE.md](CLAUDE.md) for architecture and build instructions.
 
 ## Usage
 

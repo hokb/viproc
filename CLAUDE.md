@@ -43,8 +43,9 @@ to plain sequential NumPy execution.
   as possible, by the task that produces it**: right before its kernel
   runs, on the thread that runs it. It takes a dying input's block when it
   holds the only reference to it and the layouts match (element-wise
-  kernels: NumPy's elision at run time), else a block from the pool (the
-  thread's own last-released block of the bin first: hot in cache). The
+  kernels: NumPy's elision at run time), else a block from the pool (one
+  shared LIFO per size bin under a small lock: the most recently released
+  block first, hot in cache; no per-thread caches). The
   main thread creates the `Buffer` objects at issue (deferred, no memory);
   tasks reach `size_completed` at issue and `allocated` when they run.
   Pool allocations and releases happen on any thread
@@ -217,21 +218,19 @@ ownership, release or reuse of memory.
 
 ### Goals and non-goals
 
-- **Goal:** strong scaling of whole array programs: a fixed program gets
-  faster with more cores, because independent array instructions overlap.
-- **Non-goal:** weak scaling, and data parallelism *inside* a single array
-  op (splitting one op across threads). One instruction runs on one
-  thread, as one NumPy loop call (or the same sequence of loop calls
-  NumPy itself would make).
-- **Not a goal yet:** any optimization besides array ILP: own SIMD code,
-  kernel fusion, JIT code generation, GPU offloading. SIMD comes from
-  NumPy's loops. Do not add these, but do not make design decisions that
-  rule them out (keep device and memory handling behind an interface).
+**`docs/design/goals.md`** collects the goals, non-goals and rules every
+change is judged by; read it before design decisions. In short: G1, the
+central claim, is to find the parallel potential within and throughout
+large sections of regular, un-annotated NumPy programs automatically and
+feed parallel hardware with it (strong scaling, array ILP only); G2, results identical
+to NumPy; G3, **never slower than NumPy** (hard: never below 0.95x for any
+expression; soft: at most 3% slower where there is no sufficient
+parallel potential).
 
 ### Phase 1 (current): MVP on CPUs
 
 Goal: autonomous, asynchronous execution of array instructions on
-multicore CPUs.
+multicore CPUs (`docs/design/goals.md`).
 
 - **Compute kernels: official NumPy C code, taken from the installed
   NumPy at runtime.** We do not vendor or compile NumPy. The runtime looks
@@ -267,6 +266,7 @@ execution.
 
 ```
 docs/design/           Design documents (decisions with rationale)
+  goals.md             goals, non-goals, never-slower rule (G1-G3), roadmap
   memory-management.md ownership, release, pools, NumPy interop, COW
 docs/benchmarks.md     benchmark results: current breakdown per category and
                        case, progress per change, external machines,
@@ -980,7 +980,8 @@ Rules:
 - Keep the MVP small: prefer the simplest correct scheduling over
   optimizations until there is a benchmark that shows the need.
 - Measure success as strong scaling: benchmark whole array programs
-  (fixed problem size) against plain NumPy at 1, 2, 4, … worker threads.
+  (fixed problem size) against plain NumPy at 1, 2, 4, … worker threads,
+  and check the never-slower rule (`docs/design/goals.md`, G3).
 - **Benchmark suite** (`python/benchmarks/suite.py`): the yardstick for
   changes that affect performance; run it before and after. Score =
   100 x geomean over categories of geomean(efficiency), efficiency =
@@ -1081,8 +1082,9 @@ code, comments, docs and commit messages in English.
       HT) the suite scores 22 with medium/large at 11 (`chains_wide`
       medium 6.2x of ideal 20x, large 1.2–3.9x): find out whether memory
       bandwidth, the main thread's issue rate or worker wake-ups limit it.
-- [ ] Remaining per-op overhead on small data (design guideline: never
-      slower than NumPy): `np.abs(x)` and other ufunc calls pay NumPy's
+- [ ] Remaining per-op overhead on small data (`docs/design/goals.md`,
+      G3: never below 0.95x of NumPy, at most 3% slower without
+      sufficient parallel potential): `np.abs(x)` and other ufunc calls pay NumPy's
       override dispatch (~0.4 µs over NumPy), `copy`/`astype` the borrow
       and adoption (~0.4 µs), `np.transpose`/`np.moveaxis` still via
       NumPy's `__array_function__` into Python, index parsing for
