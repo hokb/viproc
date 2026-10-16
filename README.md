@@ -65,6 +65,19 @@ The execution model follows the
   program sections is found automatically from the stream of array operations alone, at
   runtime, without annotations or a rewrite of the program, and put to work on the parallel
   resources available.
+- **Fine-grained scheduling parallelizes where manual parallelization cannot.** Scheduling
+  decisions are made per array operation, so parallel execution is automated even where
+  manual parallelization finds no parallelism because its scope is too coarse: a loop whose
+  iterations depend on their order cannot be split with `Parallel.For` or `prange`, but the
+  independent array operations inside and across its iterations still overlap. Example from
+  the [decentralized array execution artifacts](https://github.com/hokb/decentralized-array-execution-artifacts2026/tree/main/Appendix/Part%202b%20Loop%20Parallelization)
+  (in NumPy terms; later iterations overwrite what earlier ones wrote):
+  ```python
+  for i in range(A.shape[1]):
+      ES[:i + 1] = np.abs(np.sin(A[:, i])).sum()
+  ```
+  `Parallel.For` gives wrong results here; the ILNumerics Accelerator runs the loop about 3x
+  faster than sequentially (1500 x 1500), with correct results.
 - **Identical results.** Every instruction is computed by NumPy's own inner loops (including
   their SIMD paths), called exactly as NumPy calls them. Results are bit-identical to plain
   NumPy; whatever viproc cannot run asynchronously with NumPy's semantics falls back to
