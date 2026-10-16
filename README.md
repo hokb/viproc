@@ -40,15 +40,18 @@ program or dependency analysis.
   computation. Every instruction issued but not yet completed is part of the window, so
   the parallel potential is found across loop iterations, function calls and module
   boundaries, wherever the program happens to go. There is no dependency graph and no
-  ahead-of-time analysis, so loops, branches and data-dependent control flow are no
-  obstacle.
-- **Synchronization points: element access and memory.** The program waits only where it
-  needs actual values: reading elements (`print(x)`, `float(s)`, `if (x > 0).any():`,
-  scalar indexing, handing data to code outside viproc). The window is also bounded, which
-  bounds the memory held by results in flight: when it is full (today 1000 active
-  instructions), the Python thread waits until part of it has completed.
+  ahead-of-time analysis. Data-dependent control flow is an obstacle, though: a branch on
+  array values (`if (x > 0).any():`) needs those values, so the look-ahead stops there.
+- **Synchronization points: element access and memory.** Where the program needs actual
+  values (`print(x)`, `float(s)`, `if (x > 0).any():`, scalar indexing, handing data to
+  code outside viproc), only the Python thread waits, at the position it has run ahead
+  to, and only for the instruction it needs. The array computations of all earlier
+  instructions keep progressing in parallel. The window is also bounded, which bounds the
+  memory held by results in flight: when it is full (today 1000 active instructions), the
+  Python thread waits until part of it has completed.
 
-The execution model follows the ILNumerics Accelerator, described in the paper
+The execution model follows the
+[ILNumerics Accelerator](https://ilnumerics.net/auto-parallelizing-numerical-code.html), described in the paper
 [*A Virtual Processor brings back the Free Lunch*](https://arxiv.org/abs/2605.30507)
 (2026; benchmark artifacts:
 [decentralized-array-execution-artifacts2026](https://github.com/hokb/decentralized-array-execution-artifacts2026)).
@@ -65,6 +68,13 @@ The execution model follows the ILNumerics Accelerator, described in the paper
   NumPy itself.
 - **Never slower than NumPy.** viproc must not make any expression slower than NumPy
   (hard limit 0.95x; where there is nothing to overlap, at most 3% slower by design).
+- **Designed for heterogeneous hardware and further JIT optimizations.** viproc runs on
+  multi-core CPUs today, but the approach is designed to include heterogeneous compute
+  resources into execution fully automatically, by adding cost-based device scheduling to
+  the autonomous decisions of the array operations. Further JIT optimizations apply, too:
+  pipelining (partial execution starts as soon as dependencies are partially completed),
+  operator fusion and multi-stage low-level kernel specialization. Some of them are already
+  deployed successfully in the ILNumerics Accelerator.
 
 The goal is strong scaling: a fixed program with a fixed problem size gets faster with more
 cores. Goals, non-goals and rules are in [docs/design/goals.md](docs/design/goals.md),
