@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <new>
 #include <string>
+#include <utility>
+#include <vector>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -115,19 +117,6 @@ std::size_t default_limit() {
 
 } // namespace
 
-struct ElementPool::Local {
-    Node* free[kBins];
-    bool allocator; // this thread allocates (keeps released blocks itself)
-};
-
-ElementPool::Local& ElementPool::local() {
-    // Trivially destructible on purpose, as in FixedPool: no destructor that
-    // could run after the thread's last release. Only the issuing thread
-    // allocates, and it lives as long as the process.
-    thread_local Local l{};
-    return l;
-}
-
 ElementPool& ElementPool::instance() {
     static ElementPool* pool = new ElementPool(); // never destroyed: blocks may
     return *pool;                                 // be released at exit
@@ -196,14 +185,16 @@ void ElementPool::system_release(void* block, std::size_t capacity) {
 
 void* ElementPool::allocate(std::size_t nbytes, std::size_t& capacity) {
     capacity = capacity_for(nbytes);
-    const int b = bin_of(capacity);
-    Local& l = local();
-    l.allocator = true;
-    if (l.free[b] == nullptr) {
-        l.free[b] = remote_[b].exchange(nullptr, std::memory_order_acquire);
+    Bin& bin = bins_[bin_of(capacity)];
+    Node* n = nullptr;
+    {
+        std::lock_guard lock(bin.mutex);
+        n = bin.head;
+        if (n != nullptr) {
+            bin.head = n->next;
+        }
     }
-    if (Node* n = l.free[b]) {
-        l.free[b] = n->next;
+    if (n != nullptr) {
         cached_.fetch_sub(static_cast<std::int64_t>(capacity), std::memory_order_relaxed);
         hits_.fetch_add(1, std::memory_order_relaxed);
         return n;
@@ -227,42 +218,34 @@ void ElementPool::release(void* block, std::size_t capacity) {
     }
     cached_.fetch_add(c, std::memory_order_relaxed);
     Node* n = static_cast<Node*>(block);
-    const int b = bin_of(capacity);
-    Local& l = local();
-    if (l.allocator) {
-        n->next = l.free[b];
-        l.free[b] = n;
-        return;
-    }
-    Node* head = remote_[b].load(std::memory_order_relaxed);
-    do {
-        n->next = head;
-    } while (!remote_[b].compare_exchange_weak(head, n, std::memory_order_release,
-                                               std::memory_order_relaxed));
+    Bin& bin = bins_[bin_of(capacity)];
+    std::lock_guard lock(bin.mutex);
+    n->next = bin.head;
+    bin.head = n;
 }
 
 void ElementPool::trim() {
-    Local& l = local();
     for (int b = 0; b < kBins; ++b) {
-        Node* lists[2] = {l.free[b], remote_[b].exchange(nullptr, std::memory_order_acquire)};
-        l.free[b] = nullptr;
-        for (Node* n : lists) {
-            while (n != nullptr) {
-                Node* next = n->next;
-                // Every block of a bin has the bin's capacity; recover it from
-                // the bin index.
-                std::size_t capacity = 0;
-                if (b < 8) {
-                    capacity = static_cast<std::size_t>(b + 1) * 16;
-                } else {
-                    const int g = (b - 8) / 8 + 7;
-                    const int j = (b - 8) % 8;
-                    capacity = static_cast<std::size_t>(8 + j + 1) << (g - 3);
-                }
-                cached_.fetch_sub(static_cast<std::int64_t>(capacity), std::memory_order_relaxed);
-                system_release(n, capacity);
-                n = next;
-            }
+        Node* n = nullptr;
+        {
+            std::lock_guard lock(bins_[b].mutex);
+            n = std::exchange(bins_[b].head, nullptr);
+        }
+        // Every block of a bin has the bin's capacity; recover it from the
+        // bin index.
+        std::size_t capacity = 0;
+        if (b < 8) {
+            capacity = static_cast<std::size_t>(b + 1) * 16;
+        } else {
+            const int g = (b - 8) / 8 + 7;
+            const int j = (b - 8) % 8;
+            capacity = static_cast<std::size_t>(8 + j + 1) << (g - 3);
+        }
+        while (n != nullptr) {
+            Node* next = n->next;
+            cached_.fetch_sub(static_cast<std::int64_t>(capacity), std::memory_order_relaxed);
+            system_release(n, capacity);
+            n = next;
         }
     }
 }

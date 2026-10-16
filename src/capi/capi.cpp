@@ -2,6 +2,7 @@
 
 #include "viproc/viproc.h"
 
+#include "kernels/numpy_matmul.hpp"
 #include "kernels/numpy_reduce.hpp"
 #include "kernels/numpy_ufunc.hpp"
 #include "runtime/assign.hpp"
@@ -109,6 +110,8 @@ struct vp_runtime {
     // One handle per resolved loop (node-based: stable addresses).
     std::unordered_map<const numpy::UfuncLoop*, vp_loop> handles;
     std::shared_ptr<Graveyard> graveyard = std::make_shared<Graveyard>();
+    // One matmul kernel per resolved loop.
+    std::unordered_map<const numpy::UfuncLoop*, std::shared_ptr<Kernel>> matmul_kernels;
 };
 
 // A vp_array* is an Array* holding one reference (no wrapper allocation).
@@ -207,6 +210,15 @@ int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_arr
     return VP_OK;
 }
 
+int vp_array_from_item(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array** out) {
+    ArrayPtr a = numpy::item_array(*rt->rt, value, to_dtype(dtype));
+    if (!a) {
+        return VP_PYERR;
+    }
+    *out = hand_out(std::move(a));
+    return VP_OK;
+}
+
 PyObject* vp_array_scalar(const vp_array* a) {
     const Array& x = arr(a);
     return numpy::scalar_object(x.layout().dtype, x.buffer()->data() + x.layout().offset);
@@ -264,6 +276,17 @@ int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
 
 PyObject* vp_array_export(const vp_array* a, int writable) {
     return numpy::export_ndarray(arr(a), writable != 0);
+}
+
+int vp_array_host_writable(vp_array* a) {
+    Array& x = arr(a);
+    return x.ready() && !x.storage()->last_error() && !x.buffer()->has_readers() ? 1 : 0;
+}
+
+PyObject* vp_array_borrow(const vp_array* a) { return numpy::borrow_ndarray(arr(a)); }
+
+int vp_array_pin(const vp_array* a, PyObject* view) {
+    return numpy::pin_borrowed(arr(a), view) ? VP_OK : VP_PYERR;
 }
 
 int vp_array_prepare_write(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
@@ -678,6 +701,63 @@ int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* valu
     return VP_OK;
 }
 
+namespace {
+// True if NumPy's gufunc iterator would take `a` as it is (NPY_ITER_ALIGNED):
+// the first element and every stride along an axis of extent > 1 are
+// multiples of the dtype's alignment.
+bool numpy_aligned(const Array& a) {
+    const Layout& l = a.layout();
+    const std::size_t align = l.dtype == DType::Complex64 || l.dtype == DType::Complex128
+                                  ? itemsize(l.dtype) / 2
+                                  : itemsize(l.dtype);
+    // A deferred buffer has no address yet; its pool block will be aligned
+    // (element_pool.cpp: alignment_for), so only the offset counts.
+    const std::byte* data = a.buffer()->data();
+    std::uintptr_t bits =
+        reinterpret_cast<std::uintptr_t>(data) + static_cast<std::uintptr_t>(l.offset);
+    for (std::size_t i = 0; i < l.shape.size(); ++i) {
+        if (l.shape[i] > 1) {
+            bits |= static_cast<std::uintptr_t>(l.strides[i]);
+        }
+    }
+    return bits % align == 0;
+}
+} // namespace
+
+int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_array** result,
+              const char* site, char* err, size_t errlen) {
+    rt->graveyard->drain();
+    const Layout& la = arr(a).layout();
+    const Layout& lb = arr(b).layout();
+    Layout out;
+    std::int64_t work = 0;
+    if (!numpy::matmul_layout(la, lb, out, work)) {
+        set_error(err, errlen, "matmul: dtypes or shapes NumPy does not take as they are");
+        return VP_UNSUPPORTED;
+    }
+    if (!numpy_aligned(arr(a)) || !numpy_aligned(arr(b))) {
+        set_error(err, errlen, "matmul: misaligned operand (NumPy copies it)");
+        return VP_UNSUPPORTED;
+    }
+    std::string e;
+    const DType d[] = {la.dtype, la.dtype, la.dtype};
+    const numpy::UfuncLoop* loop = rt->loops->get(ufunc, d, e);
+    if (loop == nullptr) {
+        PyErr_Clear();
+        set_error(err, errlen, e);
+        return VP_UNSUPPORTED;
+    }
+    std::shared_ptr<Kernel>& kernel = rt->matmul_kernels[loop];
+    if (!kernel) {
+        kernel = numpy::make_matmul_kernel(loop);
+    }
+    const ArrayPtr ins[] = {ref(a), ref(b)};
+    ArrayPtr res;
+    rt->rt->issue(kernel, ins, {}, std::span(&out, 1), site, std::span(&res, 1), work);
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
 int vp_arg_reduce(vp_runtime* rt, int argmax, vp_array* in, int out_ndim, const int64_t* out_shape,
                   vp_array** result, const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
@@ -744,28 +824,17 @@ int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char
             : nullptr;
     if (loop == nullptr) {
         PyErr_Clear();
-        numpy::IterReduction ir;
-        if (!numpy::make_iter_reduction(ufunc, l, arr(in).buffer(), reduced, keepdims != 0, dtype,
-                                        identity, rt->loops->buffersize(),
-                                        defer_release(rt->graveyard), ir, e)) {
+        Layout rl;
+        std::shared_ptr<Kernel> k = rt->loops->iter_reduction(
+            ufunc, l, reduced, keepdims != 0, dtype, identity, defer_release(rt->graveyard), rl, e);
+        if (!k) {
             PyErr_Clear();
             set_error(err, errlen, e);
             return VP_UNSUPPORTED;
         }
-        void* data = nullptr;
-        std::size_t nbytes = 0;
-        Layout rl;
-        if (!numpy::ndarray_layout(ir.result, rl, data, nbytes)) {
-            Py_DECREF(ir.result);
-            set_error(err, errlen, "unsupported result dtype");
-            return VP_UNSUPPORTED;
-        }
-        auto buffer =
-            std::make_shared<Buffer>(data, nbytes, python_owner(rt->graveyard, ir.result));
         const ArrayPtr ins[] = {ref(in)};
         ArrayPtr res;
-        rt->rt->issue(ir.kernel, ins, {}, std::span(&rl, 1), site, std::span(&res, 1), l.size(),
-                      std::span(&buffer, 1));
+        rt->rt->issue(k, ins, {}, std::span(&rl, 1), site, std::span(&res, 1), l.size());
         *result = hand_out(std::move(res));
         return VP_OK;
     }

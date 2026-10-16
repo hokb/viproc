@@ -80,6 +80,8 @@ using DeferRelease = std::function<void(std::function<void()>)>;
 // An element-wise iterator template and its pool of reusable copies
 // (numpy_ufunc.cpp).
 struct IterTemplate;
+// A reduction iterator template (numpy_reduce.cpp).
+struct ReduceTemplate;
 
 // Caches resolved loops per (ufunc, dtype signature). Main thread with the GIL.
 // Must outlive every task that uses one of its loops (wait for the runtime
@@ -118,6 +120,23 @@ class LoopCache {
                                              bool out_given, DeferRelease defer,
                                              std::string& error);
 
+    // Reduction driven by NumPy's own iterator, for what ReducePlan does not
+    // cover (numpy_reduce.hpp): casts, initial=, reduced axes that do not
+    // coalesce, strided inputs. The iterator is set up as
+    // PyUFunc_ReduceWrapper sets it up, once per (ufunc, input layout, axes,
+    // keepdims, dtype, initial or not, buffer size) over template arrays;
+    // `result` receives the result's layout (NumPy's, as the iterator
+    // allocates it). Each kernel gets a copy of the template and points it
+    // at the real buffers when it runs: per op the main thread only looks up
+    // the template (and converts a new `initial`). `dtype`: dtype= or
+    // Py_None; `initial`: the start value or Py_None (start at the first
+    // elements). Returns nullptr (reason in `error`, Python error cleared)
+    // if NumPy cannot run it this way. Main thread with the GIL.
+    std::shared_ptr<Kernel> iter_reduction(PyObject* ufunc, const Layout& in,
+                                           std::span<const bool> reduced, bool keepdims,
+                                           PyObject* dtype, PyObject* initial, DeferRelease defer,
+                                           Layout& result, std::string& error);
+
     LoopCache() = default;
     LoopCache(const LoopCache&) = delete;
     LoopCache& operator=(const LoopCache&) = delete;
@@ -131,6 +150,7 @@ class LoopCache {
     std::map<std::tuple<PyObject*, DType, std::array<std::intptr_t, 3>>, std::unique_ptr<UfuncLoop>>
         reduction_loops_;
     std::unordered_map<std::string, std::shared_ptr<IterTemplate>> iter_templates_;
+    std::unordered_map<std::string, std::shared_ptr<ReduceTemplate>> reduce_templates_;
     PyObject* extobj_var_ = nullptr; // NumPy's extobj context variable
     PyObject* extobj_ = nullptr;     // its value at the last read
     long buffersize_ = 0;
@@ -180,6 +200,10 @@ bool ndarray_layout(PyObject* arr, Layout& layout, void*& data, std::size_t& nby
 // A ready 0-d array holding `value` converted to `dtype` by NumPy (nullptr
 // with a Python exception set on failure).
 ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype);
+// A ready 0-d array holding `value` converted as NumPy's a[i] = value
+// converts it (PyArray_Pack: dtype discovery, the dtype's setitem, a cast),
+// so values and errors are NumPy's. nullptr with the Python error set.
+ArrayPtr item_array(Runtime& rt, PyObject* value, DType dtype);
 
 // NumPy's resolution of a reduction of `in_descr` with the binary `ufunc`
 // (ufunc._resolve_dtypes_and_context((None, in_descr, None), signature=
@@ -204,5 +228,15 @@ bool scalar_bytes(PyObject* value, DType dtype, std::vector<std::byte>& out);
 //   straight into `a`, exactly as NumPy on an ndarray.
 // Main thread, with the GIL.
 PyObject* export_ndarray(const Array& a, bool writable);
+
+// A NumPy array over `a`'s data without an owner, for a NumPy call the
+// bridge makes right away on ready data that only reads it (reductions; no
+// export bookkeeping): valid while the caller keeps `a` and issues nothing
+// that writes it. Flagged writable as NumPy's own arrays are (NumPy copies
+// read-only inputs in some reductions); the callee must not write. If it is
+// still referenced after the call, pin_borrowed() turns it into a read-only
+// export. Main thread, with the GIL.
+PyObject* borrow_ndarray(const Array& a);
+bool pin_borrowed(const Array& a, PyObject* view);
 
 } // namespace viproc::numpy

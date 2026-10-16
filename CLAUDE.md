@@ -39,11 +39,19 @@ to plain sequential NumPy execution.
 - A pending array references **the task that computes it** (its producer).
   For an in/out array this is the **last** task that writes it.
 - Arrays do **not** reference the tasks that consume them as inputs.
-- Element memory comes from viproc's element pool and is taken by the main
-  thread when it issues the op that creates the array (phase 1: shapes are
-  known at issue), so tasks reach `allocated` at issue. Pool allocations
-  happen on the main thread only, releases on any thread
-  (`docs/design/memory-management.md`, D3 and D10).
+- Element memory comes from viproc's element pool and is taken **as late
+  as possible, by the task that produces it**: right before its kernel
+  runs, on the thread that runs it. It takes a dying input's block when it
+  holds the only reference to it and the layouts match (element-wise
+  kernels: NumPy's elision at run time), else a block from the pool (one
+  shared LIFO per size bin under a small lock: the most recently released
+  block first, hot in cache; no per-thread caches). The
+  main thread creates the `Buffer` objects at issue (deferred, no memory);
+  tasks reach `size_completed` at issue and `allocated` when they run.
+  Pool allocations and releases happen on any thread
+  (`docs/design/memory-management.md`, D3 and D11; D10, main-thread
+  allocation at issue, made dependent chains 2-4x slower than NumPy: up to
+  1000 cold output blocks in flight).
 - **Views share a storage.** A base array and all its views refer to one
   shared *storage*, which holds the current buffer (data version) and the
   last task writing it. Readiness, the producer and `async_reads` belong
@@ -183,8 +191,9 @@ ownership, release or reuse of memory.
     all inputs to be read before the output is written). The storage
     switches to a new buffer; the op's inputs read the old one. The old
     buffer stays alive through its readers' references.
-    - **Consolidated** (array is the only view of its storage and covers
-      all of it): no copy at all. The op reads the old buffer and writes
+    - **Consolidated** (array is the only view of its storage, covers
+      all of it, and the op writes every element: `Kernel::writes_all`,
+      false for scatter and masked assignment): no copy at all. The op reads the old buffer and writes
       the new one, with the **same layout** (as in NumPy, the array keeps
       its strides).
     - **With views or partial writes:** a copy task copies the whole old
@@ -209,21 +218,19 @@ ownership, release or reuse of memory.
 
 ### Goals and non-goals
 
-- **Goal:** strong scaling of whole array programs: a fixed program gets
-  faster with more cores, because independent array instructions overlap.
-- **Non-goal:** weak scaling, and data parallelism *inside* a single array
-  op (splitting one op across threads). One instruction runs on one
-  thread, as one NumPy loop call (or the same sequence of loop calls
-  NumPy itself would make).
-- **Not a goal yet:** any optimization besides array ILP: own SIMD code,
-  kernel fusion, JIT code generation, GPU offloading. SIMD comes from
-  NumPy's loops. Do not add these, but do not make design decisions that
-  rule them out (keep device and memory handling behind an interface).
+**`docs/design/goals.md`** collects the goals, non-goals and rules every
+change is judged by; read it before design decisions. In short: G1, the
+central claim, is to find the parallel potential within and throughout
+large sections of regular, un-annotated NumPy programs automatically and
+feed parallel hardware with it (strong scaling, array ILP only); G2, results identical
+to NumPy; G3, **never slower than NumPy** (hard: never below 0.95x for any
+expression; soft: at most 3% slower where there is no sufficient
+parallel potential).
 
 ### Phase 1 (current): MVP on CPUs
 
 Goal: autonomous, asynchronous execution of array instructions on
-multicore CPUs.
+multicore CPUs (`docs/design/goals.md`).
 
 - **Compute kernels: official NumPy C code, taken from the installed
   NumPy at runtime.** We do not vendor or compile NumPy. The runtime looks
@@ -259,9 +266,11 @@ execution.
 
 ```
 docs/design/           Design documents (decisions with rationale)
+  goals.md             goals, non-goals, never-slower rule (G1-G3), roadmap
   memory-management.md ownership, release, pools, NumPy interop, COW
 docs/benchmarks.md     benchmark results: current breakdown per category and
-                       case, progress per change, external machines
+                       case, progress per change, external machines,
+                       shape map (images in docs/benchmarks/)
 include/viproc/        Public C ABI (viproc.h). The only interface bridges may use.
 src/runtime/           Runtime core, no Python dependency (library `viproc`)
   layout.*             DType, Layout (shape, byte strides, offset), broadcasting
@@ -273,7 +282,8 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
                        per physical core, SMT siblings once, affinity)
   element_pool.*       ElementPool: process-wide pool for element memory
                        (quantized bins, LIFO, bound, huge pages)
-  buffer.*             Buffer: element memory (inline ≤ 128 B, else pool); async_reads
+  buffer.*             Buffer: element memory (inline ≤ 128 B, else pool,
+                       deferred until the producing task runs); async_reads
   task.*               Task: stages, consumer callbacks, execute(); Kernel interface
   runtime.*            Array (main-thread view), Runtime: issue protocol,
                        worker pool, trampoline, look-ahead limit, wait
@@ -284,13 +294,19 @@ src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
                        element-wise kernel, wrap_ndarray / to_ndarray
   numpy_reduce.*       reduction kernel: NumPy's reduction loop, called in
                        NumPy's blocks (ReducePlan)
+  numpy_iter.hpp       iterator templates and their pools (shared by the
+                       element-wise and reduction kernels)
+  numpy_matmul.*       matmul kernel: NumPy's matmul gufunc loop with the
+                       strides NumPy's gufunc machinery passes
 src/capi/capi.cpp      Implementation of the C ABI (library `viproc_capi`)
 src/viproc_python.h    the only way to include Python.h (MSVC debug fix)
 python/viproc/         Python package
   _viproc.c            CPython extension (C only, uses viproc.h): base class
                        _Array with the per-op hot path (__array_ufunc__ for
                        element-wise ufuncs, all operators, dtype-resolution
-                       cache, scalars, broadcasting, issue sites)
+                       cache, scalars, broadcasting, issue sites;
+                       reductions, copy, astype, reshape, swapaxes as C
+                       methods, NumPy delegate for small ready data)
   _ndarray.py          viproc.ndarray(_Array): fallbacks, __array_function__,
                        indexing, sync points; registers hooks with setup()
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
@@ -304,6 +320,13 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
   suite.py             benchmark suite: runner, machine detection, score
   suite_cases.py       its cases (plain NumPy programs, width P, variants)
   suite_report.py      its Markdown / HTML reports, multi-run comparison
+  shape_map.py         speedup vs. NumPy over rows x cols (2-d, log grid):
+                       median + IQR over cases per point, heatmap images
+  shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync/
+                       expressions/loops/control; --groups selects groups)
+  shape_map_ilnumerics.py  the same map for ILNumerics Accelerator (vs. NumPy)
+                       and viproc vs. ILNumerics, on the grid/reps of a viproc run
+  ilnumerics/          its C# side (.NET 8, needs a licensed ILNumerics build)
 pyproject.toml         pip build (scikit-build-core; CMake installs the package
                        only for SKBUILD), version from CMakeLists.txt
 dev.cmd, dev.sh        one-click dev loop (tools/dev.ps1 on Windows): pull,
@@ -349,6 +372,7 @@ clang-format -i <files>                                 # format
 PYTHONPATH=build/python python3 -m pytest -q python/tests
 PYTHONPATH=build/python python3 python/benchmarks/strong_scaling.py   # use a Release build
 PYTHONPATH=build/python python3 python/benchmarks/suite.py [--quick]   # all cases, score, report
+PYTHONPATH=build/python python3 python/benchmarks/shape_map.py [--quick]  # rows x cols heatmap
 docker/benchmark.sh [--quick]     # (re)build images, suite on Linux + Windows (Wine),
                                   # reports copied to ./reports (old ones deleted first)
 ```
@@ -568,14 +592,22 @@ Rules:
     the reduced axes, which the loop then skips (NumPy's first-visit skip).
   `ReducePlan` covers dense inputs (any axis order) without a cast whose
   reduced axes coalesce into one. **Everything else runs on NumPy's own
-  iterator** (`make_iter_reduction`, `IterReduceKernel`): casts (int32
-  sums accumulate in int64, `dtype=`), `initial=`, non-coalescing reduced
-  axes and strided inputs, which NumPy's iterator may copy into buffers
-  even without a cast (and a loop on a contiguous buffer can round
-  differently from the same loop on strided data). The iterator is built at
-  issue time with the GIL exactly as `PyUFunc_ReduceWrapper` builds it (it
-  also allocates the result in NumPy's layout); the kernel runs NumPy's
-  `reduce_loop` over it without the GIL (`NpyIter_Reset(iter, &errmsg)`).
+  iterator** (`LoopCache::iter_reduction`, `IterReduceKernel`): casts
+  (int32 sums accumulate in int64, `dtype=`), `initial=`, non-coalescing
+  reduced axes and strided inputs, which NumPy's iterator may copy into
+  buffers even without a cast (and a loop on a contiguous buffer can round
+  differently from the same loop on strided data). The iterator is built
+  exactly as `PyUFunc_ReduceWrapper` builds it, but **once per signature**
+  (ufunc, input layout, axes, keepdims, `dtype=`, initial or not, buffer
+  size) as a template over a dummy address (`ReduceTemplate`; the result
+  NumPy allocates there gives viproc's result layout). Per op the main
+  thread only looks the template up and takes a finished copy from its
+  pool (`NpyIter_Copy` on a miss): no element memory, no address. The
+  task fills the initial values, points the copy at its buffers
+  (`NpyIter_ResetBasePointers(iter, base, &errmsg)`, no GIL) and runs
+  NumPy's `reduce_loop`. 0-d inputs are iterated as 1-element 1-d ones:
+  NumPy casts a 0-d input into a copy when it builds the iterator, which a
+  template cannot reuse.
   Fuzzed against NumPy over shapes, axes, layouts and dtypes
   (`python/tests/test_reductions.py`, incl. signs of zeros and NaNs):
   bit-identical.
@@ -593,8 +625,41 @@ Rules:
   and raise `LinAlgError` via an `errstate(invalid='call')` callback when
   the gufunc sets the invalid flag. We replicate those checks in the
   bridge and map the stored FP flags to `LinAlgError` at sync. Linalg
-  loops call BLAS/LAPACK, which may be multithreaded itself; limit BLAS
-  threads (e.g. 1 per worker) to avoid oversubscription.
+  loops call BLAS/LAPACK, which may be multithreaded itself.
+- **BLAS threads decide BLAS results.** OpenBLAS (NumPy's wheels, 0.3.34)
+  splits large products differently with 1, 2 or 4 threads, and the values
+  differ (`a @ b` of 513 x 513 float64: three different results for
+  `OPENBLAS_NUM_THREADS` 1, 2, 4). So viproc must not change BLAS
+  threading (no "1 BLAS thread per worker"): bit-identity with NumPy means
+  the same BLAS configuration. Concurrent calls from several threads give
+  the values of the same calls made one after the other (checked: 4 threads,
+  sizes 513–1000, gemm/syrk/gemv). Measured on 4 cores: overlapping
+  products that OpenBLAS already threads (side >= ~300) gains little
+  (BLAS already uses the cores); serializing them with a lock did not
+  help either. Small products (side < ~200, single-threaded inside BLAS)
+  overlap well.
+- **`matmul`** (`src/kernels/numpy_matmul.*`, `vp_matmul`): NumPy's matmul
+  gufunc loop `(m?,n),(n,p?)->(m?,p?)`, called as
+  `PyUFunc_GeneralizedFunctionInternal` calls it: no buffering, one call
+  per inner batch row with `dims = {count, m, n, p}` and the core strides
+  of the operands (0 for a missing dimension or one of extent 1). The loop
+  picks gemm/syrk/gemv/dot or a copy into a BLAS-able buffer from those
+  strides and pointers; every outer index is computed on its own, so the
+  split of the batch into calls does not matter. Result layout: batch axes
+  in order K over the inputs' batch strides, core axes C-contiguous
+  innermost (the inputs have zero strides along the output's core axes in
+  NumPy's iterator). Async only where NumPy takes the operands as they
+  are: same dtype (else NumPy's iterator casts into a copy), aligned, no
+  `out=`. **`np.dot`** of vectors and matrices goes through the same
+  kernel where it makes the same loop calls (`_dot` in `_ndarray.py`):
+  integers and bool always (exact sums), floating point when every extent
+  is >= 2 (dot's scalar/row/column special cases excluded), with operands
+  prepared as `cblas_matrixproduct` prepares them (C copy if the strides
+  are not BLAS-able or a matrix is neither C- nor F-contiguous): then dot's
+  gemm/syrk, gemv and dot calls are matmul's (gemv with row-/column-major
+  swapped, which CBLAS maps onto the same kernel). Fuzzed in
+  `python/tests/test_matmul.py` (dtypes, broadcasting, 1-d operands,
+  transposed/stepped/reversed/broadcast operands, sizes OpenBLAS threads).
 - **FFT:** the Python wrappers in `numpy/fft/_pocketfft.py` handle `n`
   (padding/truncation), `axis`, `norm` (passed as the scalar `fct`
   argument) and the choice between `rfft_n_even`/`rfft_n_odd`. We port that
@@ -621,7 +686,9 @@ Rules:
 - **Supported asynchronously:** element-wise ufunc calls (`ufunc.signature
   is None`, one output) with NumPy's own dtype resolution
   (`ufunc.resolve_dtypes`, NEP 50 weak Python scalars), incl. casts of
-  inputs, `out=` and in-place operators; `astype` (NumPy's cast functions,
+  inputs, `out=` and in-place operators; `matmul` / `@` and `np.dot` /
+  `a.dot` of vectors and matrices (NumPy's matmul loop, see "Calling NumPy
+  kernels"); `astype` (NumPy's cast functions,
   NumPy's result layout); basic indexing as views (no sync); metadata-only
   NumPy functions as views without a sync (`.T`, `transpose`, `swapaxes`,
   `moveaxis`, `squeeze`, `expand_dims`, `flip`, `rot90`, `broadcast_to`,
@@ -656,7 +723,7 @@ Rules:
   scalar indexing returns NumPy's scalar if the array is ready, else a 0-d
   copy (no sync); `np.where(cond, x, y)` as a select task (NumPy's result
   dtype, x and y cast to it, layout order K);
-  `__setitem__` with basic keys (assign kernel); **reductions** (NumPy ≥
+  index assignment with basic keys (assign kernel, see below); **reductions** (NumPy ≥
   2.3): `ufunc.reduce` of reorderable ufuncs (add, multiply, minimum,
   maximum, fmin, fmax, logical and/or/xor, bitwise and/or/xor) and
   `np.sum/prod/min/max/amin/amax/any/all` (also as methods) without
@@ -669,6 +736,39 @@ Rules:
   C-contiguous copy with the axis last, as `PyArray_ArgMax`). Per-call
   preparation is cached per (ufunc, dtype, ndim, axis, keepdims)
   (`_reduce_plans`).
+- **Reductions and methods in C, NumPy delegate for small ready data.**
+  `sum prod max min any all mean var std argmax argmin copy astype` are
+  C methods of `_Array`, and `_Array.__array_function__` takes the
+  matching `np.*` functions (`setup_reductions`: entries with their
+  Python fallbacks); every other function goes to `_ndarray.py`. Per
+  call, in order: (1) sum/prod/max/min/any(bool)/all(bool) with an axis
+  or keepdims and no other arguments: `vp_reduce` (run directly for small
+  ready data, async otherwise); (2) **small ready data** (≤ `sync_below`
+  elements, no viproc `out=`/`where=`): NumPy computes it on a borrowed
+  view of the buffer (`vp_array_borrow`, design doc D7): NumPy's method
+  (`view.sum(...)`) or `np.sum._implementation`, with the caller's
+  arguments, so results, errors and warnings are NumPy's; a fresh ndarray
+  result is adopted, a view NumPy keeps is pinned as a read-only export
+  (`vp_array_pin`); (3) full reductions of larger or pending data:
+  `vp_reduce`; (4) the Python handlers. A full reduction of small ready
+  data costs NumPy's call plus ~0.15 µs (the borrow); `vp_reduce`'s
+  direct path would cost ~0.9 µs. `reshape(shape)` / `swapaxes(i, j)` with
+  exact ints are C methods too (views, `reshape_view`); orders, copies
+  and other argument types go to `_reshape_py` / `_swapaxes_py`.
+- **Index assignment in C** (`_Array.mp_ass_subscript`, `a[key] = value`):
+  every array involved (target, viproc arrays in the key, the value)
+  ready, nothing reading the target's buffer (`vp_array_host_writable`)
+  and the target (or the written view of a basic key) at most `sync_below`
+  elements: NumPy's own slot (`PyArray_Type.tp_as_mapping->
+  mp_ass_subscript`) runs on a borrowed writable view, key arrays and the
+  value borrowed too (design doc D7), so values, casts and errors are
+  NumPy's for every key kind. Otherwise basic keys issue an assignment:
+  the target is a view, the value a viproc array (`vp_assign` casts) or a
+  Python/NumPy scalar converted at issue with `PyArray_Pack`
+  (`vp_array_from_item`, NumPy's conversion and errors); the task only
+  copies. Advanced keys, sequences as values and errors of `vp_assign` go
+  to the hook `_setitem` (scatter / masked assignment tasks, fallback).
+  `out[3] = s` 0.22 µs (NumPy 0.16; it was 3.1 µs in Python).
 - **0-d results and the scalar shortcut.** Where NumPy returns a scalar
   (full reductions, `a[i, j]`, ufuncs on 0-d operands), viproc returns
   NumPy's scalar if the data is there already (the op ran directly), else
@@ -686,7 +786,8 @@ Rules:
   else (`nonzero`, `flatnonzero`, `argwhere`, `count_nonzero` sync on their
   argument and run in NumPy on a read-only export, without the general
   fallback's wait for readers): other reductions (`out=`, `where=`), gufuncs
-  (`matmul`), empty advanced-index results, 0-d boolean indices,
+  (linalg, fft; `matmul` with mixed dtypes or `out=`), `np.dot` of n-d
+  operands, empty advanced-index results, 0-d boolean indices,
   `ufunc.at`, other NumPy functions. NumPy's semantics exactly (design doc
   D7, "Eager fallbacks"): each viproc argument becomes a writable NumPy
   view after `vp_array_prepare_write` (wait for producer and task readers,
@@ -801,12 +902,13 @@ Rules:
   machines). Headline (4 CPUs, Release): suite score 43 → 69 over this
   phase, all results bit-identical; `strong_scaling.py` 8 chains vs. NumPy
   with 4 workers: 1e7 ~7.5x, 1e6 ~4.5x, 1e4 ~3x, 1e3 ~0.9x. Small ready
-  ops: `x * y` (8 elements) 0.63 µs (NumPy 0.35), ops on scalars as NumPy
+  ops: `x * y` (8 elements) 0.52 µs (NumPy 0.41), ops on scalars as NumPy
   (0.06 µs), `a[1:3]` 0.12 µs (NumPy 0.10), `a.T` 0.11 µs (NumPy 0.08),
   `a[i, j]` 0.20 µs (NumPy 0.07), `x[idx]` (1,000 elements) 2.9 µs (NumPy
-  0.7), `a.reshape(-1)` 0.6 µs (NumPy 0.15; Python handler), small
-  `np.sum` ~2.8 µs (NumPy 1.5–2; NumPy's own `__array_function__`
-  dispatch is most of it).
+  0.7), `a.reshape(-1)` 0.12 µs (NumPy 0.14), `a.swapaxes(0, 1)` 0.11 µs
+  (NumPy 0.12), 100 elements: `x.sum()` 0.7 µs (NumPy 0.54), `np.sum(x)`
+  1.8 µs (NumPy 1.45), `x.sum(axis=0)` 1.1 µs (NumPy 1.2), `x.copy()`
+  0.6 µs (NumPy 0.2), `x.astype(np.float32)` 0.73 µs (NumPy 0.36).
 - "Issue an op, read the result right away" (`sync_latency.py`): 8 elements
   8.1 → 1.4–2.4 µs (NumPy 0.5–0.9), 1e3 5.1 → 1.6–2.7 µs (NumPy 0.8–1.6),
   1e4 ~NumPy (4.3–6.9 vs. 6.1–6.9 µs), 1e5 faster than NumPy, thanks to
@@ -836,7 +938,8 @@ Rules:
   wake-up syscall per small task without taking cores from busy threads.
 - Per-op allocations: one pooled Task (operands inline up to 4), one
   pooled Buffer (element memory inline up to 128 bytes, larger from the
-  element pool: no page faults once warm), one pooled
+  element pool when the task runs: no page faults once warm, or the dying
+  input's block), one pooled
   `ArrayBlock` (Array and its Storage), the Python object. Shapes/strides
   inline (`SmallVector`), one shared kernel object per resolved loop,
   interned issue sites.
@@ -863,7 +966,7 @@ Rules:
   main thread with the GIL: a worker dropping the last reference parks
   the object in a graveyard drained at the next C ABI call.
 - Not implemented yet: casting into `out=` of another dtype, gufuncs
-  (linalg, fft, matmul), FP-flag reporting to
+  (linalg, fft; matmul with casts or `out=`), FP-flag reporting to
   Python (NumPy warnings / `np.errstate`).
 
 ## Conventions
@@ -879,7 +982,8 @@ Rules:
 - Keep the MVP small: prefer the simplest correct scheduling over
   optimizations until there is a benchmark that shows the need.
 - Measure success as strong scaling: benchmark whole array programs
-  (fixed problem size) against plain NumPy at 1, 2, 4, … worker threads.
+  (fixed problem size) against plain NumPy at 1, 2, 4, … worker threads,
+  and check the never-slower rule (`docs/design/goals.md`, G3).
 - **Benchmark suite** (`python/benchmarks/suite.py`): the yardstick for
   changes that affect performance; run it before and after. Score =
   100 x geomean over categories of geomean(efficiency), efficiency =
@@ -954,13 +1058,14 @@ code, comments, docs and commit messages in English.
   reductions (incl. casts, strided, `mean`/`var`/`std`,
   `argmin`/`argmax`), advanced indexing (gather/scatter/masks), `np.where`,
   views computed in C/Python without any ndarray, `a[key]` in the C slot,
-  direct path and scalar shortcut for small ready data, adaptive dispatch.
+  direct path and scalar shortcut for small ready data, adaptive dispatch,
+  `matmul`/`@`/`np.dot` with NumPy's matmul loop.
 - Last suite results: `docs/benchmarks.md` (4 CPUs: score 69 with 97
   cases, 68 with 100 cases incl. `kmeans_points`).
 - ILNumerics' k-means program (`kmeans_points`, from
   github.com/hokb/decentralized-array-execution-artifacts2026): 3.9x vs.
   NumPy on 4 cores (1203 x 1203, k = 50), bit-identical.
-- Next, by expected gain: async `matmul`/gufuncs; scaling analysis on many
+- Next, by expected gain: scaling analysis on many
   cores; per-op overhead of the remaining Python paths (see open
   questions).
 
@@ -974,8 +1079,9 @@ code, comments, docs and commit messages in English.
       "Dispatch decision").
 - [ ] Dispatch: op cost classes for N_min (a waiting main thread running a
       queued task itself was decided against, see "Dispatch decision").
-- [ ] `matmul`/`dot` and the other gufuncs (linalg, fft) asynchronously:
-      the largest remaining fallback (`matmul_batch`).
+- [x] `matmul`/`dot` asynchronously (NumPy's matmul loop; `matmul_batch`
+      has no fallbacks left).
+- [ ] The other gufuncs (linalg, fft) and `matmul` with casts or `out=`.
 - [ ] Scaling beyond 4 cores: on a 20-core i7-12700K (8 P + 4 E cores,
       HT) the suite scores 22 with medium/large at 11 (`chains_wide`
       medium 6.2x of ideal 20x, large 1.2–3.9x): find out whether memory
@@ -984,10 +1090,13 @@ code, comments, docs and commit messages in English.
       (12 there, were 20 = hardware threads); that score of 22 was against
       ideal 20 and is not comparable. `suite.py --workers 1,max,threads`
       measures 12 and 20 workers in one run.
-- [ ] Remaining per-op overhead on small data: views still handled in
-      Python (`reshape` 0.6 µs, `swapaxes` ~1 µs via NumPy's
-      `__array_function__`), index parsing for advanced indexing (3–10 µs
-      small), direct-path result objects (~0.25 µs over NumPy).
+- [ ] Remaining per-op overhead on small data (`docs/design/goals.md`,
+      G3: never below 0.95x of NumPy, at most 3% slower without
+      sufficient parallel potential): `np.abs(x)` and other ufunc calls pay NumPy's
+      override dispatch (~0.4 µs over NumPy), `copy`/`astype` the borrow
+      and adoption (~0.4 µs), `np.transpose`/`np.moveaxis` still via
+      NumPy's `__array_function__` into Python, index parsing for
+      advanced indexing (3–10 µs small).
 - [x] Per-op overhead of the bridge: hot path moved to C (~35 µs → ~3–7 µs).
 - [ ] Evaluate a generic path under free-threaded CPython: workers call the
       regular NumPy entry (no reimplementation of NumPy semantics).

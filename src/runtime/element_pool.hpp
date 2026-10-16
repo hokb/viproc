@@ -7,10 +7,11 @@
 // Each bin is a LIFO free list (the most recently released block is the most
 // likely to be in cache and mapped).
 //
-// Access model (D10): blocks are taken by the issuing (main) thread; they are
-// released on any thread. A thread that allocates keeps private free lists
-// (no atomics). Other threads push released blocks onto a per-bin lock-free
-// stack that an allocating thread takes over as a whole (exchange: no ABA).
+// Access model (D11): blocks are taken by the thread that runs the task
+// producing them (a worker, or the main thread for ops it runs itself) and
+// released on any thread. Each bin is one shared LIFO under its own small
+// lock: every thread sees every cached block, and a thread that released a
+// block takes it back first if nobody took it meanwhile (hot in its cache).
 //
 // Released blocks are not zeroed. A release that would grow the cached bytes
 // beyond the bound goes straight back to the system.
@@ -23,6 +24,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 
 namespace viproc {
 
@@ -32,15 +34,13 @@ class ElementPool {
     static ElementPool& instance();
 
     // A block of at least `nbytes` bytes (> 0); `capacity` receives its size.
-    // Called by the issuing thread. On failure: empties the pool, retries,
-    // then throws std::bad_alloc.
+    // Any thread. On failure: empties the pool, retries, then throws
+    // std::bad_alloc.
     void* allocate(std::size_t nbytes, std::size_t& capacity);
     // Returns a block obtained from allocate(). Any thread.
     void release(void* block, std::size_t capacity);
 
-    // Returns every cached block to the system: the calling thread's lists and
-    // the blocks other threads released. Other allocating threads' private
-    // lists are left alone.
+    // Returns every cached block to the system. Any thread.
     void trim();
 
     // Upper bound for cached bytes (default: half the physical memory, or
@@ -66,13 +66,18 @@ class ElementPool {
     struct Node {
         Node* next;
     };
-    struct Local; // per-thread free lists
-    static Local& local();
+    // One LIFO free list per bin. The lock is held only to pop or push one
+    // block (uncontended: ~20 ns); a cache line per bin, so threads working
+    // on different sizes do not share one.
+    struct alignas(64) Bin {
+        std::mutex mutex;
+        Node* head = nullptr;
+    };
     static int bin_of(std::size_t capacity);
     static void* system_allocate(std::size_t capacity);
     static void system_release(void* block, std::size_t capacity);
 
-    std::atomic<Node*> remote_[kBins] = {};
+    Bin bins_[kBins];
     std::atomic<std::size_t> limit_;
     std::atomic<std::int64_t> cached_{0};
     std::atomic<std::uint64_t> hits_{0};

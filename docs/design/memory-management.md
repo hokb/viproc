@@ -25,7 +25,8 @@ Status labels:
 | D7 | Array conversions viproc ↔ ndarray: copy-free export, copy-free import of fresh memory, eager fallbacks with NumPy's semantics | Implemented |
 | D8 | Write-after-read safety by copy-on-write, not by locking | Implemented |
 | D9 | `viproc.ndarray` is a wrapper, not a subclass of `numpy.ndarray` | Decided, implemented |
-| D10 | Access model: pool allocations on the main thread only, releases from any thread | Implemented |
+| D10 | Access model: pool allocations on the main thread only, releases from any thread | Superseded by D11 for element memory; holds for D4 |
+| D11 | Element memory as late as possible: the task producing a buffer takes its block when it runs, from a dying input or the pool | Implemented |
 
 ## Background: the ILNumerics model
 
@@ -130,9 +131,10 @@ advantage.)
 
 **Design** (implemented: `src/runtime/element_pool.*`, `buffer.*`):
 
-- **Where it plugs in.** The main thread takes a block from the pool when
-  it issues the op that creates the buffer (D10); `Buffer::~Buffer()`
-  returns it, on whatever thread. Foreign memory (NumPy arrays) is never
+- **Where it plugs in.** The task producing a buffer takes its block when
+  it runs, on whatever thread runs it (D11; ops run directly by the main
+  thread take it there); `Buffer::~Buffer()` returns it, on whatever
+  thread. Foreign memory (NumPy arrays) is never
   pooled. Element memory up to 128 bytes stays inline in the `Buffer`
   (implemented).
 - **Matching: equal or larger, bounded excess — by quantized bins** (as
@@ -163,7 +165,7 @@ advantage.)
   memory" privilege (`SeLockMemoryPrivilege`, enabled once at first use)
   and the block is a whole number of large pages (always from 16 MiB on).
   Not by default: Windows commits and zeroes a large-page block inside
-  `VirtualAlloc`, i.e. on the main thread that issues the op, ~30 ms per
+  `VirtualAlloc` (measured when the main thread still allocated at issue), ~30 ms per
   24 MB block (i7-12700K, Windows 11). Every pool miss stalled the
   run-ahead (`test_main_thread_runs_ahead`: 60 ops issued in ~100 ms
   instead of < 1 ms, 3 misses). Linux's huge pages fault in on the
@@ -185,7 +187,7 @@ advantage.)
   releases dropped by the bound, limit (C ABI: `vp_pool_get_stats`).
 - **Determinism is kept.** Release into the pool happens at the same moment
   as before; only *where* the memory goes changes. Peak memory: live data +
-  memory reserved by issued ops (D10) + the pool bound.
+  outputs of running tasks (D11) + the pool bound.
 - **Debugging.** `-DVIPROC_ELEMENT_POOL=OFF` sets the default bound to 0
   (no caching), so AddressSanitizer keeps catching use-after-free in
   element memory.
@@ -382,6 +384,43 @@ views are not (only the user can drop them). Hence:
 Measured (1e7 float64): `np.asarray(v)` 18.8 ms → 0.001 ms; `np.sum(v)`
 (eager fallback) 25 ms → 3.5 ms.
 
+### Borrowed view: NumPy computes small ready ops on the buffer
+
+Reductions, `mean`/`var`/`std`, `argmax`/`argmin`, `copy` and `astype` of
+**small ready** data (at most `sync_below` elements, the direct path's
+bound) have nothing to run asynchronously. `_Array`'s C methods and its
+`__array_function__` hand them to NumPy itself: `vp_array_borrow(a)` is an
+ndarray over the buffer with `a`'s layout and **no owner and no export
+bookkeeping**, and NumPy's own method (`view.sum(...)`) or NumPy's
+implementation of the function (`np.sum._implementation`) runs on it with
+the caller's arguments. Results, errors and warnings are NumPy's by
+construction, at NumPy's cost plus the borrow.
+
+- Safe without counting a reader: the main thread holds the GIL and issues
+  nothing while NumPy runs, and `a` is ready, so no task writes the buffer
+  (thread rules: ready stays ready until the main thread issues a writer).
+- The view is flagged writable, as NumPy's own arrays are: NumPy copies
+  read-only inputs in some calls (`argmax` through `PyArray_FromArray`).
+  The callee only reads; calls with an `out=` or `where=` of viproc arrays
+  are not delegated.
+- After the call: a view NumPy still references (refcount > 1, e.g. kept
+  in a result's base) is **pinned** (`vp_array_pin`): made read-only and
+  turned into a regular export (`host_views`). A result that is the view
+  itself (`astype(copy=False)` of the same dtype) maps to `a`; an ndarray
+  result is fresh memory and adopted (Import).
+- **Index assignment** (`a[key] = value`, small ready target) writes
+  through the borrow: NumPy's mapping slot runs on the borrowed view. This
+  needs more than readiness: no task may still read the buffer and no
+  export may be alive (`vp_array_host_writable`: ready, no stored error,
+  no `async_reads`, no `host_views`), else a reader would see the new
+  values. Key arrays and the value are borrowed in the same
+  call and pinned afterwards if NumPy kept them. Otherwise the assignment
+  is a task (copy-on-write as for any in/out op).
+- Not delegated: reductions with an axis or keepdims that `vp_reduce`
+  covers (its direct path is cheaper than NumPy's call plus adopting the
+  result array), and larger or pending inputs (`vp_reduce`
+  asynchronously, else the Python handlers).
+
 ### Eager fallbacks: NumPy code on viproc memory, NumPy's semantics
 
 Everything viproc does not run asynchronously (reductions, `np.*`
@@ -472,7 +511,11 @@ writes the current buffer only if nobody still reads it and no input of the
 op overlaps it through another view; otherwise the storage switches to a
 new buffer and the old one lives on through its readers' references.
 Single-view storages are *consolidated* (the op writes a fresh buffer with
-the array's layout, no copy); storages with views get a copy task first. An op's reads
+the array's layout, no copy) when the op writes every element
+(`Kernel::writes_all`); storages with views, and ops that write only some
+elements (scatter, masked assignment), get a copy task first (without it,
+`x[x > 1.4] = 0.6` on an `x` with pending readers left the other elements
+as fresh memory). An op's reads
 of the buffer it writes in place are not counted (D5): later writers wait
 for it as the producer anyway. Decided at
 issue time on the main thread, so layouts never change after they were
@@ -529,7 +572,8 @@ directly, bypassing every sync point:
 
 ## D10 — Access model: allocate on the main thread, release anywhere
 
-**Decided; implemented** for element memory: buffers take their block
+**Superseded by D11 for element memory** (the object pools of D4 keep this
+model). Kept for the record: buffers took their block
 when they are created, and only the main thread creates buffers (at
 issue); tasks reach `allocated` at issue. viproc enforces one access model
 for all its pools (element
@@ -597,24 +641,115 @@ memory, D3; runtime objects, D4):
 - It matches the thread rules already in place: only the main thread
   creates tasks and arrays; workers only advance and complete them.
 
+## D11 — Element memory as late as possible, taken by the producing task
+
+**Implemented** (`Buffer::Buffer(nbytes, Buffer::deferred)`,
+`Task::allocate_outputs` in `src/runtime/task.cpp`,
+`src/runtime/element_pool.*`). Replaces D10 for element memory.
+
+**Decision.** A buffer a task produces is created *deferred* at issue: the
+`Buffer` object exists (consumers capture it, count their reads on it,
+the storage refers to it), but its element memory does not. The task takes
+the memory right before its kernel runs, on the thread that runs it:
+
+1. **From a dying input** (kernels with `Kernel::in_place_ok()`: NumPy's
+   element-wise loops, plain and on NumPy's iterator): an input operand
+   whose buffer this task holds the only reference to (no array, export or
+   other task; `use_count() == 1`, `async_reads == 1`: only this task's
+   read) and whose layout equals the output's (dtype, shape, strides,
+   offset). The output takes over the input's block (`take_block`); the
+   input operand then reads the output's buffer, same data. This is
+   NumPy's temporary elision (D5), decided by the worker at run time
+   instead of by the main thread at issue. `x = np.abs(x)` in a loop runs
+   in place, in one hot block.
+2. **Else from the element pool**, on that thread: the most recently
+   released block of the bin (one shared LIFO; often the input this thread
+   just released, hot in its cache).
+
+Inline buffers (≤ 128 bytes) have their memory at once. Ops the main thread
+runs directly (`Runtime::issue_direct`) allocate there, right before they
+run. `size_completed` is still reached at issue (phase 1: shapes are known),
+`allocated` now when the task runs. Copy-on-write buffers (consolidated new
+buffer, storage copies) are deferred as well.
+
+**Why.** Measured (4-vCPU VM, Release, one worker, µs per op, `x =
+np.abs(x)` repeated; NumPy in brackets): with the main thread allocating at
+issue, 100 x 100 9.6 (2.4), 316 x 316 111 (25): the main thread runs up to
+1000 ops ahead, so up to 1000 output blocks were reserved at once (80 MB at
+100 x 100, 800 MB at 316 x 316), each cold when its task finally wrote it,
+while NumPy reuses one hot malloc block. The same chain with `out=x` (no
+new memory) ran at 2.4 (1.6) and 17 (24). With D11: 2.3 (2.6) and 19.7
+(27.8).
+
+**Pool access model that follows.**
+
+- Any thread may allocate and release. Each bin is **one shared LIFO
+  under its own small lock** (`ElementPool::Bin`, a cache line per bin),
+  held only to pop or push one block: uncontended ~20 ns, against
+  microseconds per op.
+- Replaced per-thread caches (a thread kept up to two released blocks per
+  bin, the rest went onto a lock-free shared stack that an allocating
+  thread took over whole). The takeover moved every shared block of a bin
+  into one thread's private list, where the other workers no longer found
+  them: they allocated anew (pool misses, more memory), and how often
+  depended on which worker ran which task. The shared LIFO keeps the hot
+  case (a task releases its input and takes the same bin's block for its
+  output: the block on top) and sees every cached block from every
+  thread. Measured, back to back on the 4-vCPU VM: 8 independent chains in
+  which every op allocates, `strong_scaling.py` at 1e4 and 1e5 elements,
+  `x = np.abs(x)` chains: equal within noise; misses in the chains
+  roughly halved, and the 20-iteration loop of `test_bridge.py` misses
+  only on its first iteration (before: 1–6 misses, depending on timing).
+
+**No memory needs an address at issue.** NumPy's reduction iterator used
+to be built per op at issue (it needs the GIL) over the input's real
+address, which pinned a pending input's memory on the main thread. It is
+now built once per signature over a dummy address (`ReduceTemplate`, as
+the element-wise iterator templates) and the task points its copy at the
+buffers when it runs (`NpyIter_ResetBasePointers`); the result is a
+regular deferred output in the layout NumPy allocated for the template.
+`ensure_allocated` and `take_block` still agree on one block by CAS on
+the data pointer (the direct path allocates on the main thread right
+before it runs). The alignment check for async `matmul` treats a deferred
+buffer as aligned (pool blocks are at least 64-byte aligned).
+
+**Consequences.**
+
+- Peak memory falls: pending outputs hold no memory, only running tasks'
+  outputs and live data do. The 1000-task look-ahead limit no longer
+  multiplies output sizes; a memory-based look-ahead limit becomes much
+  less pressing.
+- D5 (main-thread elision of temporaries at issue) stays: it turns the op
+  into an in/out op before a task exists, and covers ops run directly.
+- Releases remain deterministic (D2): only where a block goes changes.
+- Data-dependent output sizes (`nonzero`, boolean indexing, `unique`) fit
+  without a special case: the task learns its size and takes its memory
+  when it runs, from the same pool.
+- Devices (future): the stages `size_completed → device_selected →
+  allocated` can now all happen in the task, so the device can be chosen
+  when the task runs, from where its inputs are.
+- Versus D10: D10 kept the allocating side single-threaded (no atomics on
+  the hot path). D11 pays one uncontended CAS per release and an exchange
+  per allocation, and gains cache-hot memory, lower peak memory and in-place
+  chains; the measurements above decide it.
+
 ## Open questions
 
 - Pool bound default (fraction of RAM vs. fixed) and the eviction order.
-- When the main thread merges the remote-release stack besides misses and
-  sync points (e.g. every N issued ops), so released memory counts toward
-  the pool bound promptly.
 - `FixedPool` (D4) still lets any thread allocate; tighten it to the D10
   model (main-thread allocation, assertion in debug builds).
 - Bin granularity (8 vs. 4 per power of two) and the size range served by
   the pool at all (very small blocks could stay with malloc).
-- Per-thread caches in front of the element pool: only if contention shows
-  up in `strong_scaling.py` with large arrays.
+- Per-thread caches in front of the element pool: tried and replaced (D11,
+  "Pool access model"); reconsider only if lock contention shows up with
+  many cores.
 - Huge-page threshold. Windows large pages are not swappable, need a
   privilege and are expensive to allocate (opt-in, see "Large blocks");
   measure whether they pay off with a warm pool before recommending them,
   or allocate them off the main thread.
-- Memory-based look-ahead limit (bytes held by pending outputs) instead of,
-  or in addition to, 1000 active tasks.
+- Memory-based look-ahead limit: pending outputs hold no memory since D11;
+  check whether in-flight inputs (live data the main thread has dropped
+  but tasks still read) still call for one.
 - D5's interpreter check: how to tell "called from the interpreter" cheaply
   on CPython 3.12+ (NumPy inspects the C call chain; a cheaper criterion
   may exist for the number-protocol slots).

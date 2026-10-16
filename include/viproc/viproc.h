@@ -101,6 +101,9 @@ int vp_array_from_ndarray(vp_runtime* rt, PyObject* ndarray, vp_array** out, cha
  * converted to `dtype` with NumPy's rules (e.g. OverflowError for a Python
  * int out of range). Returns VP_PYERR with the Python exception set. */
 int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array** out);
+/* [GIL] Like vp_array_from_scalar(), but converted as NumPy's `a[i] = value`
+ * converts it (PyArray_Pack): NumPy's values and errors for assignments. */
+int vp_array_from_item(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array** out);
 /* [GIL, main thread] NumPy's scalar of the first element of `a`, which must
  * be ready (vp_array_ready). New reference. */
 PyObject* vp_array_scalar(const vp_array* a);
@@ -144,6 +147,23 @@ int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen);
  * vp_array_prepare_write(), for NumPy code run synchronously on the main
  * thread (docs/design/memory-management.md, D7). */
 PyObject* vp_array_export(const vp_array* a, int writable);
+/* [GIL, main thread] A NumPy array over `a`'s data without an owner, for a
+ * NumPy call made right away on ready data that only reads it (reductions):
+ * valid while the caller keeps `a` and issues nothing that writes it.
+ * Flagged writable as NumPy's own arrays are (NumPy copies read-only inputs
+ * in some reductions); the callee must not write. If the array is still
+ * referenced after the call, vp_array_pin() makes it a read-only export (it
+ * then keeps the buffer alive and counts as a reader). `a` must be ready.
+ * NULL with a Python error on failure. */
+PyObject* vp_array_borrow(const vp_array* a);
+/* [main thread] 1 if NumPy may write `a`'s buffer right now, on the main
+ * thread with the GIL, without waiting: `a` is ready without a stored error
+ * and no task and no NumPy view (export) reads its buffer. Then a writable
+ * vp_array_borrow() view may be written during one NumPy call (index
+ * assignment delegated to NumPy). Stays true until the main thread issues a
+ * reader or writer of the storage. */
+int vp_array_host_writable(vp_array* a);
+int vp_array_pin(const vp_array* a, PyObject* view);
 /* [no GIL, main thread] Sync point before NumPy code writes `a`'s buffer
  * directly: waits for its producer, copies-on-write if NumPy views of the
  * buffer are alive, waits until no task reads it. */
@@ -212,8 +232,8 @@ int vp_scatter(vp_runtime* rt, vp_array* dst, int nidx, vp_array* const* idx, co
                size_t errlen);
 /* dst[mask] = value: `value` 0-d with dst's dtype, `mask` bool broadcastable
  * to dst. */
-int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* value,
-                   const char* site, char* err, size_t errlen);
+int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* value, const char* site,
+                   char* err, size_t errlen);
 
 /* np.where(cond, x, y) with `cond` bool and x, y already of the result's
  * dtype (the caller casts as NumPy does); all three broadcast. The result
@@ -247,6 +267,18 @@ int vp_arg_reduce(vp_runtime* rt, int argmax, vp_array* in, int out_ndim, const 
  * initial value casts; the caller then falls back to NumPy. */
 int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
               int keepdims, PyObject* dtype, PyObject* identity, vp_array** result,
+              const char* site, char* err, size_t errlen);
+
+/* Issues np.matmul(a, b) (the `@` operator) with NumPy's matmul gufunc loop
+ * for (t, t) -> t, where t is the dtype of both operands; the loop is
+ * called with the strides NumPy's gufunc machinery passes, so it makes the
+ * same BLAS calls (src/kernels/numpy_matmul.hpp). The result has NumPy's
+ * shape and layout. Returns VP_UNSUPPORTED (reason in `err`) where NumPy
+ * would cast or copy an operand (different dtypes, misaligned data), the
+ * loop needs the Python API, or NumPy raises (0-d operands, mismatching
+ * core dimensions, batch shapes that do not broadcast); the caller then
+ * falls back to NumPy. */
+int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_array** result,
               const char* site, char* err, size_t errlen);
 
 /* Issues dst[...] = src (src broadcasts to dst's shape; another dtype is

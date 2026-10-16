@@ -317,9 +317,13 @@ def test_element_pool_reuses_memory_and_trims():
         r = ((x + 1.0) * 2.0) + 3.0
         assert same(r, expected)
     after = viproc.pool_stats()
-    # x + 1 takes a buffer each time (from the pool after the first); the
-    # other two ops may write into the temporary instead (D5).
-    assert after["hits"] - before["hits"] >= 15
+    # x + 1 takes a buffer each time; the other two ops may write into the
+    # temporary instead (D5, D11). Every block released before the next
+    # allocation is found again (one shared LIFO per bin): misses only for
+    # the first iteration and blocks still held when the next op allocates.
+    misses = after["misses"] - before["misses"]
+    assert misses <= 3
+    assert after["hits"] - before["hits"] >= 20 - misses
     assert after["cached"] <= after["limit"]
     viproc.trim()
     assert viproc.pool_stats()["cached"] == 0

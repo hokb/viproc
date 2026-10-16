@@ -3,11 +3,15 @@
 #include "runtime/pool.hpp"
 
 #define NPY_NO_DEPRECATED_API NPY_2_0_API_VERSION
+// NumPy >= 2.0 is required anyway; 2.0 adds PyArray_Pack to the C API.
+#define NPY_TARGET_VERSION NPY_2_0_API_VERSION
 #define PY_ARRAY_UNIQUE_SYMBOL viproc_ARRAY_API
 #define PY_UFUNC_UNIQUE_SYMBOL viproc_UFUNC_API
 #include <numpy/arrayobject.h>
 #include <numpy/dtype_api.h>
 #include <numpy/ufuncobject.h>
+
+#include "kernels/numpy_iter.hpp"
 
 #include <cstring>
 #include <mutex>
@@ -32,18 +36,6 @@ int init_numpy_api() {
     import_array1(-1);
     import_umath1(-1);
     return 0;
-}
-
-std::string fetch_python_error() {
-    PyObject* exc = PyErr_GetRaisedException();
-    if (exc == nullptr) {
-        return "unknown error";
-    }
-    PyObject* s = PyObject_Str(exc);
-    std::string msg = s != nullptr ? PyUnicode_AsUTF8(s) : "unknown error";
-    Py_XDECREF(s);
-    Py_DECREF(exc);
-    return msg;
 }
 
 bool dtype_of(int type_num, DType& out) {
@@ -75,6 +67,18 @@ bool dtype_of(int type_num, DType& out) {
 }
 
 } // namespace
+
+std::string fetch_python_error() {
+    PyObject* exc = PyErr_GetRaisedException();
+    if (exc == nullptr) {
+        return "unknown error";
+    }
+    PyObject* s = PyObject_Str(exc);
+    std::string msg = s != nullptr ? PyUnicode_AsUTF8(s) : "unknown error";
+    Py_XDECREF(s);
+    Py_DECREF(exc);
+    return msg;
+}
 
 bool init() { return init_numpy_api() == 0; }
 
@@ -373,6 +377,10 @@ class ElementwiseKernel : public Kernel {
   public:
     explicit ElementwiseKernel(const UfuncLoop* loop) : loop_(loop) {}
 
+    // Element-wise loops read element i before writing it: an output may
+    // share an input's memory with the same layout (NumPy's out= / elision).
+    bool in_place_ok() const override { return true; }
+
     // Only the first nin() inputs go to the loop; further inputs are in/out
     // arrays the runtime lists as read (see Runtime::issue).
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
@@ -444,54 +452,7 @@ constexpr std::size_t kMaxOps = 32;
 // Iterator templates kept per LoopCache (all dropped when full).
 constexpr std::size_t kMaxIterTemplates = 1024;
 
-// Iterators of kernels that finished are kept per template and reused: a
-// new copy (NpyIter_Copy) per op would also allocate its buffers on the
-// worker at the first reset (DELAY_BUFALLOC), and freeing them later on the
-// main thread keeps that memory cold. Main thread pops, any thread returns.
-constexpr std::size_t kMaxPooledIters = 16;
-
 } // namespace
-
-struct IterTemplate {
-    NpyIter* templ = nullptr;
-    DeferRelease defer;
-    std::mutex mutex;
-    std::vector<NpyIter*> free; // finished iterators, ready for a reset
-
-    ~IterTemplate() {
-        std::vector<NpyIter*> all = std::move(free);
-        all.push_back(templ);
-        defer([all] {
-            for (NpyIter* it : all) {
-                NpyIter_Deallocate(it);
-            }
-        });
-    }
-
-    // A clean iterator to reuse, or nullptr. Main thread.
-    NpyIter* pop() {
-        std::lock_guard lock(mutex);
-        if (free.empty()) {
-            return nullptr;
-        }
-        NpyIter* it = free.back();
-        free.pop_back();
-        return it;
-    }
-
-    // Takes back an iterator after a complete iteration (nothing left in
-    // its buffers to write back); others are released. Any thread.
-    void give_back(NpyIter* it, bool clean) {
-        if (clean) {
-            std::lock_guard lock(mutex);
-            if (free.size() < kMaxPooledIters) {
-                free.push_back(it);
-                return;
-            }
-        }
-        defer([it] { NpyIter_Deallocate(it); });
-    }
-};
 
 namespace {
 
@@ -502,6 +463,8 @@ class IterElementwiseKernel : public Kernel {
         : loop_(loop), iter_(iter), pool_(std::move(pool)) {}
 
     ~IterElementwiseKernel() override { pool_->give_back(iter_, clean_); }
+
+    bool in_place_ok() const override { return true; }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const auto nin = static_cast<std::size_t>(loop_->nin());
@@ -538,21 +501,6 @@ class IterElementwiseKernel : public Kernel {
     bool clean_ = true; // a fresh copy has nothing in its buffers
 };
 
-// An array with `l`'s shape and strides over `data` (not owned, never read
-// or written: a template for the iterator's setup).
-PyArrayObject* template_array(const Layout& l, char* data, bool writable) {
-    npy_intp shape[NPY_MAXDIMS];
-    npy_intp strides[NPY_MAXDIMS];
-    for (std::size_t i = 0; i < l.shape.size(); ++i) {
-        shape[i] = static_cast<npy_intp>(l.shape[i]);
-        strides[i] = static_cast<npy_intp>(l.strides[i]);
-    }
-    PyArray_Descr* descr = PyArray_DescrFromType(type_num(l.dtype));
-    return reinterpret_cast<PyArrayObject*>(PyArray_NewFromDescr(
-        &PyArray_Type, descr, static_cast<int>(l.shape.size()), shape, strides, data,
-        NPY_ARRAY_ALIGNED | (writable ? NPY_ARRAY_WRITEABLE : 0), nullptr)); // steals descr
-}
-
 npy_intp numpy_buffersize() {
     npy_intp buffersize = 0;
     if (PyObject* np = PyImport_ImportModule("numpy")) {
@@ -567,6 +515,24 @@ npy_intp numpy_buffersize() {
 }
 
 } // namespace
+
+PyArrayObject* template_array(const Layout& l, char* data, bool writable) {
+    npy_intp shape[NPY_MAXDIMS];
+    npy_intp strides[NPY_MAXDIMS];
+    for (std::size_t i = 0; i < l.shape.size(); ++i) {
+        shape[i] = static_cast<npy_intp>(l.shape[i]);
+        strides[i] = static_cast<npy_intp>(l.strides[i]);
+    }
+    PyArray_Descr* descr = PyArray_DescrFromType(type_num(l.dtype));
+    return reinterpret_cast<PyArrayObject*>(PyArray_NewFromDescr(
+        &PyArray_Type, descr, static_cast<int>(l.shape.size()), shape, strides, data,
+        NPY_ARRAY_ALIGNED | (writable ? NPY_ARRAY_WRITEABLE : 0), nullptr)); // steals descr
+}
+
+char* template_address() {
+    alignas(64) static char dummy[64];
+    return dummy;
+}
 
 std::shared_ptr<Kernel> make_elementwise_kernel(const UfuncLoop* loop) {
     return std::make_shared<ElementwiseKernel>(loop);
@@ -683,7 +649,7 @@ Layout at_least_1d(Layout l) {
 
 std::shared_ptr<Kernel> make_cast_kernel(const Layout& in, const Layout& out, long buffersize,
                                          DeferRelease defer, std::string& error) {
-    alignas(64) static char dummy[64];
+    char* const dummy = template_address();
     PyArrayObject* op[2] = {template_array(at_least_1d(in), dummy, false),
                             template_array(at_least_1d(out), dummy, true)};
     PyArray_Descr* descr = PyArray_DescrFromType(type_num(out.dtype));
@@ -726,6 +692,7 @@ std::shared_ptr<Kernel> make_cast_kernel(const Layout& in, const Layout& out, lo
 
 LoopCache::~LoopCache() {
     iter_templates_.clear(); // kernels still holding one release it later
+    reduce_templates_.clear();
     Py_XDECREF(extobj_);
     Py_XDECREF(extobj_var_);
 }
@@ -795,7 +762,7 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
         // separated outputs from overlapping inputs). Alignment is the only
         // property of the address it uses: element-aligned, as viproc
         // buffers.
-        alignas(64) static char dummy[64];
+        char* const dummy = template_address();
         PyArrayObject* op[kMaxOps] = {};
         PyArray_Descr* descrs[kMaxOps] = {};
         npy_uint32 op_flags[kMaxOps];
@@ -852,10 +819,7 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
         pool->defer = std::move(defer);
         iter_templates_.emplace(std::move(key), pool);
     }
-    NpyIter* iter = pool->pop();
-    if (iter == nullptr) {
-        iter = NpyIter_Copy(pool->templ);
-    }
+    NpyIter* iter = pool->get();
     if (iter == nullptr) {
         error = fetch_python_error();
         return nullptr;
@@ -950,6 +914,18 @@ ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype) {
     return rt.wrap(std::move(l), std::move(buffer));
 }
 
+ArrayPtr item_array(Runtime& rt, PyObject* value, DType dtype) {
+    PyArray_Descr* descr = PyArray_DescrFromType(type_num(dtype));
+    Layout l = Layout::contiguous(dtype, {});
+    auto buffer = make_pooled<Buffer>(l.nbytes());
+    const int status = PyArray_Pack(descr, buffer->data(), value);
+    Py_DECREF(descr);
+    if (status < 0) {
+        return nullptr;
+    }
+    return rt.wrap(std::move(l), std::move(buffer));
+}
+
 bool scalar_bytes(PyObject* value, DType dtype, std::vector<std::byte>& out) {
     PyArray_Descr* descr = PyArray_DescrFromType(type_num(dtype));
     PyObject* arr = PyArray_FromAny(value, descr, 0, 0, 0, nullptr); // steals descr
@@ -985,31 +961,61 @@ void release_export(PyObject* capsule) {
 
 } // namespace
 
-PyObject* export_ndarray(const Array& a, bool writable) {
+namespace {
+
+PyObject* ndarray_over(const Array& a, bool writable) {
     const Layout& l = a.layout();
-    std::vector<npy_intp> shape(l.shape.begin(), l.shape.end());
-    std::vector<npy_intp> strides(l.strides.begin(), l.strides.end());
+    npy_intp shape[NPY_MAXDIMS];
+    npy_intp strides[NPY_MAXDIMS];
+    for (std::size_t i = 0; i < l.shape.size(); ++i) {
+        shape[i] = static_cast<npy_intp>(l.shape[i]);
+        strides[i] = static_cast<npy_intp>(l.strides[i]);
+    }
+    // Read-only unless the caller prepared the buffer for writing (see header).
+    const int flags = writable ? NPY_ARRAY_ALIGNED | NPY_ARRAY_WRITEABLE : NPY_ARRAY_ALIGNED;
+    return PyArray_New(&PyArray_Type, static_cast<int>(l.shape.size()), shape, type_num(l.dtype),
+                       strides, a.buffer()->data() + l.offset, 0, flags, nullptr);
+}
+
+// Makes `view` (over a's buffer, no base yet) an export: its base keeps the
+// buffer alive and, read-only, counts as a reader. Returns false (view
+// untouched, Python error set) on failure.
+bool attach_export(const Array& a, PyObject* view, bool writable) {
     auto hold = std::make_unique<ExportHold>(ExportHold{a.buffer(), !writable});
     PyObject* capsule = PyCapsule_New(hold.get(), kExportCapsule, release_export);
     if (capsule == nullptr) {
-        return nullptr;
+        return false;
     }
     if (hold->counted) {
         ++hold->buffer->host_views;
     }
     hold.release(); // owned by the capsule now
-    // Read-only unless the caller prepared the buffer for writing (see header).
-    const int flags = writable ? NPY_ARRAY_ALIGNED | NPY_ARRAY_WRITEABLE : NPY_ARRAY_ALIGNED;
-    PyObject* view =
-        PyArray_New(&PyArray_Type, static_cast<int>(shape.size()), shape.data(), type_num(l.dtype),
-                    strides.data(), a.buffer()->data() + l.offset, 0, flags, nullptr);
-    if (view == nullptr ||
-        PyArray_SetBaseObject(reinterpret_cast<PyArrayObject*>(view), capsule) < 0) {
-        Py_XDECREF(view);
+    if (PyArray_SetBaseObject(reinterpret_cast<PyArrayObject*>(view), capsule) < 0) {
         Py_DECREF(capsule);
+        return false;
+    }
+    return true; // the capsule reference went to the view
+}
+
+} // namespace
+
+PyObject* export_ndarray(const Array& a, bool writable) {
+    PyObject* view = ndarray_over(a, writable);
+    if (view == nullptr || !attach_export(a, view, writable)) {
+        Py_XDECREF(view);
         return nullptr;
     }
-    return view; // the capsule reference went to the view
+    return view;
+}
+
+// Writable as NumPy's own arrays are (NumPy copies read-only inputs in some
+// reductions, e.g. argmax), for the reductions the bridge calls: they read
+// it only. Read-only once pinned.
+PyObject* borrow_ndarray(const Array& a) { return ndarray_over(a, true); }
+
+bool pin_borrowed(const Array& a, PyObject* view) {
+    PyArray_CLEARFLAGS(reinterpret_cast<PyArrayObject*>(view), NPY_ARRAY_WRITEABLE);
+    return attach_export(a, view, false);
 }
 
 } // namespace viproc::numpy

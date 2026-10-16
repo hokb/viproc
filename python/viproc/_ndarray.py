@@ -1012,7 +1012,11 @@ def _as_values(value, dtype):
     """`value` as a viproc array of `dtype` (NumPy's setitem conversion)."""
     if isinstance(value, ndarray):
         return value if value.dtype == dtype else value.astype(dtype)
-    return asarray(np.asarray(value).astype(dtype, copy=False))
+    if np.ndim(value) == 0 and not isinstance(value, np.ndarray):
+        t = np.empty((), dtype)
+        t[()] = value  # NumPy's conversion of a[i] = value (errors included)
+        return _adopt(t)
+    return _adopt(np.array(value, dtype=dtype))  # as NumPy's setitem: a cast copy
 
 
 def _scatter(a, key, value):
@@ -1162,39 +1166,14 @@ class ndarray(_viproc._Array):
         all-int key gives a 0-d view)."""
         return _basic(self, key)
 
-    def __setitem__(self, key, value):
-        if not _is_basic_index(key):  # NumPy assigns in place, overlap included
-            if not self._readonly and type(self) is ndarray:
-                try:
-                    done = _scatter(self, key, value)
-                except (TypeError, ValueError, IndexError, OverflowError):
-                    done = False  # NumPy raises its own error
-                if done:
-                    return
-
-            def assign(a, k, v):
-                a[k] = v
-
-            _host_call(assign, (self, key, value), {})
-            return
-        if self._readonly:
-            raise ValueError("assignment destination is read-only")
-        target = self._view(key)
-        if isinstance(value, ndarray):
-            src = value  # another dtype: cast in the assignment (vp_assign)
-        else:
-            src = asarray(np.asarray(value).astype(self.dtype, copy=False))
-        try:
-            _viproc.assign(target, src)
-        except NotImplementedError:  # a cast NumPy refused (warning turned into an error)
-            _viproc.assign(target, asarray(np.asarray(src).astype(self.dtype, copy=False)))
-
     # --- NumPy protocols -------------------------------------------------------
-    def __array_function__(self, func, types, args, kwargs):
+    # __array_function__ is _Array's (C): reductions there, everything else
+    # here.
+    def _array_function(self, func, types, args, kwargs):
         if func is np.copyto and len(args) >= 2 and isinstance(args[0], ndarray) and not kwargs:
             args[0][...] = args[1]
             return None
-        handler = _REDUCTIONS.get(func) or _VIEW_HANDLERS.get(func)
+        handler = _REDUCTIONS.get(func) or _VIEW_HANDLERS.get(func) or _PRODUCTS.get(func)
         if handler is not None:
             try:
                 r = handler(*args, **kwargs)
@@ -1205,7 +1184,10 @@ class ndarray(_viproc._Array):
         return _host_call(func, args, kwargs)
 
     # --- common methods (NumPy semantics via the protocols) -------------------
-    def astype(self, dtype, order="K", casting="unsafe", subok=True, copy=True):
+    # sum, prod, max, min, any, all, mean, var, std, argmax, argmin, copy and
+    # astype are _Array's C methods (setup_reductions below); these are the
+    # Python paths behind copy and astype.
+    def _astype_py(self, dtype, order="K", casting="unsafe", subok=True, copy=True):
         dtype = np.dtype(dtype)
         if dtype == self.dtype and not copy:
             return self
@@ -1217,12 +1199,14 @@ class ndarray(_viproc._Array):
                 return r
         return _host_call(lambda a: a.astype(dtype, order, casting, subok, copy), (self,), {})
 
-    def copy(self):
+    def _copy_py(self, order="C"):
+        if order != "C":
+            return _host_call(lambda a: a.copy(order), (self,), {})
         out = _wrap_numpy(np.empty(self.shape, self.dtype))
         _viproc.assign(out, self)
         return out
 
-    def reshape(self, *shape, **kwargs):
+    def _reshape_py(self, *shape, **kwargs):  # behind _Array.reshape (C)
         shape = shape[0] if len(shape) == 1 else shape
         r = _reshape(self, shape, **kwargs) if not kwargs else _NOPE
         return np.reshape(self, shape, **kwargs) if r is _NOPE else r
@@ -1248,7 +1232,7 @@ class ndarray(_viproc._Array):
             axes = axes[0]
         return _transpose(self, axes if axes != () else None)
 
-    def swapaxes(self, axis1, axis2):
+    def _swapaxes_py(self, axis1, axis2):  # behind _Array.swapaxes (C)
         return _swapaxes(self, axis1, axis2)
 
     def squeeze(self, axis=None):
@@ -1277,38 +1261,11 @@ class ndarray(_viproc._Array):
         return _host_call(lambda a: a.view(dtype) if type is None else a.view(dtype, type),
                           (self,), {})
 
-    def sum(self, *a, **k):
-        return np.sum(self, *a, **k)
+    # sum, prod, min, max, mean, std, var, any, all, argmin, argmax: _Array's
+    # (C), with _reduction_fallback below for what C does not handle.
 
-    def prod(self, *a, **k):
-        return np.prod(self, *a, **k)
-
-    def min(self, *a, **k):
-        return np.min(self, *a, **k)
-
-    def max(self, *a, **k):
-        return np.max(self, *a, **k)
-
-    def mean(self, *a, **k):
-        return np.mean(self, *a, **k)
-
-    def std(self, *a, **k):
-        return np.std(self, *a, **k)
-
-    def var(self, *a, **k):
-        return np.var(self, *a, **k)
-
-    def any(self, *a, **k):
-        return np.any(self, *a, **k)
-
-    def all(self, *a, **k):
-        return np.all(self, *a, **k)
-
-    def argmin(self, *a, **k):
-        return np.argmin(self, *a, **k)
-
-    def argmax(self, *a, **k):
-        return np.argmax(self, *a, **k)
+    def dot(self, b, out=None):
+        return np.dot(self, b, out=out)
 
 
 def _ufunc_reduce(ufunc, a, axis=0, dtype=None, out=None, keepdims=False, initial=_NV,
@@ -1318,9 +1275,64 @@ def _ufunc_reduce(ufunc, a, axis=0, dtype=None, out=None, keepdims=False, initia
     return _reduce(ufunc, a, axis, keepdims, dtype, initial)
 
 
+def _product_operands(inputs):
+    """Both operands of a matrix product as viproc arrays (NumPy arrays are
+    imported), or None if NumPy has to run it."""
+    if len(inputs) != 2 or not all(isinstance(x, (ndarray, np.ndarray)) for x in inputs):
+        return None
+    ops = tuple(x if isinstance(x, ndarray) else asarray(x) for x in inputs)
+    if not all(isinstance(x, ndarray) for x in ops) or ops[0].dtype != ops[1].dtype:
+        return None  # unsupported dtype, or a cast (NumPy's iterator copies)
+    return ops
+
+
+def _matmul(a, b):
+    ops = _product_operands((a, b))
+    return _viproc.matmul(*ops) if ops is not None else None
+
+
+def _dot_operand(x):
+    """x as NumPy's dot passes it to BLAS (cblas_matrixproduct): copied to C
+    order if its strides are not BLAS-able (negative, zero, not a multiple
+    of the item size) or, for a matrix, if it is neither C- nor
+    F-contiguous."""
+    st, n = x.strides, x.itemsize
+    bad = any(s <= 0 or s % n for s in st)
+    if x.ndim == 2 and not bad:
+        c = st[1] == n and st[0] == x.shape[1] * n
+        f = st[0] == n and st[1] == x.shape[0] * n
+        bad = not (c or f)
+    return x.astype(x.dtype, order="C") if bad else x
+
+
+def _dot(a, b, out=None):
+    """np.dot of vectors and matrices as matmul where both make the same loop
+    calls: NumPy's dot gives integers and bool the values of matmul (exact
+    sums), and for floating-point matrices and vectors with every extent >= 2
+    makes the BLAS call matmul makes (gemm/syrk, gemv, dot), once its
+    operands are prepared as dot prepares them. Everything else (0-d and
+    n-d operands, extents of 1, out=) runs in NumPy."""
+    ops = _product_operands((a, b)) if out is None else None
+    if ops is None or not all(1 <= x.ndim <= 2 for x in ops):
+        return _NOPE
+    if ops[0].dtype.kind in "fc":
+        if any(e < 2 for x in ops for e in x.shape):
+            return _NOPE  # dot's scalar/row/column special cases
+        ops = tuple(_dot_operand(x) for x in ops)
+    r = _viproc.matmul(*ops)
+    return _NOPE if r is None else r
+
+
+_PRODUCTS = {np.dot: _dot}
+
+
 def _fallback_ufunc(ufunc, method, inputs, kwargs):
-    """ufunc.reduce asynchronously where possible; anything else syncs and
-    runs eagerly in NumPy (in place for out= and ufunc.at)."""
+    """ufunc.reduce and matmul asynchronously where possible; anything else
+    syncs and runs eagerly in NumPy (in place for out= and ufunc.at)."""
+    if method == "__call__" and ufunc is np.matmul and not kwargs:
+        r = _matmul(*inputs) if len(inputs) == 2 else None
+        if r is not None:
+            return r
     if method == "reduce" and len(inputs) == 1:
         try:
             r = _ufunc_reduce(ufunc, *inputs, **kwargs)
@@ -1341,6 +1353,37 @@ _OPS = {
         "equal", "not_equal", "greater", "greater_equal",
     )
 }
+def _setitem(self, key, value):
+    """a[key] = value beyond _Array's C slot (which hands small work on ready
+    data to NumPy and issues basic-key assignments of scalars and viproc
+    arrays): advanced keys, sequences as values, NumPy's errors."""
+    if not _is_basic_index(key):  # NumPy assigns in place, overlap included
+        if not self._readonly and type(self) is ndarray:
+            try:
+                done = _scatter(self, key, value)
+            except (TypeError, ValueError, IndexError, OverflowError):
+                done = False  # NumPy raises its own error
+            if done:
+                return
+
+        def assign(a, k, v):
+            a[k] = v
+
+        _host_call(assign, (self, key, value), {})
+        return
+    if self._readonly:
+        raise ValueError("assignment destination is read-only")
+    target = self._view(key)
+    if isinstance(value, ndarray):
+        src = value  # another dtype: cast in the assignment (vp_assign)
+    else:
+        src = asarray(np.asarray(value).astype(self.dtype, copy=False))
+    try:
+        _viproc.assign(target, src)
+    except NotImplementedError:  # a cast NumPy refused (warning turned into an error)
+        _viproc.assign(target, asarray(np.asarray(src).astype(self.dtype, copy=False)))
+
+
 def _getitem(self, key):
     """a[key] beyond the C fast path (_Array.__getitem__ handles integer
     keys of ready arrays and basic keys itself): advanced indexing, NumPy's
@@ -1370,6 +1413,45 @@ def _getitem(self, key):
     return _host_call(lambda a, k: a[k], (self, key), {})
 
 
+def _reduction_fallback(func, args, kwargs):
+    """np.<reduction>(*args, **kwargs) beyond the C path (_Array's methods and
+    __array_function__): the asynchronous handlers, else NumPy."""
+    handler = _REDUCTIONS[func]
+    try:
+        r = handler(*args, **kwargs)
+    except TypeError:  # unexpected arguments: NumPy reports them
+        r = _NOPE
+    return _host_call(func, args, kwargs) if r is _NOPE else r
+
+
+_viproc.setup_reductions(
+    tuple(
+        (f, m, k, u, lambda args, kwargs, f=f: _reduction_fallback(f, args, kwargs))
+        for f, m, k, u in (
+            (np.sum, "sum", 0, np.add),
+            (np.prod, "prod", 0, np.multiply),
+            (np.max, "max", 1, np.maximum),
+            (np.min, "min", 1, np.minimum),
+            (np.amax, None, 1, np.maximum),
+            (np.amin, None, 1, np.minimum),
+            (np.any, "any", 2, np.logical_or),
+            (np.all, "all", 2, np.logical_and),
+            (np.mean, "mean", 3, None),
+            (np.var, "var", 3, None),
+            (np.std, "std", 3, None),
+            (np.argmax, "argmax", 3, None),
+            (np.argmin, "argmin", 3, None),
+        )
+    )
+    + (
+        (None, "copy", 3, None, lambda args, kwargs: ndarray._copy_py(*args, **kwargs)),
+        (None, "astype", 3, None, lambda args, kwargs: ndarray._astype_py(*args, **kwargs)),
+    ),
+    ndarray._array_function,
+    np._NoValue,
+    _REDUCE_ASYNC,
+)
+
 _viproc.setup(
     ndarray,
     tuple(_DTYPES[c] for c in range(7)),
@@ -1380,6 +1462,7 @@ _viproc.setup(
     np.ndarray,
     np.generic,
     _getitem,
+    _setitem,
 )
 
 

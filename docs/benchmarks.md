@@ -222,6 +222,8 @@ compare directly.
 | 10-13 | `2f7cac1` | `kmeans_points` case; back-pressure hysteresis, pooled iterators, faster `a[:, idx]` (2.10) | 100 | 68 | 1.68x | 0.87x | 85 | 52 | 80 | 56 | 56 | 91 | 101 | 71 | 69 | 52 | 81 |
 | 10-14 | `3111820` | same-VM baseline for the view changes: state before them (2.80) | 100 | 64 | 1.60x | 0.87x | 82 | 48 | 79 | 54 | 53 | 77 | 73 | 68 | 71 | 48 | 77 |
 | 10-14 | `5db8972` | views computed without ndarrays, `a[key]` in the C slot (2.80) | 100 | 64 | 1.62x | 0.87x | 85 | 49 | 78 | 55 | 53 | 71 | 96 | 62 | 72 | 48 | 79 |
+| 10-15 | `937393a` | same-VM baseline for matmul: state before it (2.10) | 100 | 72 | 1.77x | 0.90x | 87 | 58 | 87 | 58 | 59 | 93 | 117 | 71 | 74 | 57 | 80 |
+| 10-15 | `233fe84` | async `matmul` / `@` / `np.dot` with NumPy's matmul loop (2.10) | 100 | 68 | 1.73x | 0.90x | 89 | 52 | 78 | 61 | 58 | 76 | 80 | 64 | 72 | 56 | 79 |
 
 View changes, same VM (`3111820` → `5db8972`): score 64.0 → 63.7,
 unchanged within noise; the programs dominated by slicing gained:
@@ -231,6 +233,16 @@ configurations: up to ±25-30% (`dtype_chains` float16, which runs
 entirely in NumPy, 1.27x → 1.00x). Judge a change by the cases it
 targets and by repeated runs, not by one score difference of a few
 points.
+
+matmul, same VM (`937393a` → `233fe84`, builds `#8788db05` / `#f4ae3e57`):
+`matmul_batch` has no fallbacks left (11,540 and 48 before); small
+0.48x → 1.04x, medium 0.67x → 0.90x (separate filtered runs: small
+0.32x → 0.85-1.24x, medium ~1.0x). Medium products (316 x 316) are
+already threaded by OpenBLAS in NumPy, so overlapping four of them gains
+little. The score difference (72 → 68) is noise: the cases that moved
+most do not use matmul, and repeated runs of the scalar cases swing in
+both builds alike (`chain_serial` scalar: base 1.76x, 0.86x, 1.00x; new
+0.97x, 1.06x, 0.96x).
 
 The Windows build (Wine image) scored 46 (Linux 41 in the same Docker
 run) at `7b2846f` and 48 (Linux 42) with 89 cases: it tracks the Linux
@@ -290,6 +302,220 @@ worker at 1e7 elements 117 → 40 ms (`2c67ed2`), with temporary elision
 float64 18.8 → 0.001 ms (`e0732f4`); ILNumerics' k-means program
 (`kmeans_points`, 1203 x 1203, k = 50) 3.9x vs. NumPy on 4 cores
 (`2f7cac1`).
+
+## Shape map
+
+`python/benchmarks/shape_map.py` maps viproc's speedup vs. NumPy (NumPy
+time / viproc time, one worker per core) over the 2-d problem size: rows
+x columns, both log-spaced in half decades from 1 to 10,000 (rows stop at
+5,000 when 10,000 x 10,000 does not fit into RAM with the largest case),
+plus 0-d scalars. Each grid point runs 19 plain NumPy programs
+(`shape_map_cases.py`) in five groups: dependent chains of 1, 2 and 3
+unary ops, 2 to 8 independent chains (float64 and float32, cheap and
+expensive ops), mixed unary/binary expressions (P = 2 and 8, in-place
+updates, row/column broadcasting, a slice stencil), axis and full
+reductions feeding back into element-wise ops, and programs with a sync
+point (a Python float read) after every step. Per point: the **median**
+over the cases (on the log scale) as the representative value, the
+**interquartile range** (25th..75th percentile, as factor q75/q25) as the
+spread. `--plot shape_map.json` redraws the images; `--quick` uses whole
+decades.
+
+Full run, 2026-10-15, code of `937393a`, build `2026-10-15T07:43:29
+#8788db05`; Linux, Intel Xeon @ 2.10 GHz, 4 cores, 15.7 GiB, Python
+3.13.16, NumPy 2.5.3, Release, 4 workers; 1,552 measurements, all
+bit-identical, no fallbacks; 2 skipped (8-chain cases at 5,000 x 10,000,
+RAM). Runtime ~35 minutes, two thirds of it in the points above 10
+million elements.
+
+![median speedup and spread over rows x columns](benchmarks/shape_map.png)
+
+![median speedup per case group](benchmarks/shape_map_groups.png)
+
+- **Below ~30,000 elements viproc is slower than NumPy:** median
+  0.55-0.9x (scalar-like 1 x 1 to 32 x 32: ~0.55-0.65x). 0-d scalars run
+  at parity (0.98x, scalar shortcut). Per-op overhead of the task and
+  bridge, not parallelism, decides this region.
+- **Parity at ~100,000 elements, gains from ~1 million:** median 1.1-1.3x
+  at 1e5-3e6 elements, 1.5-1.8x from 1e7 on, with an IQR of up to
+  1.5-3.4x: the gain is concentrated in the parallel cases.
+- **By group** (largest points): independent chains 2.8-4.7x (ideal 4,
+  above it where temporary reuse saves NumPy's page faults), mixed
+  expressions 1.7-2.8x, reductions 1.5-2.2x, dependent chains ~1.5x
+  (no parallelism: element pool and temporary reuse), programs that sync
+  after every step 1.1-1.4x.
+- **Shape matters at equal size:** single rows (1 x n) stay below 1x up
+  to 10,000 columns; tall thin arrays (n x 1) behave like vectors; the
+  sync group stays below parity up to ~1 million elements.
+
+### After D11: tasks allocate their output memory
+
+Same machine, full run each, back to back: `main` (`33d373b`) vs. the
+branch with D11 (element memory taken by the producing task when it runs,
+from a dying input or the pool; `docs/design/memory-management.md`),
+build `2026-10-15T11:21:27 #38e22687`. All 1,552 measurements
+bit-identical in both runs.
+
+| | main | D11 |
+|---|---:|---:|
+| median over the 81 grid points | 0.85x | 1.06x |
+| points below 0.95x / below 0.8x | 51 / 32 | 36 / 22 |
+| 0-d scalars | 0.88x | 1.01x |
+| dependent (median over points) | 0.70x | 1.05x |
+| independent | 1.18x | 1.10x |
+| mixed | 0.82x | 1.18x |
+| reductions | 0.84x | 1.29x |
+| sync | 0.83x | 0.82x |
+
+![median speedup after D11](benchmarks/shape_map_d11.png)
+
+![median speedup per case group after D11](benchmarks/shape_map_d11_groups.png)
+
+- Parity moves down from ~100,000 to ~10,000-30,000 elements; dependent
+  chains, which had no point above 1.5x and many at 0.4-0.7x from 10,000
+  elements on, run at or above NumPy there (`x = abs(x)` at 316 x 316,
+  µs per op: NumPy 28, main 64, D11 21: the chain runs in place in one
+  hot block).
+- Unchanged: the region below ~10,000 elements (direct path and Python
+  paths: per-op overhead), and programs that sync after every step.
+- Independent chains' median is within run-to-run noise (±25-30 % per
+  configuration on this VM).
+
+### Reduction iterators built once per signature
+
+Reductions on NumPy's iterator (casts, strided inputs, `initial=`) used to
+build their iterator per op on the main thread, over the input's real
+address (which also took a pending input's memory early). Now a template
+per signature is built once and the task points a copy at its buffers.
+Same 4-CPU VM, back to back against the previous commit, best of 3,
+bit-identical (`int32` matrix, per step `x = -x; x.sum(axis=1);
+x[:, ::2].max(axis=0)`, all three ops dependent on the last step):
+
+| side | NumPy µs/step | before | after |
+|---:|---:|---:|---:|
+| 32 | 5.5–6.2 | 18–21 | 10–11 |
+| 100 | 14–17 | 39–59 | 20–39 |
+| 316 | 81–85 | 61–62 | 57–60 |
+| 1000 | 970–990 | 640–1150 | 470–500 |
+
+Independent small iterator reductions (8 x 8) issue faster too: `int32`
+`sum(axis=1)` 7.7 → 4.3 µs per op, `x.T[::2].max(axis=1)` 6.8 → 3.4 µs
+(NumPy 1.3 and 1.6–2.6 µs). The fast path (dense, no cast) is unchanged.
+
+### Tiny ops: reductions and methods in C, NumPy delegate
+
+Reductions, `mean`/`var`/`std`, `argmax`/`argmin`, `copy`, `astype`,
+`reshape` and `swapaxes` as C methods; small ready data runs in NumPy on a
+borrowed view of the buffer; direct path trimmed. Same 4-CPU VM, back to
+back against `main` (`7c77eda`), best of 5, µs per op (100 float64
+elements unless noted, ready):
+
+| op | NumPy | before | after |
+|---|---:|---:|---:|
+| `x * y` (8) | 0.41 | 0.73 | 0.52 |
+| `x + 1.0` | 0.66 | 1.06 | 0.87 |
+| `x.sum()` | 0.54 | 2.57 | 0.69–0.76 |
+| `np.sum(x)` | 1.45 | 2.37 | 1.78 |
+| `x.max()` | 0.53 | 2.28 | 0.68–0.74 |
+| `x.mean()` | 1.74 | 4.98 | 1.92 |
+| `x2.sum(axis=0)` (10 x 10) | 1.2 | 3.02 | 1.11 |
+| `np.max(x2, axis=1)` (10 x 10) | 2.55 | 2.34 | 1.24 |
+| `(x > 0.5).any()` | 1.18 | 4.01 | 1.62 |
+| `x2.reshape(-1)` | 0.14 | 0.55 | 0.12 |
+| `x2.swapaxes(0, 1)` | 0.12 | 0.51 | 0.11 |
+| `x.copy()` | 0.20 | 2.04 | 0.57–0.61 |
+| `x.astype(np.float32)` | 0.36 | 2.00 | 0.73 |
+| `x.argmax()` | 0.26 | 1.68 | 0.44–0.60 |
+
+`x * y`: callgrind 5,250 → 4,000 instructions (operator and result
+release, without the interpreter). `np.abs(x)` stays at ~0.8 µs (NumPy
+0.4): NumPy's override dispatch (`PyUFunc_CheckOverride`, ~1,800
+instructions) runs before viproc sees the call.
+
+Suite `--quick`, 4 workers, back to back (`#fcebb840` main, `#bd9f3351`
+this change): score 69 → 73; tiny 60 → 80, small 76 → 82, reductions 81 →
+96, scalars 69 → 75 (large 73 → 66, medium 62 → 67: noise of quick runs
+on this VM); 91/91 bit-identical.
+
+### Programs: longer expressions, loops, conditionals
+
+15 more cases in three groups (34 in all, `shape_map_cases.py`):
+**expressions** (Horner polynomial, Gaussian, a Black-Scholes-like
+formula, `np.where`, masked assignment, row softmax), **loops** (Python
+loops over slices: ILNumerics' Part 2a loop `out[i] = sum(abs(sin(A[:,
+i])))` and its order-dependent Part 2b variant `out[:i+1] = ...`, rows
+written independently, a recurrence `x[i] = f(x[i-1], x[i])` in place, a
+scalar carry over row sums, disjoint `out=` column blocks) and
+**control** (branches on the step index, on a reduction of the data with
+a sync per step, Newton with a convergence test every 4th step).
+`--groups expressions,loops,control` reports only those.
+
+Full run, 2026-10-16, build `2026-10-16T08:11:58 #d2856a1b`, same 4-CPU
+VM, grid 1-1,000 in half decades (49 points + 0-d), 4 workers; 1,688
+measurements, all bit-identical, no fallbacks. The first smoke run of
+these cases found a copy-on-write bug (masked assignment and scatter on an
+array with pending readers lost the unwritten elements), fixed in the
+same change.
+
+![median speedup with the program cases](benchmarks/shape_map_programs.png)
+
+![median speedup per group with the program cases](benchmarks/shape_map_programs_groups.png)
+
+| group | median over points | ≤ 2,048 elements | ≥ 100,000 elements |
+|---|---:|---:|---:|
+| dependent | 0.81 | 0.67 | 1.15 |
+| independent | 0.88 | 0.65 | 2.53 |
+| mixed | 0.85 | 0.71 | 1.97 |
+| reductions | 0.92 | 0.81 | 1.70 |
+| sync | 0.80 | 0.77 | 1.00 |
+| expressions | 0.81 | 0.65 | 1.40 |
+| loops | 0.58 | 0.55 | 0.72 |
+| control | 0.81 | 0.73 | 1.45 |
+
+- Cells below 0.95x / 0.8x: 35 / 22 of 49 (old 19 cases alone 29 / 19,
+  new 15 cases alone 46 / 41).
+- **Loops never reach parity** (0.4-0.8x at every size): `out[i] = s`
+  costs 3.1 µs (NumPy 0.04), `out[:4] = s` 2.9 µs (0.3), `x[3] = row`
+  1.2 µs (0.35): `__setitem__` runs in Python. The recurrence
+  (`loop_scan`) falls to 0.02-0.12x from 30,000 elements on: once its
+  array is pending, every row op takes the task path and every row write
+  meets pending readers, so copy-on-write copies the whole array per row.
+- `np.where` (3.6 µs, NumPy 0.8) and masked assignment (5.2 µs, NumPy
+  0.7) still go through Python at small sizes; their kernels are at
+  parity on one worker.
+
+**Index assignment in C** (`_Array.mp_ass_subscript`, build
+`2026-10-16T11:39:22 #f5e952ad`, same VM, all results bit-identical):
+small ready assignments run in NumPy's own slot on a borrowed view, the
+rest as assign tasks with the value converted at issue. Micro (10 x 10,
+ready, µs incl. call overhead, NumPy / viproc): `out[3] = s` 0.16 / 0.22
+(was 3.1), `out[:4] = s` 0.65 / 0.51, `x[3] = r` 0.41 / 0.38,
+`x[m] = 0.6` 0.77 / 0.96 (was 5.2), loop body
+`out[3] = np.sum(np.abs(np.sin(a[:, 3])))` 2.3 / 3.9 (was 8.5). Map
+medians (<= 2,048 / >= 100,000 elements): loops 0.55 / 0.66 -> 0.65 /
+0.72, expressions 0.64 -> 0.73 (small); `loop_cols` 0.38-0.64x ->
+0.60-0.84x. Cells below 0.95x unchanged (35 -> 36, noise): what remains
+is the tiny-ufunc overhead (P4), pending chains and the full-buffer
+copy-on-write of `loop_scan` (0.02x at 1000 x 1000).
+
+### Element pool: shared LIFO per bin instead of per-thread caches
+
+Same 4-vCPU VM, back to back against `main` (`1adc652`), two rounds each,
+µs per op (8 independent chains, every op allocates: `y = x + y * 0.5`
+with the previous `y` still referenced) and `strong_scaling.py --workers 4
+--length 40`:
+
+| case | main | shared LIFO |
+|---|---:|---:|
+| chains, 4,096 elements | 7.70 / 4.83 | 4.66 / 4.25 (NumPy 4.3–4.5) |
+| chains, 16,384 | 4.70 / 3.37 | 3.33 / 4.48 |
+| chains, 100,000 | 15.45 / 14.23 | 15.05 / 14.56 |
+| chains, 1,000,000 | 272.5 / 268.7 | 257.3 / 252.4 |
+| `strong_scaling` 1e4 | 3.70x / 3.80x | 3.43x / 3.78x |
+| `strong_scaling` 1e5 | 5.50x / 5.70x | 5.75x / 5.47x |
+
+Equal within noise; pool misses in the chains roughly halved (138 → 66
+over the run), the pool test's loop misses only on its first iteration.
 
 ## Other machines
 
