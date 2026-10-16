@@ -408,6 +408,14 @@ construction, at NumPy's cost plus the borrow.
   turned into a regular export (`host_views`). A result that is the view
   itself (`astype(copy=False)` of the same dtype) maps to `a`; an ndarray
   result is fresh memory and adopted (Import).
+- **Index assignment** (`a[key] = value`, small ready target) writes
+  through the borrow: NumPy's mapping slot runs on the borrowed view. This
+  needs more than readiness: no task may still read the buffer and no
+  export may be alive (`vp_array_host_writable`: ready, no stored error,
+  no `async_reads`, no `host_views`), else a reader would see the new
+  values. Key arrays and the value are borrowed in the same
+  call and pinned afterwards if NumPy kept them. Otherwise the assignment
+  is a task (copy-on-write as for any in/out op).
 - Not delegated: reductions with an axis or keepdims that `vp_reduce`
   covers (its direct path is cheaper than NumPy's call plus adopting the
   result array), and larger or pending inputs (`vp_reduce`
@@ -503,7 +511,11 @@ writes the current buffer only if nobody still reads it and no input of the
 op overlaps it through another view; otherwise the storage switches to a
 new buffer and the old one lives on through its readers' references.
 Single-view storages are *consolidated* (the op writes a fresh buffer with
-the array's layout, no copy); storages with views get a copy task first. An op's reads
+the array's layout, no copy) when the op writes every element
+(`Kernel::writes_all`); storages with views, and ops that write only some
+elements (scatter, masked assignment), get a copy task first (without it,
+`x[x > 1.4] = 0.6` on an `x` with pending readers left the other elements
+as fresh memory). An op's reads
 of the buffer it writes in place are not counted (D5): later writers wait
 for it as the producer anyway. Decided at
 issue time on the main thread, so layouts never change after they were

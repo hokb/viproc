@@ -1012,7 +1012,11 @@ def _as_values(value, dtype):
     """`value` as a viproc array of `dtype` (NumPy's setitem conversion)."""
     if isinstance(value, ndarray):
         return value if value.dtype == dtype else value.astype(dtype)
-    return asarray(np.asarray(value).astype(dtype, copy=False))
+    if np.ndim(value) == 0 and not isinstance(value, np.ndarray):
+        t = np.empty((), dtype)
+        t[()] = value  # NumPy's conversion of a[i] = value (errors included)
+        return _adopt(t)
+    return _adopt(np.array(value, dtype=dtype))  # as NumPy's setitem: a cast copy
 
 
 def _scatter(a, key, value):
@@ -1161,33 +1165,6 @@ class ndarray(_viproc._Array):
         """Basic indexing as a runtime view (metadata only, no sync; an
         all-int key gives a 0-d view)."""
         return _basic(self, key)
-
-    def __setitem__(self, key, value):
-        if not _is_basic_index(key):  # NumPy assigns in place, overlap included
-            if not self._readonly and type(self) is ndarray:
-                try:
-                    done = _scatter(self, key, value)
-                except (TypeError, ValueError, IndexError, OverflowError):
-                    done = False  # NumPy raises its own error
-                if done:
-                    return
-
-            def assign(a, k, v):
-                a[k] = v
-
-            _host_call(assign, (self, key, value), {})
-            return
-        if self._readonly:
-            raise ValueError("assignment destination is read-only")
-        target = self._view(key)
-        if isinstance(value, ndarray):
-            src = value  # another dtype: cast in the assignment (vp_assign)
-        else:
-            src = asarray(np.asarray(value).astype(self.dtype, copy=False))
-        try:
-            _viproc.assign(target, src)
-        except NotImplementedError:  # a cast NumPy refused (warning turned into an error)
-            _viproc.assign(target, asarray(np.asarray(src).astype(self.dtype, copy=False)))
 
     # --- NumPy protocols -------------------------------------------------------
     # __array_function__ is _Array's (C): reductions there, everything else
@@ -1376,6 +1353,37 @@ _OPS = {
         "equal", "not_equal", "greater", "greater_equal",
     )
 }
+def _setitem(self, key, value):
+    """a[key] = value beyond _Array's C slot (which hands small work on ready
+    data to NumPy and issues basic-key assignments of scalars and viproc
+    arrays): advanced keys, sequences as values, NumPy's errors."""
+    if not _is_basic_index(key):  # NumPy assigns in place, overlap included
+        if not self._readonly and type(self) is ndarray:
+            try:
+                done = _scatter(self, key, value)
+            except (TypeError, ValueError, IndexError, OverflowError):
+                done = False  # NumPy raises its own error
+            if done:
+                return
+
+        def assign(a, k, v):
+            a[k] = v
+
+        _host_call(assign, (self, key, value), {})
+        return
+    if self._readonly:
+        raise ValueError("assignment destination is read-only")
+    target = self._view(key)
+    if isinstance(value, ndarray):
+        src = value  # another dtype: cast in the assignment (vp_assign)
+    else:
+        src = asarray(np.asarray(value).astype(self.dtype, copy=False))
+    try:
+        _viproc.assign(target, src)
+    except NotImplementedError:  # a cast NumPy refused (warning turned into an error)
+        _viproc.assign(target, asarray(np.asarray(src).astype(self.dtype, copy=False)))
+
+
 def _getitem(self, key):
     """a[key] beyond the C fast path (_Array.__getitem__ handles integer
     keys of ready arrays and basic keys itself): advanced indexing, NumPy's
@@ -1454,6 +1462,7 @@ _viproc.setup(
     np.ndarray,
     np.generic,
     _getitem,
+    _setitem,
 )
 
 

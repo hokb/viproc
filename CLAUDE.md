@@ -191,8 +191,9 @@ ownership, release or reuse of memory.
     all inputs to be read before the output is written). The storage
     switches to a new buffer; the op's inputs read the old one. The old
     buffer stays alive through its readers' references.
-    - **Consolidated** (array is the only view of its storage and covers
-      all of it): no copy at all. The op reads the old buffer and writes
+    - **Consolidated** (array is the only view of its storage, covers
+      all of it, and the op writes every element: `Kernel::writes_all`,
+      false for scatter and masked assignment): no copy at all. The op reads the old buffer and writes
       the new one, with the **same layout** (as in NumPy, the array keeps
       its strides).
     - **With views or partial writes:** a copy task copies the whole old
@@ -319,7 +320,8 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
   suite_report.py      its Markdown / HTML reports, multi-run comparison
   shape_map.py         speedup vs. NumPy over rows x cols (2-d, log grid):
                        median + IQR over cases per point, heatmap images
-  shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync)
+  shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync/
+                       expressions/loops/control; --groups selects groups)
   shape_map_ilnumerics.py  the same map for ILNumerics Accelerator (vs. NumPy)
                        and viproc vs. ILNumerics, on the grid/reps of a viproc run
   ilnumerics/          its C# side (.NET 8, needs a licensed ILNumerics build)
@@ -719,7 +721,7 @@ Rules:
   scalar indexing returns NumPy's scalar if the array is ready, else a 0-d
   copy (no sync); `np.where(cond, x, y)` as a select task (NumPy's result
   dtype, x and y cast to it, layout order K);
-  `__setitem__` with basic keys (assign kernel); **reductions** (NumPy ≥
+  index assignment with basic keys (assign kernel, see below); **reductions** (NumPy ≥
   2.3): `ufunc.reduce` of reorderable ufuncs (add, multiply, minimum,
   maximum, fmin, fmax, logical and/or/xor, bitwise and/or/xor) and
   `np.sum/prod/min/max/amin/amax/any/all` (also as methods) without
@@ -751,6 +753,20 @@ Rules:
   direct path would cost ~0.9 µs. `reshape(shape)` / `swapaxes(i, j)` with
   exact ints are C methods too (views, `reshape_view`); orders, copies
   and other argument types go to `_reshape_py` / `_swapaxes_py`.
+- **Index assignment in C** (`_Array.mp_ass_subscript`, `a[key] = value`):
+  every array involved (target, viproc arrays in the key, the value)
+  ready, nothing reading the target's buffer (`vp_array_host_writable`)
+  and the target (or the written view of a basic key) at most `sync_below`
+  elements: NumPy's own slot (`PyArray_Type.tp_as_mapping->
+  mp_ass_subscript`) runs on a borrowed writable view, key arrays and the
+  value borrowed too (design doc D7), so values, casts and errors are
+  NumPy's for every key kind. Otherwise basic keys issue an assignment:
+  the target is a view, the value a viproc array (`vp_assign` casts) or a
+  Python/NumPy scalar converted at issue with `PyArray_Pack`
+  (`vp_array_from_item`, NumPy's conversion and errors); the task only
+  copies. Advanced keys, sequences as values and errors of `vp_assign` go
+  to the hook `_setitem` (scatter / masked assignment tasks, fallback).
+  `out[3] = s` 0.22 µs (NumPy 0.16; it was 3.1 µs in Python).
 - **0-d results and the scalar shortcut.** Where NumPy returns a scalar
   (full reductions, `a[i, j]`, ufuncs on 0-d operands), viproc returns
   NumPy's scalar if the data is there already (the op ran directly), else

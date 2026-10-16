@@ -100,6 +100,9 @@ int vp_array_from_ndarray(vp_runtime* rt, PyObject* ndarray, vp_array** out, cha
  * converted to `dtype` with NumPy's rules (e.g. OverflowError for a Python
  * int out of range). Returns VP_PYERR with the Python exception set. */
 int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array** out);
+/* [GIL] Like vp_array_from_scalar(), but converted as NumPy's `a[i] = value`
+ * converts it (PyArray_Pack): NumPy's values and errors for assignments. */
+int vp_array_from_item(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array** out);
 /* [GIL, main thread] NumPy's scalar of the first element of `a`, which must
  * be ready (vp_array_ready). New reference. */
 PyObject* vp_array_scalar(const vp_array* a);
@@ -152,6 +155,13 @@ PyObject* vp_array_export(const vp_array* a, int writable);
  * then keeps the buffer alive and counts as a reader). `a` must be ready.
  * NULL with a Python error on failure. */
 PyObject* vp_array_borrow(const vp_array* a);
+/* [main thread] 1 if NumPy may write `a`'s buffer right now, on the main
+ * thread with the GIL, without waiting: `a` is ready without a stored error
+ * and no task and no NumPy view (export) reads its buffer. Then a writable
+ * vp_array_borrow() view may be written during one NumPy call (index
+ * assignment delegated to NumPy). Stays true until the main thread issues a
+ * reader or writer of the storage. */
+int vp_array_host_writable(vp_array* a);
 int vp_array_pin(const vp_array* a, PyObject* view);
 /* [no GIL, main thread] Sync point before NumPy code writes `a`'s buffer
  * directly: waits for its producer, copies-on-write if NumPy views of the

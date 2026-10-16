@@ -294,14 +294,15 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         switched.push_back(&s);
         const bool only_view = a.storage_.use_count() == 1;
         const bool covers_buffer = a.layout_.nbytes() == s.buffer_->nbytes();
-        if (only_view && covers_buffer) {
+        if (only_view && covers_buffer && kernel->writes_all()) {
             // Consolidated: no copy task. The op reads the old buffer (step 1)
             // and writes a new one with the same layout (as NumPy, the array
             // keeps its strides; later reductions see NumPy's element order).
             s.buffer_ = make_pooled<Buffer>(s.buffer_->nbytes(), Buffer::deferred);
         } else {
-            // Views share the storage (or the op writes only part of it):
-            // copy the whole buffer first, views keep their layouts.
+            // Views share the storage (or the op writes only part of it, or
+            // only some of its elements): copy the whole buffer first, views
+            // keep their layouts.
             issue_storage_copy(s);
         }
     }

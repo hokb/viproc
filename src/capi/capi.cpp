@@ -210,6 +210,15 @@ int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_arr
     return VP_OK;
 }
 
+int vp_array_from_item(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array** out) {
+    ArrayPtr a = numpy::item_array(*rt->rt, value, to_dtype(dtype));
+    if (!a) {
+        return VP_PYERR;
+    }
+    *out = hand_out(std::move(a));
+    return VP_OK;
+}
+
 PyObject* vp_array_scalar(const vp_array* a) {
     const Array& x = arr(a);
     return numpy::scalar_object(x.layout().dtype, x.buffer()->data() + x.layout().offset);
@@ -267,6 +276,11 @@ int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
 
 PyObject* vp_array_export(const vp_array* a, int writable) {
     return numpy::export_ndarray(arr(a), writable != 0);
+}
+
+int vp_array_host_writable(vp_array* a) {
+    Array& x = arr(a);
+    return x.ready() && !x.storage()->last_error() && !x.buffer()->has_readers() ? 1 : 0;
 }
 
 PyObject* vp_array_borrow(const vp_array* a) { return numpy::borrow_ndarray(arr(a)); }
