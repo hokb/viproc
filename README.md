@@ -9,9 +9,8 @@ runs it on parallel hardware.
 
 - **Finds parallel potential automatically, across large parts of a program.** viproc looks
   at the stream of array instructions a NumPy program issues (`c = a + b`, `m = c.max()`,
-  `s = c.sum(axis=0)`, ...) and runs every instruction as soon as its inputs are ready.
-  Independent instructions run at the same time, dependent ones keep only the order their
-  data needs. The program is not rewritten and carries no annotations, decorators or
+  `s = c.sum(axis=0)`, ...) and finds which of them can run at the same time, across loops,
+  functions and modules. The program is not rewritten and carries no annotations, decorators or
   parallel loops: viproc is switched on from outside (`python -m viproc prog.py`).
 - **Puts that potential to work on the available parallel resources, dynamically.** Work is
   handed to compute resources at runtime, as instructions become ready, and small
@@ -19,16 +18,43 @@ runs it on parallel hardware.
   resources are the cores of a multi-core CPU; the execution model is meant for
   heterogeneous hardware.
 
+## How it works
+
+All array instructions are first freed from the sequential order the program text gives
+them. When they run, their order is decided strictly and only by their input data and its
+availability: an instruction runs as soon as its inputs are computed, independent
+instructions run at the same time, dependent ones keep only the order their data needs.
+Local availability (is this input ready, or still being computed?) replaces any global
+program or dependency analysis.
+
+- **Granularity: the array operation.** One instruction is one NumPy operation (`a + b`,
+  `np.sin(x)`, `x.sum(axis=0)`, `x[idx]`, `a @ b`, ...). viproc does not split single
+  operations across threads; it overlaps whole array instructions, the way a superscalar
+  CPU overlaps machine instructions.
+- **Scope: a dynamic window of active instructions that runs ahead.** The Python thread does
+  not compute. It only issues instructions and returns at once, racing far ahead of the
+  computation. Every instruction issued but not yet completed is part of the window, so
+  the parallel potential is found across loop iterations, function calls and module
+  boundaries, wherever the program happens to go. There is no dependency graph and no
+  ahead-of-time analysis, so loops, branches and data-dependent control flow are no
+  obstacle.
+- **Synchronization points: element access and memory.** The program waits only where it
+  needs actual values: reading elements (`print(x)`, `float(s)`, `if (x > 0).any():`,
+  scalar indexing, handing data to code outside viproc). The window is also bounded, which
+  bounds the memory held by results in flight: when it is full (today 1000 active
+  instructions), the Python thread waits until part of it has completed.
+
+The execution model follows the ILNumerics Accelerator, described in the paper
+[*A Virtual Processor brings back the Free Lunch*](https://arxiv.org/abs/2605.30507)
+(2026; benchmark artifacts:
+[decentralized-array-execution-artifacts2026](https://github.com/hokb/decentralized-array-execution-artifacts2026)).
+
 ## What makes it different
 
-- **Array ILP instead of data parallelism.** viproc does not split single operations across
-  threads. It overlaps whole array instructions, the way a superscalar CPU overlaps machine
-  instructions. The parallelism is found while the program runs, from the sequential stream
-  of array operations alone: the Python thread only issues instructions and races far
-  ahead of the computation, and every decision is local (is this input ready or still being
-  computed?). There is no dependency graph and no ahead-of-time analysis, so loops, branches
-  and data-dependent control flow are no obstacle. The execution model follows the
-  ILNumerics Accelerator.
+- **Array ILP from the sequential instruction stream.** All the parallel potential of wide
+  program sections is found automatically from the stream of array operations alone, at
+  runtime, without annotations or a rewrite of the program, and put to work on the parallel
+  resources available.
 - **Identical results.** Every instruction is computed by NumPy's own inner loops (including
   their SIMD paths), called exactly as NumPy calls them. Results are bit-identical to plain
   NumPy; whatever viproc cannot run asynchronously with NumPy's semantics falls back to
