@@ -190,8 +190,9 @@ ownership, release or reuse of memory.
     all inputs to be read before the output is written). The storage
     switches to a new buffer; the op's inputs read the old one. The old
     buffer stays alive through its readers' references.
-    - **Consolidated** (array is the only view of its storage and covers
-      all of it): no copy at all. The op reads the old buffer and writes
+    - **Consolidated** (array is the only view of its storage, covers
+      all of it, and the op writes every element: `Kernel::writes_all`,
+      false for scatter and masked assignment): no copy at all. The op reads the old buffer and writes
       the new one, with the **same layout** (as in NumPy, the array keeps
       its strides).
     - **With views or partial writes:** a copy task copies the whole old
@@ -319,7 +320,8 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
   suite_report.py      its Markdown / HTML reports, multi-run comparison
   shape_map.py         speedup vs. NumPy over rows x cols (2-d, log grid):
                        median + IQR over cases per point, heatmap images
-  shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync)
+  shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync/
+                       expressions/loops/control; --groups selects groups)
   shape_map_ilnumerics.py  the same map for ILNumerics Accelerator (vs. NumPy)
                        and viproc vs. ILNumerics, on the grid/reps of a viproc run
   ilnumerics/          its C# side (.NET 8, needs a licensed ILNumerics build)

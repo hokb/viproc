@@ -503,7 +503,11 @@ writes the current buffer only if nobody still reads it and no input of the
 op overlaps it through another view; otherwise the storage switches to a
 new buffer and the old one lives on through its readers' references.
 Single-view storages are *consolidated* (the op writes a fresh buffer with
-the array's layout, no copy); storages with views get a copy task first. An op's reads
+the array's layout, no copy) when the op writes every element
+(`Kernel::writes_all`); storages with views, and ops that write only some
+elements (scatter, masked assignment), get a copy task first (without it,
+`x[x > 1.4] = 0.6` on an `x` with pending readers left the other elements
+as fresh memory). An op's reads
 of the buffer it writes in place are not counted (D5): later writers wait
 for it as the producer anyway. Decided at
 issue time on the main thread, so layouts never change after they were

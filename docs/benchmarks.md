@@ -437,6 +437,53 @@ this change): score 69 → 73; tiny 60 → 80, small 76 → 82, reductions 81 �
 96, scalars 69 → 75 (large 73 → 66, medium 62 → 67: noise of quick runs
 on this VM); 91/91 bit-identical.
 
+### Programs: longer expressions, loops, conditionals
+
+15 more cases in three groups (34 in all, `shape_map_cases.py`):
+**expressions** (Horner polynomial, Gaussian, a Black-Scholes-like
+formula, `np.where`, masked assignment, row softmax), **loops** (Python
+loops over slices: ILNumerics' Part 2a loop `out[i] = sum(abs(sin(A[:,
+i])))` and its order-dependent Part 2b variant `out[:i+1] = ...`, rows
+written independently, a recurrence `x[i] = f(x[i-1], x[i])` in place, a
+scalar carry over row sums, disjoint `out=` column blocks) and
+**control** (branches on the step index, on a reduction of the data with
+a sync per step, Newton with a convergence test every 4th step).
+`--groups expressions,loops,control` reports only those.
+
+Full run, 2026-10-16, build `2026-10-16T08:11:58 #d2856a1b`, same 4-CPU
+VM, grid 1-1,000 in half decades (49 points + 0-d), 4 workers; 1,688
+measurements, all bit-identical, no fallbacks. The first smoke run of
+these cases found a copy-on-write bug (masked assignment and scatter on an
+array with pending readers lost the unwritten elements), fixed in the
+same change.
+
+![median speedup with the program cases](benchmarks/shape_map_programs.png)
+
+![median speedup per group with the program cases](benchmarks/shape_map_programs_groups.png)
+
+| group | median over points | ≤ 2,048 elements | ≥ 100,000 elements |
+|---|---:|---:|---:|
+| dependent | 0.81 | 0.67 | 1.15 |
+| independent | 0.88 | 0.65 | 2.53 |
+| mixed | 0.85 | 0.71 | 1.97 |
+| reductions | 0.92 | 0.81 | 1.70 |
+| sync | 0.80 | 0.77 | 1.00 |
+| expressions | 0.81 | 0.65 | 1.40 |
+| loops | 0.58 | 0.55 | 0.72 |
+| control | 0.81 | 0.73 | 1.45 |
+
+- Cells below 0.95x / 0.8x: 35 / 22 of 49 (old 19 cases alone 29 / 19,
+  new 15 cases alone 46 / 41).
+- **Loops never reach parity** (0.4-0.8x at every size): `out[i] = s`
+  costs 3.1 µs (NumPy 0.04), `out[:4] = s` 2.9 µs (0.3), `x[3] = row`
+  1.2 µs (0.35): `__setitem__` runs in Python. The recurrence
+  (`loop_scan`) falls to 0.02-0.12x from 30,000 elements on: once its
+  array is pending, every row op takes the task path and every row write
+  meets pending readers, so copy-on-write copies the whole array per row.
+- `np.where` (3.6 µs, NumPy 0.8) and masked assignment (5.2 µs, NumPy
+  0.7) still go through Python at small sizes; their kernels are at
+  parity on one worker.
+
 ## Other machines
 
 **i7-12700K, 20 logical cores (8 P-cores with HT + 4 E-cores), 31 GiB,
