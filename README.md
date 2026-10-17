@@ -18,7 +18,7 @@ print(s)              # only here does the program wait
 Every array instruction becomes a task. A task starts as soon as its inputs exist, on
 whichever core is free. The Python thread does not compute: it only issues instructions and
 runs ahead. Unlike existing approaches, viproc does not analyse program dependencies at all,
-and there is no central scheduler: each task only checks whether its own inputs are ready.
+and there is no central scheduler.
 Parallelism thus appears wherever the data allows it, across loops, functions and modules,
 in unchanged programs (`python -m viproc prog.py`). Today the tasks run on the cores of a
 multi-core CPU; the model is designed for heterogeneous hardware.
