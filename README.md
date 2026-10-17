@@ -3,10 +3,10 @@
 **viproc strongly scales regular NumPy programs for any data on common (parallel)
 hardware without code changes.**
 
-Array instruction-level parallelism for NumPy programs: viproc, a virtual processor for
-serial array instruction streams, finds the parallel potential between the array instructions
-of a regular, sequentially written NumPy program, automatically and without annotations, and
-runs it on parallel hardware.
+viproc, a ***vi**rtual **proc**essor* for numerical programs, turns array instructions into
+autonomously scheduling workloads. At runtime, thousands of such tasks cooperatively make
+local decisions based on the actual data and hardware state, involving parallel computing
+resources efficiently.
 
 ## What viproc does
 
