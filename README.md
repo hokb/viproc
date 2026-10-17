@@ -65,7 +65,7 @@ The execution model follows the
   their SIMD paths), called exactly as NumPy calls them. Results are bit-identical to plain
   NumPy; whatever viproc cannot run asynchronously with NumPy's semantics falls back to
   NumPy itself.
-- **Never slower than NumPy.** Array operations on medium-sized and large data commonly run
+- **Never slower than NumPy.** Array operations on medium-sized and large data viproc commonly runs
   efficiently in parallel. Small data and algorithms without much parallel potential must
   not get slower: viproc must not make any expression slower than NumPy (hard limit 0.95x;
   where there is nothing to overlap, at most 3% slower by design).
@@ -87,7 +87,7 @@ measurements in [docs/benchmarks.md](docs/benchmarks.md), architecture and build
 viproc gains where a program issues many array instructions that do not all depend on each
 other: several independent expressions, chains over different arrays, reductions next to
 element-wise work, iterative algorithms over arrays (k-means, simulations, image and signal
-pipelines), on medium and large data.
+pipelines), on medium and large data. The more complex a program gets the more parallel potential it brings. viproc shines on real-world algorithms not on too simple toy examples. 
 
 Programs that spend their time in algorithms or loops over **scalar** data, one element
 at a time, offer little array-level parallelism and gain little from viproc today (they must
