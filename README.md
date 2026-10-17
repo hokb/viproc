@@ -10,16 +10,18 @@ resources efficiently.
 
 ## What viproc does
 
-- **Finds parallel potential automatically, across large parts of a program.** viproc looks
-  at the stream of array instructions a NumPy program issues (`c = a + b`, `m = c.max()`,
-  `s = c.sum(axis=0)`, ...) and finds which of them can run at the same time, across loops,
-  functions and modules. The program is not rewritten and carries no annotations, decorators or
-  parallel loops: viproc is switched on from outside (`python -m viproc prog.py`).
-- **Puts that potential to work on the available parallel resources, dynamically.** Work is
-  handed to compute resources at runtime, as instructions become ready, and small
-  instructions whose result is needed right away stay on the calling thread. Today the
-  resources are the cores of a multi-core CPU; the execution model is meant for
-  heterogeneous hardware.
+- **Uses parallel potential automatically, across large parts of a program.** Every array
+  instruction a NumPy program issues (`c = a + b`, `m = c.max()`, `s = c.sum(axis=0)`, ...)
+  becomes a task that schedules itself onto the parallel hardware as soon as its inputs are
+  ready. No central instance looks for parallelism: instructions that can run at the same
+  time simply do, across loops, functions and modules. The program is not rewritten and
+  carries no annotations, decorators or parallel loops: viproc is switched on from outside
+  (`python -m viproc prog.py`).
+- **Puts that potential to work on the available parallel resources, dynamically.** Where a
+  task runs is decided locally, per task, at runtime: small instructions whose result is needed right
+  away stay on the calling thread, others go to a parallel resource. Today the resources
+  are the cores of a multi-core CPU; the execution model is meant for heterogeneous
+  hardware.
 
 ## How it works
 
