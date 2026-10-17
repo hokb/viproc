@@ -8,42 +8,30 @@ autonomously scheduling workloads. At runtime, thousands of such tasks cooperati
 local decisions based on the actual data and hardware state, involving parallel computing
 resources efficiently.
 
-## What viproc does
+```python
+c = np.sin(a) * b     # issued, returns at once
+d = np.cos(b) - a     # does not need c: runs at the same time
+s = (c + d).sum()     # starts as soon as c and d are done
+print(s)              # only here does the program wait
+```
 
-- **Uses parallel potential automatically, across large parts of a program.** Every array
-  instruction a NumPy program issues (`c = a + b`, `m = c.max()`, `s = c.sum(axis=0)`, ...)
-  becomes a task that schedules itself onto the parallel hardware as soon as its inputs are
-  ready. No central instance looks for parallelism: instructions that can run at the same
-  time simply do, across loops, functions and modules. The program is not rewritten and
-  carries no annotations, decorators or parallel loops: viproc is switched on from outside
-  (`python -m viproc prog.py`).
-- **Puts that potential to work on the available parallel resources, dynamically.** Where a
-  task runs is decided locally, per task, at runtime: small instructions whose result is needed right
-  away stay on the calling thread, others go to a parallel resource. Today the resources
-  are the cores of a multi-core CPU; the execution model is meant for heterogeneous
-  hardware.
+Every array instruction becomes a task. A task starts as soon as its inputs exist, on
+whichever core is free. The Python thread does not compute: it only issues instructions and
+runs ahead. Unlike existing approaches, viproc does not analyse program dependencies at all,
+and there is no central scheduler: each task only checks whether its own inputs are ready.
+Parallelism thus appears wherever the data allows it, across loops, functions and modules,
+in unchanged programs (`python -m viproc prog.py`). Today the tasks run on the cores of a
+multi-core CPU; the model is designed for heterogeneous hardware.
 
 ## How it works
-
-viproc is different in that it avoids the restrictions of existing approaches by not even
-attempting to analyse program dependencies globally. Instead, array operations decide their
-own scheduling at runtime, in parallel and autonomously. There is no central scheduler.
-
-All array instructions are first freed from the sequential order the program text gives
-them. When they run, their order is decided strictly and only by their input data and its
-availability: an instruction runs as soon as its inputs are completed, independent
-instructions run at the same time, dependent ones keep only the order their data needs.
-Local decisions (is this input ready, or still being computed?) replace any global
-program or dependency analysis.
 
 - **Granularity: the array operation.** One instruction is one NumPy operation (`a + b`,
   `np.sin(x)`, `x.sum(axis=0)`, `x[idx]`, `a @ b`, ...). viproc does not split single
   operations across threads; it overlaps whole array instructions, the way a superscalar
   CPU overlaps machine instructions.
-- **Scope: a dynamic window of active instructions that runs ahead.** The Python thread does
-  not compute. It only issues instructions and returns at once, racing far ahead of the
-  computation. Every instruction issued but not yet completed is part of the window, so
-  the parallel potential is found across loop iterations, function calls and module
+- **Scope: a dynamic window of active instructions that runs ahead.** Every instruction
+  issued but not yet completed is part of the window. Because the Python thread runs far
+  ahead of the computation, the window spans loop iterations, function calls and module
   boundaries, wherever the program happens to go. There is no dependency graph and no
   ahead-of-time analysis. Data-dependent control flow is an obstacle, though: a branch on
   array values (`if (x > 0).any():`) needs those values, so the look-ahead stops there.
@@ -63,10 +51,8 @@ The execution model follows the
 
 ## What makes it different
 
-- **Array ILP from the sequential instruction stream.** All the parallel potential of wide
-  program sections is found automatically from the stream of array operations alone, at
-  runtime, without annotations or a rewrite of the program, and put to work on the parallel
-  resources available.
+- **Array ILP for NumPy.** The parallelism comes from the sequential stream of array
+  instructions alone: no annotations, no rewrite, no ahead-of-time analysis.
 - **Fine-grained scheduling parallelizes where manual parallelization cannot.** Scheduling
   decisions are made per array operation, so parallel execution is automated even where
   manual parallelization finds no parallelism because its scope is too coarse: a loop whose
