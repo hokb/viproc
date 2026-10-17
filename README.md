@@ -35,13 +35,10 @@ multi-core CPU; the model is designed for heterogeneous hardware.
   boundaries, wherever the program happens to go. There is no dependency graph and no
   ahead-of-time analysis. Data-dependent control flow is an obstacle, though: a branch on
   array values (`if (x > 0).any():`) needs those values, so the look-ahead stops there.
-- **Synchronization points: element access and memory.** Where the program needs actual
-  values (`print(x)`, `float(s)`, `if (x > 0).any():`, scalar indexing, handing data to
-  code outside viproc), only the Python thread waits, at the position it has run ahead
-  to, and only for the instruction it needs. The array computations of all earlier
-  instructions keep progressing in parallel. The window is also bounded, which bounds the
-  memory held by results in flight: when it is full (today 1000 active instructions), the
-  Python thread waits until part of it has completed.
+- **Synchronization points: element access and memory.** Only reading values
+  (`print(x)`, `float(s)`, `if (x > 0).any():`) makes the Python thread wait, for that one
+  result; all earlier instructions keep computing. The window is bounded too (today 1000
+  active instructions), which bounds the memory held by results in flight.
 
 The execution model follows the
 [ILNumerics Accelerator](https://ilnumerics.net/auto-parallelizing-numerical-code.html), described in the paper
