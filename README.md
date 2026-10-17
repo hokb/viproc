@@ -89,7 +89,7 @@ other: several independent expressions, chains over different arrays, reductions
 element-wise work, iterative algorithms over arrays (k-means, simulations, image and signal
 pipelines), on medium and large data.
 
-Programs that spend their time in long algorithms or loops over **scalar** data, one element
+Programs that spend their time in algorithms or loops over **scalar** data, one element
 at a time, offer little array-level parallelism and gain little from viproc today (they must
 not get slower either). For them the manual options remain: vectorizing the loop into array
 operations, or parallelizing it explicitly (`multiprocessing`, `concurrent.futures`, Numba's
