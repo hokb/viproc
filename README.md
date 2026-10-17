@@ -32,9 +32,7 @@ multi-core CPU; the model is designed for heterogeneous hardware.
 - **Scope: a dynamic window of active instructions that runs ahead.** Every instruction
   issued but not yet completed is part of the window. Because the Python thread runs far
   ahead of the computation, the window spans loop iterations, function calls and module
-  boundaries, wherever the program happens to go. There is no dependency graph and no
-  ahead-of-time analysis. Data-dependent control flow is an obstacle, though: a branch on
-  array values (`if (x > 0).any():`) needs those values, so the look-ahead stops there.
+  boundaries, wherever the program happens to go. 
 - **Synchronization points: element access and memory.** Only reading values
   (`print(x)`, `float(s)`, `if (x > 0).any():`) makes the Python thread wait, for that one
   result; all earlier instructions keep computing. The window is bounded too (today 1000
