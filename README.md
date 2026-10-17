@@ -3,7 +3,7 @@
 **viproc strongly scales regular NumPy programs for any data on common (parallel)
 hardware without code changes.**
 
-viproc, a ***vi**rtual **proc**essor* for numerical programs, turns array instructions into
+viproc, a **vi**rtual **proc**essor for numerical programs, turns array instructions into
 autonomously scheduling workloads. At runtime, thousands of such tasks cooperatively make
 local decisions based on the actual data and hardware state, involving parallel computing
 resources efficiently.
