@@ -171,7 +171,19 @@ Then run programs with `.venv\Scripts\python prog.py` (Linux: `.venv/bin/python 
 run takes a minute; later ones rebuild incrementally (`build/pip-<tag>`). No developer prompt is
 needed on Windows: the build picks Visual Studio for the interpreter's architecture.
 
-Into any environment: `pip install .` (or `pip install git+https://github.com/hokb/viproc`).
+Into any other environment, from a checkout or straight from GitHub:
+
+```bash
+pip install .                                   # in the checkout
+pip install git+https://github.com/hokb/viproc  # clones the repository first
+```
+
+There is no prebuilt wheel yet, so pip builds one from the sources on your machine and installs
+it: its build backend (scikit-build-core, see `pyproject.toml`) runs CMake, compiles the
+extension module and packs it into a wheel. pip fetches CMake and Ninja itself if they are
+missing; the C++20 compiler named above must be installed. The build takes about a minute.
+`pip wheel .` instead keeps the wheel (`viproc-*.whl`), to install on other machines with the same
+platform, Python version and architecture.
 
 ## Build (development, CMake)
 
