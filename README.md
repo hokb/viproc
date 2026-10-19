@@ -96,13 +96,50 @@ operations, or parallelizing it explicitly (`multiprocessing`, `concurrent.futur
 `prange`, ...). Overlapping consecutive loop iterations automatically (instruction
 pipelining) is on the roadmap.
 
+## Install
+
+viproc is a regular Python package: one extension module (`_viproc.*.pyd` / `.so`, runtime
+linked in statically) plus Python files. It needs Python >= 3.12 (64 bit), NumPy >= 2.0 and,
+until there are prebuilt wheels, a C++20 compiler (Visual Studio with the C++ workload on
+Windows, GCC or Clang on Linux). NumPy itself is not modified: viproc arrays take part through
+NumPy's array protocols.
+
+One click, after every commit (pull, build into `.venv`, run the tests):
+
+```bat
+dev.cmd                 :: Windows: double-click, or dev.cmd -NoPull -NoTest -Python <python.exe>
+```
+```bash
+./dev.sh                # Linux: ./dev.sh --no-pull --no-test, PYTHON=python3.13 ./dev.sh
+```
+
+Then run programs with the venv's Python, as in [Usage](#usage):
+`.venv\Scripts\python -m viproc prog.py` (Linux: `.venv/bin/python -m viproc prog.py`). The
+first build takes a minute; later ones rebuild incrementally (`build/pip-<tag>`). No developer
+prompt is needed on Windows: the build picks Visual Studio for the interpreter's architecture.
+
+Into any other environment, from a checkout or straight from GitHub:
+
+```bash
+pip install .                                   # in the checkout
+pip install git+https://github.com/hokb/viproc  # clones the repository first
+```
+
+There is no prebuilt wheel yet, so pip builds one from the sources on your machine and installs
+it: its build backend (scikit-build-core, see `pyproject.toml`) runs CMake, compiles the
+extension module and packs it into a wheel. pip fetches CMake and Ninja itself if they are
+missing; the C++20 compiler named above must be installed. The build takes about a minute.
+`pip wheel .` instead keeps the wheel (`viproc-*.whl`), to install on other machines with the same
+platform, Python version and architecture.
+
 ## Usage
 
-Run an unchanged NumPy program with viproc:
+Once viproc is installed (see [Install](#install)), run an unchanged NumPy program with it:
 
 ```bash
 python -m viproc prog.py [args]       # also: -m module, -c "code"; no arguments: console
 VIPROC=1 python prog.py               # the same, for a pip-installed viproc (viproc.pth)
+python prog.py                        # plain NumPy, for comparison
 ```
 
 `import numpy` in the program's own code then imports viproc: creation functions
@@ -111,7 +148,7 @@ arrays, and NumPy functions on them run asynchronously. The standard library and
 packages (SciPy, pandas, ...) keep the real NumPy; viproc arrays they receive are synced and
 read through NumPy's array protocols. Results are bit-identical to plain NumPy.
 
-Or opt in explicitly:
+Or opt in explicitly, in the code:
 
 ```python
 import numpy as np
@@ -149,51 +186,6 @@ Differences from NumPy under `python -m viproc`: `isinstance(x, np.ndarray)` in 
 tests for viproc arrays; `np.array(nd)`/`np.asarray(nd)` of a NumPy array always copy it into
 viproc (also with `copy=False`); dtypes viproc does not run (object, str, float16, ...) give
 NumPy arrays, as NumPy does.
-
-## Try it
-
-viproc is a regular Python package: one extension module (`_viproc.*.pyd` / `.so`, runtime
-linked in statically) plus Python files. It needs Python >= 3.12 (64 bit), NumPy >= 2.0 and,
-until there are prebuilt wheels, a C++20 compiler (Visual Studio with the C++ workload on
-Windows, GCC or Clang on Linux). NumPy itself is not modified: viproc arrays take part through
-NumPy's array protocols.
-
-One click, after every commit (pull, build into `.venv`, run the tests):
-
-```bat
-dev.cmd                 :: Windows: double-click, or dev.cmd -NoPull -NoTest -Python <python.exe>
-```
-```bash
-./dev.sh                # Linux: ./dev.sh --no-pull --no-test, PYTHON=python3.13 ./dev.sh
-```
-
-Then run programs with `.venv\Scripts\python -m viproc prog.py` (Linux:
-`.venv/bin/python -m viproc prog.py`). The first build takes a minute; later ones rebuild incrementally (`build/pip-<tag>`). No developer prompt is
-needed on Windows: the build picks Visual Studio for the interpreter's architecture.
-
-Into any other environment, from a checkout or straight from GitHub:
-
-```bash
-pip install .                                   # in the checkout
-pip install git+https://github.com/hokb/viproc  # clones the repository first
-```
-
-There is no prebuilt wheel yet, so pip builds one from the sources on your machine and installs
-it: its build backend (scikit-build-core, see `pyproject.toml`) runs CMake, compiles the
-extension module and packs it into a wheel. pip fetches CMake and Ninja itself if they are
-missing; the C++20 compiler named above must be installed. The build takes about a minute.
-`pip wheel .` instead keeps the wheel (`viproc-*.whl`), to install on other machines with the same
-platform, Python version and architecture.
-
-Then test any NumPy program locally, unchanged, and compare it with plain NumPy:
-
-```bash
-python -m viproc prog.py        # with viproc: `import numpy` in prog.py gives viproc
-python prog.py                  # plain NumPy, for comparison
-```
-
-Results are bit-identical; only the run time differs (see [Usage](#usage) for `-m module`,
-`-c "code"`, the console and `VIPROC=1`).
 
 ## Build (development, CMake)
 
