@@ -132,7 +132,7 @@ VIPROC=1 python prog.py               # the same, through viproc.pth
 python prog.py                        # plain NumPy, for comparison
 ```
 
-`import numpy` in the program's own code then imports viproc: creation functions
+`import numpy` in the program's own code then actually imports viproc: creation functions
 (`np.zeros`, `np.arange`, `np.loadtxt`, `np.random.*`, `default_rng()`, ...) return viproc
 arrays, and NumPy functions on them run asynchronously. The standard library and installed
 packages (SciPy, pandas, ...) keep the real NumPy; viproc arrays they receive are synced and
