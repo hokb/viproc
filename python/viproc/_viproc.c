@@ -46,6 +46,7 @@ static vp_runtime* g_rt = NULL;
 static unsigned long g_main_thread = 0;
 static PyObject* AsyncError = NULL;
 static PyObject* AsyncIndexError = NULL; /* AsyncError and IndexError */
+static PyObject* AsyncValueError = NULL; /* AsyncError and ValueError */
 static long long g_small = 2048;         /* the runtime's sync_below: ops this small run directly */
 
 /* Registered by _ndarray.py via _viproc.setup(). */
@@ -334,9 +335,13 @@ static int raise_status(int status, const char* err) {
         PyErr_SetString(PyExc_ValueError, err);
         return -1;
     default:
-        /* Kernels report index errors as "IndexError: ...": raise them as an
-         * IndexError too, as NumPy would have. */
-        PyErr_SetString(strncmp(err, "IndexError: ", 12) == 0 ? AsyncIndexError : AsyncError, err);
+        /* Kernels report index errors as "IndexError: ..." and value errors as
+         * "ValueError: ...": raise them as an IndexError / ValueError too, as
+         * NumPy would have. */
+        PyErr_SetString(strncmp(err, "IndexError: ", 12) == 0   ? AsyncIndexError
+                        : strncmp(err, "ValueError: ", 12) == 0 ? AsyncValueError
+                                                                : AsyncError,
+                        err);
         return -1;
     }
 }
@@ -3586,9 +3591,19 @@ PyMODINIT_FUNC PyInit__viproc(void) {
                                         bases, NULL)
             : NULL;
     Py_XDECREF(bases);
+    bases = AsyncError != NULL ? PyTuple_Pack(2, AsyncError, PyExc_ValueError) : NULL;
+    AsyncValueError =
+        bases != NULL
+            ? PyErr_NewExceptionWithDoc("viproc._viproc.AsyncValueError",
+                                        "A value error in an asynchronous op (as NumPy's "
+                                        "ValueError, e.g. integers to negative integer powers).",
+                                        bases, NULL)
+            : NULL;
+    Py_XDECREF(bases);
     if (s_call == NULL || s_out == NULL || AsyncError == NULL || AsyncIndexError == NULL ||
-        PyModule_AddObjectRef(m, "AsyncError", AsyncError) < 0 ||
+        AsyncValueError == NULL || PyModule_AddObjectRef(m, "AsyncError", AsyncError) < 0 ||
         PyModule_AddObjectRef(m, "AsyncIndexError", AsyncIndexError) < 0 ||
+        PyModule_AddObjectRef(m, "AsyncValueError", AsyncValueError) < 0 ||
         PyModule_AddObjectRef(m, "_Array", (PyObject*)&ArrayType) < 0 ||
         PyModule_AddObjectRef(m, "ufunc_proxy", (PyObject*)&UfuncProxyType) < 0 ||
         PyModule_AddStringConstant(m, "version", vp_version()) < 0) {

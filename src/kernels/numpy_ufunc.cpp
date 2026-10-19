@@ -164,6 +164,7 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve(PyObject* ufunc, std::span<const D
         error = "loop requires the Python API; cannot run asynchronously";
         return nullptr;
     }
+    loop->init_checks();
     loop->kernel_ = make_elementwise_kernel(loop.get());
     return loop;
 }
@@ -240,6 +241,7 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve_reduction(PyObject* ufunc, DType d
         error = "loop requires the Python API; cannot run asynchronously";
         return nullptr;
     }
+    loop->init_checks();
     return loop;
 }
 
@@ -247,11 +249,75 @@ bool UfuncLoop::requires_pyapi() const {
     return static_cast<const UfuncCallInfoPrefix*>(info_)->requires_pyapi != 0;
 }
 
+namespace {
+
+thread_local const char* t_loop_failure = "NumPy loop failed";
+
+template <typename T> bool any_negative(const char* p, std::intptr_t n, std::intptr_t stride) {
+    for (std::intptr_t i = 0; i < n; ++i, p += stride) {
+        T v;
+        std::memcpy(&v, p, sizeof(T));
+        if (v < 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool any_negative(int type_num, const char* p, std::intptr_t n, std::intptr_t stride) {
+    switch (type_num) {
+    case NPY_BYTE:
+        return any_negative<npy_byte>(p, n, stride);
+    case NPY_SHORT:
+        return any_negative<npy_short>(p, n, stride);
+    case NPY_INT:
+        return any_negative<npy_int>(p, n, stride);
+    case NPY_LONG:
+        return any_negative<npy_long>(p, n, stride);
+    case NPY_LONGLONG:
+        return any_negative<npy_longlong>(p, n, stride);
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
+void UfuncLoop::init_checks() {
+    // Called with the GIL, at resolution. NumPy's own `power` only.
+    static PyObject* power = [] {
+        PyObject* umath = PyImport_ImportModule("numpy._core.umath");
+        PyObject* p = umath != nullptr ? PyObject_GetAttrString(umath, "power") : nullptr;
+        Py_XDECREF(umath);
+        PyErr_Clear();
+        return p; // kept for the process
+    }();
+    const auto* info = static_cast<const UfuncCallInfoPrefix*>(info_);
+    if (ufunc_ != power || power == nullptr || nin_ != 2) {
+        return;
+    }
+    const int t = info->context->descriptors[1]->type_num;
+    if (PyTypeNum_ISSIGNED(t)) {
+        negative_exponent_check_ = t;
+    }
+}
+
 int UfuncLoop::call(char* const* data, const std::intptr_t* dims,
                     const std::intptr_t* strides) const {
     const auto* info = static_cast<const UfuncCallInfoPrefix*>(info_);
-    return info->strided_loop(info->context, data, dims, strides, info->auxdata);
+    if (negative_exponent_check_ != 0 &&
+        any_negative(negative_exponent_check_, data[1], dims[0], strides[1])) {
+        t_loop_failure = "ValueError: Integers to negative integer powers are not allowed.";
+        return -1;
+    }
+    const int rc = info->strided_loop(info->context, data, dims, strides, info->auxdata);
+    if (rc != 0) {
+        t_loop_failure = "NumPy loop failed";
+    }
+    return rc;
 }
+
+const char* UfuncLoop::failure() { return t_loop_failure; }
 
 const UfuncLoop* LoopCache::get(PyObject* ufunc, std::span<const DType> dtypes,
                                 std::string& error) {
@@ -332,6 +398,7 @@ std::unique_ptr<UfuncLoop> UfuncLoop::from_call_info(PyObject* ufunc, PyObject* 
         error = "loop requires the Python API; cannot run asynchronously";
         return nullptr;
     }
+    loop->init_checks();
     return loop;
 }
 
@@ -403,7 +470,7 @@ class ElementwiseKernel : public Kernel {
                 }
                 return loop_->call(ptrs, &count, strides) == 0
                            ? KernelResult{}
-                           : KernelResult{1, "NumPy loop failed", 0};
+                           : KernelResult{1, UfuncLoop::failure(), 0};
             }
         }
         std::vector<Layout> layouts;
@@ -421,7 +488,7 @@ class ElementwiseKernel : public Kernel {
                                      [this](char** ptrs, std::intptr_t n, const std::intptr_t* st) {
                                          return loop_->call(ptrs, &n, st) == 0;
                                      });
-        return ok ? KernelResult{} : KernelResult{1, "NumPy loop failed", 0};
+        return ok ? KernelResult{} : KernelResult{1, UfuncLoop::failure(), 0};
     }
 
   private:
@@ -483,7 +550,7 @@ class IterElementwiseKernel : public Kernel {
         }
         do {
             if (loop_->call(dataptr_, countptr_, strideptr_) != 0) {
-                return {1, "NumPy loop failed", 0};
+                return {1, UfuncLoop::failure(), 0};
             }
         } while (iternext_(iter_));
         clean_ = true;

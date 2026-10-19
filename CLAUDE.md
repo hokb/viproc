@@ -574,6 +574,13 @@ Rules:
 - **Call without the GIL** from worker threads. Never run a loop with
   `requires_pyapi` set (object dtype etc.) asynchronously; fall back to
   eager NumPy instead.
+- **Loops that raise through the Python API anyway:** NumPy's signed
+  integer `power` loops raise `ValueError` for a negative exponent via
+  `npy_gil_error` without `requires_pyapi`. On a worker that error was lost
+  (a result came back), on the main thread it leaked (`SystemError`).
+  `UfuncLoop::call` checks the exponents of such loops before calling them
+  and fails the op with NumPy's message; `AsyncValueError` (a `ValueError`)
+  raises it at the sync point.
 - **Casting:** when promotion casts an operand, the cast is its own
   instruction (cast loops via the same ArrayMethod machinery) or done
   eagerly before the op. Never call a loop on data of the wrong dtype.

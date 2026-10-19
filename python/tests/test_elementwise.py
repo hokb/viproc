@@ -181,3 +181,23 @@ def test_writes_through_views_and_read_only_views():
     with pytest.raises(ValueError):
         np.transpose(v, (0, 0))  # NumPy's own errors
     assert np.real(v) is v  # NumPy returns real data itself
+
+
+@pytest.mark.parametrize("n", [5, 100_000])  # run directly / on a worker
+@pytest.mark.parametrize("dtype", ["i4", "i8"])
+def test_integer_power_with_negative_exponent_raises_numpys_value_error(n, dtype):
+    # NumPy's integer power loop raises through the Python API, which a worker
+    # cannot report: viproc checks the exponents first, on any thread.
+    base = np.arange(n, dtype=dtype) % 7
+    exp = np.full(n, 2, dtype=dtype)
+    exp[-1] = -1
+    with pytest.raises(ValueError, match="Integers to negative integer powers"):
+        np.power(base, exp)
+    x, y = viproc.asarray(base), viproc.asarray(exp)
+    for f in (lambda: np.power(x, y), lambda: viproc.power(x, y), lambda: x ** y,
+              lambda: x ** -1, lambda: np.power(x, exp[::-1])):
+        with pytest.raises(ValueError, match="Integers to negative integer powers"):
+            np.asarray(f())
+    assert np.array_equal(np.asarray(x + 1), base + 1)  # no stray Python error
+    ok = np.abs(exp)
+    assert np.array_equal(np.asarray(x ** viproc.asarray(ok)), base ** ok)
