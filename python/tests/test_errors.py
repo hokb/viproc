@@ -1,6 +1,7 @@
 """Asynchronous error reporting (docs/design/error-handling.md): an op that
-fails on any thread is reported at the next call into viproc, with NumPy's
-exception type (as a subclass), its message, the op and where it was issued."""
+fails on any thread is raised in the main thread as soon as it failed, with
+NumPy's exception type (as a subclass), its message, the op and where it was
+issued."""
 
 import sys
 import time
@@ -56,41 +57,55 @@ def test_integer_power_stays_asynchronous():
         assert np.array_equal(np.asarray(a), b)
 
 
-def test_error_is_raised_at_the_next_call_into_viproc_and_reported_once():
+def test_error_is_raised_in_the_main_thread_right_away_and_reported_once():
     base, exp = _operands(100_000)
     x, y = viproc.asarray(base), viproc.asarray(exp)
-    line = _line() + 1
-    r = x ** y  # fails on a worker; nobody syncs on r
+    line = _line() + 3
     with pytest.raises(viproc.AsyncValueError, match=NEG) as e:
-        for _ in range(2000):  # some later, unrelated call raises it
+        # fails on a worker; nobody syncs on r, no other call into viproc
+        r = x ** y
+        for _ in range(2000):
             time.sleep(0.001)
-            _ = x + 1
     assert f"{__file__}:{line} in " in str(e.value)
     assert np.array_equal(np.asarray(x + 1), base + 1)  # reported once only
     with pytest.raises(ValueError, match=NEG):
         np.asarray(r)  # r itself stays failed
 
 
+def test_an_error_in_the_direct_path_is_raised_right_after_the_op():
+    base, exp = _operands(5)
+    x, y = viproc.asarray(base), viproc.asarray(exp)
+    reached = False
+    with pytest.raises(viproc.AsyncValueError, match=NEG):
+        x ** y
+        for _ in range(1000):  # the next bytecodes, at the latest
+            pass
+        reached = True
+    assert not reached
+
+
 def test_wait_all_raises_a_failed_op_and_sync_points_do_not_report_twice():
     base, exp = _operands(100_000)
     x, y = viproc.asarray(base), viproc.asarray(exp)
-    x ** y
     with pytest.raises(viproc.AsyncValueError, match=NEG):
+        x ** y
         viproc.wait_all()
     viproc.wait_all()  # nothing left
-    r = x ** y
     with pytest.raises(ValueError, match=NEG):
+        r = x ** y
         np.asarray(r)  # the sync point reports it ...
     viproc.wait_all()  # ... and the store does not report it again
+    for _ in range(1000):
+        pass
 
 
 def test_consumers_inherit_the_error_of_the_op_that_failed():
     base, exp = _operands(100_000)
     x, y = viproc.asarray(base), viproc.asarray(exp)
-    line = _line() + 1
-    p = x ** y
-    s = ((p + 1) * 2).sum()
+    line = _line() + 2
     with pytest.raises(viproc.AsyncValueError, match=NEG) as e:
+        p = x ** y
+        s = ((p + 1) * 2).sum()
         float(s)
     assert f"in numpy.power, issued at {__file__}:{line} in " in str(e.value)
     viproc.wait_all()  # only the op that failed was reported, once
@@ -118,27 +133,29 @@ def test_the_earliest_failed_op_is_reported_and_the_others_counted():
 
 
 @pytest.mark.parametrize("n", [5, 100_000])
-def test_an_array_written_by_a_failed_op_fails_until_it_is_overwritten(n):
+def test_an_array_written_by_a_failed_op_stays_failed(n):
     base, exp = _operands(n)
     a, y = viproc.asarray(base), viproc.asarray(exp)
-    a **= y  # NumPy raises here, having written a prefix; viproc fails `a`
     with pytest.raises(viproc.AsyncValueError, match=NEG):
+        a **= y  # NumPy raises here, having written a prefix; viproc fails `a`
         viproc.wait_all()
     with pytest.raises(ValueError, match=NEG):
         np.asarray(a)
     with pytest.raises(ValueError, match=NEG):
         np.asarray(a + 1)  # computed from it
-    a[...] = 7  # writes every element: valid data again
-    assert np.array_equal(np.asarray(a), np.full(n, 7))
+    a[...] = 7  # writing into it does not make it valid: the program failed
+    with pytest.raises(ValueError, match=NEG):
+        np.asarray(a)
 
 
 def test_failing_ops_on_many_threads_leave_no_python_error_behind():
     base, exp = _operands(50_000)
     x, y, ok = viproc.asarray(base), viproc.asarray(exp), viproc.asarray(np.abs(exp))
-    bad = [x ** y for _ in range(40)]
-    good = [x ** ok for _ in range(40)]
     with pytest.raises(ValueError, match=NEG):
+        bad = []
+        bad += [x ** y for _ in range(40)]
         viproc.wait_all()
+    good = [x ** ok for _ in range(40)]
     for b in bad:
         with pytest.raises(ValueError, match=NEG):
             np.asarray(b)
@@ -149,9 +166,9 @@ def test_failing_ops_on_many_threads_leave_no_python_error_behind():
 def test_restarting_the_runtime_raises_an_error_nobody_reported():
     base, exp = _operands(100_000)
     x, y = viproc.asarray(base), viproc.asarray(exp)
-    x ** y
     try:
         with pytest.raises(viproc.AsyncValueError, match=NEG):
+            x ** y
             viproc.init()
     finally:
         if not viproc._viproc.initialized():

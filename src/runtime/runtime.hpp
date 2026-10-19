@@ -46,12 +46,15 @@ class Storage : public MainThreadCounted {
     const std::shared_ptr<Buffer>& buffer() const { return buffer_; }
     // Last task that writes this storage; null once known to be completed.
     const std::shared_ptr<Task>& producer() const { return producer_; }
-    // Error of the last completed producer, if it failed.
-    const TaskErrorPtr& last_error() const { return last_error_; }
+    // Error of the last completed producer, if it failed (a reference into
+    // the runtime's ErrorTable).
+    const ErrorRef& last_error() const { return last_error_; }
 
     bool ready() {
         if (producer_ && producer_->completed()) {
-            last_error_ = producer_->error();
+            if (producer_->error()) {
+                last_error_ = producer_->error();
+            }
             producer_.reset(); // break the storage -> task reference early
         }
         return !producer_;
@@ -64,7 +67,7 @@ class Storage : public MainThreadCounted {
 
     std::shared_ptr<Buffer> buffer_;
     std::shared_ptr<Task> producer_;
-    TaskErrorPtr last_error_;
+    ErrorRef last_error_;
     ArrayBlock* block_;
 };
 
@@ -155,8 +158,8 @@ class Runtime {
     // its kernel is called on the main thread and its outputs are created
     // ready. The task path would run it inline too (rule 1 of the policy),
     // but pays for the task, its operand capture, read counting, the
-    // look-ahead slot and the completion protocol. A kernel error is stored
-    // on the outputs and reported (errors()), as with a task.
+    // look-ahead slot and the completion protocol. A kernel error is
+    // recorded in errors() and the outputs refer to it, as with a task.
     void issue(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
                std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
                const char* issue_site, std::span<ArrayPtr> results, std::int64_t work_elements = -1,
@@ -167,14 +170,14 @@ class Runtime {
 
     // Sync point: waits until `a` is ready. Returns the error of the task that
     // produced it, if any.
-    TaskErrorPtr wait(Array& a);
+    ErrorRef wait(Array& a);
     // Sync point before NumPy code on the main thread writes `a`'s buffer
     // directly (design doc D7): waits for `a`'s producer; if NumPy views of
     // the buffer are alive (host_views), switches the storage to a copy first
     // (copy-on-write, so those views keep their data); then waits until no
     // issued task reads the buffer. Afterwards nothing but the caller touches
     // the buffer until the main thread issues the next op.
-    TaskErrorPtr prepare_host_write(Array& a);
+    ErrorRef prepare_host_write(Array& a);
     // Waits until no task is active.
     void wait_all();
 
@@ -187,8 +190,8 @@ class Runtime {
     // Main thread, before issuing ops: replaces the dispatch policy.
     void set_offload_options(const OffloadOptions& o) { policy_ = OffloadPolicy(o); }
     std::size_t worker_count() const { return workers_.size(); }
-    // Errors of failed ops not yet reported to the user (see ErrorReports).
-    ErrorReports& errors() { return errors_; }
+    // The one store of failed ops' errors (see ErrorTable). Any thread.
+    ErrorTable& errors() { return *errors_; }
 
   private:
     void worker_loop();
@@ -210,7 +213,7 @@ class Runtime {
     void issue_storage_copy(Storage& s);
 
     RuntimeOptions options_;
-    ErrorReports errors_;
+    std::shared_ptr<ErrorTable> errors_ = std::make_shared<ErrorTable>();
     OffloadPolicy policy_;     // main thread only
     std::uint64_t seq_ = 0;    // ops issued so far (main thread only)
     std::uint64_t direct_ = 0; // ... of which ran directly, without a task

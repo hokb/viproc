@@ -83,13 +83,16 @@ def test_inplace_operators_on_scalar_results_rebind_like_numpy_scalars():
     assert float(b) == 6.0
 
 
-def test_errors_of_direct_ops_surface_at_the_sync_point():
+def test_errors_of_direct_ops_are_raised_right_after_the_op():
     small = viproc.asarray(np.arange(10.0))
     idx = viproc.asarray(np.array([1, 99]))
     viproc.wait_all()
-    r = small[idx]  # ran directly; the error is stored on the result
     with pytest.raises(IndexError, match="index 99 is out of bounds"):
-        np.asarray(r)
+        r = small[idx]  # ran directly: raised at the next call or loop iteration
+        for _ in range(2):
+            r = None
+    with pytest.raises(IndexError, match="index 99 is out of bounds"):
+        np.asarray(small[idx][:1])  # and at the sync point of its result
 
 
 REDUCTION_CALLS = [

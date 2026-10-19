@@ -13,8 +13,8 @@ Status labels as in `memory-management.md` (Decided, Implemented, Proposed).
 | # | Decision | Status |
 |---|----------|--------|
 | E1 | Issue-time errors are raised at the call; run-time errors may arise on any thread | Implemented |
-| E2 | A failed op stores its error on its task and outputs; consumers inherit it | Implemented |
-| E3 | Asynchronous reporting: every call into viproc reads the runtime's error store | Implemented |
+| E2 | One record per failed op, in the runtime; tasks and arrays only refer to it | Implemented |
+| E3 | Fail fast: the error is raised in the main thread as soon as the op failed | Implemented |
 | E4 | NumPy's exception types, as subclasses (`AsyncValueError`, `AsyncIndexError`) | Implemented |
 | E5 | Where: the exact issue site and the NumPy function, not the full call stack | Implemented |
 | E6 | Loops that raise through the Python API are watched on the thread that runs them | Implemented |
@@ -44,55 +44,81 @@ Python exception type is known (`"IndexError: index 12000 is out of bounds
 ..."`, `"ValueError: Integers to negative integer powers are not allowed."`),
 else as plain text.
 
-## E2 — Recording a failed op
+## E2 — One record per failed op, in the runtime
 
-`TaskError` (`src/runtime/task.hpp`): the message, the issue site, the op
-(`Kernel::name()`) and the op's issue number (`id`). It is created once, by
-the thread that ran the kernel, and shared (`TaskErrorPtr`, a
-`shared_ptr<const TaskError>`) by:
+The error of a failed op exists **once, in the runtime**: its `ErrorTable`
+(`src/runtime/task.hpp`) holds a `TaskError` record per failed op (the
+message, the issue site, the op, `Kernel::name()`, and the op's issue
+number `id`). The thread that ran the kernel records it there (worker or
+main thread, under the table's mutex). Everything else holds only a
+reference, an `ErrorRef` (the table and the id; empty for ops that did not
+fail):
 
 - the failed task (`Task::error()`) and, through `Storage::last_error()`,
   every array it writes, new outputs and in/out arrays alike;
 - every consumer: a task whose input failed skips its kernel and completes
-  with the same error (`upstream_error_`), so `((x ** y) + 1).sum()` fails
-  with the error of `**`, naming where `**` was issued;
-- the runtime's error store (E3), for the op that failed itself only.
+  referring to the same record (`upstream_error_`), so `((x ** y) +
+  1).sum()` fails with the error of `**`, naming where `**` was issued. An
+  inherited error is no new record.
+
+Records are counted by their references (copies and releases lock the table;
+only failed ops have any, an empty `ErrorRef` is a null check). A record goes
+when it was reported (E3) and nothing refers to it any more; one that nothing
+refers to before it was reported stays until it is (up to 64; further ones are
+only counted). The table belongs to the runtime and outlives it only while an
+array still refers to a record.
 
 A sync point on any of these arrays raises the error (`vp_array_wait`,
-`vp_array_prepare_write`), every time: their data is not NumPy's.
+`vp_array_prepare_write`, `ErrorTable::raise_at_sync_point`), every time:
+their data is not NumPy's.
 
-## E3 — Asynchronous reporting
+## E3 — Fail fast: raised in the main thread right away
 
-The thread that runs a failing kernel reports the error to the runtime
-(`ErrorReports::report`, a mutex-protected list and an atomic flag) **before
-the task completes**: a sync point that sees the task completed finds the
-report too, so it can mark it as reported (`forget`) and nothing is raised
-twice.
+A failed op ends the program as NumPy's would, as soon as it failed: its
+error is raised **in the main thread, wherever the program is**, the way
+Python raises `KeyboardInterrupt`. User code that catches NumPy's exception
+can still handle it (E4).
 
-The bridge reads the store **at every call into viproc** from Python
-(`check_async_errors` in `_viproc.c`: in `check_runtime`, which every C
-entry point calls, and in `fast_ufunc`, which every operator and ufunc call
-goes through). While no op failed this is one atomic load
-(`vp_error_pending`), measured at ~25 instructions per op with callgrind
-(`x * y`, 8 elements: ~5,400 instructions; about 0.5%). After a failure it
-takes the store (`vp_take_error`) and raises:
+1. The thread that runs the failing kernel records it (E2) **before the task
+   completes**: a sync point that sees the task completed finds the record.
+2. When the table goes from no unreported error to one, it calls the
+   bridge's notifier (`vp_set_error_notify`) on that thread. The Python bridge
+   schedules `pending_raise` with `Py_AddPendingCall`: no GIL and no thread
+   state needed, so the failing thread takes no lock of Python's to report.
+   The interpreter runs it in the main thread at its next check (the next
+   call or loop iteration of the running Python code; while the main thread
+   waits in viproc with the GIL released, as soon as it is back), and it
+   raises the error there. Direct ops (small ready data, run on the main
+   thread) fail the same way, so their error appears right after the call,
+   as in NumPy.
+3. Never inside viproc's or NumPy's own Python code: their `except
+   ValueError:` blocks around fallbacks would swallow it. There
+   `pending_raise` schedules itself again, so the error surfaces in the
+   user's code (`in_user_code`: the innermost frame outside viproc and NumPy,
+   the issue site's rule).
+4. Every call into viproc from user code checks the table as well
+   (`check_async_errors`: in `check_runtime`, which every C entry point
+   calls, and in `fast_ufunc`, which every operator and ufunc call goes
+   through): one atomic load while no op failed (`vp_error_pending`). This
+   covers what the interpreter's pending calls do not (a full queue of
+   pending calls, viproc used from another thread than Python's main
+   thread).
 
-- the error of the **earliest issued** failed op (the one sequential NumPy
-  would have raised first), with the number of further failures not reported
-  (`"[2 more failed ops not reported]"`); all reports are cleared then;
-- once: a later call raises nothing until another op fails;
-- deterministically at `viproc.wait_all()` (after waiting) and at shutdown:
-  `viproc.shutdown()` / `viproc.init()` raise an error nobody reported, and
-  at interpreter exit Python prints it ("Exception ignored in atexit
-  callback"); the exit status stays 0.
+Raised is the error of the **earliest issued** failed op recorded so far,
+with the number of further unreported failures (`"[2 more failed ops not
+reported]"`); all records count as reported then, and it is raised once. A
+sync point raising an error marks its record reported too. `viproc.wait_all()`
+raises after waiting (while it waits, nothing else runs in the main thread, so
+it reports the earliest of all ops that failed), and so do
+`viproc.shutdown()` / `viproc.init()`; at interpreter exit Python prints an
+error nobody reported ("Exception ignored in atexit callback").
 
-Which call raises a worker's error depends on timing (the first call after
-the failure); that the error is raised does not: the next sync point on a
-result of the failed op, `wait_all` or shutdown raises it at the latest.
+The raised exception's traceback shows where the main thread was, which can
+be a few lines after the failing op; the message names the op and its issue
+site (E5).
 
-The bridge must never swallow such an error: Python code in `_ndarray.py`
-that catches `TypeError`/`ValueError`/`IndexError` around viproc calls to
-fall back to NumPy re-raises `AsyncError` first.
+The bridge's own `except` blocks re-raise `AsyncError` first where they
+catch around a sync point (`_ndarray.py`).
 
 ## E4 — Exception types
 
@@ -167,7 +193,9 @@ runs them (`UfuncLoop::call_watched`):
   No other thread touches that state, so this needs no GIL.
 - Only if the loop raised (the error path, where `npy_gil_error` took the
   GIL already) the thread takes the GIL, fetches and clears the exception
-  and fails the op with `"ValueError: <NumPy's message>"` (E1–E3).
+  (it must not stay on the worker's thread state) and fails the op with
+  `"ValueError: <NumPy's message>"`, recorded in the runtime (E2) and
+  raised in the main thread (E3).
 
 Cost on success: a thread-local load and two pointer reads per loop call
 (per op, or per buffer of NumPy's iterator). `int ** int` keeps running
@@ -192,20 +220,19 @@ asynchronously and in parallel.
 Asynchronous execution cannot raise at the call that failed, because that
 call returned long ago. Deliberately, and only for run-time errors (E1):
 
-- **When:** the error is raised at a later call into viproc (E3), with
-  NumPy's type (as a subclass) and message. Small ready ops run directly on
-  the main thread report the same way, at the next call.
+- **When:** a worker's error is raised a little after the failing call
+  returned, wherever the main thread is then (E3), with NumPy's type (as a
+  subclass) and message. Direct ops raise right after their call.
 - **Ops issued after the failing one still run:** the main thread ran
   ahead, so later ops (in NumPy never reached) were issued and run if they do
   not depend on the failed one; their side effects (in-place writes to other
   arrays) happen.
-- **Arrays written by the failed op are failed:** an in/out array (`out=`,
-  `a **= b`) raises at every sync point afterwards (and so does everything
-  computed from it), where NumPy keeps the elements its loop wrote before
-  the error. An op that overwrites all of it (`a[...] = 0`, `np.add(x, 1,
-  out=a)`) gives it valid data again: an in/out whose old data the op does
-  not read (`Kernel::writes_all`, the whole buffer) does not pass its error
-  on (`Runtime::issue`, step 1).
+- **Arrays written by the failed op stay failed:** an in/out array (`out=`,
+  `a **= b`) raises at every sync point afterwards, and so does everything
+  computed from it or written into it, where NumPy keeps the elements its
+  loop wrote before the error. Not even an op that overwrites all of it
+  (`a[...] = 0`) makes it valid again: a program that caught the error and
+  goes on must not compute with data of a failed run.
 - **Exit status:** an error reported only at interpreter exit is printed,
   but the process exits with status 0.
 
@@ -217,7 +244,7 @@ division by zero is a warning too. Workers already record the FP flags per
 task (`Task::fp_flags`); the plan: capture the `errstate` mode at issue (it
 is thread-local in NumPy and belongs to the issuing code), and at reporting
 time either warn (NumPy's `RuntimeWarning` text) or raise
-`FloatingPointError`, through the store of E3, with the issue site of E5.
+`FloatingPointError`, through the channel of E3, with the issue site of E5.
 Linalg's `LinAlgError` (set through the invalid flag in NumPy's
 `errstate(invalid='call')` callback) uses the same path.
 
@@ -250,5 +277,10 @@ Rules that follow (also in CLAUDE.md, "Conventions"):
 - Never add a pass over the data (a scan, check or copy) to detect a rare
   condition. Detect errors where they occur, in the kernel, and report them
   through the asynchronous channel (E3).
+- Store a piece of state in one place. A failed op's error is a record in the
+  runtime; tasks and arrays refer to it, they do not carry it.
+- Among several ways to implement an issue, take the one that adds the fewest
+  instructions to an op's main-thread paths; among equal ones, the one that
+  measures fastest.
 - A fallback to eager NumPy is not a fix for a supported op: it costs the
   op's parallelism on every call.

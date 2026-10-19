@@ -40,7 +40,8 @@ final computation of every instruction is delegated to NumPy's own inner
 loops, including their SIMD paths, called exactly as NumPy calls them.
 Anything viproc cannot run with NumPy's semantics falls back to eager NumPy.
 Errors keep NumPy's type (as a subclass) and message; run-time errors of
-asynchronous ops are raised at a later call into viproc, by design
+asynchronous ops are raised in the main thread as soon as the op failed,
+a little after its call returned, by design
 (`error-handling.md`, E7).
 Every benchmark case and every test must stay bit-identical.
 

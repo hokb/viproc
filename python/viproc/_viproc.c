@@ -299,6 +299,7 @@ static PyGetSetDef Array_getset[] = {
 
 static int check_runtime(void);
 static int check_async_errors(void);
+static int code_is_internal(PyCodeObject* code);
 
 /* Arguments (viproc array, any object) of a METH_FASTCALL function; checks
  * the runtime too. 0 or -1 with an exception. */
@@ -348,8 +349,49 @@ static int raise_pending_error(void) {
     return -1;
 }
 
+/* 1 if the running Python code is the user's: no frame, or the innermost one
+ * outside viproc and NumPy. An asynchronous error is raised only there, never
+ * inside viproc's or NumPy's own Python code, whose `except ValueError:`
+ * blocks would swallow it. */
+static int in_user_code(void) {
+    PyFrameObject* f = PyEval_GetFrame(); /* borrowed */
+    if (f == NULL) {
+        return 1;
+    }
+    PyCodeObject* code = PyFrame_GetCode(f); /* new ref */
+    const int internal = code_is_internal(code);
+    Py_DECREF(code);
+    return !internal;
+}
+
 /* At every call into viproc: one atomic load while no op failed. */
-static int check_async_errors(void) { return vp_error_pending(g_rt) ? raise_pending_error() : 0; }
+static int check_async_errors(void) {
+    return vp_error_pending(g_rt) && in_user_code() ? raise_pending_error() : 0;
+}
+
+/* Raises a failed op's error in the main thread as soon as it is recorded,
+ * wherever the program is (as Python raises KeyboardInterrupt): run by the
+ * interpreter's eval loop (Py_AddPendingCall) in the main thread, with the
+ * GIL. Inside viproc's or NumPy's own code it is scheduled again, so it
+ * surfaces in the user's code. Nothing is done if the error was raised
+ * already (a sync point, wait_all, the next call into viproc). */
+static int pending_raise(void* arg) {
+    (void)arg;
+    if (g_rt == NULL || PyThread_get_thread_ident() != g_main_thread || !vp_error_pending(g_rt)) {
+        return 0; /* another thread uses viproc: the next call raises it */
+    }
+    if (!in_user_code()) {
+        (void)Py_AddPendingCall(pending_raise, NULL); /* queue full: the next call */
+        return 0;
+    }
+    return raise_pending_error();
+}
+
+/* vp_set_error_notify: on the failing thread, no GIL needed. */
+static void error_recorded(void* arg) {
+    (void)arg;
+    (void)Py_AddPendingCall(pending_raise, NULL);
+}
 
 static int raise_status(int status, const char* err) {
     switch (status) {
@@ -392,6 +434,30 @@ static int read_dims(PyObject* seq, int64_t* out) {
     return (int)n;
 }
 
+/* 1 if `code` belongs to viproc or NumPy (g_internal_dirs), cached per code
+ * object. */
+static int code_is_internal(PyCodeObject* code) {
+    const Entry* flag = t_find(&g_code_flags, code, 0);
+    if (flag != NULL) {
+        return (int)flag->v;
+    }
+    PyObject* fn = PyObject_GetAttrString((PyObject*)code, "co_filename");
+    int is_internal = 0;
+    if (fn != NULL && g_internal_dirs != NULL) {
+        PyObject* name = PyUnicode_InternFromString("startswith");
+        PyObject* r = PyObject_CallMethodOneArg(fn, name, g_internal_dirs);
+        Py_DECREF(name);
+        is_internal = r == Py_True;
+        Py_XDECREF(r);
+    }
+    Py_XDECREF(fn);
+    PyErr_Clear();
+    if (t_put(&g_code_flags, code, 0, is_internal, NULL, (PyObject*)code) < 0) {
+        PyErr_Clear(); /* not cached: computed again next time */
+    }
+    return is_internal;
+}
+
 /* Issue site: "file:line in function" of the first frame outside viproc and
  * NumPy, interned in the runtime (vp_intern) and cached per (code object,
  * bytecode offset). The offset, unlike the line number, is free to read: the
@@ -401,26 +467,7 @@ static const char* issue_site(void) {
     Py_XINCREF(f);
     while (f != NULL) {
         PyCodeObject* code = PyFrame_GetCode(f); /* new ref */
-        const Entry* flag = t_find(&g_code_flags, code, 0);
-        int is_internal;
-        if (flag != NULL) {
-            is_internal = (int)flag->v;
-        } else {
-            PyObject* fn = PyObject_GetAttrString((PyObject*)code, "co_filename");
-            is_internal = 0;
-            if (fn != NULL && g_internal_dirs != NULL) {
-                PyObject* name = PyUnicode_InternFromString("startswith");
-                PyObject* r = PyObject_CallMethodOneArg(fn, name, g_internal_dirs);
-                Py_DECREF(name);
-                is_internal = r == Py_True;
-                Py_XDECREF(r);
-            }
-            Py_XDECREF(fn);
-            PyErr_Clear();
-            if (t_put(&g_code_flags, code, 0, is_internal, NULL, (PyObject*)code) < 0) {
-                PyErr_Clear(); /* not cached: computed again next time */
-            }
-        }
+        const int is_internal = code_is_internal(code);
         if (!is_internal) {
             const int lasti = PyFrame_GetLasti(f);
             const Entry* hit = t_find(&g_sites, code, lasti);
@@ -1808,6 +1855,7 @@ static PyObject* m_init(PyObject* self, PyObject* args) {
         return NULL;
     }
     g_main_thread = PyThread_get_thread_ident();
+    vp_set_error_notify(g_rt, error_recorded, NULL);
     g_small = sync_below >= 0 ? sync_below : 2048;
     if (sync_below >= 0 || !adaptive) {
         vp_set_offload_policy(g_rt, sync_below >= 0 ? sync_below : 2048, adaptive);

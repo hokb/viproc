@@ -44,7 +44,7 @@ bool Task::add_consumer(const std::shared_ptr<Task>& consumer) {
     return true;
 }
 
-void Task::add_upstream_error(const TaskErrorPtr& error) {
+void Task::add_upstream_error(const ErrorRef& error) {
     std::lock_guard lock(mutex_);
     if (!upstream_error_) {
         upstream_error_ = error;
@@ -142,46 +142,139 @@ void Task::allocate_outputs() {
     }
 }
 
-void ErrorReports::report(const TaskErrorPtr& e) {
-    std::lock_guard lock(mutex_);
-    if (errors_.size() < kMaxKept) {
-        errors_.push_back(e);
-    } else {
-        ++dropped_;
+ErrorRef::ErrorRef(const ErrorRef& o) : table_(o.table_), id_(o.id_) {
+    if (table_) {
+        table_->acquire(id_);
     }
-    pending_.store(true, std::memory_order_release);
 }
 
-TaskErrorPtr ErrorReports::take(std::size_t* more) {
+ErrorRef& ErrorRef::operator=(const ErrorRef& o) {
+    if (this != &o) {
+        ErrorRef copy(o);
+        *this = std::move(copy);
+    }
+    return *this;
+}
+
+ErrorRef& ErrorRef::operator=(ErrorRef&& o) noexcept {
+    if (this != &o) {
+        reset();
+        table_ = std::move(o.table_);
+        id_ = std::exchange(o.id_, 0);
+    }
+    return *this;
+}
+
+void ErrorRef::reset() {
+    if (table_) {
+        table_->release(id_);
+        table_.reset();
+        id_ = 0;
+    }
+}
+
+ErrorTable::Record* ErrorTable::find(std::uint64_t id) {
+    for (Record& r : records_) {
+        if (r.error.id == id) {
+            return &r;
+        }
+    }
+    return nullptr;
+}
+
+void ErrorTable::update_pending() {
+    bool any = dropped_ > 0;
+    for (const Record& r : records_) {
+        any = any || !r.reported;
+    }
+    pending_.store(any, std::memory_order_release);
+}
+
+ErrorRef ErrorTable::record(TaskError e) {
+    const std::uint64_t id = e.id;
+    bool was_pending;
+    {
+        std::lock_guard lock(mutex_);
+        records_.push_back({std::move(e), 1, false});
+        was_pending = pending_.exchange(true, std::memory_order_acq_rel);
+    }
+    if (!was_pending) {
+        if (auto fn = notify_.load(std::memory_order_acquire)) {
+            fn(notify_arg_);
+        }
+    }
+    return ErrorRef(shared_from_this(), id);
+}
+
+void ErrorTable::acquire(std::uint64_t id) {
     std::lock_guard lock(mutex_);
-    pending_.store(false, std::memory_order_relaxed);
-    TaskErrorPtr first;
-    if (!errors_.empty()) {
-        auto it = std::min_element(
-            errors_.begin(), errors_.end(),
-            [](const TaskErrorPtr& a, const TaskErrorPtr& b) { return a->id < b->id; });
-        first = std::move(*it);
+    Record* r = find(id);
+    if (r->refs++ == 0 && !r->reported) {
+        --orphans_;
+    }
+}
+
+void ErrorTable::release(std::uint64_t id) {
+    std::lock_guard lock(mutex_);
+    Record* r = find(id);
+    if (--r->refs > 0) {
+        return;
+    }
+    if (!r->reported && orphans_ < kMaxOrphans) {
+        ++orphans_; // kept until take() reports it
+        return;
+    }
+    if (!r->reported) {
+        ++dropped_; // counted only
+    }
+    *r = std::move(records_.back());
+    records_.pop_back();
+}
+
+std::optional<TaskError> ErrorTable::take(std::size_t* more) {
+    std::lock_guard lock(mutex_);
+    std::optional<TaskError> first;
+    std::size_t unreported = 0;
+    for (const Record& r : records_) {
+        if (!r.reported) {
+            ++unreported;
+            if (!first || r.error.id < first->id) {
+                first = r.error;
+            }
+        }
     }
     if (more != nullptr) {
-        *more = errors_.empty() ? 0 : errors_.size() - 1 + dropped_;
+        *more = first ? unreported - 1 + dropped_ : 0;
     }
-    errors_.clear();
+    for (Record& r : records_) {
+        r.reported = true;
+    }
+    std::erase_if(records_, [](const Record& r) { return r.refs == 0; });
+    orphans_ = 0;
     dropped_ = 0;
+    pending_.store(false, std::memory_order_release);
     return first;
 }
 
-void ErrorReports::forget(std::uint64_t id) {
+TaskError ErrorTable::raise_at_sync_point(const ErrorRef& ref) {
     std::lock_guard lock(mutex_);
-    std::erase_if(errors_, [id](const TaskErrorPtr& e) { return e->id == id; });
-    pending_.store(!errors_.empty() || dropped_ > 0, std::memory_order_relaxed);
+    Record* r = find(ref.id());
+    r->reported = true;
+    update_pending();
+    return r->error;
 }
 
-std::vector<std::shared_ptr<Task>> Task::execute(ErrorReports* reports) {
+std::size_t ErrorTable::size() const {
+    std::lock_guard lock(mutex_);
+    return records_.size();
+}
+
+std::vector<std::shared_ptr<Task>> Task::execute(ErrorTable* errors) {
     // No lock: every write of upstream_error_ happens before the release
     // decrement of pending_ by its writer, and this thread observed the final
     // decrement (or got the task from the thread that did).
     if (upstream_error_) {
-        error_ = upstream_error_;
+        error_ = std::move(upstream_error_);
     }
     // Output memory as late as possible (design doc D11): here, right before
     // the kernel, on the thread that runs it. Also on errors: readers of an
@@ -203,10 +296,9 @@ std::vector<std::shared_ptr<Task>> Task::execute(ErrorReports* reports) {
         }
         fp_flags_ = r.fp_flags | std::fetestexcept(FE_ALL_EXCEPT);
         if (r.status != 0) {
-            error_ = std::make_shared<const TaskError>(
-                TaskError{std::move(r.message), issue_site_, kernel_->name(), id_});
-            if (reports != nullptr) {
-                reports->report(error_);
+            if (errors != nullptr) {
+                error_ = errors->record(
+                    TaskError{std::move(r.message), issue_site_, kernel_->name(), id_});
             }
         }
     }

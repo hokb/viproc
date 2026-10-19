@@ -494,18 +494,22 @@ reference counting.
   to date with any change to how errors are recorded or raised).
   Issue-time errors (shapes, dtypes, arguments) are NumPy's, raised at the
   call. Run-time errors (element values: index out of bounds, integer power
-  with a negative exponent) may arise on any thread: the failed op stores
-  its `TaskError` (message `"TypeName: ..."`, issue site, op name, issue
-  number; shared, `TaskErrorPtr`) on its task and outputs, consumers
-  inherit it, and the thread that ran it reports it to the runtime
-  (`ErrorReports`) before the task completes. **Every call into viproc**
-  from Python checks the store (`check_async_errors`: one atomic load,
-  ~25 instructions per op) and raises the earliest failed op's error once,
-  as `AsyncValueError` / `AsyncIndexError` (subclasses of NumPy's type and
-  `AsyncError`); sync points on affected arrays raise it every time,
-  `wait_all()` and shutdown deterministically. An op that overwrites an
-  in/out completely does not inherit its error. The full call stack is not
-  captured (too expensive per op).
+  with a negative exponent) may arise on any thread. **The error exists
+  once, in the runtime** (`ErrorTable`: one `TaskError` record per failed
+  op, message `"TypeName: ..."`, issue site, op name, issue number);
+  the failed task, its outputs and every consumer only hold an `ErrorRef`
+  to it (an inherited error is no new record). The failing thread records
+  it before the task completes. **Fail fast:** the record's arrival
+  schedules a raise in the main thread (`Py_AddPendingCall`, no GIL taken),
+  which raises it at the next check of the running user code, as Python
+  raises `KeyboardInterrupt` (never inside viproc's or NumPy's own Python
+  code), as `AsyncValueError` / `AsyncIndexError` (subclasses of NumPy's
+  type and `AsyncError`); every call into viproc checks too
+  (`check_async_errors`, one atomic load). Raised once; sync points on
+  failed arrays raise it every time, `wait_all()` and shutdown
+  deterministically. A failed array stays failed, also after it is
+  overwritten completely. The full call stack is not captured (too
+  expensive per op).
 
 ### Notes on the reference projects
 
@@ -1038,7 +1042,11 @@ Rules:
   the numbers in the PR. Never add a pass over the data (scan, check, copy)
   to catch a rare condition, and never move a supported op to the eager
   fallback to fix it: detect errors where they occur, in the kernel, and
-  report them asynchronously (error-handling.md, "Lesson").
+  report them asynchronously (error-handling.md, "Lesson"). **Where an
+  issue can be implemented in several ways, take the one that adds the
+  fewest instructions to an op's main-thread paths; among equal ones, the
+  one that measures fastest.** Keep each piece of state in one place (the
+  runtime), referenced from elsewhere, not copied.
 - Keep the MVP small: prefer the simplest correct scheduling over
   optimizations until there is a benchmark that shows the need.
 - Measure success as strong scaling: benchmark whole array programs

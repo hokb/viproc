@@ -159,11 +159,15 @@ void vp_runtime_destroy(vp_runtime* rt) {
     ElementPool::instance().trim(); // cached blocks are not kept across runtimes
 }
 
+void vp_set_error_notify(vp_runtime* rt, void (*fn)(void*), void* arg) {
+    rt->rt->errors().set_notify(fn, arg);
+}
+
 int vp_error_pending(const vp_runtime* rt) { return rt->rt->errors().pending() ? 1 : 0; }
 
 int vp_take_error(vp_runtime* rt, char* err, size_t errlen) {
     std::size_t more = 0;
-    TaskErrorPtr e = rt->rt->errors().take(&more);
+    std::optional<TaskError> e = rt->rt->errors().take(&more);
     if (!e) {
         return VP_OK;
     }
@@ -290,10 +294,9 @@ size_t vp_array_reusable_bytes(const vp_array* a) {
 }
 
 int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
-    TaskErrorPtr e = rt->rt->wait(arr(a));
+    ErrorRef e = rt->rt->wait(arr(a));
     if (e) {
-        rt->rt->errors().forget(e->id); // reported here
-        set_error(err, errlen, describe(*e));
+        set_error(err, errlen, describe(rt->rt->errors().raise_at_sync_point(e)));
         return VP_ERROR;
     }
     return VP_OK;
@@ -315,10 +318,9 @@ int vp_array_pin(const vp_array* a, PyObject* view) {
 }
 
 int vp_array_prepare_write(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
-    TaskErrorPtr e = rt->rt->prepare_host_write(arr(a));
+    ErrorRef e = rt->rt->prepare_host_write(arr(a));
     if (e) {
-        rt->rt->errors().forget(e->id); // reported here
-        set_error(err, errlen, describe(*e));
+        set_error(err, errlen, describe(rt->rt->errors().raise_at_sync_point(e)));
         return VP_ERROR;
     }
     return VP_OK;

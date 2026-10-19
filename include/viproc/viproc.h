@@ -62,9 +62,14 @@ void vp_runtime_destroy(vp_runtime* rt);
 size_t vp_worker_count(const vp_runtime* rt);
 
 /* Asynchronous error reporting (docs/design/error-handling.md). An op that
- * fails on any thread reports its error to the runtime; bridges check for it
- * at every call into viproc and raise it.
- * [main thread] 1 if a failed op's error waits to be reported (one atomic
+ * fails on any thread records its error in the runtime, the one place errors
+ * live (arrays and tasks only refer to it). Bridges raise it in their main
+ * thread as soon as possible: `fn` is called on the failing thread, without
+ * locks or the GIL, when the runtime goes from no unreported error to one
+ * (Python: Py_AddPendingCall); every call into viproc checks too.
+ * [main thread, before issuing ops] */
+void vp_set_error_notify(vp_runtime* rt, void (*fn)(void*), void* arg);
+/* [main thread] 1 if a failed op's error waits to be reported (one atomic
  * load; nothing else). */
 int vp_error_pending(const vp_runtime* rt);
 /* [main thread] VP_ERROR with the error of the earliest issued op among those
