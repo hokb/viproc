@@ -188,8 +188,8 @@ def test_writes_through_views_and_read_only_views():
 def test_integer_power_with_negative_exponent_raises_numpys_value_error(n, dtype):
     # NumPy's integer power loop raises through the Python API, which a worker
     # cannot report: viproc checks the exponents first, on any thread.
-    base = (np.arange(n) % 7).astype(dtype)
-    exp = np.full(n, 2).astype(dtype)
+    base = np.arange(n, dtype=dtype) % 7
+    exp = np.full(n, 2, dtype=dtype)
     exp[-1] = -1
     with pytest.raises(ValueError, match="Integers to negative integer powers"):
         np.power(base, exp)

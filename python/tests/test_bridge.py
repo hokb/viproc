@@ -604,3 +604,14 @@ def test_read_only_viproc_views_raise_like_numpy():
         b[0][0] = 1.0  # views of a read-only array are read-only
     x[0] = 5.0  # the base stays writable, and the view sees the write
     assert np.asarray(b)[2, 0] == 5.0
+
+
+@pytest.mark.parametrize("code", ["i", "l", "q"])
+def test_every_c_integer_type_of_a_supported_width_imports(code):
+    # int32 and int64 each have two NumPy type numbers (Linux: "l" and "q" for
+    # int64; Windows: "i" and "l" for int32); NumPy treats them as one dtype.
+    a = np.arange(-3, 4, dtype=code)
+    v = viproc.asarray(a)
+    assert isinstance(v, viproc.ndarray) and v.dtype == a.dtype
+    assert np.array_equal(np.asarray(v * 3 + a), a * 3 + a)
+    assert np.asarray(v ** 2).dtype == (a ** 2).dtype

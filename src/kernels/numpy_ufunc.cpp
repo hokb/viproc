@@ -63,8 +63,28 @@ bool dtype_of(int type_num, DType& out) {
         out = DType::Complex128;
         return true;
     default:
-        return false;
+        break;
     }
+    // The other C integer type of the same width (Linux: `longlong` next to
+    // `long` for int64; Windows: `int` next to `long` for int32): the same
+    // dtype for NumPy (np.dtype("q") == np.dtype("l")), only another number.
+    std::size_t size = 0;
+    if (type_num == NPY_INT) {
+        size = sizeof(int);
+    } else if (type_num == NPY_LONG) {
+        size = sizeof(long);
+    } else if (type_num == NPY_LONGLONG) {
+        size = sizeof(long long);
+    }
+    if (size == 4) {
+        out = DType::Int32;
+        return true;
+    }
+    if (size == 8) {
+        out = DType::Int64;
+        return true;
+    }
+    return false;
 }
 
 } // namespace
