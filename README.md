@@ -68,7 +68,7 @@ The execution model follows the
 - **Never slower than NumPy.** Array operations on medium-sized and large data viproc commonly runs
   efficiently in parallel. Small data and algorithms without much parallel potential must
   not get slower: viproc must not make any expression slower than NumPy (hard limit 0.95x;
-  where there is nothing to overlap, at most 3% slower by design).
+  where there is nothing to overlap, at most 3% slower by design – not quite there yet).
 - **Designed for heterogeneous hardware and further JIT optimizations.** viproc runs on
   multi-core CPUs today, but the approach is designed to include heterogeneous compute
   resources into execution fully automatically, by adding cost-based device scheduling to
