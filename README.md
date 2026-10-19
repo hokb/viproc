@@ -98,32 +98,19 @@ pipelining) is on the roadmap.
 
 ## Install
 
+```bash
+git clone https://github.com/hokb/viproc
+cd viproc
+pip install .           # into the active Python environment (a venv, conda, ...)
+```
+
 viproc is a regular Python package: one extension module (`_viproc.*.pyd` / `.so`, runtime
 linked in statically) plus Python files. It needs Python >= 3.12 (64 bit), NumPy >= 2.0 and,
 until there are prebuilt wheels, a C++20 compiler (Visual Studio with the C++ workload on
 Windows, GCC or Clang on Linux). NumPy itself is not modified: viproc arrays take part through
 NumPy's array protocols.
 
-One click, after every commit (pull, build into `.venv`, run the tests):
-
-```bat
-dev.cmd                 :: Windows: double-click, or dev.cmd -NoPull -NoTest -Python <python.exe>
-```
-```bash
-./dev.sh                # Linux: ./dev.sh --no-pull --no-test, PYTHON=python3.13 ./dev.sh
-```
-
-Then run programs with the venv's Python, as in [Usage](#usage):
-`.venv\Scripts\python -m viproc prog.py` (Linux: `.venv/bin/python -m viproc prog.py`). The
-first build takes a minute; later ones rebuild incrementally (`build/pip-<tag>`). No developer
-prompt is needed on Windows: the build picks Visual Studio for the interpreter's architecture.
-
-Into any other environment, from a checkout or straight from GitHub:
-
-```bash
-pip install .                                   # in the checkout
-pip install git+https://github.com/hokb/viproc  # clones the repository first
-```
+Without a checkout, `pip install git+https://github.com/hokb/viproc` does the same.
 
 There is no prebuilt wheel yet, so pip builds one from the sources on your machine and installs
 it: its build backend (scikit-build-core, see `pyproject.toml`) runs CMake, compiles the
@@ -201,6 +188,15 @@ viproc (also with `copy=False`); dtypes viproc does not run (object, str, float1
 NumPy arrays, as NumPy does.
 
 ## Build (development, CMake)
+
+`dev.cmd` (Windows, also by double-click) and `./dev.sh` (Linux) pull, build into `.venv` and
+run the tests; run programs with `.venv\Scripts\python -m viproc prog.py` (Linux:
+`.venv/bin/python -m viproc prog.py`). Later builds are incremental (`build/pip-<tag>`), and no
+developer prompt is needed on Windows: the build picks Visual Studio for the interpreter's
+architecture. Options: `dev.cmd -NoPull -NoTest -Python <python.exe>`, `./dev.sh --no-pull
+--no-test`, `PYTHON=python3.13 ./dev.sh`.
+
+With CMake directly:
 
 ```bash
 cmake -S . -B build -G Ninja
