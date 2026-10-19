@@ -156,6 +156,7 @@ template <class Body> std::string with_copy(std::size_t item, Body&& body) {
 class GatherKernel : public Kernel {
   public:
     explicit GatherKernel(IndexSpec spec) : spec_(std::move(spec)) {}
+    const char* name() const override { return "indexing (a[index])"; }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Operand& out = outputs[0];
@@ -191,6 +192,7 @@ class GatherKernel : public Kernel {
 class ScatterKernel : public Kernel {
   public:
     explicit ScatterKernel(IndexSpec spec) : spec_(std::move(spec)) {}
+    const char* name() const override { return "index assignment (a[index] = v)"; }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Operand& dst = outputs[0];
@@ -222,6 +224,7 @@ class ScatterKernel : public Kernel {
 
 class MaskAssignKernel : public Kernel {
   public:
+    const char* name() const override { return "masked assignment (a[mask] = v)"; }
     bool writes_all() const override { return false; }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
@@ -246,6 +249,7 @@ class MaskAssignKernel : public Kernel {
 
 class SelectKernel : public Kernel {
   public:
+    const char* name() const override { return "numpy.where"; }
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Layout& out = outputs[0].layout;
         const std::size_t item = itemsize(out.dtype);

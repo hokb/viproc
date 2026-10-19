@@ -52,7 +52,17 @@ class UfuncLoop {
                                                      std::span<const std::intptr_t> fixed,
                                                      std::string& error);
 
+    // Calls the loop; 0 on success. On failure (-1) take_loop_error() on the
+    // same thread gives the error. Loops that raise through the Python API
+    // without requiring it (raises_through_pyapi) are watched on any thread:
+    // their error is turned into a failure (design doc error-handling.md).
     int call(char* const* data, const std::intptr_t* dims, const std::intptr_t* strides) const;
+    // NumPy's signed integer `power` loops raise ValueError for a negative
+    // exponent through the Python API (npy_gil_error, which takes the GIL)
+    // and still return success, without setting requires_pyapi.
+    bool raises_through_pyapi() const { return raises_through_pyapi_; }
+    // "numpy.<ufunc>", "numpy.<ufunc>.reduce" for reduction loops.
+    const char* name() const { return name_.c_str(); }
 
     int nin() const { return nin_; }
     // Element-wise kernel for this loop, shared by all tasks using it.
@@ -69,8 +79,19 @@ class UfuncLoop {
     void* info_ = nullptr; // UfuncCallInfoPrefix inside the capsule
     int nin_ = 0;
     int nout_ = 0;
+    bool raises_through_pyapi_ = false;
+    PyInterpreterState* interp_ = nullptr;
+    std::string name_;
+    // At resolution, with the GIL: name_, raises_through_pyapi_, interp_.
+    void init_info(const char* suffix);
+    int call_watched(char* const* data, const std::intptr_t* dims,
+                     const std::intptr_t* strides) const;
     std::shared_ptr<Kernel> kernel_;
 };
+
+// The error of the last failed UfuncLoop::call() on this thread ("ValueError:
+// ..." if the loop raised a Python exception), cleared by taking it.
+std::string take_loop_error();
 
 // Runs `release` on the main thread with the GIL: now, if the caller holds
 // the GIL, else at the next C ABI call. Kernels owning Python objects

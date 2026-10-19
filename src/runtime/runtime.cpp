@@ -66,6 +66,7 @@ namespace {
 // Copies a whole buffer (copy-on-write with views).
 class CopyKernel : public Kernel {
   public:
+    const char* name() const override { return "copy-on-write"; }
     KernelResult run(std::span<const Operand> in, std::span<const Operand> out) override {
         std::memcpy(out[0].first(), in[0].first(), in[0].layout.nbytes());
         return {};
@@ -175,6 +176,7 @@ void Runtime::acquire_slot() {
 void Runtime::launch(const std::shared_ptr<Task>& task,
                      const std::vector<std::shared_ptr<Task>>& producers, std::int64_t elements) {
     ++seq_;
+    task->set_id(seq_);
     // While pending, the task's work is attributed to the decision that
     // started the work it waits for.
     for (const std::shared_ptr<Task>& p : producers) {
@@ -198,7 +200,7 @@ void Runtime::issue_storage_copy(Storage& s) {
     std::shared_ptr<Buffer> old = s.buffer_;
     auto fresh = make_pooled<Buffer>(old->nbytes(), Buffer::deferred); // the copy task allocates
     std::vector<std::shared_ptr<Task>> producers;
-    std::optional<TaskError> failed;
+    ErrorRef failed;
     if (!s.ready()) {
         producers.push_back(s.producer_);
     } else {
@@ -214,7 +216,7 @@ void Runtime::issue_storage_copy(Storage& s) {
     task->operands_for_issue().push_back({fresh, bytes_of(*fresh)});
     task->set_ninputs(1);
     if (failed) {
-        task->add_upstream_error(*failed);
+        task->add_upstream_error(failed);
     }
     task->advance(TaskState::SizeCompleted);
     s.buffer_ = fresh;
@@ -253,7 +255,10 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     //    layout and pending producer, before any copy-on-write switch. Reads
     //    always see the data as it was before this op.
     std::vector<std::shared_ptr<Task>> producers;
-    std::optional<TaskError> failed_input;
+    ErrorRef failed_input;
+    // An error on an input or in/out passes to this op: data computed from a
+    // failed op, or written into its result, is failed too (also when the op
+    // overwrites every element: a failed program does not continue).
     auto snapshot = [&](Array& a) {
         Storage& s = *a.storage_;
         if (!s.ready()) {
@@ -360,7 +365,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
 
     task->set_ninputs(ninputs);
     if (failed_input) {
-        task->add_upstream_error(*failed_input);
+        task->add_upstream_error(failed_input);
     }
     // Phase 1: shapes are known at issue time. The output memory is taken by
     // the task itself, right before its kernel runs (memory-management.md,
@@ -430,7 +435,8 @@ bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<cons
         r = KernelResult{1, "unknown exception in kernel", 0};
     }
     if (r.status != 0) {
-        const TaskError e{std::move(r.message), issue_site};
+        const ErrorRef e =
+            errors_->record(TaskError{std::move(r.message), issue_site, kernel->name(), seq_});
         for (const ArrayPtr& a : inouts) {
             a->storage_->last_error_ = e;
         }
@@ -461,7 +467,7 @@ void Runtime::trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t 
     }
 }
 
-std::optional<TaskError> Runtime::wait(Array& a) {
+ErrorRef Runtime::wait(Array& a) {
     Storage& s = *a.storage_;
     if (s.producer_) {
         Task& p = *s.producer_;
@@ -476,8 +482,8 @@ std::optional<TaskError> Runtime::wait(Array& a) {
     return s.last_error_;
 }
 
-std::optional<TaskError> Runtime::prepare_host_write(Array& a) {
-    std::optional<TaskError> e = wait(a);
+ErrorRef Runtime::prepare_host_write(Array& a) {
+    ErrorRef e = wait(a);
     Storage& s = *a.storage_;
     if (s.buffer_->host_views > 0) {
         issue_storage_copy(s);
@@ -490,7 +496,7 @@ std::optional<TaskError> Runtime::prepare_host_write(Array& a) {
 void Runtime::wait_all() { wait_active_below(1); }
 
 std::vector<std::shared_ptr<Task>> Runtime::run(const std::shared_ptr<Task>& task) {
-    std::vector<std::shared_ptr<Task>> runnable = task->execute();
+    std::vector<std::shared_ptr<Task>> runnable = task->execute(errors_.get());
     const std::size_t left = active_.fetch_sub(1, std::memory_order_seq_cst) - 1;
     if (active_waiters_.load(std::memory_order_seq_cst) > 0 &&
         left < wake_below_.load(std::memory_order_seq_cst)) {

@@ -108,11 +108,11 @@ def test_integer_array_indexing_runs_asynchronously():
         assert np.asarray(got).strides == expected.strides
 
 
-def test_out_of_bounds_indices_raise_index_error_at_the_sync_point():
+def test_out_of_bounds_indices_raise_index_error():
     v = viproc.asarray(np.arange(10000.0))  # large: a gather task
     idx = viproc.asarray(np.array([1, 12000]))
-    r = v[idx]
     with pytest.raises(IndexError, match="index 12000 is out of bounds"):
+        r = v[idx]  # raised as soon as the task failed, at the latest here:
         np.asarray(r)
     with pytest.raises(IndexError):
         np.asarray(v[[3, -10001]])

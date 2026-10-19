@@ -21,6 +21,8 @@ from numpy.lib.array_utils import normalize_axis_index, normalize_axis_tuple
 from . import _viproc
 
 AsyncError = _viproc.AsyncError
+AsyncIndexError = _viproc.AsyncIndexError
+AsyncValueError = _viproc.AsyncValueError
 
 # dtype <-> runtime dtype code (vp_dtype in viproc.h)
 _CODES = {
@@ -840,6 +842,8 @@ def _parse_index(a, key):
         else:
             try:
                 x = np.asarray(k)
+            except AsyncError:
+                raise  # a failed op's error: never swallowed (error-handling.md)
             except Exception:
                 return None
             if x.dtype == np.bool_:
@@ -1361,6 +1365,8 @@ def _setitem(self, key, value):
         if not self._readonly and type(self) is ndarray:
             try:
                 done = _scatter(self, key, value)
+            except AsyncError:
+                raise
             except (TypeError, ValueError, IndexError, OverflowError):
                 done = False  # NumPy raises its own error
             if done:
@@ -1406,6 +1412,8 @@ def _getitem(self, key):
             return _adopt(np.asarray(self.numpy()[_numpy_key(key)]))
         try:
             r = _gather(self, key)
+        except AsyncError:
+            raise
         except (TypeError, ValueError, IndexError):
             r = _NOPE  # NumPy raises its own error
         if r is not _NOPE:
@@ -1484,11 +1492,13 @@ def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
         identical either way; only where ops run changes.
     """
     env_sync, env_adaptive = _env_policy()
-    shutdown()
     sync_below = env_sync if sync_below is None else sync_below
-    _viproc.init(workers, max_active_tasks, sync_below,
-                 env_adaptive if adaptive is None else adaptive)
-    _small_ops[0] = 2048 if sync_below < 0 else sync_below
+    try:
+        shutdown()  # raises an error of the old runtime nothing reported yet
+    finally:
+        _viproc.init(workers, max_active_tasks, sync_below,
+                     env_adaptive if adaptive is None else adaptive)
+        _small_ops[0] = 2048 if sync_below < 0 else sync_below
 
 
 def offload_stats():
@@ -1518,6 +1528,8 @@ def set_pool_limit(nbytes):
 
 
 def shutdown():
+    """Waits for all ops and stops the runtime. Raises the error of a failed op
+    that was not reported yet (at exit Python prints it)."""
     if _viproc.initialized():
         _viproc.shutdown()
 

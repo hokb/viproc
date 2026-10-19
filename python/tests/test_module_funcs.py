@@ -96,7 +96,11 @@ def test_ufunc_proxies_match_numpy():
                 ref.append(n)
             with np.errstate(all="ignore"):
                 expected = _outcome(uf, *ref)
-                assert _outcome(proxy, *args) == expected, (name, trial)
+                got = _outcome(proxy, *args)
+                # viproc raises a failed op's error as a subclass of NumPy's
+                # (AsyncValueError for a negative integer exponent).
+                assert got == expected or (isinstance(expected, type) and isinstance(got, type)
+                                           and issubclass(got, expected)), (name, trial)
     x = viproc.asarray(np.arange(6.0))
     out = viproc.asarray(np.zeros(6))
     assert viproc.add(x, 1.0, out=out) is out

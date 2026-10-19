@@ -61,6 +61,25 @@ void vp_wait_all(vp_runtime* rt);
 void vp_runtime_destroy(vp_runtime* rt);
 size_t vp_worker_count(const vp_runtime* rt);
 
+/* Asynchronous error reporting (docs/design/error-handling.md). An op that
+ * fails on any thread records its error in the runtime, the one place errors
+ * live (arrays and tasks only refer to it). Bridges raise it in their main
+ * thread as soon as possible: `fn` is called on the failing thread, without
+ * locks or the GIL, when the runtime goes from no unreported error to one
+ * (Python: Py_AddPendingCall); every call into viproc checks too.
+ * [main thread, before issuing ops] */
+void vp_set_error_notify(vp_runtime* rt, void (*fn)(void*), void* arg);
+/* [main thread] 1 if a failed op's error waits to be reported (one atomic
+ * load; nothing else). */
+int vp_error_pending(const vp_runtime* rt);
+/* [main thread] VP_ERROR with the error of the earliest issued op among those
+ * that failed and were not reported yet ("<message> (in <op>, issued at
+ * <site>)"; a message starting with "TypeName: " names the Python exception
+ * type), VP_OK if there is none. Clears all pending reports. Errors raised
+ * at a sync point (vp_array_wait, vp_array_prepare_write) are not reported
+ * again here. */
+int vp_take_error(vp_runtime* rt, char* err, size_t errlen);
+
 /* Dispatch policy for ops whose inputs are all ready (call before issuing):
  * ops with fewer than `sync_below` output elements run inline on the calling
  * thread; above that, `adaptive` != 0 lets each issue site switch to inline

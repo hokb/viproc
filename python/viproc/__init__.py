@@ -22,6 +22,8 @@ from . import _ndarray, _viproc
 from ._ndarray import fresh as _fresh
 from ._ndarray import (
     AsyncError,
+    AsyncIndexError,
+    AsyncValueError,
     array,
     asarray,
     init,

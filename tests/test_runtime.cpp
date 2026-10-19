@@ -377,12 +377,49 @@ void test_error_propagation() {
     ArrayPtr pending_child = issue1(rt, add_const(1.0), {bad}, 4, "prog.py:11 f");
     rt.wait_all();
     ArrayPtr late_child = issue1(rt, add_const(1.0), {bad}, 4, "prog.py:12 f");
-    auto e1 = rt.wait(*pending_child);
-    auto e2 = rt.wait(*late_child);
-    check(e1 && e1->message == "boom" && e1->issue_site == "prog.py:10 f",
+    auto r1 = rt.wait(*pending_child);
+    auto r2 = rt.wait(*late_child);
+    check(r1 && r2, "consumers of a failed op fail");
+    const TaskError e1 = rt.errors().raise_at_sync_point(r1);
+    const TaskError e2 = rt.errors().raise_at_sync_point(r2);
+    check(e1.message == "boom" && e1.issue_site == "prog.py:10 f",
           "error reaches a consumer that was pending, with the original issue site");
-    check(e2 && e2->issue_site == "prog.py:10 f",
-          "error reaches a consumer issued after the failure");
+    check(e2.issue_site == "prog.py:10 f", "error reaches a consumer issued after the failure");
+}
+
+void test_error_reports() {
+    Runtime rt(opts(2));
+    auto fail = [](const char* msg) {
+        return std::make_shared<FnKernel>([msg](auto, auto) { return KernelResult{1, msg, 0}; });
+    };
+    ArrayPtr src = make_ready(rt, 4, 0.0);
+    ArrayPtr first = issue1(rt, fail("first"), {src}, 4, "prog.py:1 f");
+    ArrayPtr child = issue1(rt, add_const(1.0), {first}, 4, "prog.py:2 f");
+    ArrayPtr second = issue1(rt, fail("second"), {src}, 4, "prog.py:3 f");
+    rt.wait_all();
+    check(rt.errors().pending(), "a failed op is reported to the runtime");
+    std::size_t more = 0;
+    std::optional<TaskError> e = rt.errors().take(&more);
+    check(e && e->message == "first" && e->issue_site == "prog.py:1 f" && more == 1,
+          "take() gives the earliest issued failure and counts the others (not inherited ones)");
+    check(!rt.errors().pending() && !rt.errors().take(), "take() reports them all");
+    ArrayPtr third = issue1(rt, fail("third"), {src}, 4, "prog.py:4 f");
+    ErrorRef w = rt.wait(*third);
+    check(w && rt.errors().pending(), "the record exists once the failed task completed");
+    check(rt.errors().raise_at_sync_point(w).message == "third" && !rt.errors().pending(),
+          "an error raised at a sync point counts as reported");
+    check(rt.wait(*child) == rt.wait(*first), "consumers refer to the failed op's record");
+    const std::size_t held = rt.errors().size();
+    ArrayPtr overwrite = issue1(rt, add_const(1.0), {first}, 4, "prog.py:5 f");
+    check(rt.wait(*overwrite) == rt.wait(*first) && rt.errors().size() == held,
+          "an inherited error is no new record");
+    first.reset();
+    child.reset();
+    overwrite.reset();
+    second.reset();
+    third.reset();
+    w.reset();
+    check(rt.errors().size() == 0, "a reported record goes when nothing refers to it");
 }
 
 void test_active_limit() {
@@ -794,6 +831,7 @@ int main() {
     test_consolidated_copy_on_write_of_strided_array();
     test_overlapping_inplace();
     test_error_propagation();
+    test_error_reports();
     test_active_limit();
     test_random_programs(3, false);
     test_random_programs(64, false);

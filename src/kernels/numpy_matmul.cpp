@@ -37,6 +37,7 @@ std::vector<std::intptr_t> batch_strides(const Layout& l, const Shape& out_batch
 class MatmulKernel : public Kernel {
   public:
     explicit MatmulKernel(const UfuncLoop* loop) : loop_(loop) {}
+    const char* name() const override { return loop_->name(); }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Layout& a = inputs[0].layout;
