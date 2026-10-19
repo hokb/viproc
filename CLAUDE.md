@@ -578,9 +578,11 @@ Rules:
   integer `power` loops raise `ValueError` for a negative exponent via
   `npy_gil_error` without `requires_pyapi`. On a worker that error was lost
   (a result came back), on the main thread it leaked (`SystemError`).
-  `UfuncLoop::call` checks the exponents of such loops before calling them
-  and fails the op with NumPy's message; `AsyncValueError` (a `ValueError`)
-  raises it at the sync point.
+  Such loops (`UfuncLoop::raises_through_pyapi`) run in NumPy (eager
+  fallback): its error, and what the loop wrote before it, exactly. Only a
+  ready one-element exponent that is not negative (`a ** 3`) keeps the
+  async path. A pre-scan of the exponents (rejected) cost 3-10% of large
+  integer powers and wrote nothing to `out=` where NumPy writes a prefix.
 - **Casting:** when promotion casts an operand, the cast is its own
   instruction (cast loops via the same ArrayMethod machinery) or done
   eagerly before the op. Never call a loop on data of the wrong dtype.

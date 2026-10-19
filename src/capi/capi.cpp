@@ -10,7 +10,9 @@
 #include "runtime/index.hpp"
 #include "runtime/runtime.hpp"
 
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -410,6 +412,31 @@ bool cast_small_inputs(vp_runtime* rt, const vp_loop& loop, std::span<ArrayPtr> 
     return true;
 }
 
+// Whether `a` is a ready single element that is not negative (main thread).
+bool known_non_negative(Array& a) {
+    const Layout& l = a.layout();
+    if (!a.ready() || a.storage()->last_error() || l.size() != 1) {
+        return false;
+    }
+    const std::byte* p = a.buffer()->data() + l.offset;
+    switch (l.dtype) {
+    case DType::Bool:
+        return true;
+    case DType::Int32: {
+        std::int32_t v;
+        std::memcpy(&v, p, sizeof v);
+        return v >= 0;
+    }
+    case DType::Int64: {
+        std::int64_t v;
+        std::memcpy(&v, p, sizeof v);
+        return v >= 0;
+    }
+    default:
+        return false;
+    }
+}
+
 } // namespace
 
 extern "C" {
@@ -426,6 +453,13 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
     }
     for (int i = 0; i < nin; ++i) {
         ins[i] = ref(inputs[i]);
+    }
+    // NumPy raises a negative exponent's error from inside the loop: NumPy
+    // runs it then, exactly (its error, and what it wrote before it), unless
+    // the exponent is one element known to be fine already.
+    if (loop->loop->raises_through_pyapi() && !known_non_negative(*ins[1])) {
+        set_error(err, errlen, "integer power with an array exponent runs in NumPy");
+        return VP_UNSUPPORTED;
     }
     if (!cast_small_inputs(rt, *loop, std::span(ins, static_cast<std::size_t>(nin)), site, err,
                            errlen)) {

@@ -33,11 +33,7 @@ def _outcome(f, *args):
     try:
         a = np.asarray(f(*args))  # errors of ops run directly surface at the sync
     except Exception as e:  # noqa: BLE001
-        t = type(e)
-        for base in (ValueError, IndexError):  # AsyncValueError / AsyncIndexError at the sync
-            if issubclass(t, base):
-                t = base
-        return t
+        return type(e)
     return a.dtype, a.shape, a.tobytes()
 
 

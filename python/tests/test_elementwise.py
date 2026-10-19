@@ -183,11 +183,12 @@ def test_writes_through_views_and_read_only_views():
     assert np.real(v) is v  # NumPy returns real data itself
 
 
+
 @pytest.mark.parametrize("n", [5, 100_000])  # run directly / on a worker
 @pytest.mark.parametrize("dtype", ["i4", "i8"])
 def test_integer_power_with_negative_exponent_raises_numpys_value_error(n, dtype):
     # NumPy's integer power loop raises through the Python API, which a worker
-    # cannot report: viproc checks the exponents first, on any thread.
+    # cannot report: with an array exponent NumPy runs it, exactly.
     base = np.arange(n, dtype=dtype) % 7
     exp = np.full(n, 2, dtype=dtype)
     exp[-1] = -1
@@ -201,3 +202,21 @@ def test_integer_power_with_negative_exponent_raises_numpys_value_error(n, dtype
     assert np.array_equal(np.asarray(x + 1), base + 1)  # no stray Python error
     ok = np.abs(exp)
     assert np.array_equal(np.asarray(x ** viproc.asarray(ok)), base ** ok)
+    # What NumPy's loop wrote before it raised stays written, as in NumPy.
+    want, got = base.copy(), viproc.asarray(base)
+    with pytest.raises(ValueError):
+        want **= exp
+    with pytest.raises(ValueError):
+        got **= y
+    assert np.array_equal(np.asarray(got), want)
+
+
+def test_integer_power_with_a_non_negative_scalar_exponent_stays_asynchronous():
+    import viproc._ndarray as nd
+    base = np.arange(100_000, dtype="i8") % 7
+    x = viproc.asarray(base)
+    f0 = nd.fallback_calls
+    r = [x ** 3, np.power(x, 2), x ** np.int32(0)]
+    assert nd.fallback_calls == f0
+    for a, b in zip(r, [base ** 3, base ** 2, base ** np.int32(0)]):
+        assert np.array_equal(np.asarray(a), b)

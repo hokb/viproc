@@ -52,17 +52,18 @@ class UfuncLoop {
                                                      std::span<const std::intptr_t> fixed,
                                                      std::string& error);
 
-    // Runs the loop on `dims[0]` elements. Returns 0 on success; on failure
-    // `failure()` names the error (as NumPy would raise it).
     int call(char* const* data, const std::intptr_t* dims, const std::intptr_t* strides) const;
-    // The error of the last failed call() on this thread.
-    static const char* failure();
 
     int nin() const { return nin_; }
     // Element-wise kernel for this loop, shared by all tasks using it.
     const std::shared_ptr<Kernel>& elementwise_kernel() const { return kernel_; }
     int nout() const { return nout_; }
     bool requires_pyapi() const;
+    // NumPy's signed integer `power` loops raise ValueError for a negative
+    // exponent through the Python API (npy_gil_error) without requiring it:
+    // only NumPy itself may run them, unless the exponent (input 1) is known
+    // not to be negative before the call.
+    bool raises_through_pyapi() const { return raises_through_pyapi_; }
     // The ufunc (borrowed; ufuncs live as long as NumPy).
     PyObject* ufunc() const { return ufunc_; }
 
@@ -73,11 +74,8 @@ class UfuncLoop {
     void* info_ = nullptr; // UfuncCallInfoPrefix inside the capsule
     int nin_ = 0;
     int nout_ = 0;
-    // NumPy's integer `power` loops raise ValueError for a negative exponent
-    // through the Python API (npy_gil_error), which a worker cannot report:
-    // the type of the exponent operand to check before the call, else 0.
-    int negative_exponent_check_ = 0;
-    void init_checks();
+    bool raises_through_pyapi_ = false;
+    void init_raises_through_pyapi();
     std::shared_ptr<Kernel> kernel_;
 };
 
