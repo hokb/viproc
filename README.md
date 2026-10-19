@@ -134,11 +134,14 @@ platform, Python version and architecture.
 
 ## Usage
 
-Once viproc is installed (see [Install](#install)), run an unchanged NumPy program with it:
+Installing makes viproc available to your Python. To bring it into an existing NumPy program,
+use one of three ways:
+
+**1. Run the program with `python -m viproc`** (no code change):
 
 ```bash
 python -m viproc prog.py [args]       # also: -m module, -c "code"; no arguments: console
-VIPROC=1 python prog.py               # the same, for a pip-installed viproc (viproc.pth)
+VIPROC=1 python prog.py               # the same, through viproc.pth
 python prog.py                        # plain NumPy, for comparison
 ```
 
@@ -148,15 +151,25 @@ arrays, and NumPy functions on them run asynchronously. The standard library and
 packages (SciPy, pandas, ...) keep the real NumPy; viproc arrays they receive are synced and
 read through NumPy's array protocols. Results are bit-identical to plain NumPy.
 
-Or opt in explicitly, in the code:
+**2. Import viproc in place of NumPy** (one line changed):
+
+```python
+import viproc as np          # was: import numpy as np
+
+x = np.random.default_rng(0).standard_normal((2000, 2000))   # a viproc array
+y = np.sin(x) * np.cos(x)    # returns immediately, computed in the background
+print(float(y.sum()))        # sync point
+```
+
+**3. Keep NumPy and convert selected arrays** (explicit, in the code):
 
 ```python
 import numpy as np
 import viproc
 
-a = viproc.asarray(np.random.rand(1_000_000))   # or: import viproc as np
+a = viproc.asarray(np.random.rand(1_000_000))   # NumPy array -> viproc array
 b = viproc.asarray(np.random.rand(1_000_000))
-c = np.sin(a) * b + 1.0      # returns immediately, computed in the background
+c = np.sin(a) * b + 1.0      # NumPy's functions on viproc arrays run in viproc
 d = np.cos(b) - a            # independent of c: runs in parallel
 print((c + d)[:5])           # sync point
 ```
