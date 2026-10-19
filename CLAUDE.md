@@ -280,7 +280,9 @@ docs/design/           Design documents (decisions with rationale)
   memory-management.md ownership, release, pools, NumPy interop, COW
 docs/benchmarks.md     benchmark results: current breakdown per category and
                        case, progress per change, external machines,
-                       shape map (images in docs/benchmarks/)
+                       shape map (images in docs/benchmarks/; reference
+                       runs there, e.g. windows/, replaced only with
+                       --reference: local runs go to ./reports, untracked)
 include/viproc/        Public C ABI (viproc.h). The only interface bridges may use.
 src/runtime/           Runtime core, no Python dependency (library `viproc`)
   layout.*             DType, Layout (shape, byte strides, offset), broadcasting

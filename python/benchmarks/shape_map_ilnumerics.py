@@ -288,7 +288,10 @@ def main():
     p.add_argument("--check-reps", type=int, default=3, help="steps of the result check")
     p.add_argument("--timeout", type=float, default=300,
                    help="seconds without a new result before a point counts as hung")
+    p.add_argument("--reference", action="store_true",
+                   help="allow --out to replace results committed to git (reference runs)")
     args = p.parse_args()
+    shape_map.check_out_dir(args.out, args.reference)
     os.makedirs(args.out, exist_ok=True)
 
     vrun = json.load(open(args.viproc, encoding="utf-8"))
