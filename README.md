@@ -167,8 +167,8 @@ dev.cmd                 :: Windows: double-click, or dev.cmd -NoPull -NoTest -Py
 ./dev.sh                # Linux: ./dev.sh --no-pull --no-test, PYTHON=python3.13 ./dev.sh
 ```
 
-Then run programs with `.venv\Scripts\python prog.py` (Linux: `.venv/bin/python prog.py`). The first
-run takes a minute; later ones rebuild incrementally (`build/pip-<tag>`). No developer prompt is
+Then run programs with `.venv\Scripts\python -m viproc prog.py` (Linux:
+`.venv/bin/python -m viproc prog.py`). The first build takes a minute; later ones rebuild incrementally (`build/pip-<tag>`). No developer prompt is
 needed on Windows: the build picks Visual Studio for the interpreter's architecture.
 
 Into any other environment, from a checkout or straight from GitHub:
@@ -184,6 +184,16 @@ extension module and packs it into a wheel. pip fetches CMake and Ninja itself i
 missing; the C++20 compiler named above must be installed. The build takes about a minute.
 `pip wheel .` instead keeps the wheel (`viproc-*.whl`), to install on other machines with the same
 platform, Python version and architecture.
+
+Then test any NumPy program locally, unchanged, and compare it with plain NumPy:
+
+```bash
+python -m viproc prog.py        # with viproc: `import numpy` in prog.py gives viproc
+python prog.py                  # plain NumPy, for comparison
+```
+
+Results are bit-identical; only the run time differs (see [Usage](#usage) for `-m module`,
+`-c "code"`, the console and `VIPROC=1`).
 
 ## Build (development, CMake)
 
