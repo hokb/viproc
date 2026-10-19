@@ -1,5 +1,6 @@
 #include "task.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cfenv>
@@ -43,7 +44,7 @@ bool Task::add_consumer(const std::shared_ptr<Task>& consumer) {
     return true;
 }
 
-void Task::add_upstream_error(const TaskError& error) {
+void Task::add_upstream_error(const TaskErrorPtr& error) {
     std::lock_guard lock(mutex_);
     if (!upstream_error_) {
         upstream_error_ = error;
@@ -141,7 +142,41 @@ void Task::allocate_outputs() {
     }
 }
 
-std::vector<std::shared_ptr<Task>> Task::execute() {
+void ErrorReports::report(const TaskErrorPtr& e) {
+    std::lock_guard lock(mutex_);
+    if (errors_.size() < kMaxKept) {
+        errors_.push_back(e);
+    } else {
+        ++dropped_;
+    }
+    pending_.store(true, std::memory_order_release);
+}
+
+TaskErrorPtr ErrorReports::take(std::size_t* more) {
+    std::lock_guard lock(mutex_);
+    pending_.store(false, std::memory_order_relaxed);
+    TaskErrorPtr first;
+    if (!errors_.empty()) {
+        auto it = std::min_element(
+            errors_.begin(), errors_.end(),
+            [](const TaskErrorPtr& a, const TaskErrorPtr& b) { return a->id < b->id; });
+        first = std::move(*it);
+    }
+    if (more != nullptr) {
+        *more = errors_.empty() ? 0 : errors_.size() - 1 + dropped_;
+    }
+    errors_.clear();
+    dropped_ = 0;
+    return first;
+}
+
+void ErrorReports::forget(std::uint64_t id) {
+    std::lock_guard lock(mutex_);
+    std::erase_if(errors_, [id](const TaskErrorPtr& e) { return e->id == id; });
+    pending_.store(!errors_.empty() || dropped_ > 0, std::memory_order_relaxed);
+}
+
+std::vector<std::shared_ptr<Task>> Task::execute(ErrorReports* reports) {
     // No lock: every write of upstream_error_ happens before the release
     // decrement of pending_ by its writer, and this thread observed the final
     // decrement (or got the task from the thread that did).
@@ -168,7 +203,11 @@ std::vector<std::shared_ptr<Task>> Task::execute() {
         }
         fp_flags_ = r.fp_flags | std::fetestexcept(FE_ALL_EXCEPT);
         if (r.status != 0) {
-            error_ = TaskError{std::move(r.message), issue_site_};
+            error_ = std::make_shared<const TaskError>(
+                TaskError{std::move(r.message), issue_site_, kernel_->name(), id_});
+            if (reports != nullptr) {
+                reports->report(error_);
+            }
         }
     }
 

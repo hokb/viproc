@@ -68,11 +68,47 @@ class Kernel {
     // without copying the old data into it (Runtime::issue, step 2); kernels
     // that write a subset (scatter, masked assignment) keep the others.
     virtual bool writes_all() const { return true; }
+    // The NumPy function the op runs ("numpy.power", "numpy.add.reduce"),
+    // reported with its errors. A string with static storage.
+    virtual const char* name() const { return "array op"; }
 };
 
+// The error of a failed op (docs/design/error-handling.md). Consumers of its
+// outputs inherit it unchanged (same id).
 struct TaskError {
+    // "ValueError: ..." when the kernel knows the Python exception type
+    // (bridges raise that type), else a plain message.
     std::string message;
-    std::string issue_site; // where the failing op was issued
+    std::string issue_site; // where the failing op was issued (user code)
+    std::string op;         // Kernel::name() of the failing op
+    std::uint64_t id = 0;   // the failing op's issue number (Runtime: ops issued before it + 1)
+};
+// Shared by the failed task, its outputs and every consumer that inherits it.
+using TaskErrorPtr = std::shared_ptr<const TaskError>;
+
+// Errors of failed ops, waiting to be reported by the main thread
+// (asynchronous error reporting, docs/design/error-handling.md). The thread
+// that runs a failing op reports it before the op completes; the main thread
+// checks pending() at every call into viproc (one atomic load) and takes the
+// earliest one. Only an op's own error is reported, not the ones its
+// consumers inherit.
+class ErrorReports {
+  public:
+    // Any thread.
+    void report(const TaskErrorPtr& e);
+    bool pending() const { return pending_.load(std::memory_order_acquire); }
+    // Main thread: the error of the earliest issued failed op, if any; all
+    // reports up to now are cleared. `more` receives how many others there were.
+    TaskErrorPtr take(std::size_t* more = nullptr);
+    // Main thread: an error raised at a sync point is reported there already.
+    void forget(std::uint64_t id);
+
+  private:
+    static constexpr std::size_t kMaxKept = 64; // further reports are only counted
+    std::atomic<bool> pending_{false};
+    std::mutex mutex_;
+    std::vector<TaskErrorPtr> errors_;
+    std::size_t dropped_ = 0;
 };
 
 class Task {
@@ -90,8 +126,10 @@ class Task {
     void wait_completed() const;
 
     const char* issue_site() const { return issue_site_; }
+    // The op's issue number (set by the runtime when it launches the task).
+    void set_id(std::uint64_t id) { id_ = id; }
     // Valid once completed (acquire through state()).
-    const std::optional<TaskError>& error() const { return error_; }
+    const TaskErrorPtr& error() const { return error_; }
     int fp_flags() const { return fp_flags_; }
 
     // --- Main thread, while issuing -------------------------------------
@@ -112,7 +150,7 @@ class Task {
     bool producer_already_done(const Task& producer) { return input_done(&producer); }
     // Marks an input as failed (its producer completed with an error before
     // this task was issued). The task then skips its kernel and fails too.
-    void add_upstream_error(const TaskError& error);
+    void add_upstream_error(const TaskErrorPtr& error);
     // Copy-on-write inside this task: before its kernel runs, `to` (one of
     // its deferred output buffers) gets the old data of `from`, whose read
     // the caller counted. Decided as late as possible, right before the
@@ -137,8 +175,10 @@ class Task {
     // --- Any thread ---------------------------------------------------------
     // Runs the kernel (or skips it if an input failed), completes the task and
     // returns the consumers that became runnable. Never runs consumers itself:
-    // the calling thread schedules them as continuations.
-    std::vector<std::shared_ptr<Task>> execute();
+    // the calling thread schedules them as continuations. A kernel error is
+    // reported to `reports` (if given) before the task completes, so a sync
+    // point that sees the failed task finds its report too.
+    std::vector<std::shared_ptr<Task>> execute(ErrorReports* reports = nullptr);
 
   private:
     // Gives every output without memory its block: a dying input's (same
@@ -160,6 +200,7 @@ class Task {
     Operands operands_; // inputs, then outputs
     std::size_t ninputs_ = 0;
     const char* issue_site_;
+    std::uint64_t id_ = 0;
     struct Copy {
         std::shared_ptr<Buffer> from, to;
     };
@@ -172,9 +213,9 @@ class Task {
     // waiters (libstdc++ bumps a process-wide counter for 1-byte atomics).
     mutable bool waiters_ = false;
     std::vector<std::shared_ptr<Task>> consumers_;
-    std::optional<TaskError> upstream_error_;
+    TaskErrorPtr upstream_error_;
 
-    std::optional<TaskError> error_;
+    TaskErrorPtr error_;
     int fp_flags_ = 0;
 
     // Main thread only (see set_blame).

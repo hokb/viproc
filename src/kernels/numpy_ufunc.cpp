@@ -184,6 +184,7 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve(PyObject* ufunc, std::span<const D
         error = "loop requires the Python API; cannot run asynchronously";
         return nullptr;
     }
+    loop->init_info("");
     loop->kernel_ = make_elementwise_kernel(loop.get());
     return loop;
 }
@@ -260,6 +261,7 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve_reduction(PyObject* ufunc, DType d
         error = "loop requires the Python API; cannot run asynchronously";
         return nullptr;
     }
+    loop->init_info(".reduce");
     return loop;
 }
 
@@ -267,10 +269,122 @@ bool UfuncLoop::requires_pyapi() const {
     return static_cast<const UfuncCallInfoPrefix*>(info_)->requires_pyapi != 0;
 }
 
+namespace {
+
+thread_local std::string t_loop_error;
+
+// The Python thread state of this thread, for loops that raise through the
+// Python API. The main thread has one. A worker gets its own on first use
+// (PyThreadState_New needs no GIL) and keeps it: then the GIL state the
+// loop's npy_gil_error() takes (PyGILState_Ensure) finds it, and the error
+// stays on it after PyGILState_Release (a temporary thread state would be
+// deleted, and the error with it). Deleted when the worker exits; the
+// runtime is destroyed with the GIL released (vp_runtime_destroy), so the
+// worker can take it then.
+struct WorkerThreadState {
+    PyThreadState* ts = nullptr;
+    bool own = false;
+    ~WorkerThreadState() {
+        if (own && Py_IsInitialized() != 0 && !python_finalizing()) {
+            PyEval_RestoreThread(ts);
+            PyThreadState_Clear(ts);
+            PyThreadState_DeleteCurrent();
+        }
+    }
+    static bool python_finalizing() {
+#if PY_VERSION_HEX >= 0x030D0000
+        return Py_IsFinalizing() != 0;
+#else
+        return _Py_IsFinalizing() != 0;
+#endif
+    }
+};
+thread_local WorkerThreadState t_python;
+
+PyThreadState* this_thread_state(PyInterpreterState* interp) {
+    if (t_python.ts == nullptr) {
+        t_python.ts = PyGILState_GetThisThreadState();
+        if (t_python.ts == nullptr) {
+            t_python.ts = PyThreadState_New(interp);
+            t_python.own = t_python.ts != nullptr;
+        }
+    }
+    return t_python.ts;
+}
+
+// The raised exception as "TypeName: message" (builtin types by their name).
+std::string fetch_typed_python_error() {
+    PyObject* exc = PyErr_GetRaisedException();
+    if (exc == nullptr) {
+        return "unknown error";
+    }
+    std::string msg = Py_TYPE(exc)->tp_name;
+    PyObject* s = PyObject_Str(exc);
+    const char* text = s != nullptr ? PyUnicode_AsUTF8(s) : nullptr;
+    msg += ": ";
+    msg += text != nullptr ? text : "unknown error";
+    Py_XDECREF(s);
+    Py_DECREF(exc);
+    PyErr_Clear();
+    return msg;
+}
+
+} // namespace
+
+std::string take_loop_error() {
+    std::string e = std::move(t_loop_error);
+    t_loop_error.clear();
+    return e.empty() ? std::string("NumPy loop failed") : e;
+}
+
 int UfuncLoop::call(char* const* data, const std::intptr_t* dims,
                     const std::intptr_t* strides) const {
+    if (raises_through_pyapi_) {
+        return call_watched(data, dims, strides);
+    }
     const auto* info = static_cast<const UfuncCallInfoPrefix*>(info_);
     return info->strided_loop(info->context, data, dims, strides, info->auxdata);
+}
+
+int UfuncLoop::call_watched(char* const* data, const std::intptr_t* dims,
+                            const std::intptr_t* strides) const {
+    // The loop sets its exception on this thread's Python thread state. That
+    // state belongs to this thread alone: reading its current exception
+    // needs no GIL. The GIL is taken only if there is one (the error path,
+    // where npy_gil_error() took it already).
+    PyThreadState* ts = this_thread_state(interp_);
+    if (ts == nullptr) {
+        t_loop_error = "cannot create a Python thread state for this loop";
+        return -1;
+    }
+    PyObject* const before = ts->current_exception;
+    const auto* info = static_cast<const UfuncCallInfoPrefix*>(info_);
+    int r = info->strided_loop(info->context, data, dims, strides, info->auxdata);
+    if (ts->current_exception != before) {
+        const PyGILState_STATE g = PyGILState_Ensure();
+        t_loop_error = fetch_typed_python_error();
+        PyGILState_Release(g);
+        r = -1;
+    }
+    return r;
+}
+
+void UfuncLoop::init_info(const char* suffix) {
+    auto* uf = reinterpret_cast<PyUFuncObject*>(ufunc_);
+    name_ = std::string("numpy.") + (uf->name != nullptr ? uf->name : "?") + suffix;
+    interp_ = PyInterpreterState_Get();
+    // NumPy's own `power` with a signed integer exponent only.
+    static PyObject* power = [] {
+        PyObject* umath = PyImport_ImportModule("numpy._core.umath");
+        PyObject* p = umath != nullptr ? PyObject_GetAttrString(umath, "power") : nullptr;
+        Py_XDECREF(umath);
+        PyErr_Clear();
+        return p; // kept for the process
+    }();
+    if (ufunc_ == power && power != nullptr && nin_ == 2) {
+        const auto* info = static_cast<const UfuncCallInfoPrefix*>(info_);
+        raises_through_pyapi_ = PyTypeNum_ISSIGNED(info->context->descriptors[1]->type_num);
+    }
 }
 
 const UfuncLoop* LoopCache::get(PyObject* ufunc, std::span<const DType> dtypes,
@@ -352,6 +466,7 @@ std::unique_ptr<UfuncLoop> UfuncLoop::from_call_info(PyObject* ufunc, PyObject* 
         error = "loop requires the Python API; cannot run asynchronously";
         return nullptr;
     }
+    loop->init_info(".reduce"); // only reductions on NumPy's iterator use it
     return loop;
 }
 
@@ -397,6 +512,7 @@ bool same_order(const Layout& a, const Layout& b) {
 class ElementwiseKernel : public Kernel {
   public:
     explicit ElementwiseKernel(const UfuncLoop* loop) : loop_(loop) {}
+    const char* name() const override { return loop_->name(); }
 
     // Element-wise loops read element i before writing it: an output may
     // share an input's memory with the same layout (NumPy's out= / elision).
@@ -423,7 +539,7 @@ class ElementwiseKernel : public Kernel {
                 }
                 return loop_->call(ptrs, &count, strides) == 0
                            ? KernelResult{}
-                           : KernelResult{1, "NumPy loop failed", 0};
+                           : KernelResult{1, take_loop_error(), 0};
             }
         }
         std::vector<Layout> layouts;
@@ -441,7 +557,7 @@ class ElementwiseKernel : public Kernel {
                                      [this](char** ptrs, std::intptr_t n, const std::intptr_t* st) {
                                          return loop_->call(ptrs, &n, st) == 0;
                                      });
-        return ok ? KernelResult{} : KernelResult{1, "NumPy loop failed", 0};
+        return ok ? KernelResult{} : KernelResult{1, take_loop_error(), 0};
     }
 
   private:
@@ -484,6 +600,7 @@ class IterElementwiseKernel : public Kernel {
         : loop_(loop), iter_(iter), pool_(std::move(pool)) {}
 
     ~IterElementwiseKernel() override { pool_->give_back(iter_, clean_); }
+    const char* name() const override { return loop_->name(); }
 
     bool in_place_ok() const override { return true; }
 
@@ -503,7 +620,7 @@ class IterElementwiseKernel : public Kernel {
         }
         do {
             if (loop_->call(dataptr_, countptr_, strideptr_) != 0) {
-                return {1, "NumPy loop failed", 0};
+                return {1, take_loop_error(), 0};
             }
         } while (iternext_(iter_));
         clean_ = true;
@@ -632,6 +749,7 @@ namespace {
 class CastKernel : public Kernel {
   public:
     CastKernel(NpyIter* iter, DeferRelease defer) : iter_(iter), defer_(std::move(defer)) {}
+    const char* name() const override { return "astype"; }
 
     ~CastKernel() override {
         NpyIter* iter = iter_;

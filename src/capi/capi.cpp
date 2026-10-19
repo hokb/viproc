@@ -90,6 +90,13 @@ static_assert(static_cast<int>(DType::Bool) == VP_BOOL &&
                   static_cast<int>(DType::Complex128) == VP_COMPLEX128,
               "vp_dtype and DType must match");
 
+// "<message> (in <op>, issued at <site>)": the message keeps a leading
+// "TypeName: " for the bridge to raise that exception type.
+std::string describe(const TaskError& e) {
+    return e.message + " (in " + (e.op.empty() ? std::string("array op") : e.op) + ", issued at " +
+           e.issue_site + ")";
+}
+
 DType to_dtype(vp_dtype d) { return static_cast<DType>(d); }
 vp_dtype to_vp(DType d) { return static_cast<vp_dtype>(d); }
 
@@ -150,6 +157,23 @@ void vp_runtime_destroy(vp_runtime* rt) {
     rt->graveyard->drain();
     delete rt;
     ElementPool::instance().trim(); // cached blocks are not kept across runtimes
+}
+
+int vp_error_pending(const vp_runtime* rt) { return rt->rt->errors().pending() ? 1 : 0; }
+
+int vp_take_error(vp_runtime* rt, char* err, size_t errlen) {
+    std::size_t more = 0;
+    TaskErrorPtr e = rt->rt->errors().take(&more);
+    if (!e) {
+        return VP_OK;
+    }
+    std::string msg = describe(*e);
+    if (more > 0) {
+        msg += " [" + std::to_string(more) + " more failed op" + (more > 1 ? "s" : "") +
+               " not reported]";
+    }
+    set_error(err, errlen, msg);
+    return VP_ERROR;
 }
 
 size_t vp_worker_count(const vp_runtime* rt) { return rt->rt->worker_count(); }
@@ -266,9 +290,10 @@ size_t vp_array_reusable_bytes(const vp_array* a) {
 }
 
 int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
-    std::optional<TaskError> e = rt->rt->wait(arr(a));
+    TaskErrorPtr e = rt->rt->wait(arr(a));
     if (e) {
-        set_error(err, errlen, e->message + " (in op issued at " + e->issue_site + ")");
+        rt->rt->errors().forget(e->id); // reported here
+        set_error(err, errlen, describe(*e));
         return VP_ERROR;
     }
     return VP_OK;
@@ -290,9 +315,10 @@ int vp_array_pin(const vp_array* a, PyObject* view) {
 }
 
 int vp_array_prepare_write(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
-    std::optional<TaskError> e = rt->rt->prepare_host_write(arr(a));
+    TaskErrorPtr e = rt->rt->prepare_host_write(arr(a));
     if (e) {
-        set_error(err, errlen, e->message + " (in op issued at " + e->issue_site + ")");
+        rt->rt->errors().forget(e->id); // reported here
+        set_error(err, errlen, describe(*e));
         return VP_ERROR;
     }
     return VP_OK;

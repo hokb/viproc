@@ -118,6 +118,7 @@ class ReduceKernel : public Kernel {
   public:
     ReduceKernel(const UfuncLoop* loop, ReducePlan plan, std::vector<std::byte> identity)
         : loop_(loop), plan_(std::move(plan)), identity_(std::move(identity)) {}
+    const char* name() const override { return loop_->name(); }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Layout& out_layout = outputs[0].layout;
@@ -286,6 +287,7 @@ class IterReduceKernel : public Kernel {
         : t_(std::move(t)), iter_(iter) {}
 
     ~IterReduceKernel() override { t_->iters->give_back(iter_, clean_); }
+    const char* name() const override { return t_->loop->name(); }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         char* const in = reinterpret_cast<char*>(inputs[0].first());
@@ -622,7 +624,8 @@ namespace {
 
 class ArgReduceKernel : public Kernel {
   public:
-    explicit ArgReduceKernel(PyArray_ArgFunc* fn) : fn_(fn) {}
+    ArgReduceKernel(PyArray_ArgFunc* fn, bool argmax) : fn_(fn), argmax_(argmax) {}
+    const char* name() const override { return argmax_ ? "numpy.argmax" : "numpy.argmin"; }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Layout& l = inputs[0].layout;
@@ -642,6 +645,7 @@ class ArgReduceKernel : public Kernel {
 
   private:
     PyArray_ArgFunc* fn_;
+    bool argmax_;
 };
 
 } // namespace
@@ -655,7 +659,7 @@ std::shared_ptr<Kernel> make_arg_reduce_kernel(DType dtype, bool argmax, std::st
         error = "no argmin/argmax function for this dtype";
         return nullptr;
     }
-    return std::make_shared<ArgReduceKernel>(fn);
+    return std::make_shared<ArgReduceKernel>(fn, argmax);
 }
 
 } // namespace viproc::numpy

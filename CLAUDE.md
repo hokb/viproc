@@ -128,7 +128,8 @@ pool's queue.
 
 Each task records its **issue site** (Python file, line and function,
 captured by the main thread at issue time). Errors from a task are
-reported with that issue site, not with the worker's stack.
+reported with that issue site and the NumPy function it runs
+(`Kernel::name()`), not with the worker's stack (see "Error handling").
 
 ### Eventing
 
@@ -275,6 +276,7 @@ execution.
 ```
 docs/design/           Design documents (decisions with rationale)
   goals.md             goals, non-goals, never-slower rule (G1-G3), roadmap
+  error-handling.md    run-time errors on any thread, asynchronous reporting
   memory-management.md ownership, release, pools, NumPy interop, COW
 docs/benchmarks.md     benchmark results: current breakdown per category and
                        case, progress per change, external machines,
@@ -488,8 +490,22 @@ reference counting.
   happened only for the async exploration calls, which the policy keeps
   rare.
   `python/benchmarks/sync_latency.py` measures the targeted pattern.
-- **Errors** from asynchronous execution are stored on the task and its
-  outputs and raised at the next sync point that touches them.
+- **Errors** (`docs/design/error-handling.md`, the reference; keep it up
+  to date with any change to how errors are recorded or raised).
+  Issue-time errors (shapes, dtypes, arguments) are NumPy's, raised at the
+  call. Run-time errors (element values: index out of bounds, integer power
+  with a negative exponent) may arise on any thread: the failed op stores
+  its `TaskError` (message `"TypeName: ..."`, issue site, op name, issue
+  number; shared, `TaskErrorPtr`) on its task and outputs, consumers
+  inherit it, and the thread that ran it reports it to the runtime
+  (`ErrorReports`) before the task completes. **Every call into viproc**
+  from Python checks the store (`check_async_errors`: one atomic load,
+  ~25 instructions per op) and raises the earliest failed op's error once,
+  as `AsyncValueError` / `AsyncIndexError` (subclasses of NumPy's type and
+  `AsyncError`); sync points on affected arrays raise it every time,
+  `wait_all()` and shutdown deterministically. An op that overwrites an
+  in/out completely does not inherit its error. The full call stack is not
+  captured (too expensive per op).
 
 ### Notes on the reference projects
 
@@ -574,6 +590,17 @@ Rules:
 - **Call without the GIL** from worker threads. Never run a loop with
   `requires_pyapi` set (object dtype etc.) asynchronously; fall back to
   eager NumPy instead.
+- **Loops that raise through the Python API anyway** (NumPy's signed
+  integer `power`: `npy_gil_error` for a negative exponent, then success,
+  no `requires_pyapi`; `UfuncLoop::raises_through_pyapi`) run
+  asynchronously, watched (`UfuncLoop::call_watched`): the thread keeps a
+  Python thread state (workers: `PyThreadState_New` on first use, deleted
+  at worker exit, so the runtime must be destroyed with the GIL released)
+  and compares its `current_exception` before and after the call, without
+  the GIL; only on an error it takes the GIL, fetches it and fails the op
+  (design doc E6). Rejected: a pre-scan of the exponents (3-10% of large
+  integer powers, against G3) and running them synchronously in NumPy (no
+  parallelism).
 - **Casting:** when promotion casts an operand, the cast is its own
   instruction (cast loops via the same ArrayMethod machinery) or done
   eagerly before the op. Never call a loop on data of the wrong dtype.
@@ -727,7 +754,8 @@ Rules:
   first) and NumPy's result layout (the order of the result's axes),
   taken once per key pattern from NumPy indexing a tiny proxy (extents
   1 or 2, same axis order) and cached, never per op; out-of-bounds
-  indices raise `AsyncIndexError` (an `IndexError`) at the sync point;
+  indices raise `AsyncIndexError` (an `IndexError`) asynchronously
+  (error-handling.md);
   scalar indexing returns NumPy's scalar if the array is ready, else a 0-d
   copy (no sync); `np.where(cond, x, y)` as a select task (NumPy's result
   dtype, x and y cast to it, layout order K);
@@ -1004,6 +1032,13 @@ Rules:
   call it and which locks it takes.
 - Every new instruction needs a test that compares the asynchronous result
   with NumPy executing the same ops eagerly.
+- **Every change to a kernel, the issue path or the bridge's per-op code is
+  a performance change** (G3): measure it against `main` before pushing
+  (callgrind instructions per op, timings for data-sized costs) and give
+  the numbers in the PR. Never add a pass over the data (scan, check, copy)
+  to catch a rare condition, and never move a supported op to the eager
+  fallback to fix it: detect errors where they occur, in the kernel, and
+  report them asynchronously (error-handling.md, "Lesson").
 - Keep the MVP small: prefer the simplest correct scheduling over
   optimizations until there is a benchmark that shows the need.
 - Measure success as strong scaling: benchmark whole array programs

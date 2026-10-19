@@ -46,6 +46,7 @@ static vp_runtime* g_rt = NULL;
 static unsigned long g_main_thread = 0;
 static PyObject* AsyncError = NULL;
 static PyObject* AsyncIndexError = NULL; /* AsyncError and IndexError */
+static PyObject* AsyncValueError = NULL; /* AsyncError and ValueError */
 static long long g_small = 2048;         /* the runtime's sync_below: ops this small run directly */
 
 /* Registered by _ndarray.py via _viproc.setup(). */
@@ -297,6 +298,7 @@ static PyGetSetDef Array_getset[] = {
 /* --- helpers -------------------------------------------------------------- */
 
 static int check_runtime(void);
+static int check_async_errors(void);
 
 /* Arguments (viproc array, any object) of a METH_FASTCALL function; checks
  * the runtime too. 0 or -1 with an exception. */
@@ -318,8 +320,36 @@ static int check_runtime(void) {
                         "viproc may only be used from the thread that initialized it");
         return -1;
     }
-    return 0;
+    return check_async_errors();
 }
+
+/* Raises the error of a failed asynchronous op. Kernels name the Python
+ * exception type ("IndexError: ...", "ValueError: ..."): those are raised as
+ * AsyncIndexError / AsyncValueError (subclasses of the type NumPy raises),
+ * everything else as AsyncError. */
+static void raise_async(const char* err) {
+    if (strncmp(err, "IndexError: ", 12) == 0) {
+        PyErr_SetString(AsyncIndexError, err + 12);
+    } else if (strncmp(err, "ValueError: ", 12) == 0) {
+        PyErr_SetString(AsyncValueError, err + 12);
+    } else {
+        PyErr_SetString(AsyncError, err);
+    }
+}
+
+/* Asynchronous error reporting (docs/design/error-handling.md): raises the
+ * error of the earliest failed op not reported yet. 0 if there is none. */
+static int raise_pending_error(void) {
+    char err[ERRLEN] = "";
+    if (vp_take_error(g_rt, err, sizeof err) != VP_ERROR) {
+        return 0;
+    }
+    raise_async(err);
+    return -1;
+}
+
+/* At every call into viproc: one atomic load while no op failed. */
+static int check_async_errors(void) { return vp_error_pending(g_rt) ? raise_pending_error() : 0; }
 
 static int raise_status(int status, const char* err) {
     switch (status) {
@@ -334,9 +364,7 @@ static int raise_status(int status, const char* err) {
         PyErr_SetString(PyExc_ValueError, err);
         return -1;
     default:
-        /* Kernels report index errors as "IndexError: ...": raise them as an
-         * IndexError too, as NumPy would have. */
-        PyErr_SetString(strncmp(err, "IndexError: ", 12) == 0 ? AsyncIndexError : AsyncError, err);
+        raise_async(err);
         return -1;
     }
 }
@@ -1047,6 +1075,9 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
     if (g_rt == NULL || g_array_cls == NULL || n > MAXIN ||
         PyThread_get_thread_ident() != g_main_thread) {
         return 0;
+    }
+    if (check_async_errors() < 0) {
+        return -1;
     }
     if (ufunc == g_matmul) {
         return n == 2 && out == NULL && is_array(inputs[0]) && is_array(inputs[1])
@@ -1847,11 +1878,22 @@ static PyObject* m_shutdown(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
     if (g_rt != NULL) {
+        /* An error nothing reported yet is raised here, after the runtime is
+         * gone (at exit, Python prints it: "Exception ignored in atexit"). */
+        Py_BEGIN_ALLOW_THREADS;
+        vp_wait_all(g_rt);
+        Py_END_ALLOW_THREADS;
+        char err[ERRLEN] = "";
+        const int failed = vp_take_error(g_rt, err, sizeof err) == VP_ERROR;
         vp_runtime* rt = g_rt;
         g_rt = NULL;
         t_clear(&g_sites); /* interned in the runtime being destroyed */
         t_clear(&g_sigs);  /* holds its loop handles */
         vp_runtime_destroy(rt);
+        if (failed) {
+            raise_async(err);
+            return NULL;
+        }
     }
     Py_RETURN_NONE;
 }
@@ -1889,6 +1931,9 @@ static PyObject* m_wait_all(PyObject* self, PyObject* noargs) {
     Py_BEGIN_ALLOW_THREADS;
     vp_wait_all(g_rt);
     Py_END_ALLOW_THREADS;
+    if (raise_pending_error() < 0) {
+        return NULL;
+    }
     Py_RETURN_NONE;
 }
 
@@ -3575,8 +3620,9 @@ PyMODINIT_FUNC PyInit__viproc(void) {
     s_out = PyUnicode_InternFromString("out");
     AsyncError = PyErr_NewExceptionWithDoc(
         "viproc._viproc.AsyncError",
-        "An array op that ran asynchronously failed. Raised at the next sync "
-        "point touching its result; the message names where the op was issued.",
+        "An array op that ran asynchronously failed. Raised at the next call into "
+        "viproc after the failure and at every sync point touching its results; "
+        "the message names the op and where it was issued.",
         PyExc_RuntimeError, NULL);
     PyObject* bases = AsyncError != NULL ? PyTuple_Pack(2, AsyncError, PyExc_IndexError) : NULL;
     AsyncIndexError =
@@ -3586,9 +3632,20 @@ PyMODINIT_FUNC PyInit__viproc(void) {
                                         bases, NULL)
             : NULL;
     Py_XDECREF(bases);
+    bases = AsyncError != NULL ? PyTuple_Pack(2, AsyncError, PyExc_ValueError) : NULL;
+    AsyncValueError =
+        bases != NULL
+            ? PyErr_NewExceptionWithDoc("viproc._viproc.AsyncValueError",
+                                        "An invalid element value in an asynchronous op (as "
+                                        "NumPy's ValueError: integer power with a negative "
+                                        "exponent).",
+                                        bases, NULL)
+            : NULL;
+    Py_XDECREF(bases);
     if (s_call == NULL || s_out == NULL || AsyncError == NULL || AsyncIndexError == NULL ||
-        PyModule_AddObjectRef(m, "AsyncError", AsyncError) < 0 ||
+        AsyncValueError == NULL || PyModule_AddObjectRef(m, "AsyncError", AsyncError) < 0 ||
         PyModule_AddObjectRef(m, "AsyncIndexError", AsyncIndexError) < 0 ||
+        PyModule_AddObjectRef(m, "AsyncValueError", AsyncValueError) < 0 ||
         PyModule_AddObjectRef(m, "_Array", (PyObject*)&ArrayType) < 0 ||
         PyModule_AddObjectRef(m, "ufunc_proxy", (PyObject*)&UfuncProxyType) < 0 ||
         PyModule_AddStringConstant(m, "version", vp_version()) < 0) {

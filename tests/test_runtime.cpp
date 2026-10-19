@@ -385,6 +385,31 @@ void test_error_propagation() {
           "error reaches a consumer issued after the failure");
 }
 
+void test_error_reports() {
+    Runtime rt(opts(2));
+    auto fail = [](const char* msg) {
+        return std::make_shared<FnKernel>([msg](auto, auto) { return KernelResult{1, msg, 0}; });
+    };
+    ArrayPtr src = make_ready(rt, 4, 0.0);
+    ArrayPtr first = issue1(rt, fail("first"), {src}, 4, "prog.py:1 f");
+    ArrayPtr child = issue1(rt, add_const(1.0), {first}, 4, "prog.py:2 f");
+    ArrayPtr second = issue1(rt, fail("second"), {src}, 4, "prog.py:3 f");
+    rt.wait_all();
+    check(rt.errors().pending(), "a failed op is reported to the runtime");
+    std::size_t more = 0;
+    TaskErrorPtr e = rt.errors().take(&more);
+    check(e && e->message == "first" && e->issue_site == "prog.py:1 f" && more == 1,
+          "take() gives the earliest issued failure and counts the others (not inherited ones)");
+    check(!rt.errors().pending() && !rt.errors().take(), "take() clears the reports");
+    ArrayPtr third = issue1(rt, fail("third"), {src}, 4, "prog.py:4 f");
+    TaskErrorPtr w = rt.wait(*third);
+    check(w && w->message == "third" && rt.errors().pending(),
+          "the report exists once the failed task completed");
+    rt.errors().forget(w->id);
+    check(!rt.errors().pending(), "forget() drops an error raised at a sync point");
+    check(rt.wait(*child) == rt.wait(*first), "consumers share the failed op's error");
+}
+
 void test_active_limit() {
     std::atomic<int> running{0};
     std::atomic<int> max_seen{0};
@@ -794,6 +819,7 @@ int main() {
     test_consolidated_copy_on_write_of_strided_array();
     test_overlapping_inplace();
     test_error_propagation();
+    test_error_reports();
     test_active_limit();
     test_random_programs(3, false);
     test_random_programs(64, false);

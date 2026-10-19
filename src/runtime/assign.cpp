@@ -8,6 +8,7 @@ namespace {
 
 class AssignKernel : public Kernel {
   public:
+    const char* name() const override { return "assignment (a[...] = v)"; }
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Layout& dst = outputs[0].layout;
         const std::size_t item = itemsize(dst.dtype);
