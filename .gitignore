@@ -1,5 +1,6 @@
 # Build output
 /reports/
+/bench_win/
 /viproc-benchmark/
 /build*/
 /out/

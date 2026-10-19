@@ -40,7 +40,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import shape_map_cases  # noqa: E402
-from suite import (best_of, calibrate_reps, identical, machine_info,  # noqa: E402
+from suite import (best_of, calibrate_reps, check_out_dir, identical, machine_info,  # noqa: E402
                    materialize, physical_memory, repeats_for, usable_cores)
 
 MEM_BUDGET = 0.5  # fraction of RAM a single measurement may use
@@ -447,7 +447,10 @@ def main():
     p.add_argument("--module", action="store_true",
                    help="viproc runs call np.* through the viproc module (python -m viproc)")
     p.add_argument("--plot", metavar="SHAPE_MAP_JSON", help="only redraw the reports of a run")
+    p.add_argument("--reference", action="store_true",
+                   help="allow --out to replace results committed to git (reference runs)")
     args = p.parse_args()
+    check_out_dir(args.out, args.reference)
     os.makedirs(args.out, exist_ok=True)
     if args.plot:
         run = json.load(open(args.plot, encoding="utf-8"))

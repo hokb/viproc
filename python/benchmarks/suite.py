@@ -153,6 +153,26 @@ def build_stamp():
     return f"{built} #{h.hexdigest()[:8]}"
 
 
+def check_out_dir(out, reference):
+    """Stop before a run overwrites results git tracks: local runs write to
+    an untracked directory (./reports, gitignored), so `git pull` never
+    conflicts with them. Committed reference results (docs/benchmarks/) are
+    replaced only on purpose, with --reference."""
+    import subprocess
+
+    if reference or not os.path.isdir(out):
+        return
+    try:
+        tracked = subprocess.run(["git", "-C", out, "ls-files", "."], capture_output=True,
+                                 text=True, timeout=30).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return
+    if tracked:
+        sys.exit(f"{out} holds files tracked by git ({tracked[0]}, ...): write local runs to an "
+                 "untracked directory (default ./reports), or pass --reference to replace "
+                 "committed reference results on purpose")
+
+
 def machine_info(cores, ram):
     import viproc
 
@@ -438,8 +458,11 @@ def main():
     p.add_argument("--repeat", type=int, help="timed runs per measurement (best of)")
     p.add_argument("--merge", nargs="+", metavar="RESULTS_JSON",
                    help="combine results of several machines/platforms into one report")
+    p.add_argument("--reference", action="store_true",
+                   help="allow --out to replace results committed to git (reference runs)")
     args = p.parse_args()
 
+    check_out_dir(args.out, args.reference)
     os.makedirs(args.out, exist_ok=True)
     if args.merge:
         runs = [json.load(open(f)) for f in args.merge]

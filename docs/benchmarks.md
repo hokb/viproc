@@ -24,6 +24,12 @@ run" at the end).
 - Micro benchmarks: `strong_scaling.py` (independent sin/cos chains),
   `sync_latency.py` (issue an op, read the result right away), callgrind
   instruction counts per op (Release, `OPENBLAS_NUM_THREADS=1`).
+- **Where results go.** Local runs write to `./reports` (gitignored;
+  `bench_win/` is ignored too), so `git pull` never conflicts with them.
+  The scripts refuse an `--out` directory that holds files tracked by git;
+  committed reference results (`docs/benchmarks/`, e.g.
+  `docs/benchmarks/windows/`: shape maps of viproc and ILNumerics on the
+  i7-12700K, Windows) are replaced only on purpose, with `--reference`.
 
 **Comparability.** Compare scores only between runs on the same machine
 and with the same options. The cloud VM of the development sessions
