@@ -27,7 +27,9 @@ do is still reached (and signalled to consumers) right after the previous
 one:
 
 1. **Created**: the array exists. Nothing else is known: no size, no shape,
-   no storage, no elements.
+   no storage, no elements. Subsequent array operations in user code accept
+   an array in any stage, including **created**, as a regular input: they
+   are issued at once and register for the stage events they need.
 2. **Size completed**: shape (size) known.
 3. **Device selected**: where the elements will live and be computed
    (phase 1: always the CPU, reached right after size completed).
