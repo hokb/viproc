@@ -16,7 +16,7 @@ Status labels as in `memory-management.md`: **Decided**, **Implemented**,
 | S2 | The main thread guarantees only `Created`; tasks advance the rest | Decided, not implemented (today: `SizeCompleted` at issue) |
 | S3 | Tasks react to every stage of their inputs, not only `Completed` | Decided, not implemented |
 | S4 | Pending size inputs make a task, whatever the size | Decided, not implemented (today: sync) |
-| S5 | Properties of an array block until it reached their stage | Decided, not implemented |
+| S5 | An array in stage S gives access to the properties of stages 1..S; handlers run only on their stage signal (no locks) | Decided, not implemented |
 | S6 | `Disposed` is never observed; checked by sanitizer builds, debug assertions and counters | Proposed |
 
 ## S1: stages
@@ -127,9 +127,27 @@ Strides belong to **allocated**, not to size completed: they describe the
 memory, which the task chooses when it allocates. A consumer in stage size
 completed may read the size only, never the strides.
 
-The wait is per stage (a stage event the waiter registers for, as
-`wait_completed` does for `Completed`; individual stage locks), not a
-general lock on the array.
+**Enforced by construction, not by locks.** Fine-grained locks per stage or
+property are hard to implement and to maintain. Instead:
+
+- **Stage handlers.** Every function that works on an array in a stage (a
+  task's size-completed handler computing its output size, its allocation,
+  its kernel) declares the stage it requires, as an attribute of the
+  function (a template parameter or tag type in C++). It reads only
+  properties of that stage or lower ones.
+- **Called on the signal only.** A handler is called only as the direct
+  consequence of the stage event it requires being signalled (S2, S3), so
+  the stage is reached when it runs: no lock, no check of the state on the
+  hot path. Keep this structural (stage handlers are reachable only from
+  the event dispatch) so that refactoring and CI tooling can verify it.
+- **Checks.** Debug builds assert the required stage at the entry of each
+  handler. A CI check (a static analysis over the handlers, e.g. a
+  clang-tidy rule or typed accessors that take a stage token) reports any
+  access to a property of a higher stage inside a handler as an error.
+
+Blocking remains only where the main thread waits at a sync point or a
+metadata query: it waits for the stage event it needs (as `wait_completed`
+does for `Completed`), not on a lock of the array.
 
 Open points for the implementation:
 - **Thread rules.** `Array` and `Storage` are main-thread only today, and the
