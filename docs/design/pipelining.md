@@ -58,13 +58,20 @@ happens in the task, driven by stage events of its inputs:
 
 - When all inputs reached **size completed**, the task computes its own
   output size(s) (broadcasting, reduction axes, ...) and signals **size
-  completed** to the consumers of its outputs, which react the same way.
-  Sizes propagate down a chain of pending ops before any element is
-  computed.
+  completed** to the consumers of its outputs, which **may** react the same
+  way. Sizes propagate down a chain of pending ops before any element is
+  computed, as far as the tasks on it support partial eventing.
 - **Device selected** and **allocated** follow in the task (allocation is
   therefore practically always done by tasks, not by the main thread; D11
   already does this for element memory).
 - **Completed** when the kernel ran.
+
+Tasks may or may not support partial eventing. A task that does not (linalg,
+fft, NumPy loops taken as a whole) ignores the intermediate events of its
+inputs and reacts only when the last input reaches **completed**. It still
+takes its own outputs through every stage, exactly once and in order (S1),
+one right after the other when it runs, so its consumers see the same
+sequence of events either way.
 
 Only the small-array shortcut (direct path, `Runtime::issue_direct`) has the
 main thread do all stages itself, since there is nothing to overlap.
