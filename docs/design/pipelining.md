@@ -69,9 +69,10 @@ happens in the task, driven by stage events of its inputs:
 Tasks may or may not support partial eventing. A task that does not (linalg,
 fft, NumPy loops taken as a whole) ignores the intermediate events of its
 inputs and reacts only when the last input reaches **completed**. It still
-takes its own outputs through every stage, exactly once and in order (S1),
-one right after the other when it runs, so its consumers see the same
-sequence of events either way.
+must still signal every stage to its consumers, exactly once and in this
+order (S1): **size completed**, **device selected**, **allocated**,
+**completed**, typically one right after the other when it runs. Its
+consumers see the same sequence of events either way.
 
 Only the small-array shortcut (direct path, `Runtime::issue_direct`) has the
 main thread do all stages itself, since there is nothing to overlap.
