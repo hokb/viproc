@@ -82,7 +82,8 @@ to plain sequential NumPy execution.
   may skip states, never go back.
 - Full stage pipelining (Accelerator; `docs/design/pipelining.md`, not
   implemented yet): six array stages (created, size completed, device
-  selected, allocated, completed, disposed); the main thread guarantees only
+  selected, allocated, completed, disposed), each reached exactly once, in
+  increasing order; the main thread guarantees only
   `created`, tasks advance the rest on their inputs' stage events. Today
   every task reaches `size_completed` at issue; pending size arguments
   (`np.zeros(n)` with pending `n`) are to issue a task instead of syncing.

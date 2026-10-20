@@ -12,7 +12,7 @@ Status labels as in `memory-management.md`: **Decided**, **Implemented**,
 
 | # | Decision | Status |
 |---|----------|--------|
-| S1 | Six stages per array, always in this order | Decided; stages 1, 2, 4, 5 exist (`TaskState`) |
+| S1 | Six stages per array, each reached exactly once, in increasing order | Decided; stages 1, 2, 4, 5 exist (`TaskState`) |
 | S2 | The main thread guarantees only `Created`; tasks advance the rest | Decided, not implemented (today: `SizeCompleted` at issue) |
 | S3 | Tasks react to every stage of their inputs, not only `Completed` | Decided, not implemented |
 | S4 | Pending size inputs make a task, whatever the size | Decided, not implemented (today: sync) |
@@ -20,14 +20,17 @@ Status labels as in `memory-management.md`: **Decided**, **Implemented**,
 
 ## S1: stages
 
-An array (with the task producing it) passes six stages, at most once each
-and only forward:
+An array (with the task producing it) reaches each of six stages **exactly
+once**, in **monotonically increasing order**: no stage is skipped, none is
+repeated, none is reached before the previous one. A stage with nothing to
+do is still reached (and signalled to consumers) right after the previous
+one:
 
 1. **Created**: the array exists. Nothing else is known: no size, no shape,
    no storage, no elements.
 2. **Size completed**: shape (size) known.
 3. **Device selected**: where the elements will live and be computed
-   (phase 1: always the CPU; the stage is skipped).
+   (phase 1: always the CPU, reached right after size completed).
 4. **Allocated**: element memory exists.
 5. **Completed**: the elements are computed; the array is `ready`.
 6. **Disposed**: the last reference is gone, the memory is released.
@@ -35,6 +38,8 @@ and only forward:
 `TaskState` (`src/runtime/task.hpp`) has `Created`, `SizeCompleted`,
 `DeviceSelected`, `Allocated` and `Completed`; `Disposed` is implicit today
 (reference counting releases the buffer, D2/D11 in `memory-management.md`).
+Today a task may skip states (`DeviceSelected` is unused, the direct path
+sets none); the scheme requires every stage to be reached.
 
 ## S2, S3: who advances the stages
 
