@@ -78,8 +78,12 @@ to plain sequential NumPy execution.
   - `size_completed`: output shape (and dtype) is known.
   - `allocated`: output element memory exists.
   - `completed`: output data is computed; the outputs become `ready`.
-- A task passes through each state **at most once and only forward**. It
-  may skip states, never go back.
+- A task passes through each state **exactly once, in increasing order**
+  (`docs/design/pipelining.md`, S1): a stage with nothing to do is still
+  reached and signalled; handlers may rely on it, and a skipped stage can
+  deadlock its waiters. Today's code still skips `DeviceSelected` (no
+  callbacks on it yet) and the direct path creates ready outputs without
+  a task.
 - Full stage pipelining (Accelerator; `docs/design/pipelining.md`, not
   implemented yet): six array stages (created, size completed, device
   selected, allocated, completed, disposed), each reached exactly once, in

@@ -24,7 +24,10 @@ An array (with the task producing it) reaches each of six stages **exactly
 once**, in **monotonically increasing order**: no stage is skipped, none is
 repeated, none is reached before the previous one. A stage with nothing to
 do is still reached (and signalled to consumers) right after the previous
-one:
+one. This is an implementation guarantee, not a convention: handlers of a
+stage may rely on being called for it, and a consumer waiting for a stage
+that is skipped (or a handler run twice) can deadlock.
+
 
 1. **Created**: the array exists. Nothing else is known: no size, no shape,
    no storage, no elements. Subsequent array operations in user code accept
