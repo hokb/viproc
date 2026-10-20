@@ -1198,6 +1198,8 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             temps[ntemps++] = t;
             ins[i] = t;
         }
+        /* Folds input i into the broadcast shape of inputs 0..i-1: after the
+         * loop, shape/ndim is the output shape. */
         if (broadcast_into(shape, &ndim, vp_array_ndim(ins[i]), vp_array_shape(ins[i])) < 0) {
             status = 1; /* not broadcastable: the fallback raises NumPy's error */
         }
