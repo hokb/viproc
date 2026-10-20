@@ -17,7 +17,7 @@ Status labels as in `memory-management.md`: **Decided**, **Implemented**,
 | S3 | Tasks react to every stage of their inputs, not only `Completed` | Decided, not implemented |
 | S4 | Pending size inputs make a task, whatever the size | Decided, not implemented (today: sync) |
 | S5 | An array in stage S gives access to the properties of stages 1..S; handlers run only on their stage signal (no locks) | Decided, not implemented |
-| S6 | `Disposed` is never observed; checked by sanitizer builds, debug assertions and counters | Proposed |
+| S6 | `Disposed` is never observed; checked by sanitizer builds, debug assertions, counters and versions | Proposed |
 
 ## S1: stages
 
@@ -192,4 +192,14 @@ none of them in Release builds (G3):
 3. **Counters.** Debug builds count created and disposed objects per type;
    tests check at runtime shutdown that both match (each object disposed
    exactly once, nothing leaked); a second dispose fails assertion 2.
+4. **Versions (generation counters).** Every pooled object (`Task`,
+   `Buffer`, `ArrayBlock`) carries an integer that `FixedPool` increments
+   with each allocation of its block. A holder of a non-owning reference (a
+   raw pointer, a callback entry, an operand) stores the version next to it
+   and checks it on access: a changed version means the object was disposed
+   and its block reused, and the access fails at once instead of reading an
+   unrelated live object. Unlike 1 and 2, this catches reuse within the pool
+   precisely and is cheap (one store per allocation, one compare per
+   checked access), so it could stay enabled in more builds than the
+   sanitizer.
 
