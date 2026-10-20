@@ -80,6 +80,12 @@ to plain sequential NumPy execution.
   - `completed`: output data is computed; the outputs become `ready`.
 - A task passes through each state **at most once and only forward**. It
   may skip states, never go back.
+- Full stage pipelining (Accelerator; `docs/design/pipelining.md`, not
+  implemented yet): six array stages (created, size completed, device
+  selected, allocated, completed, disposed); the main thread guarantees only
+  `created`, tasks advance the rest on their inputs' stage events. Today
+  every task reaches `size_completed` at issue; pending size arguments
+  (`np.zeros(n)` with pending `n`) are to issue a task instead of syncing.
 - The task holds references to its input arrays, its output arrays and the
   resolved NumPy loop.
 - Tasks, buffers and array blocks come from per-thread memory pools
@@ -278,6 +284,7 @@ docs/design/           Design documents (decisions with rationale)
   goals.md             goals, non-goals, never-slower rule (G1-G3), roadmap
   error-handling.md    run-time errors on any thread, asynchronous reporting
   memory-management.md ownership, release, pools, NumPy interop, COW
+  pipelining.md        array stages, partial completion, pending sizes (roadmap)
 docs/benchmarks.md     benchmark results: current breakdown per category and
                        case, progress per change, external machines,
                        shape map (images in docs/benchmarks/; reference

@@ -103,6 +103,14 @@ before calling a result a violation or a fix.
   overlapping consecutive iterations of a loop, so that even a loop body
   without sufficient parallel potential of its own (`x = a[x + 1]` repeated) can run
   faster than NumPy.
+- **Stage pipelining** (the full scheme of the ILNumerics Accelerator,
+  `docs/design/pipelining.md`): the main thread only creates tasks and
+  arrays; tasks advance their outputs through the stages (size completed,
+  device selected, allocated, completed) on the stage events of their
+  inputs. Sizes propagate before data, allocation and device decisions
+  happen in tasks, and an unknown size forces a sync only where a branch
+  depends on it. First step: creators with pending size arguments issue a
+  task instead of syncing.
 - Scaling beyond 4 cores, the remaining gufuncs (linalg, fft), per-op
   overhead on small data (G3): see `CLAUDE.md`, "Status and next steps"
   and "Open questions".
