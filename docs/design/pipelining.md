@@ -34,10 +34,11 @@ that is skipped (or a handler run twice) can deadlock.
    no storage, no elements. Subsequent array operations in user code accept
    an array in any stage, including **created**, as a regular input: they
    are issued at once and register for the stage events they need.
-2. **Size completed**: shape (size) known.
+2. **Size completed**: size known: `ndim`, extents, offset (not the
+   strides).
 3. **Device selected**: where the elements will live and be computed
    (phase 1: always the CPU, reached right after size completed).
-4. **Allocated**: element memory exists.
+4. **Allocated**: element memory exists, and with it the strides.
 5. **Completed**: the elements are computed; the array is `ready`.
 6. **Disposed**: the last reference is gone, the memory is released. An
    array in this stage is **never observed**: observing it needs a
@@ -108,23 +109,38 @@ instead of at issue.
 
 ## S5: access to properties of an incomplete array
 
-Whoever reads a property of an array needs the array to have reached the
-stage that provides it, or blocks until it has:
+Every stage, once reached, opens access to the properties it guarantees.
+Since stages are reached in strict order (S1), an array in stage S allows
+access to the properties of stages 1 to S, and to nothing beyond them.
+Whoever (the main thread or a consuming task) reads a property of an array
+needs the array to have reached its stage, or blocks until it has:
 
-| property | needs stage |
-|---|---|
-| `shape`, `size`, `ndim`, `len()`, strides/layout | size completed |
-| element memory (export, fallback) | allocated + completed (writers) |
-| element values (sync points) | completed |
+| stage | opens access to | access allowed in this stage |
+|---|---|---|
+| 1 created | the array object (as an input of later ops, S1) | the array object |
+| 2 size completed | size: `ndim`, extents (`shape`, `size`, `len()`), offset | + size |
+| 3 device selected | device selection | + device |
+| 4 allocated | storage memory (addresses, not values) and **strides** | + memory, strides |
+| 5 completed | element values (sync points, exports, fallbacks) | everything |
+
+Strides belong to **allocated**, not to size completed: they describe the
+memory, which the task chooses when it allocates. A consumer in stage size
+completed may read the size only, never the strides.
 
 The wait is per stage (a stage event the waiter registers for, as
-`wait_completed` does for `Completed`), not a general lock on the array.
+`wait_completed` does for `Completed`; individual stage locks), not a
+general lock on the array.
 
 Open points for the implementation:
 - **Thread rules.** `Array` and `Storage` are main-thread only today, and the
-  layout lives there. With S2, a task writes the layout of its outputs:
-  publish it with the stage (release on advance, acquire on read), so the
-  main thread reads it without a lock once it saw the stage.
+  layout lives there. With S2, a task writes the size and the strides of its
+  outputs: publish each with its stage (release on advance, acquire on
+  read), so the main thread reads it without a lock once it saw the stage.
+- **Strides at issue today.** Today the main thread fixes the result layout
+  at issue (NumPy's layout, `Layout::keep_order`; views and copy-on-write
+  derive from it). With strides in **allocated**, ops that need an input's
+  strides (views, the result layout of order K, reduction plans, iterator
+  templates) wait for that input's allocated stage, in their task.
 - **Issue path cost (G3).** A consumer of a size-pending input computes its
   shape in the task; consumers of size-completed inputs keep computing it
   at issue (no extra work on the common path).
