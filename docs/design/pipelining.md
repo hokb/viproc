@@ -17,6 +17,7 @@ Status labels as in `memory-management.md`: **Decided**, **Implemented**,
 | S3 | Tasks react to every stage of their inputs, not only `Completed` | Decided, not implemented |
 | S4 | Pending size inputs make a task, whatever the size | Decided, not implemented (today: sync) |
 | S5 | Properties of an array block until it reached their stage | Decided, not implemented |
+| S6 | `Disposed` is never observed; checked by sanitizer builds, debug assertions and counters | Proposed |
 
 ## S1: stages
 
@@ -38,7 +39,10 @@ that is skipped (or a handler run twice) can deadlock.
    (phase 1: always the CPU, reached right after size completed).
 4. **Allocated**: element memory exists.
 5. **Completed**: the elements are computed; the array is `ready`.
-6. **Disposed**: the last reference is gone, the memory is released.
+6. **Disposed**: the last reference is gone, the memory is released. An
+   array in this stage is **never observed**: observing it needs a
+   reference, and reference counting disposes it only when none is left
+   (S6).
 
 `TaskState` (`src/runtime/task.hpp`) has `Created`, `SizeCompleted`,
 `DeviceSelected`, `Allocated` and `Completed`; `Disposed` is implicit today
@@ -119,3 +123,31 @@ Open points for the implementation:
 - **dtype** stays known at issue (dtype resolution does not depend on data).
 - **Data-dependent results** (`nonzero`, boolean indexing, `unique`) become
   tasks too, once S3 exists: their size is known when their kernel ran.
+
+## S6: checking that `Disposed` is never observed
+
+By construction, nothing can observe a disposed array, task or buffer: an
+observer needs a reference, and the last reference is gone. A bug breaks
+this as a use after release (a raw pointer kept past its reference, a
+release too many). Pools make such bugs silent: a released `Task`, `Buffer`
+or `ArrayBlock` goes back to `FixedPool` and is handed out again, so a stale
+access reads a live, unrelated object instead of crashing. Proposed checks,
+none of them in Release builds (G3):
+
+1. **Sanitizer builds.** With AddressSanitizer, `FixedPool` passes every
+   allocation to `operator new`/`delete` (as the element pool already does
+   with `VIPROC_ELEMENT_POOL=OFF`), or poisons blocks on its free lists
+   (`ASAN_POISON_MEMORY_REGION`). Every access to a disposed object is then
+   an ASan error. A CI job runs ctest (C++ tests and pytest) on such a
+   build.
+2. **Debug assertions.** Debug builds give `Task`, `Buffer` and
+   `Array`/`Storage` a stage (or magic) field that the destructor sets to
+   `Disposed`; accessors and stage transitions assert it is not, and
+   `FixedPool` fills released blocks with a pattern so a stale read fails
+   the assertion. The existing forward-only assertion of task states
+   (`task.cpp`) becomes "exactly the next stage" once every stage is
+   reached (S1).
+3. **Counters.** Debug builds count created and disposed objects per type;
+   tests check at runtime shutdown that both match (each object disposed
+   exactly once, nothing leaked); a second dispose fails assertion 2.
+
