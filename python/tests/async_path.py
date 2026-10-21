@@ -3,8 +3,8 @@
 A bit-identity test alone also passes when an op falls back to NumPy, syncs
 its inputs or runs on the main thread. assert_async() reads the runtime's
 counters around one call instead: no fallback, no sync point, exactly the
-expected number of tasks, none of them run on the main thread, and viproc
-arrays as results. Use it inside deterministic(), on data above sync_below
+expected number of tasks, none of them run on the main thread, and no
+NumPy array as a result. Use it inside deterministic(), on data above sync_below
 (SIZE elements), on pending inputs (pending()), then compare the result
 with NumPy."""
 
@@ -47,7 +47,7 @@ def counters():
 def assert_async(fn, *args, ops=1, small_steps=False, **kwargs):
     """Runs fn(*args, **kwargs) and checks that it took the asynchronous path:
     `ops` ops issued as tasks, none run inline, no fallback to NumPy, no sync
-    point, every result a viproc array. Returns the result.
+    point, no NumPy array as a result. Returns the result.
 
     small_steps: the op is a composition with small intermediate results (the
     count of mean, the scalars of var): such a step takes the direct path, or
@@ -61,11 +61,11 @@ def assert_async(fn, *args, ops=1, small_steps=False, **kwargs):
     after = counters()
     delta = {k: after[k] - before[k] for k in before}
     results = r if isinstance(r, tuple) else () if r is None else (r,)  # None: a statement
-    # Where NumPy returns a scalar, viproc returns NumPy's scalar if the data
-    # happened to be there already, else a pending 0-d array; never an
-    # np.ndarray (that would be a sync through __array__).
-    assert all(isinstance(x, (viproc.ndarray, np.generic)) for x in results), [
-        type(x) for x in results]
+    # Arrays are viproc arrays, never an np.ndarray (that would be a sync
+    # through __array__). Where NumPy returns a scalar, viproc returns NumPy's
+    # scalar if the data happened to be there already, else a pending 0-d
+    # array; metadata (flags, device) are plain Python values.
+    assert not any(isinstance(x, np.ndarray) for x in results), [type(x) for x in results]
     assert delta["fallbacks"] == 0, f"fell back to NumPy: {delta}"
     assert delta["syncs"] == 0, f"synced an array: {delta}"
     if small_steps:
