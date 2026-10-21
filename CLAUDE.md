@@ -871,6 +871,14 @@ Rules:
   (`vp_array_view`, dtype views, read-only if NumPy made it read-only); a
   NumPy argument → unchanged; fresh memory → adopted; else copied.
   `np.copyto(dst, src)` maps to assignment.
+- **ndarray methods:** every method and attribute of `numpy.ndarray`
+  except `base` (views do not track their Python base object) and `ctypes`
+  (a raw pointer would bypass the runtime). The ones with a NumPy function
+  form delegate to it (`a.clip(...)` is `np.clip(a, ...)`), so they take
+  the function's path; in-place ones without one (`sort`, `partition`,
+  `resize`, `setfield`, `flat[...] = v`) run NumPy's method in the eager
+  fallback; `fill` is an assignment; `flags` and `setflags` work on the
+  layout and `_readonly` without a sync (`python/tests/test_methods.py`).
 - **Read-only viproc arrays** (`_readonly`, e.g. from `broadcast_to`):
   writes raise NumPy's errors; never reused by temporary elision.
 - **Entry: `python -m viproc prog.py`** (`__main__.py`, also `-m mod`, `-c

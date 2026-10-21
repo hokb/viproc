@@ -1271,6 +1271,211 @@ class ndarray(_viproc._Array):
     def dot(self, b, out=None):
         return np.dot(self, b, out=out)
 
+    # --- the other ndarray methods ---------------------------------------------
+    # Delegates to NumPy's function forms, so they take whatever path the
+    # function takes (asynchronous where viproc supports it, else the eager
+    # fallback) and get faster with it. In-place methods without a function
+    # form run NumPy's method in the fallback, on the writable view it makes
+    # after waiting for readers (vp_array_prepare_write).
+    def conj(self):
+        return np.conjugate(self)
+
+    def conjugate(self):
+        return np.conjugate(self)
+
+    def round(self, decimals=0, out=None):
+        return np.round(self, decimals, out)
+
+    def clip(self, min=None, max=None, out=None, **kwargs):
+        return np.clip(self, min, max, out, **kwargs)
+
+    def cumsum(self, axis=None, dtype=None, out=None):
+        return np.cumsum(self, axis, dtype, out)
+
+    def cumprod(self, axis=None, dtype=None, out=None):
+        return np.cumprod(self, axis, dtype, out)
+
+    def trace(self, offset=0, axis1=0, axis2=1, dtype=None, out=None):
+        return np.trace(self, offset, axis1, axis2, dtype, out)
+
+    def nonzero(self):
+        return np.nonzero(self)
+
+    def argsort(self, *args, **kwargs):
+        return np.argsort(self, *args, **kwargs)
+
+    def argpartition(self, *args, **kwargs):
+        return np.argpartition(self, *args, **kwargs)
+
+    def searchsorted(self, v, side="left", sorter=None):
+        return np.searchsorted(self, v, side, sorter)
+
+    def take(self, indices, axis=None, out=None, mode="raise"):
+        return np.take(self, indices, axis, out, mode)
+
+    def put(self, indices, values, mode="raise"):
+        np.put(self, indices, values, mode)
+
+    def choose(self, choices, out=None, mode="raise"):
+        return np.choose(self, choices, out, mode)
+
+    def compress(self, condition, axis=None, out=None):
+        return np.compress(condition, self, axis, out)
+
+    def repeat(self, repeats, axis=None):
+        return np.repeat(self, repeats, axis)
+
+    def sort(self, *args, **kwargs):
+        _host_call(lambda a, *ar, **kw: a.sort(*ar, **kw), (self,) + args, kwargs)
+
+    def partition(self, *args, **kwargs):
+        _host_call(lambda a, *ar, **kw: a.partition(*ar, **kw), (self,) + args, kwargs)
+
+    def resize(self, *args, **kwargs):
+        # NumPy resizes only arrays that own their memory; viproc's memory
+        # belongs to the runtime, so NumPy raises its own error here.
+        _host_call(lambda a, *ar, **kw: a.resize(*ar, **kw), (self,) + args, kwargs)
+
+    def byteswap(self, inplace=False):
+        return _host_call(lambda a: a.byteswap(inplace), (self,), {})
+
+    def getfield(self, dtype, offset=0):
+        return _host_call(lambda a: a.getfield(dtype, offset), (self,), {})
+
+    def setfield(self, val, dtype, offset=0):
+        _host_call(lambda a, v: a.setfield(v, dtype, offset), (self, val), {})
+
+    def fill(self, value):
+        if np.ndim(value) != 0:  # NumPy's error for a sequence
+            _host_call(lambda a: a.fill(value), (self,), {})
+            return
+        self[...] = value  # an assignment task (vp_assign), as NumPy casts
+
+    # Sync points: they read the data.
+    @property
+    def flat(self):
+        return _FlatIter(self)
+
+    @property
+    def data(self):
+        return self.numpy().data  # read-only, as every export
+
+    def tobytes(self, order="C"):
+        return self.numpy().tobytes(order)
+
+    def tofile(self, fid, sep="", format="%s"):
+        self.numpy().tofile(fid, sep, format)
+
+    def dumps(self):
+        return self.numpy().dumps()
+
+    def dump(self, file):
+        self.numpy().dump(file)
+
+    # Metadata (no sync).
+    @property
+    def flags(self):
+        return _Flags(self)
+
+    def setflags(self, write=None, align=None, uic=None):
+        if uic:
+            raise ValueError("cannot set WRITEBACKIFCOPY flag to True")
+        # align: viproc's memory is always aligned; NumPy accepts both values.
+        if write is not None:
+            if write and self._readonly:
+                raise ValueError("cannot set WRITEABLE flag to True of this array")
+            self._readonly = not write
+
+    @property
+    def device(self):
+        return "cpu"
+
+    def to_device(self, device, /, *, stream=None):
+        if stream is not None:
+            raise ValueError("The stream argument in to_device() is not supported")
+        if device != "cpu":
+            raise ValueError(f"Unsupported device {device!r}. Only 'cpu' is accepted.")
+        return self
+
+
+class _Flags:
+    """ndarray.flags of a viproc array, from its layout (no sync): NumPy's
+    flags of a probe with the same shape and strides over one element, with
+    WRITEABLE from the viproc array (settable, as NumPy's). OWNDATA is False:
+    the memory belongs to the runtime."""
+
+    __slots__ = ("_a", "_f")
+
+    def __init__(self, a):
+        probe = np.lib.stride_tricks.as_strided(np.empty(1, a.dtype), a.shape, a.strides)
+        object.__setattr__(self, "_a", a)
+        object.__setattr__(self, "_f", probe.flags)
+
+    @property
+    def writeable(self):
+        return not self._a._readonly
+
+    @writeable.setter
+    def writeable(self, value):
+        self._a.setflags(write=value)
+
+    def __getattr__(self, name):
+        return getattr(self._f, name)
+
+    def __setattr__(self, name, value):
+        if name != "writeable":
+            raise AttributeError(f"viproc: flag {name!r} cannot be set")
+        type(self).writeable.fset(self, value)
+
+    def __getitem__(self, key):
+        if key in ("W", "WRITEABLE"):
+            return self.writeable
+        return self._f[key]
+
+    def __setitem__(self, key, value):
+        if key not in ("W", "WRITEABLE"):
+            raise KeyError(f"viproc: flag {key!r} cannot be set")
+        self.writeable = value
+
+    def __eq__(self, other):
+        return repr(self) == repr(other)
+
+    def __repr__(self):
+        return repr(self._f).replace(
+            f"WRITEABLE : {self._f.writeable}", f"WRITEABLE : {self.writeable}")
+
+
+class _FlatIter:
+    """a.flat of a viproc array: reading syncs (NumPy's flatiter on the
+    read-only export), assigning runs NumPy's in the eager fallback."""
+
+    __slots__ = ("base",)
+
+    def __init__(self, a):
+        self.base = a
+
+    def __len__(self):
+        return self.base.size
+
+    def __iter__(self):
+        return iter(self.base.numpy().flat)
+
+    def __getitem__(self, key):
+        r = self.base.numpy().flat[_numpy_key(key)]
+        return _adopt(r) if isinstance(r, np.ndarray) else r  # NumPy copies
+
+    def __setitem__(self, key, value):
+        def assign(a, k, v):
+            a.flat[k] = v
+
+        _host_call(assign, (self.base, key, value), {})
+
+    def __array__(self, dtype=None, copy=None):
+        return np.asarray(self.base.numpy().flat.copy(), dtype=dtype)
+
+    def copy(self):
+        return self.base.flatten()
+
 
 def _ufunc_reduce(ufunc, a, axis=0, dtype=None, out=None, keepdims=False, initial=_NV,
                   where=True):
