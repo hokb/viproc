@@ -68,7 +68,7 @@ class CopyKernel : public Kernel {
   public:
     const char* name() const override { return "copy-on-write"; }
     KernelResult run(std::span<const Operand> in, std::span<const Operand> out) override {
-        std::memcpy(out[0].first(), in[0].first(), in[0].layout.nbytes());
+        std::memcpy(out[0].first(), in[0].first(), in[0].layout().nbytes());
         return {};
     }
 };
@@ -78,7 +78,7 @@ bool same_view(const Layout& x, const Layout& y) {
            x.offset == y.offset;
 }
 
-Layout bytes_of(const Buffer& b) {
+Layout bytes_of(const CountableArray& b) {
     return Layout::contiguous(DType::Bool, {static_cast<std::int64_t>(b.nbytes())});
 }
 
@@ -103,9 +103,9 @@ void free_block(ArrayBlock* b) {
 
 } // namespace
 
-void Storage::last_ref_dropped(Storage* s) {
-    ArrayBlock* b = s->block_;
-    b->storage.reset();
+void AliasGroup::last_ref_dropped(AliasGroup* g) {
+    ArrayBlock* b = g->block_;
+    b->group.reset();
     if (--b->alive == 0) {
         free_block(b);
     }
@@ -113,7 +113,7 @@ void Storage::last_ref_dropped(Storage* s) {
 
 void Array::last_ref_dropped(Array* a) {
     ArrayBlock* b = a->block_;
-    b->array.reset(); // may drop the storage of the same block first
+    b->array.reset(); // may drop the group of the same block first
     if (--b->alive == 0) {
         free_block(b);
     }
@@ -121,23 +121,24 @@ void Array::last_ref_dropped(Array* a) {
 
 namespace {
 
-// A base array with a new storage, both in one block.
-ArrayPtr new_array(Layout layout, std::shared_ptr<Buffer> buffer, std::shared_ptr<Task> producer) {
+// A base array with a new group, both in one block.
+ArrayPtr new_array(MetadataPtr meta, std::shared_ptr<CountableArray> buffer,
+                   std::shared_ptr<Task> last_writer) {
     ArrayBlock* block = new_block(2); // owned by the references from here on
-    Storage& s = block->storage.emplace(std::move(buffer), std::move(producer), block);
-    Array& a = block->array.emplace(std::move(layout), Ref<Storage>(&s), block);
+    AliasGroup& g = block->group.emplace(std::move(buffer), std::move(last_writer), block);
+    Array& a = block->array.emplace(std::move(meta), Ref<AliasGroup>(&g), block);
     return ArrayPtr(&a);
 }
 
 } // namespace
 
-ArrayPtr Runtime::wrap(Layout layout, std::shared_ptr<Buffer> buffer) {
-    return new_array(std::move(layout), std::move(buffer), nullptr);
+ArrayPtr Runtime::wrap(Layout layout, std::shared_ptr<CountableArray> buffer) {
+    return new_array(make_metadata(std::move(layout)), std::move(buffer), nullptr);
 }
 
 ArrayPtr Runtime::view(const ArrayPtr& base, Layout&& layout) {
     ArrayBlock* block = new_block(1);
-    Array& a = block->array.emplace(std::move(layout), base->storage_, block);
+    Array& a = block->array.emplace(make_metadata(std::move(layout)), base->group_, block);
     return ArrayPtr(&a);
 }
 
@@ -196,15 +197,16 @@ void Runtime::launch(const std::shared_ptr<Task>& task,
     }
 }
 
-void Runtime::issue_storage_copy(Storage& s) {
-    std::shared_ptr<Buffer> old = s.buffer_;
-    auto fresh = make_pooled<Buffer>(old->nbytes(), Buffer::deferred); // the copy task allocates
+void Runtime::issue_group_copy(AliasGroup& g) {
+    std::shared_ptr<CountableArray> old = g.current_;
+    auto fresh = make_pooled<CountableArray>(old->nbytes(),
+                                             CountableArray::deferred); // the copy task allocates
     std::vector<std::shared_ptr<Task>> producers;
     ErrorRef failed;
-    if (!s.ready()) {
-        producers.push_back(s.producer_);
+    if (!g.ready()) {
+        producers.push_back(g.last_writer_);
     } else {
-        failed = s.last_error_;
+        failed = g.last_error_;
     }
 
     // Counted, but not held back: the op that needs the copy holds a slot
@@ -212,15 +214,16 @@ void Runtime::issue_storage_copy(Storage& s) {
     active_.fetch_add(1, std::memory_order_acq_rel);
     auto task = make_pooled<Task>(std::make_shared<CopyKernel>(), "copy-on-write");
     old->async_reads.fetch_add(1, std::memory_order_relaxed);
-    task->operands_for_issue().push_back({old, bytes_of(*old)});
-    task->operands_for_issue().push_back({fresh, bytes_of(*fresh)});
+    MetadataPtr meta = make_metadata(bytes_of(*old)); // same bytes for both versions
+    task->operands_for_issue().push_back({old, meta});
+    task->operands_for_issue().push_back({fresh, std::move(meta)});
     task->set_ninputs(1);
     if (failed) {
         task->add_upstream_error(failed);
     }
     task->advance(TaskState::SizeCompleted);
-    s.buffer_ = fresh;
-    s.producer_ = task;
+    g.current_ = fresh;
+    g.last_writer_ = task;
     launch(task, producers, static_cast<std::int64_t>(old->nbytes()));
 }
 
@@ -236,10 +239,10 @@ std::vector<ArrayPtr> Runtime::issue(const std::shared_ptr<Kernel>& kernel,
 void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
                     std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
                     const char* issue_site, std::span<ArrayPtr> results, std::int64_t work_elements,
-                    std::span<const std::shared_ptr<Buffer>> output_buffers) {
+                    std::span<const std::shared_ptr<CountableArray>> output_buffers) {
     const std::int64_t elements = work_elements >= 0     ? work_elements
                                   : !new_outputs.empty() ? new_outputs[0].size()
-                                  : !inouts.empty()      ? inouts[0]->layout_.size()
+                                  : !inouts.empty()      ? inouts[0]->layout().size()
                                                          : 0;
     if (issue_direct(kernel, inputs, inouts, new_outputs, issue_site, results, elements,
                      output_buffers)) {
@@ -260,13 +263,13 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     // failed op, or written into its result, is failed too (also when the op
     // overwrites every element: a failed program does not continue).
     auto snapshot = [&](Array& a) {
-        Storage& s = *a.storage_;
-        if (!s.ready()) {
-            producers.push_back(s.producer_);
-        } else if (s.last_error_ && !failed_input) {
-            failed_input = s.last_error_;
+        AliasGroup& g = *a.group_;
+        if (!g.ready()) {
+            producers.push_back(g.last_writer_);
+        } else if (g.last_error_ && !failed_input) {
+            failed_input = g.last_error_;
         }
-        in_ops.push_back({s.buffer_, a.layout_});
+        in_ops.push_back({g.current_, a.meta_});
     };
     for (const ArrayPtr& a : inputs) {
         snapshot(*a);
@@ -278,48 +281,49 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     // 2. Copy-on-write decisions, before this op counts its own reads. All
     //    layout changes happen here, at issue time: what later tasks learn
     //    (layout, size) never changes afterwards.
-    std::vector<Storage*> switched;
+    std::vector<AliasGroup*> switched;
     for (const ArrayPtr& ap : inouts) {
         Array& a = *ap;
-        Storage& s = *a.storage_;
-        if (std::find(switched.begin(), switched.end(), &s) != switched.end()) {
-            continue; // same storage written twice by this op: switched already
+        AliasGroup& g = *a.group_;
+        if (std::find(switched.begin(), switched.end(), &g) != switched.end()) {
+            continue; // same group written twice by this op: switched already
         }
-        const bool pending_readers = s.buffer_->has_readers();
-        // An input reading the same storage through a different view would see
+        const bool pending_readers = g.current_->has_readers();
+        // An input reading the same group through a different view would see
         // partly updated data if the op wrote in place; NumPy semantics are
         // "all inputs read before any output is written".
         bool overlapping_input = false;
         for (const ArrayPtr& in : inputs) {
             overlapping_input = overlapping_input ||
-                                (in->storage_ == a.storage_ && !same_view(in->layout_, a.layout_));
+                                (in->group_ == a.group_ && !same_view(in->layout(), a.layout()));
         }
         if (!pending_readers && !overlapping_input) {
             continue; // write in place
         }
-        switched.push_back(&s);
-        const bool only_view = a.storage_.use_count() == 1;
-        const bool covers_buffer = a.layout_.nbytes() == s.buffer_->nbytes();
+        switched.push_back(&g);
+        const bool only_view = a.group_.use_count() == 1;
+        const bool covers_buffer = a.layout().nbytes() == g.current_->nbytes();
         if (only_view && covers_buffer && kernel->writes_all()) {
             // Consolidated: no copy task. The op reads the old buffer (step 1)
             // and writes a new one with the same layout (as NumPy, the array
             // keeps its strides; later reductions see NumPy's element order).
-            s.buffer_ = make_pooled<Buffer>(s.buffer_->nbytes(), Buffer::deferred);
+            g.current_ =
+                make_pooled<CountableArray>(g.current_->nbytes(), CountableArray::deferred);
         } else {
-            // Views share the storage (or the op writes only part of it, or
+            // Views share the group (or the op writes only part of it, or
             // only some of its elements): the whole old data goes into the new
             // buffer first, views keep their layouts. Not a task of its own:
             // this op does it right before its kernel, when its inputs (the
             // readers that feed it, as in x[i] = f(x[i-1])) are done; a buffer
             // nobody reads any more is then taken over, not copied. Its own
-            // read of the in/outs on `s` (step 1) moves to the new buffer.
-            std::shared_ptr<Buffer> old = s.buffer_;
-            s.buffer_ = make_pooled<Buffer>(old->nbytes(), Buffer::deferred);
+            // read of the in/outs on `g` (step 1) moves to the new buffer.
+            std::shared_ptr<CountableArray> old = g.current_;
+            g.current_ = make_pooled<CountableArray>(old->nbytes(), CountableArray::deferred);
             old->async_reads.fetch_add(1, std::memory_order_relaxed);
-            task->add_copy_on_write(old, s.buffer_);
+            task->add_copy_on_write(old, g.current_);
             for (std::size_t j = 0; j < inouts.size(); ++j) {
-                if (inouts[j]->storage_ == a.storage_) {
-                    in_ops[inputs.size() + j].buffer = s.buffer_;
+                if (inouts[j]->group_ == a.group_) {
+                    in_ops[inputs.size() + j].buffer = g.current_;
                 }
             }
         }
@@ -329,7 +333,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     //    are not counted (see Operand::counted_read).
     for (Operand& op : in_ops) {
         for (const ArrayPtr& ap : inouts) {
-            op.counted_read = op.counted_read && op.buffer != ap->storage_->buffer_;
+            op.counted_read = op.counted_read && op.buffer != ap->group_->current_;
         }
         if (op.counted_read) {
             op.buffer->async_reads.fetch_add(1, std::memory_order_relaxed);
@@ -338,29 +342,31 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
 
     const std::size_t ninputs = in_ops.size();
     for (const ArrayPtr& ap : inouts) {
-        Storage& s = *ap->storage_;
-        // A storage copy issued in step 2 must finish before this op writes.
-        if (s.producer_ && s.producer_ != task &&
-            std::find(producers.begin(), producers.end(), s.producer_) == producers.end()) {
-            producers.push_back(s.producer_);
+        AliasGroup& g = *ap->group_;
+        // A group copy issued in step 2 must finish before this op writes.
+        if (g.last_writer_ && g.last_writer_ != task &&
+            std::find(producers.begin(), producers.end(), g.last_writer_) == producers.end()) {
+            producers.push_back(g.last_writer_);
         }
-        s.producer_ = task;
-        in_ops.push_back({s.buffer_, ap->layout_});
+        g.last_writer_ = task;
+        in_ops.push_back({g.current_, ap->meta_});
     }
     for (std::size_t i = 0; i < new_outputs.size(); ++i) {
         const Layout& l = new_outputs[i];
         if (i < output_buffers.size() && output_buffers[i]) {
-            in_ops.push_back({output_buffers[i], l});
-            results[i] = new_array(l, output_buffers[i], task);
+            MetadataPtr st = make_metadata(l);
+            in_ops.push_back({output_buffers[i], st});
+            results[i] = new_array(std::move(st), output_buffers[i], task);
             continue;
         }
         // Dense layouts (C, F, any axis order) are kept: ufunc results follow
         // NumPy's order (Layout::keep_order).
         Layout contiguous = l.dense() ? l : Layout::contiguous(l.dtype, l.shape);
         // The task takes the memory when it runs (D11).
-        auto buffer = make_pooled<Buffer>(contiguous.nbytes(), Buffer::deferred);
-        in_ops.push_back({buffer, contiguous});
-        results[i] = new_array(std::move(contiguous), std::move(buffer), task);
+        auto buffer = make_pooled<CountableArray>(contiguous.nbytes(), CountableArray::deferred);
+        MetadataPtr st = make_metadata(std::move(contiguous));
+        in_ops.push_back({buffer, st});
+        results[i] = new_array(std::move(st), std::move(buffer), task);
     }
 
     task->set_ninputs(ninputs);
@@ -378,49 +384,51 @@ bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<cons
                            std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
                            const char* issue_site, std::span<ArrayPtr> results,
                            std::int64_t elements,
-                           std::span<const std::shared_ptr<Buffer>> output_buffers) {
+                           std::span<const std::shared_ptr<CountableArray>> output_buffers) {
     if (options_.should_offload || elements >= policy_.options().sync_below) {
         return false;
     }
     for (const ArrayPtr& a : inputs) {
-        Storage& s = *a->storage_;
-        if (!s.ready() || s.last_error_) {
+        AliasGroup& g = *a->group_;
+        if (!g.ready() || g.last_error_) {
             return false;
         }
     }
     for (const ArrayPtr& a : inouts) {
-        Storage& s = *a->storage_;
-        if (!s.ready() || s.last_error_ || s.buffer_->has_readers()) {
+        AliasGroup& g = *a->group_;
+        if (!g.ready() || g.last_error_ || g.current_->has_readers()) {
             return false; // copy-on-write or upstream errors: the task path
         }
         for (const ArrayPtr& in : inputs) {
-            if (in->storage_ == a->storage_ && !same_view(in->layout_, a->layout_)) {
+            if (in->group_ == a->group_ && !same_view(in->layout(), a->layout())) {
                 return false;
             }
         }
     }
     Operands ops;
     for (const ArrayPtr& a : inputs) {
-        ops.push_back({a->storage_->buffer_, a->layout_, false});
+        ops.push_back({a->group_->current_, a->layout(), false});
     }
     for (const ArrayPtr& a : inouts) {
-        ops.push_back({a->storage_->buffer_, a->layout_, false});
+        ops.push_back({a->group_->current_, a->layout(), false});
     }
     const std::size_t ninputs = ops.size();
     for (const ArrayPtr& a : inouts) {
-        ops.push_back({a->storage_->buffer_, a->layout_, false});
+        ops.push_back({a->group_->current_, a->layout(), false});
     }
     for (std::size_t i = 0; i < new_outputs.size(); ++i) {
         const Layout& l = new_outputs[i];
         if (i < output_buffers.size() && output_buffers[i]) {
-            ops.push_back({output_buffers[i], l, false});
-            results[i] = new_array(l, output_buffers[i], nullptr);
+            MetadataPtr st = make_metadata(l);
+            ops.push_back({output_buffers[i], st, false});
+            results[i] = new_array(std::move(st), output_buffers[i], nullptr);
             continue;
         }
         Layout contiguous = l.dense() ? l : Layout::contiguous(l.dtype, l.shape);
-        auto buffer = make_pooled<Buffer>(contiguous.nbytes());
-        ops.push_back({buffer, contiguous, false});
-        results[i] = new_array(std::move(contiguous), std::move(buffer), nullptr);
+        auto buffer = make_pooled<CountableArray>(contiguous.nbytes());
+        MetadataPtr st = make_metadata(std::move(contiguous));
+        ops.push_back({buffer, st, false});
+        results[i] = new_array(std::move(st), std::move(buffer), nullptr);
     }
     ++seq_;
     ++direct_;
@@ -438,10 +446,10 @@ bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<cons
         const ErrorRef e =
             errors_->record(TaskError{std::move(r.message), issue_site, kernel->name(), seq_});
         for (const ArrayPtr& a : inouts) {
-            a->storage_->last_error_ = e;
+            a->group_->last_error_ = e;
         }
         for (std::size_t i = 0; i < new_outputs.size(); ++i) {
-            results[i]->storage_->last_error_ = e;
+            results[i]->group_->last_error_ = e;
         }
     }
     return true;
@@ -468,9 +476,9 @@ void Runtime::trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t 
 }
 
 ErrorRef Runtime::wait(Array& a) {
-    Storage& s = *a.storage_;
-    if (s.producer_) {
-        Task& p = *s.producer_;
+    AliasGroup& g = *a.group_;
+    if (g.last_writer_) {
+        Task& p = *g.last_writer_;
         // Any access right after issuing counts, finished or not: async had
         // nothing to overlap with in between.
         if (p.mark_blocked()) {
@@ -478,18 +486,18 @@ ErrorRef Runtime::wait(Array& a) {
         }
         p.wait_completed();
     }
-    s.ready();
-    return s.last_error_;
+    g.ready();
+    return g.last_error_;
 }
 
 ErrorRef Runtime::prepare_host_write(Array& a) {
     ErrorRef e = wait(a);
-    Storage& s = *a.storage_;
-    if (s.buffer_->host_views > 0) {
-        issue_storage_copy(s);
+    AliasGroup& g = *a.group_;
+    if (g.current_->host_views > 0) {
+        issue_group_copy(g);
         e = wait(a);
     }
-    s.buffer_->wait_task_readers();
+    g.current_->wait_task_readers();
     return e;
 }
 

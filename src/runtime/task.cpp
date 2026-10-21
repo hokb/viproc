@@ -1,5 +1,7 @@
 #include "task.hpp"
 
+#include "pool.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -8,6 +10,23 @@
 #include <exception>
 
 namespace viproc {
+
+namespace {
+using MetadataPool = FixedPool<sizeof(Metadata), alignof(Metadata)>;
+}
+
+MetadataPtr make_metadata(const Layout& sd) {
+    return MetadataPtr(::new (MetadataPool::allocate()) Metadata(sd));
+}
+
+MetadataPtr make_metadata(Layout&& sd) {
+    return MetadataPtr(::new (MetadataPool::allocate()) Metadata(std::move(sd)));
+}
+
+void Metadata::destroy(const Metadata* s) {
+    s->~Metadata();
+    MetadataPool::deallocate(const_cast<Metadata*>(s));
+}
 
 Task::Task(std::shared_ptr<Kernel> kernel, const char* issue_site)
     : kernel_(std::move(kernel)), issue_site_(issue_site) {}
@@ -122,7 +141,7 @@ void Task::allocate_outputs() {
                 // export the main thread read): their reads happen before our
                 // writes.
                 if (!in.counted_read || in.buffer.use_count() != 1 ||
-                    !same_layout(in.layout, out.layout) ||
+                    !same_layout(in.layout(), out.layout()) ||
                     in.buffer->async_reads.load(std::memory_order_acquire) != 1) {
                     continue;
                 }

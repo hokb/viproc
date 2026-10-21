@@ -1,48 +1,56 @@
-// Element memory of arrays.
+// Element memory of arrays: one data version, one handle per device.
 #pragma once
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 
 namespace viproc {
 
-// A block of element memory: up to kInlineBytes inside the Buffer object,
-// larger ones from the element pool (docs/design/memory-management.md, D3,
-// D10, D11). Buffer objects are created by the main thread only (at issue);
-// the last reference may go on any thread, which returns the block to the
-// pool.
+// Devices a CountableArray can hold a copy on. Phase 1: the host only.
+enum Device : std::uint8_t { kHost = 0, kDeviceCount };
+
+// One version of an array's data (docs/design/array-data-model.md, A1): one handle
+// per device, each empty or a valid copy of the same values. Host memory is up
+// to kInlineBytes inside the object, larger blocks come from the element pool
+// (docs/design/memory-management.md, D3, D10, D11). CountableArrays are
+// created by the main thread only (at issue); the last reference may go on
+// any thread, which returns the blocks to their pools. Readers capture the
+// CountableArray they were issued against; copy-on-write points the
+// AliasGroup to a new one, so readers keep their version.
 //
-// A deferred buffer (`Buffer(nbytes, Buffer::deferred)`) takes its block as
-// late as possible: the task producing it calls `ensure_allocated()` or
-// `take_block()` right before its kernel runs, on whatever thread runs it.
+// A deferred buffer (`CountableArray(nbytes, CountableArray::deferred)`)
+// takes its block as late as possible: the task producing it calls
+// `ensure_allocated()` or `take_block()` right before its kernel runs, on
+// whatever thread runs it.
 //
 // Thread safety: the producing task writes `data()` after all tasks it depends
 // on completed; consumers read it only after the producer completed (acquire
 // on the producer's state). `ensure_allocated()` may race with itself (the
 // main thread pinning the memory of a pending buffer, D11): one block wins.
-class Buffer {
+class CountableArray {
   public:
     // A buffer of `nbytes` with uninitialized element memory, taken now.
-    explicit Buffer(std::size_t nbytes);
+    explicit CountableArray(std::size_t nbytes);
     // A buffer of `nbytes` whose memory is taken later (ensure_allocated(),
     // take_block()). Small buffers (inline) have their memory right away.
     struct Deferred {};
     static constexpr Deferred deferred{};
-    Buffer(std::size_t nbytes, Deferred);
+    CountableArray(std::size_t nbytes, Deferred);
     // Wraps memory owned elsewhere (e.g. by a NumPy array); `owner` keeps it alive.
-    Buffer(void* data, std::size_t nbytes, std::shared_ptr<void> owner);
-    ~Buffer();
+    CountableArray(void* data, std::size_t nbytes, std::shared_ptr<void> owner);
+    ~CountableArray();
 
-    Buffer(const Buffer&) = delete;
-    Buffer& operator=(const Buffer&) = delete;
+    CountableArray(const CountableArray&) = delete;
+    CountableArray& operator=(const CountableArray&) = delete;
 
     // Null for a deferred buffer whose memory was not taken yet.
-    std::byte* data() const { return data_.load(std::memory_order_acquire); }
+    std::byte* data() const { return handles_[kHost].data.load(std::memory_order_acquire); }
     bool allocated() const { return data() != nullptr; }
     // Element memory from the element pool (now or, deferred, later): a block
     // of capacity_for(nbytes) bytes, reusable by another buffer of the bin.
-    bool pooled() const { return capacity_ != 0; }
+    bool pooled() const { return handles_[kHost].capacity != 0; }
 
     // Takes the memory of a deferred buffer from the pool if it has none yet
     // (any thread; concurrent calls agree on one block). Returns data().
@@ -51,11 +59,11 @@ class Buffer {
     // block has this buffer's capacity. The caller must hold the only
     // reference to `src` (nobody else can read it); `src` is left without
     // memory. Any thread. False if nothing was moved.
-    bool take_block(Buffer& src);
+    bool take_block(CountableArray& src);
     // Logical size: the bytes the arrays on this buffer cover.
     std::size_t nbytes() const { return nbytes_; }
     // Size of the pool block behind the buffer (0: inline or foreign memory).
-    std::size_t capacity() const { return capacity_; }
+    std::size_t capacity() const { return handles_[kHost].capacity; }
 
     // Number of issued, not yet completed tasks that read this buffer.
     // Incremented only by the main thread (at issue), decremented by the
@@ -95,16 +103,20 @@ class Buffer {
         read_waiters_.fetch_sub(1, std::memory_order_relaxed);
     }
 
-    // Up to this many bytes live inside the Buffer object itself: one
+    // Up to this many bytes live inside the CountableArray object itself: one
     // allocation for small arrays instead of two.
     static constexpr std::size_t kInlineBytes = 128;
 
   private:
     std::atomic<int> read_waiters_{0};
     alignas(64) std::byte inline_[kInlineBytes];
-    std::atomic<std::byte*> data_{nullptr};
+    // Memory on one device; capacity > 0: data is (or will be) a pool block.
+    struct DeviceHandle {
+        std::atomic<std::byte*> data{nullptr};
+        std::size_t capacity = 0;
+    };
+    DeviceHandle handles_[kDeviceCount];
     std::size_t nbytes_;
-    std::size_t capacity_ = 0; // > 0: data_ is (or will be) a pool block
     std::shared_ptr<void> owner_;
 };
 

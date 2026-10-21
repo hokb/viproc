@@ -1,4 +1,4 @@
-// Memory pools for the fixed-size objects created once per op (Task, Buffer,
+// Memory pools for the fixed-size objects created once per op (Task, CountableArray,
 // ArrayBlock): no malloc/free per op once the pools are warm.
 //
 // Each thread keeps a private free list. A thread that allocates from a pool

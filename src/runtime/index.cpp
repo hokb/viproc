@@ -29,7 +29,7 @@ template <class Fn>
 std::string for_each_indexed(const IndexSpec& spec, const Operand& view,
                              std::span<const Operand> index, char* other,
                              const Strides& other_strides, Fn&& fn) {
-    const Layout& vl = view.layout;
+    const Layout& vl = view.layout();
     const std::size_t nr = spec.result_axes.size();
     Shape shape(nr, 0);
     // Per result axis: stride in the view (non-indexed axes) and in each
@@ -46,7 +46,7 @@ std::string for_each_indexed(const IndexSpec& spec, const Operand& view,
             const std::size_t d = static_cast<std::size_t>(-1 - a);
             shape[k] = spec.bshape[d];
             for (std::size_t j = 0; j < index.size(); ++j) {
-                const Layout& il = index[j].layout;
+                const Layout& il = index[j].layout();
                 const std::size_t lead = nb - il.shape.size();
                 if (d >= lead && il.shape[d - lead] != 1) {
                     istride[j][k] = il.strides[d - lead];
@@ -74,7 +74,7 @@ std::string for_each_indexed(const IndexSpec& spec, const Operand& view,
     const std::int64_t n_inner = nr != 0 ? shape[nr - 1] : 1;
     const std::int64_t vs_inner = nr != 0 ? vstride[nr - 1] : 0;
     const std::int64_t os_inner = nr != 0 ? other_strides[nr - 1] : 0;
-    const bool one_int64 = nidx == 1 && index[0].layout.dtype == DType::Int64;
+    const bool one_int64 = nidx == 1 && index[0].layout().dtype == DType::Int64;
     auto bad = [&](std::size_t j, std::int64_t i) {
         return "IndexError: index " + std::to_string(i) + " is out of bounds for axis " +
                std::to_string(spec.index_axes[j]) + " with size " + std::to_string(extent[j]);
@@ -100,7 +100,7 @@ std::string for_each_indexed(const IndexSpec& spec, const Operand& view,
                 char* e = vp + t * vs_inner;
                 for (std::size_t j = 0; j < nidx; ++j) {
                     const std::int64_t i =
-                        read_index(ip[j] + t * inner_is[j], index[j].layout.dtype);
+                        read_index(ip[j] + t * inner_is[j], index[j].layout().dtype);
                     const std::int64_t n = extent[j];
                     if (i < -n || i >= n) {
                         return bad(j, i);
@@ -164,7 +164,7 @@ class GatherKernel : public Kernel {
         // result in its memory order, so the innermost loop writes
         // contiguously (NumPy's index-outer layouts, a[:, idx]).
         IndexSpec spec = spec_;
-        Strides strides = out.layout.strides;
+        Strides strides = out.layout().strides;
         const std::size_t nr = spec.result_axes.size();
         std::vector<std::size_t> order(nr);
         for (std::size_t k = 0; k < nr; ++k) {
@@ -175,9 +175,9 @@ class GatherKernel : public Kernel {
         });
         for (std::size_t k = 0; k < nr; ++k) {
             spec.result_axes[k] = spec_.result_axes[order[k]];
-            strides[k] = out.layout.strides[order[k]];
+            strides[k] = out.layout().strides[order[k]];
         }
-        const std::string e = with_copy(itemsize(out.layout.dtype), [&](auto copy) {
+        const std::string e = with_copy(itemsize(out.layout().dtype), [&](auto copy) {
             return for_each_indexed(spec, inputs[0], inputs.subspan(1),
                                     reinterpret_cast<char*>(out.first()), strides,
                                     [copy](char* src, char* dst) { copy(dst, src); });
@@ -196,10 +196,10 @@ class ScatterKernel : public Kernel {
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Operand& dst = outputs[0];
-        const std::size_t item = itemsize(dst.layout.dtype);
+        const std::size_t item = itemsize(dst.layout().dtype);
         const std::size_t nidx = spec_.index_axes.size();
         // The values, broadcast to the indexing result's shape.
-        const Layout& vl = inputs[0].layout;
+        const Layout& vl = inputs[0].layout();
         const std::size_t nr = spec_.result_axes.size();
         Strides vs(nr, 0);
         const std::size_t lead = nr - vl.shape.size();
@@ -228,10 +228,10 @@ class MaskAssignKernel : public Kernel {
     bool writes_all() const override { return false; }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
-        const Layout& dst = outputs[0].layout;
+        const Layout& dst = outputs[0].layout();
         const std::size_t item = itemsize(dst.dtype);
         const char* value = reinterpret_cast<const char*>(inputs[0].first());
-        std::vector<Layout> layouts{broadcast_to(inputs[1].layout, dst.shape), dst};
+        std::vector<Layout> layouts{broadcast_to(inputs[1].layout(), dst.shape), dst};
         OperandPointers base{reinterpret_cast<char*>(inputs[1].first()),
                              reinterpret_cast<char*>(outputs[0].first())};
         for_each_row(dst.shape, layouts, std::move(base),
@@ -251,11 +251,11 @@ class SelectKernel : public Kernel {
   public:
     const char* name() const override { return "numpy.where"; }
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
-        const Layout& out = outputs[0].layout;
+        const Layout& out = outputs[0].layout();
         const std::size_t item = itemsize(out.dtype);
-        std::vector<Layout> layouts{broadcast_to(inputs[0].layout, out.shape),
-                                    broadcast_to(inputs[1].layout, out.shape),
-                                    broadcast_to(inputs[2].layout, out.shape), out};
+        std::vector<Layout> layouts{broadcast_to(inputs[0].layout(), out.shape),
+                                    broadcast_to(inputs[1].layout(), out.shape),
+                                    broadcast_to(inputs[2].layout(), out.shape), out};
         OperandPointers base{reinterpret_cast<char*>(inputs[0].first()),
                              reinterpret_cast<char*>(inputs[1].first()),
                              reinterpret_cast<char*>(inputs[2].first()),

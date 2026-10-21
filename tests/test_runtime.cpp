@@ -61,14 +61,14 @@ double* f64(const Operand& op) { return reinterpret_cast<double*>(op.first()); }
 
 // Element i of a 1-d (possibly strided) float64 operand.
 double& at(const Operand& op, std::int64_t i) {
-    return *reinterpret_cast<double*>(op.first() + i * op.layout.strides[0]);
+    return *reinterpret_cast<double*>(op.first() + i * op.layout().strides[0]);
 }
 
 Layout vec(std::int64_t n) { return Layout::contiguous(DType::Float64, {n}); }
 
 ArrayPtr make_ready(Runtime& rt, std::int64_t n, double value) {
     Layout l = vec(n);
-    auto b = std::make_shared<Buffer>(l.nbytes());
+    auto b = std::make_shared<CountableArray>(l.nbytes());
     std::fill_n(reinterpret_cast<double*>(b->data()), n, value);
     return rt.wrap(l, b);
 }
@@ -80,7 +80,7 @@ std::shared_ptr<Kernel> add_const(double c, std::chrono::milliseconds delay = 0m
     return std::make_shared<FnKernel>(
         [c, delay](auto in, auto out) {
             std::this_thread::sleep_for(delay);
-            const std::int64_t n = out[0].layout.size();
+            const std::int64_t n = out[0].layout().size();
             for (std::int64_t i = 0; i < n; ++i) {
                 at(out[0], i) = at(in[0], i) + c;
             }
@@ -93,7 +93,7 @@ std::shared_ptr<Kernel> add_const(double c, std::chrono::milliseconds delay = 0m
 std::shared_ptr<Kernel> add_all(bool in_place = false) {
     return std::make_shared<FnKernel>(
         [](auto in, auto out) {
-            const std::int64_t n = out[0].layout.size();
+            const std::int64_t n = out[0].layout().size();
             for (std::int64_t i = 0; i < n; ++i) {
                 double s = 0;
                 for (const Operand& op : in) {
@@ -220,7 +220,7 @@ void test_inout_in_place() {
     Runtime rt(opts(2));
     ArrayPtr a = make_ready(rt, 8, 1.0);
     ArrayPtr one = make_ready(rt, 8, 1.0);
-    Buffer* before = a->buffer().get();
+    CountableArray* before = a->buffer().get();
     std::vector<ArrayPtr> in{one};
     std::vector<ArrayPtr> io{a};
     rt.issue(add_all(), in, io, {}, "a += 1");
@@ -234,7 +234,7 @@ void test_inout_chain_stays_in_place() {
     Runtime rt(opts(2));
     ArrayPtr gate = issue1(rt, add_const(0.0, 30ms), {make_ready(rt, 8, 0.0)}, 8);
     ArrayPtr a = make_ready(rt, 8, 1.0);
-    Buffer* before = a->buffer().get();
+    CountableArray* before = a->buffer().get();
     std::vector<ArrayPtr> io{a};
     for (int k = 0; k < 3; ++k) {
         std::vector<ArrayPtr> in{gate}; // pending: the in/out ops stay pending too
@@ -248,7 +248,7 @@ void test_prepare_host_write() {
     Runtime rt(opts(2));
     // Live NumPy views (host_views): the storage moves to a copy first.
     ArrayPtr a = make_ready(rt, 8, 3.0);
-    std::shared_ptr<Buffer> exported = a->buffer(); // held, as a read-only export does
+    std::shared_ptr<CountableArray> exported = a->buffer(); // held, as a read-only export does
     ++exported->host_views;
     rt.prepare_host_write(*a);
     check(a->buffer() != exported && value(rt, a, 7) == 3.0,
@@ -257,7 +257,7 @@ void test_prepare_host_write() {
     // Issued readers: waits until they are done, keeps the buffer.
     ArrayPtr b = make_ready(rt, 8, 1.0);
     ArrayPtr reader = issue1(rt, add_const(1.0, 30ms), {b}, 8);
-    Buffer* kept = b->buffer().get();
+    CountableArray* kept = b->buffer().get();
     rt.prepare_host_write(*b);
     check(b->buffer().get() == kept && b->buffer()->async_reads.load() == 0 && reader->ready(),
           "prepare_host_write: waits for issued readers, writes in place");
@@ -270,7 +270,7 @@ void test_copy_on_write() {
     // Pending reader of `a`: waits on a slow gate, so it reads `a` later.
     ArrayPtr gate = issue1(rt, add_const(0.0, 50ms), {make_ready(rt, 8, 0.0)}, 8);
     ArrayPtr reader = issue1(rt, add_all(), {gate, a}, 8);
-    Buffer* before = a->buffer().get();
+    CountableArray* before = a->buffer().get();
     check(before->async_reads.load() == 1, "a has one pending reader");
     std::vector<ArrayPtr> in{one};
     std::vector<ArrayPtr> io{a};
@@ -285,7 +285,7 @@ void test_view_write_visible_in_base() {
     Runtime rt(opts(2));
     ArrayPtr base = make_ready(rt, 8, 0.0);
     ArrayPtr even = slice(rt, base, 0, 2, 4); // base[0::2]
-    Buffer* before = base->buffer().get();
+    CountableArray* before = base->buffer().get();
     inplace_add(rt, even, make_ready(rt, 4, 1.0)); // base[0::2] += 1
     check(base->buffer().get() == before, "view write without readers is in place");
     check(!base->ready() || value(rt, base, 0) == 1.0,
@@ -314,7 +314,7 @@ void test_view_copy_on_write() {
     // Pending reader of the whole base.
     ArrayPtr gate = issue1(rt, add_const(0.0, 50ms), {make_ready(rt, 8, 0.0)}, 8);
     ArrayPtr reader = issue1(rt, add_all(), {gate, base}, 8);
-    Buffer* before = base->buffer().get();
+    CountableArray* before = base->buffer().get();
     inplace_add(rt, even, make_ready(rt, 4, 1.0)); // base[0::2] += 1
     check(base->buffer().get() != before && base->buffer() == even->buffer(),
           "view write with pending reader: base and view switch to a new buffer together");
@@ -332,7 +332,7 @@ void test_consolidated_copy_on_write_of_strided_array() {
     Layout rev = vec(4);
     rev.strides[0] = -8;
     rev.offset = 24;
-    auto b = std::make_shared<Buffer>(rev.nbytes());
+    auto b = std::make_shared<CountableArray>(rev.nbytes());
     for (int i = 0; i < 4; ++i) {
         reinterpret_cast<double*>(b->data())[i] = i; // logical a = [3, 2, 1, 0]
     }
@@ -353,7 +353,7 @@ void test_overlapping_inplace() {
     Runtime rt(opts(2));
     // a += a[::-1] must read all of `a` before writing (NumPy semantics).
     Layout l = vec(6);
-    auto b = std::make_shared<Buffer>(l.nbytes());
+    auto b = std::make_shared<CountableArray>(l.nbytes());
     for (int i = 0; i < 6; ++i) {
         reinterpret_cast<double*>(b->data())[i] = i;
     }
@@ -583,7 +583,7 @@ std::atomic<bool> on_main_thread_last{false};
 std::shared_ptr<Kernel> add_one_where(std::thread::id main) {
     return std::make_shared<FnKernel>([main](auto in, auto out) {
         on_main_thread_last = std::this_thread::get_id() == main;
-        const std::int64_t n = out[0].layout.size();
+        const std::int64_t n = out[0].layout().size();
         for (std::int64_t i = 0; i < n; ++i) {
             at(out[0], i) = at(in[0], i) + 1;
         }
@@ -674,7 +674,7 @@ void test_deferred_allocation() {
         while (!open.load()) {
             std::this_thread::sleep_for(1ms);
         }
-        for (std::int64_t i = 0; i < out[0].layout.size(); ++i) {
+        for (std::int64_t i = 0; i < out[0].layout().size(); ++i) {
             at(out[0], i) = at(in[0], i);
         }
         return KernelResult{};
@@ -683,7 +683,7 @@ void test_deferred_allocation() {
     auto record = std::make_shared<FnKernel>(
         [&a_memory](auto in, auto out) {
             a_memory = out[0].buffer->data();
-            for (std::int64_t i = 0; i < out[0].layout.size(); ++i) {
+            for (std::int64_t i = 0; i < out[0].layout().size(); ++i) {
                 at(out[0], i) = at(in[0], i) + 1;
             }
             return KernelResult{};
@@ -789,12 +789,12 @@ void test_element_pool() {
     pool.set_limit(std::size_t{1} << 30);
     void* first = nullptr;
     {
-        Buffer buf(8 * 50000);
+        CountableArray buf(8 * 50000);
         first = buf.data();
         check(buf.capacity() >= buf.nbytes(), "buffer: memory from the pool at creation");
     }
     {
-        Buffer buf(8 * 50000);
+        CountableArray buf(8 * 50000);
         check(buf.data() == first, "buffer: released memory is reused by the next buffer");
     }
     pool.trim();

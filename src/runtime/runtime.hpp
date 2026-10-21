@@ -1,7 +1,7 @@
 // The runtime: issues array ops as tasks and runs them on worker threads.
 #pragma once
 
-#include "buffer.hpp"
+#include "countable_array.hpp"
 #include "layout.hpp"
 #include "offload.hpp"
 #include "ref.hpp"
@@ -27,81 +27,89 @@ inline constexpr std::size_t kDefaultMaxActiveTasks = 1000;
 
 struct ArrayBlock;
 
-// Shared storage of a base array and all of its views. Main-thread only.
+// The node a base array and all of its views share (docs/design/array-data-model.md,
+// A1). Main-thread only.
 //
-// The storage, not the individual array, carries the data version (buffer)
-// and the last task writing it (producer): a write through one view makes the
-// base and all other views pending, and copy-on-write switches all of them to
-// the new buffer together.
+// The group, not the individual array, carries the current data version
+// (`current`, a CountableArray) and the last task writing it (`last_writer`):
+// a write through one view makes the base and all other views pending, and
+// copy-on-write switches all of them to the new version together, without
+// viproc knowing the views.
 //
-// State: `pending` while `producer` is set and not completed, `ready`
-// otherwise. Only the main thread sets `producer` (ready -> pending); the
-// producer completing makes it ready. So a ready storage stays ready until the
+// State: `pending` while `last_writer` is set and not completed, `ready`
+// otherwise. Only the main thread sets `last_writer` (ready -> pending); the
+// writer completing makes it ready. So a ready group stays ready until the
 // main thread issues a new write to it.
-class Storage : public MainThreadCounted {
+class AliasGroup : public MainThreadCounted {
   public:
-    Storage(std::shared_ptr<Buffer> buffer, std::shared_ptr<Task> producer, ArrayBlock* block)
-        : buffer_(std::move(buffer)), producer_(std::move(producer)), block_(block) {}
+    AliasGroup(std::shared_ptr<CountableArray> current, std::shared_ptr<Task> last_writer,
+               ArrayBlock* block)
+        : current_(std::move(current)), last_writer_(std::move(last_writer)), block_(block) {}
 
-    const std::shared_ptr<Buffer>& buffer() const { return buffer_; }
-    // Last task that writes this storage; null once known to be completed.
-    const std::shared_ptr<Task>& producer() const { return producer_; }
-    // Error of the last completed producer, if it failed (a reference into
+    const std::shared_ptr<CountableArray>& current() const { return current_; }
+    // Last task that writes this group; null once known to be completed.
+    const std::shared_ptr<Task>& last_writer() const { return last_writer_; }
+    // Error of the last completed writer, if it failed (a reference into
     // the runtime's ErrorTable).
     const ErrorRef& last_error() const { return last_error_; }
 
     bool ready() {
-        if (producer_ && producer_->completed()) {
-            if (producer_->error()) {
-                last_error_ = producer_->error();
+        if (last_writer_ && last_writer_->completed()) {
+            if (last_writer_->error()) {
+                last_error_ = last_writer_->error();
             }
-            producer_.reset(); // break the storage -> task reference early
+            last_writer_.reset(); // break the group -> task reference early
         }
-        return !producer_;
+        return !last_writer_;
     }
 
-    static void last_ref_dropped(Storage* s);
+    static void last_ref_dropped(AliasGroup* g);
 
   private:
     friend class Runtime;
 
-    std::shared_ptr<Buffer> buffer_;
-    std::shared_ptr<Task> producer_;
+    std::shared_ptr<CountableArray> current_;
+    std::shared_ptr<Task> last_writer_;
     ErrorRef last_error_;
     ArrayBlock* block_;
 };
 
-// An array as seen by the main thread: a layout (view) onto a shared storage.
-// Main-thread only: workers never touch Array or Storage objects, only the
-// Buffers and Tasks they refer to.
+// An array as seen by the main thread (docs/design/array-data-model.md, A1): its
+// Metadata (size descriptor) and its AliasGroup (data). Main-thread only:
+// workers never touch Array or AliasGroup objects, only the Metadata
+// objects, CountableArrays and Tasks they refer to. The array, not its Metadata, holds
+// the group (A5): a task's operand keeps the Metadata alive, and must not keep
+// the group's current version alive with it (run-time elision, D11).
 class Array : public MainThreadCounted {
   public:
-    Array(Layout&& layout, Ref<Storage> storage, ArrayBlock* block)
-        : layout_(std::move(layout)), storage_(std::move(storage)), block_(block) {}
+    Array(MetadataPtr meta, Ref<AliasGroup> group, ArrayBlock* block)
+        : meta_(std::move(meta)), group_(std::move(group)), block_(block) {}
 
-    const Layout& layout() const { return layout_; }
-    const Ref<Storage>& storage() const { return storage_; }
-    const std::shared_ptr<Buffer>& buffer() const { return storage_->buffer(); }
-    const std::shared_ptr<Task>& producer() const { return storage_->producer(); }
-    bool ready() { return storage_->ready(); }
+    const Layout& layout() const { return meta_->sd(); }
+    const MetadataPtr& meta() const { return meta_; }
+    const Ref<AliasGroup>& group() const { return group_; }
+    // The current data version.
+    const std::shared_ptr<CountableArray>& buffer() const { return group_->current(); }
+    const std::shared_ptr<Task>& producer() const { return group_->last_writer(); }
+    bool ready() { return group_->ready(); }
 
     static void last_ref_dropped(Array* a);
 
   private:
     friend class Runtime;
 
-    Layout layout_;
-    Ref<Storage> storage_;
+    MetadataPtr meta_;
+    Ref<AliasGroup> group_;
     ArrayBlock* block_;
 };
 
-// One allocation for an array and, for a base array, its storage. Each
-// object is destroyed when its last reference goes; the block is freed when
-// both are gone. (The base array's reference to its own storage is an
-// ordinary one: the storage outlives it only while views refer to it.)
+// One allocation for an array and, for a base array, its group. Each object
+// is destroyed when its last reference goes; the block is freed when both are
+// gone. (The base array's reference to its own group is an ordinary one: the
+// group outlives it only while views refer to it.)
 struct ArrayBlock {
     int alive = 0; // objects not yet destroyed
-    std::optional<Storage> storage;
+    std::optional<AliasGroup> group;
     std::optional<Array> array;
 };
 
@@ -130,9 +138,9 @@ class Runtime {
     // --- Main thread only ---------------------------------------------------
 
     // A ready array over existing memory.
-    ArrayPtr wrap(Layout layout, std::shared_ptr<Buffer> buffer);
-    // A view of `base`: same storage, different layout (shape, strides,
-    // offset into the storage's buffer). Metadata only, no task.
+    ArrayPtr wrap(Layout layout, std::shared_ptr<CountableArray> buffer);
+    // A view of `base`: same alias group, different layout (shape, strides,
+    // offset into its current data version). Metadata only, no task.
     ArrayPtr view(const ArrayPtr& base, Layout&& layout);
 
     // Issues one array op and returns immediately.
@@ -163,7 +171,7 @@ class Runtime {
     void issue(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
                std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
                const char* issue_site, std::span<ArrayPtr> results, std::int64_t work_elements = -1,
-               std::span<const std::shared_ptr<Buffer>> output_buffers = {});
+               std::span<const std::shared_ptr<CountableArray>> output_buffers = {});
     std::vector<ArrayPtr> issue(const std::shared_ptr<Kernel>& kernel,
                                 std::span<const ArrayPtr> inputs, std::span<const ArrayPtr> inouts,
                                 std::span<const Layout> new_outputs, const char* issue_site);
@@ -173,7 +181,7 @@ class Runtime {
     ErrorRef wait(Array& a);
     // Sync point before NumPy code on the main thread writes `a`'s buffer
     // directly (design doc D7): waits for `a`'s producer; if NumPy views of
-    // the buffer are alive (host_views), switches the storage to a copy first
+    // the buffer are alive (host_views), switches the group to a copy first
     // (copy-on-write, so those views keep their data); then waits until no
     // issued task reads the buffer. Afterwards nothing but the caller touches
     // the buffer until the main thread issues the next op.
@@ -203,14 +211,14 @@ class Runtime {
     bool issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
                       std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
                       const char* issue_site, std::span<ArrayPtr> results, std::int64_t elements,
-                      std::span<const std::shared_ptr<Buffer>> output_buffers);
+                      std::span<const std::shared_ptr<CountableArray>> output_buffers);
     void acquire_slot();
     // Registers `task` on its pending producers and triggers it if none.
     void launch(const std::shared_ptr<Task>& task,
                 const std::vector<std::shared_ptr<Task>>& producers, std::int64_t elements);
-    // Copy-on-write with views: switches `s` to a new buffer holding a copy of
+    // Copy-on-write with views: switches `g` to a new version holding a copy of
     // the old data (issued as its own task); views keep their layouts.
-    void issue_storage_copy(Storage& s);
+    void issue_group_copy(AliasGroup& g);
 
     RuntimeOptions options_;
     std::shared_ptr<ErrorTable> errors_ = std::make_shared<ErrorTable>();
