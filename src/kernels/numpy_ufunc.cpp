@@ -565,6 +565,94 @@ class ElementwiseKernel : public Kernel {
     const UfuncLoop* loop_;
 };
 
+// ufunc.at(a, idx, b) with a 1-d index into axis 0 (see make_at_kernel).
+class AtKernel : public Kernel {
+  public:
+    explicit AtKernel(const UfuncLoop* loop)
+        : loop_(loop), name_(std::string(loop->name()) + ".at") {}
+    const char* name() const override { return name_.c_str(); }
+    bool writes_all() const override { return false; }
+
+    KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
+        const Layout& al = outputs[0].layout();
+        const Layout& xl = inputs[0].layout();
+        const std::int64_t n = xl.shape[0];
+        const std::int64_t extent = al.shape[0];
+        const char* xp = reinterpret_cast<const char*>(inputs[0].first());
+        const bool i64 = xl.dtype == DType::Int64;
+        auto index = [&](std::int64_t i) {
+            const char* p = xp + i * xl.strides[0];
+            std::int64_t v;
+            if (i64) {
+                std::memcpy(&v, p, sizeof v);
+            } else {
+                std::int32_t w;
+                std::memcpy(&w, p, sizeof w);
+                v = w;
+            }
+            return v;
+        };
+        // NumPy checks every index before it changes anything
+        // (PyArray_MapIterCheckIndices)
+        for (std::int64_t i = 0; i < n; ++i) {
+            const std::int64_t v = index(i);
+            if (v < -extent || v >= extent) {
+                return {1,
+                        "IndexError: index " + std::to_string(v) +
+                            " is out of bounds for axis 0 with size " + std::to_string(extent),
+                        0};
+            }
+        }
+        // the subspace: a's other axes, in C order; b broadcast to idx.shape + it
+        Shape sub(al.shape.begin() + 1, al.shape.end());
+        Shape full = al.shape; // idx.shape + a.shape[1:]
+        full[0] = n;
+        const bool binary = loop_->nin() == 2;
+        Layout bl;
+        const char* bp = nullptr;
+        if (binary) {
+            bl = broadcast_to(inputs[1].layout(), full);
+            bp = reinterpret_cast<const char*>(inputs[1].first());
+        }
+        char* ap = reinterpret_cast<char*>(outputs[0].first());
+        const std::size_t ns = sub.size();
+        std::int64_t total = 1;
+        for (std::int64_t e : sub) {
+            total *= e;
+        }
+        SmallVector<std::int64_t, kInlineRank> idx(ns, 0);
+        const std::intptr_t strides[3] = {0, 0, 0};
+        std::intptr_t one = 1;
+        for (std::int64_t i = 0; i < n; ++i) {
+            const std::int64_t v = index(i);
+            char* a = ap + (v < 0 ? v + extent : v) * al.strides[0];
+            char* b = binary ? const_cast<char*>(bp) + i * bl.strides[0] : a;
+            for (std::int64_t j = 0; j < total; ++j) {
+                // ufunc_at__fast_iter: one element per call, a is in and out
+                char* data[3] = {a, b, a};
+                if (loop_->call(data, &one, strides) != 0) {
+                    return {1, take_loop_error(), 0};
+                }
+                for (std::size_t k = ns; k-- > 0;) {
+                    if (++idx[k] < sub[k]) {
+                        a += al.strides[k + 1];
+                        b += binary ? bl.strides[k + 1] : al.strides[k + 1];
+                        break;
+                    }
+                    a -= (sub[k] - 1) * al.strides[k + 1];
+                    b -= (sub[k] - 1) * (binary ? bl.strides[k + 1] : al.strides[k + 1]);
+                    idx[k] = 0;
+                }
+            }
+        }
+        return {};
+    }
+
+  private:
+    const UfuncLoop* loop_;
+    std::string name_;
+};
+
 // NumPy's C/F contiguity flags (extent-1 dimensions may have any stride).
 bool f_contiguous(const Layout& l) {
     std::int64_t step = static_cast<std::int64_t>(itemsize(l.dtype));
@@ -596,13 +684,16 @@ namespace {
 // NumPy's element-wise ufunc loop over its iterator (execute_ufunc_loop).
 class IterElementwiseKernel : public Kernel {
   public:
-    IterElementwiseKernel(const UfuncLoop* loop, NpyIter* iter, std::shared_ptr<IterTemplate> pool)
-        : loop_(loop), iter_(iter), pool_(std::move(pool)) {}
+    IterElementwiseKernel(const UfuncLoop* loop, NpyIter* iter, std::shared_ptr<IterTemplate> pool,
+                          bool masked)
+        : loop_(loop), iter_(iter), pool_(std::move(pool)), masked_(masked) {}
 
     ~IterElementwiseKernel() override { pool_->give_back(iter_, clean_); }
     const char* name() const override { return loop_->name(); }
 
     bool in_place_ok() const override { return true; }
+    // where=: masked-off elements of the output keep their values
+    bool writes_all() const override { return !masked_; }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const auto nin = static_cast<std::size_t>(loop_->nin());
@@ -610,8 +701,12 @@ class IterElementwiseKernel : public Kernel {
         for (std::size_t i = 0; i < nin; ++i) {
             base[i] = reinterpret_cast<char*>(inputs[i].first());
         }
-        for (std::size_t j = 0; j < static_cast<std::size_t>(loop_->nout()); ++j) {
-            base[nin + j] = reinterpret_cast<char*>(outputs[j].first());
+        const auto nop = nin + static_cast<std::size_t>(loop_->nout());
+        for (std::size_t j = nin; j < nop; ++j) {
+            base[j] = reinterpret_cast<char*>(outputs[j - nin].first());
+        }
+        if (masked_) {
+            base[nop] = reinterpret_cast<char*>(inputs[nin].first()); // the where= mask
         }
         char* errmsg = nullptr;
         clean_ = false;
@@ -621,12 +716,49 @@ class IterElementwiseKernel : public Kernel {
             return {1, errmsg != nullptr ? errmsg : "NpyIter_ResetBasePointers failed", 0};
         }
         do {
-            if (loop_->call(dataptr_, countptr_, strideptr_) != 0) {
+            const int r = masked_ ? masked_call(nop) : loop_->call(dataptr_, countptr_, strideptr_);
+            if (r != 0) {
                 return {1, take_loop_error(), 0};
             }
         } while (iternext_(iter_));
         clean_ = true;
         return {};
+    }
+
+    // NumPy's generic_masked_strided_loop (array_method.c): the loop is
+    // called once per run of True mask values, the False ones are skipped.
+    int masked_call(std::size_t nop) const {
+        char* ptrs[kMaxOps];
+        std::copy(dataptr_, dataptr_ + nop, ptrs);
+        const char* mask = dataptr_[nop];
+        const npy_intp ms = strideptr_[nop];
+        npy_intp n = *countptr_;
+        while (n > 0) {
+            npy_intp skip = 0;
+            while (skip < n && *mask == 0) {
+                mask += ms;
+                ++skip;
+            }
+            n -= skip;
+            npy_intp run = 0;
+            while (run < n && *mask != 0) {
+                mask += ms;
+                ++run;
+            }
+            for (std::size_t i = 0; i < nop; ++i) {
+                ptrs[i] += skip * strideptr_[i];
+            }
+            if (run > 0) {
+                if (loop_->call(ptrs, &run, strideptr_) != 0) {
+                    return -1;
+                }
+                for (std::size_t i = 0; i < nop; ++i) {
+                    ptrs[i] += run * strideptr_[i];
+                }
+                n -= run;
+            }
+        }
+        return 0;
     }
 
     NpyIter_IterNextFunc* iternext_ = nullptr;
@@ -639,6 +771,7 @@ class IterElementwiseKernel : public Kernel {
     NpyIter* iter_;
     std::shared_ptr<IterTemplate> pool_;
     bool clean_ = true; // a fresh copy has nothing in its buffers
+    bool masked_;
 };
 
 npy_intp numpy_buffersize() {
@@ -672,6 +805,10 @@ PyArrayObject* template_array(const Layout& l, char* data, bool writable) {
 char* template_address() {
     alignas(64) static char dummy[64];
     return dummy;
+}
+
+std::shared_ptr<Kernel> make_at_kernel(const UfuncLoop* loop) {
+    return std::make_shared<AtKernel>(loop);
 }
 
 std::shared_ptr<Kernel> make_elementwise_kernel(const UfuncLoop* loop) {
@@ -886,10 +1023,12 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
                                                     std::span<const DType> dtypes,
                                                     std::span<const Layout> inputs,
                                                     std::span<const Layout> outs, bool out_given,
-                                                    DeferRelease defer, std::string& error) {
+                                                    DeferRelease defer, std::string& error,
+                                                    const Layout* mask) {
     const std::size_t nin = inputs.size();
     const std::size_t nop = nin + outs.size();
-    if (nop > kMaxOps || static_cast<int>(nin) != loop->nin() ||
+    const std::size_t nit = nop + (mask != nullptr ? 1 : 0);
+    if (nit > kMaxOps || static_cast<int>(nin) != loop->nin() ||
         static_cast<int>(outs.size()) != loop->nout()) {
         error = "unsupported number of operands";
         return nullptr;
@@ -900,8 +1039,9 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
     put(reinterpret_cast<std::intptr_t>(loop));
     put(out_given ? 1 : 0);
     put(bufsize);
-    for (std::size_t i = 0; i < nop; ++i) {
-        const Layout& l = i < nin ? inputs[i] : outs[i - nin];
+    put(mask != nullptr ? 1 : 0);
+    for (std::size_t i = 0; i < nit; ++i) {
+        const Layout& l = i < nin ? inputs[i] : i < nop ? outs[i - nin] : *mask;
         put(static_cast<std::int64_t>(l.shape.size()));
         put(static_cast<std::int64_t>(l.dtype));
         for (std::size_t d = 0; d < l.shape.size(); ++d) {
@@ -925,38 +1065,67 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
         PyArray_Descr* descrs[kMaxOps] = {};
         npy_uint32 op_flags[kMaxOps];
         bool ok = true;
-        for (std::size_t i = 0; i < nop && ok; ++i) {
-            const Layout& l = i < nin ? inputs[i] : outs[i - nin];
-            op[i] = template_array(l, dummy, i >= nin);
+        for (std::size_t i = 0; i < nit && ok; ++i) {
+            const Layout& l = i < nin ? inputs[i] : i < nop ? outs[i - nin] : *mask;
+            op[i] = template_array(l, dummy, i >= nin && i < nop);
             ok = op[i] != nullptr;
+            if (i == nop) { // the where= mask: its own dtype (bool), not buffered for a cast
+                descrs[i] = nullptr;
+                op_flags[i] = NPY_ITER_READONLY | NPY_ITER_ARRAYMASK;
+                continue;
+            }
             // The loop's dtypes; operands of another dtype are cast in the
             // iterator's buffers, as in NumPy.
             descrs[i] = PyArray_DescrFromType(type_num(dtypes[i]));
             // NumPy's default operand flags for ufuncs (ufunc_object.c,
             // NPY_UFUNC_DEFAULT_INPUT_FLAGS / _OUTPUT_FLAGS with WRITEONLY;
             // ALLOCATE does nothing for a given output).
+            // With where=, PyUFunc_GenericFunctionInternal adds WRITEMASKED
+            // and execute_ufunc_loop READWRITE for a given output (WRITEONLY
+            // for one it allocates).
+            const npy_uint32 out_access = mask == nullptr ? NPY_ITER_WRITEONLY
+                                          : out_given ? NPY_ITER_READWRITE | NPY_ITER_WRITEMASKED
+                                                      : NPY_ITER_WRITEONLY | NPY_ITER_WRITEMASKED;
             op_flags[i] =
                 i < nin ? NPY_ITER_READONLY | NPY_ITER_ALIGNED | NPY_ITER_OVERLAP_ASSUME_ELEMENTWISE
-                        : NPY_ITER_WRITEONLY | NPY_ITER_ALIGNED | NPY_ITER_NO_BROADCAST |
+                        : out_access | NPY_ITER_ALIGNED | NPY_ITER_NO_BROADCAST |
                               NPY_ITER_NO_SUBTYPE | NPY_ITER_OVERLAP_ASSUME_ELEMENTWISE;
         }
+        PyObject* ufunc = loop->ufunc();
+        const npy_uint32 uflags =
+            ufunc != nullptr ? reinterpret_cast<PyUFuncObject*>(ufunc)->iter_flags : 0;
+        // execute_ufunc_loop's flags, without COPY_IF_OVERLAP (see
+        // above). An output NumPy allocates is never reversed (no
+        // negative strides): DONT_NEGATE_STRIDES keeps it that way with
+        // viproc's output.
+        const npy_uint32 flags = uflags | NPY_ITER_EXTERNAL_LOOP | NPY_ITER_REFS_OK |
+                                 NPY_ITER_ZEROSIZE_OK | NPY_ITER_BUFFERED | NPY_ITER_GROWINNER |
+                                 NPY_ITER_DELAY_BUFALLOC |
+                                 (out_given ? 0 : NPY_ITER_DONT_NEGATE_STRIDES);
         if (ok) {
-            PyObject* ufunc = loop->ufunc();
-            const npy_uint32 uflags =
-                ufunc != nullptr ? reinterpret_cast<PyUFuncObject*>(ufunc)->iter_flags : 0;
-            // execute_ufunc_loop's flags, without COPY_IF_OVERLAP (see
-            // above). An output NumPy allocates is never reversed (no
-            // negative strides): DONT_NEGATE_STRIDES keeps it that way with
-            // viproc's output.
-            const npy_uint32 flags = uflags | NPY_ITER_EXTERNAL_LOOP | NPY_ITER_REFS_OK |
-                                     NPY_ITER_ZEROSIZE_OK | NPY_ITER_BUFFERED | NPY_ITER_GROWINNER |
-                                     NPY_ITER_DELAY_BUFALLOC |
-                                     (out_given ? 0 : NPY_ITER_DONT_NEGATE_STRIDES);
-            templ = NpyIter_AdvancedNew(static_cast<int>(nop), op, flags, NPY_KEEPORDER,
+            templ = NpyIter_AdvancedNew(static_cast<int>(nit), op, flags, NPY_KEEPORDER,
                                         NPY_UNSAFE_CASTING, op_flags, descrs, -1, nullptr, nullptr,
                                         bufsize);
         }
-        for (std::size_t i = 0; i < nop; ++i) {
+        pool = std::make_shared<IterTemplate>();
+        if (templ != nullptr && mask != nullptr) {
+            // masked: new iterators from the same arguments (IterTemplate)
+            std::vector<PyArrayObject*> ops(op, op + nit);
+            std::vector<PyArray_Descr*> ds(descrs, descrs + nit);
+            std::vector<npy_uint32> fl(op_flags, op_flags + nit);
+            for (std::size_t i = 0; i < nit; ++i) {
+                Py_XINCREF(op[i]);
+                Py_XINCREF(descrs[i]);
+                pool->owned.push_back(reinterpret_cast<PyObject*>(op[i]));
+                pool->owned.push_back(reinterpret_cast<PyObject*>(descrs[i]));
+            }
+            pool->fresh = [ops, ds, fl, flags, bufsize]() mutable {
+                return NpyIter_AdvancedNew(static_cast<int>(ops.size()), ops.data(), flags,
+                                           NPY_KEEPORDER, NPY_UNSAFE_CASTING, fl.data(), ds.data(),
+                                           -1, nullptr, nullptr, bufsize);
+            };
+        }
+        for (std::size_t i = 0; i < nit; ++i) {
             Py_XDECREF(op[i]); // the iterator holds its own references
             Py_XDECREF(descrs[i]);
         }
@@ -972,7 +1141,6 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
         if (iter_templates_.size() >= kMaxIterTemplates) {
             iter_templates_.clear();
         }
-        pool = std::make_shared<IterTemplate>();
         pool->templ = templ;
         pool->defer = std::move(defer);
         iter_templates_.emplace(std::move(key), pool);
@@ -982,7 +1150,7 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
         error = fetch_python_error();
         return nullptr;
     }
-    auto kernel = std::make_shared<IterElementwiseKernel>(loop, iter, pool);
+    auto kernel = std::make_shared<IterElementwiseKernel>(loop, iter, pool, mask != nullptr);
     kernel->iternext_ = NpyIter_GetIterNext(iter, nullptr);
     if (kernel->iternext_ == nullptr) {
         error = fetch_python_error();

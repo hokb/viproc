@@ -6,6 +6,7 @@
 #include "kernels/numpy_ufunc.hpp"
 
 #include <cstddef>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -26,13 +27,23 @@ struct IterTemplate {
     DeferRelease defer;
     std::mutex mutex;
     std::vector<NpyIter*> free; // finished iterators, ready for a reset
+    // Set for iterators NpyIter_Copy cannot copy: a new one is made this
+    // way instead (where= masks: NumPy 2.x's copy of a masked buffered
+    // transfer frees its data twice). `owned`: Python references `fresh`
+    // uses, released with the template.
+    std::function<NpyIter*()> fresh;
+    std::vector<PyObject*> owned;
 
     ~IterTemplate() {
         std::vector<NpyIter*> all = std::move(free);
         all.push_back(templ);
-        defer([all] {
+        std::vector<PyObject*> refs = std::move(owned);
+        defer([all, refs] {
             for (NpyIter* it : all) {
                 NpyIter_Deallocate(it);
+            }
+            for (PyObject* o : refs) {
+                Py_XDECREF(o);
             }
         });
     }
@@ -48,7 +59,7 @@ struct IterTemplate {
                 return it;
             }
         }
-        return NpyIter_Copy(templ);
+        return fresh ? fresh() : NpyIter_Copy(templ);
     }
 
     // Takes back an iterator after a complete iteration (nothing left in
