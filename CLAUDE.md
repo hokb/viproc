@@ -278,6 +278,8 @@ docs/design/           Design documents (decisions with rationale)
   goals.md             goals, non-goals, never-slower rule (G1-G3), roadmap
   error-handling.md    run-time errors on any thread, asynchronous reporting
   memory-management.md ownership, release, pools, NumPy interop, COW
+  array-model.md       target array data model: Array, Storage (SD + task),
+                       AliasGroup, CountableArray; lifecycle, checks per op (proposed)
 docs/benchmarks.md     benchmark results: current breakdown per category and
                        case, progress per change, external machines,
                        shape map (images in docs/benchmarks/; reference
