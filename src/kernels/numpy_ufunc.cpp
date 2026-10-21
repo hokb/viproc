@@ -521,19 +521,19 @@ class ElementwiseKernel : public Kernel {
     // Only the first nin() inputs go to the loop; further inputs are in/out
     // arrays the runtime lists as read (see Runtime::issue).
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
-        const Shape& shape = outputs[0].layout.shape;
+        const Shape& shape = outputs[0].layout().shape;
         const auto nin = static_cast<std::size_t>(loop_->nin());
         if (nin + outputs.size() <= kMaxFlat && outputs.size() == 1) {
             const Layout* layouts[kMaxFlat];
             char* ptrs[kMaxFlat];
             for (std::size_t i = 0; i < nin; ++i) {
-                layouts[i] = &inputs[i].layout;
+                layouts[i] = &inputs[i].layout();
                 ptrs[i] = reinterpret_cast<char*>(inputs[i].first());
             }
             ptrs[nin] = reinterpret_cast<char*>(outputs[0].first());
             std::intptr_t strides[kMaxFlat];
-            if (single_call(std::span(layouts, nin), outputs[0].layout, strides)) {
-                const auto count = static_cast<std::intptr_t>(outputs[0].layout.size());
+            if (single_call(std::span(layouts, nin), outputs[0].layout(), strides)) {
+                const auto count = static_cast<std::intptr_t>(outputs[0].layout().size());
                 if (count == 0) {
                     return {};
                 }
@@ -546,11 +546,11 @@ class ElementwiseKernel : public Kernel {
         layouts.reserve(nin + outputs.size());
         OperandPointers base;
         for (const Operand& op : inputs.first(nin)) {
-            layouts.push_back(broadcast_to(op.layout, shape));
+            layouts.push_back(broadcast_to(op.layout(), shape));
             base.push_back(reinterpret_cast<char*>(op.first()));
         }
         for (const Operand& op : outputs) {
-            layouts.push_back(op.layout);
+            layouts.push_back(op.layout());
             base.push_back(reinterpret_cast<char*>(op.first()));
         }
         const bool ok = for_each_row(shape, layouts, std::move(base),
@@ -1051,8 +1051,8 @@ ArrayPtr wrap_ndarray(Runtime& rt, PyObject* obj, std::string& error, std::share
         (span < 0 ? lo : hi) += l.shape[i] > 0 ? span : 0;
     }
     l.offset = -lo;
-    auto buffer = std::make_shared<Buffer>(PyArray_BYTES(arr) + lo,
-                                           static_cast<std::size_t>(hi - lo), std::move(owner));
+    auto buffer = std::make_shared<CountableArray>(
+        PyArray_BYTES(arr) + lo, static_cast<std::size_t>(hi - lo), std::move(owner));
     return rt.wrap(std::move(l), std::move(buffer));
 }
 
@@ -1063,7 +1063,7 @@ ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype) {
         return nullptr;
     }
     Layout l = Layout::contiguous(dtype, {});
-    auto buffer = make_pooled<Buffer>(l.nbytes());
+    auto buffer = make_pooled<CountableArray>(l.nbytes());
     std::memcpy(buffer->data(), PyArray_DATA(reinterpret_cast<PyArrayObject*>(arr)), l.nbytes());
     Py_DECREF(arr);
     return rt.wrap(std::move(l), std::move(buffer));
@@ -1072,7 +1072,7 @@ ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype) {
 ArrayPtr item_array(Runtime& rt, PyObject* value, DType dtype) {
     PyArray_Descr* descr = PyArray_DescrFromType(type_num(dtype));
     Layout l = Layout::contiguous(dtype, {});
-    auto buffer = make_pooled<Buffer>(l.nbytes());
+    auto buffer = make_pooled<CountableArray>(l.nbytes());
     const int status = PyArray_Pack(descr, buffer->data(), value);
     Py_DECREF(descr);
     if (status < 0) {
@@ -1102,7 +1102,7 @@ namespace {
 constexpr const char* kExportCapsule = "viproc.export";
 
 struct ExportHold {
-    std::shared_ptr<Buffer> buffer;
+    std::shared_ptr<CountableArray> buffer;
     bool counted; // holds a host_views count
 };
 

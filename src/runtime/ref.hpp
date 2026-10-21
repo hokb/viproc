@@ -1,4 +1,4 @@
-// Intrusive reference counting for main-thread-only objects (Array, Storage).
+// Intrusive reference counting for main-thread-only objects (Array, AliasGroup).
 //
 // Arrays and storages are created, referenced and released by the main thread
 // only (workers see Tasks and Buffers), so their counts are plain ints: no

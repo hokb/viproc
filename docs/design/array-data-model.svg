@@ -1,0 +1,95 @@
+<svg viewBox="0 0 860 470" width="860" height="470" xmlns="http://www.w3.org/2000/svg">
+<style>
+text { font-family: "IBM Plex Sans", "Segoe UI", Helvetica, Arial, sans-serif; fill: #1b2230; font-size: 13px; }
+.mono { font-family: "IBM Plex Mono", Consolas, "DejaVu Sans Mono", monospace; font-size: 11.5px; }
+.small { font-size: 11.5px; fill: #5a6577; }
+.ttl { font-weight: 600; font-size: 13.5px; }
+.arr { stroke: #5a6577; stroke-width: 1.4; fill: none; }
+.cap { stroke: #7a3fb0; stroke-width: 1.4; fill: none; stroke-dasharray: 5 4; }
+</style>
+<rect x="0" y="0" width="860" height="470" fill="#ffffff"/>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5a6577"/></marker>
+    <marker id="aht" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7a3fb0"/></marker>
+  </defs>
+  <!-- column labels -->
+  <text x="20" y="22" class="small">Python</text>
+  <text x="110" y="22" class="small">Array (main thread)</text>
+  <text x="300" y="22" class="small">Storage: one per array / view</text>
+  <text x="545" y="22" class="small">shared by base + views</text>
+  <text x="735" y="22" class="small">data version</text>
+
+  <!-- names -->
+  <rect x="20" y="72" width="54" height="34" rx="4" fill="#ffffff" stroke="#c9d0db"/>
+  <text x="47" y="94" text-anchor="middle" class="mono">a</text>
+  <rect x="20" y="232" width="54" height="34" rx="4" fill="#ffffff" stroke="#c9d0db"/>
+  <text x="47" y="254" text-anchor="middle" class="mono">b</text>
+
+  <!-- arrays -->
+  <rect x="110" y="56" width="150" height="66" rx="5" fill="#eef0f4" stroke="#6b7385"/>
+  <text x="122" y="78" class="ttl">Array A</text>
+  <text x="122" y="96" class="small">Python object,</text>
+  <text x="122" y="111" class="small">main thread only</text>
+  <rect x="110" y="216" width="150" height="66" rx="5" fill="#eef0f4" stroke="#6b7385"/>
+  <text x="122" y="238" class="ttl">Array B</text>
+  <text x="122" y="256" class="small">view of A</text>
+  <text x="122" y="271" class="small">(a[:, ::2])</text>
+
+  <!-- storages -->
+  <rect x="300" y="40" width="228" height="104" rx="5" fill="#e8eefb" stroke="#2f55b5"/>
+  <text x="312" y="62" class="ttl">Storage S_A</text>
+  <text x="312" y="82" class="mono">SD f8 · ndim 2 · offset 0</text>
+  <text x="312" y="98" class="mono">shape [3,4] · strides [32,8]</text>
+  <text x="312" y="116" class="small">task: op configuring S_A</text>
+  <text x="312" y="132" class="small">ref count (atomic)</text>
+  <rect x="300" y="200" width="228" height="104" rx="5" fill="#e8eefb" stroke="#2f55b5"/>
+  <text x="312" y="222" class="ttl">Storage S_B</text>
+  <text x="312" y="242" class="mono">SD f8 · ndim 2 · offset 0</text>
+  <text x="312" y="258" class="mono">shape [3,2] · strides [32,16]</text>
+  <text x="312" y="276" class="small">task: op configuring S_B</text>
+  <text x="312" y="292" class="small">ref count (atomic)</text>
+
+  <!-- data slot -->
+  <rect x="545" y="104" width="160" height="136" rx="5" fill="#e3f4f1" stroke="#0f7f74"/>
+  <text x="557" y="126" class="ttl">AliasGroup G</text>
+  <text x="557" y="146" class="mono">current → V1</text>
+  <text x="557" y="166" class="small">last writer: task</text>
+  <text x="557" y="182" class="small">(decides ready / pending)</text>
+  <text x="557" y="202" class="small">ref count</text>
+  <text x="557" y="222" class="small">main thread only</text>
+
+  <!-- version: countable array of device handles -->
+  <rect x="735" y="40" width="120" height="250" rx="5" fill="#fbf0e1" stroke="#b0670c"/>
+  <text x="746" y="62" class="ttl">CountableArray</text>
+  <text x="746" y="79" class="ttl">V1</text>
+  <text x="746" y="98" class="small">one data version</text>
+  <rect x="744" y="110" width="97" height="40" rx="3" fill="#ffffff" stroke="#b0670c"/>
+  <text x="752" y="127" class="mono">dev0: CPU</text>
+  <text x="752" y="142" class="small">valid</text>
+  <rect x="744" y="158" width="97" height="40" rx="3" fill="#ffffff" stroke="#b0670c" stroke-dasharray="4 3"/>
+  <text x="752" y="175" class="mono">dev1: GPU</text>
+  <text x="752" y="190" class="small">empty / copy</text>
+  <text x="746" y="222" class="mono">async_reads</text>
+  <text x="746" y="240" class="mono">host_views</text>
+  <text x="746" y="258" class="small">ref count</text>
+  <text x="746" y="276" class="small">(atomic)</text>
+
+  <!-- task -->
+  <rect x="300" y="352" width="405" height="70" rx="5" fill="#f1e9fa" stroke="#7a3fb0"/>
+  <text x="312" y="374" class="ttl">Task T = awaiter, one per NumPy op</text>
+  <text x="312" y="393" class="small">operand = (Storage → SD, CountableArray of the version at issue)</text>
+  <text x="312" y="410" class="small">configures the Storages of its outputs: size, device, memory, strides</text>
+
+  <!-- references -->
+  <path class="arr" d="M74,89 L108,89" marker-end="url(#ah)"/>
+  <path class="arr" d="M74,249 L108,249" marker-end="url(#ah)"/>
+  <path class="arr" d="M260,89 L298,89" marker-end="url(#ah)"/>
+  <path class="arr" d="M260,249 L298,249" marker-end="url(#ah)"/>
+  <path class="arr" d="M260,112 C282,112 280,170 300,170 L543,170" marker-end="url(#ah)"/>
+  <path class="arr" d="M260,266 C286,266 284,186 300,186 L543,186" marker-end="url(#ah)"/>
+  <path class="arr" d="M705,142 L733,142" marker-end="url(#ah)"/>
+  <!-- task captures -->
+  <path class="cap" d="M360,352 C360,330 290,320 290,180 C290,140 296,120 298,118" marker-end="url(#aht)"/>
+  <path class="cap" d="M705,385 C800,385 800,330 795,292" marker-end="url(#aht)"/>
+  <text x="20" y="455" class="small">Solid: references held by arrays, groups and versions. Dashed: references a task holds through its operands.</text>
+</svg>

@@ -280,14 +280,14 @@ const int64_t* vp_array_strides(const vp_array* a) { return arr(a).layout().stri
 vp_dtype vp_array_dtype(const vp_array* a) { return to_vp(arr(a).layout().dtype); }
 int vp_array_ready(vp_array* a) { return arr(a).ready() ? 1 : 0; }
 int vp_array_same_storage(const vp_array* a, const vp_array* b) {
-    return arr(a).storage() == arr(b).storage() ? 1 : 0;
+    return arr(a).group() == arr(b).group() ? 1 : 0;
 }
 
 size_t vp_array_reusable_bytes(const vp_array* a) {
     const Array& x = arr(a);
-    const Buffer& b = *x.buffer();
+    const CountableArray& b = *x.buffer();
     const Layout& l = x.layout();
-    const bool ok = x.ref_count() == 1 && x.storage().use_count() == 1 && b.capacity() != 0 &&
+    const bool ok = x.ref_count() == 1 && x.group().use_count() == 1 && b.capacity() != 0 &&
                     !b.has_readers() && l.offset == 0 && l.c_contiguous() &&
                     l.nbytes() == b.nbytes();
     return ok ? b.nbytes() : 0;
@@ -308,7 +308,7 @@ PyObject* vp_array_export(const vp_array* a, int writable) {
 
 int vp_array_host_writable(vp_array* a) {
     Array& x = arr(a);
-    return x.ready() && !x.storage()->last_error() && !x.buffer()->has_readers() ? 1 : 0;
+    return x.ready() && !x.group()->last_error() && !x.buffer()->has_readers() ? 1 : 0;
 }
 
 PyObject* vp_array_borrow(const vp_array* a) { return numpy::borrow_ndarray(arr(a)); }

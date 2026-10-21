@@ -1,7 +1,7 @@
 // Tasks: one per array op, carrying the op's progress through its stages.
 #pragma once
 
-#include "buffer.hpp"
+#include "countable_array.hpp"
 #include "layout.hpp"
 #include "offload.hpp"
 
@@ -27,19 +27,105 @@ enum class TaskState : std::uint8_t {
     Completed,
 };
 
-// One argument of a kernel call: the buffer captured at issue time and the
-// view onto it. Capturing the buffer (not the array) keeps readers on the data
-// version they were issued against, even if the array switches buffers later
-// (copy-on-write).
+class Task;
+
+// The layout of one array or view (docs/design/array-data-model.md, A1, A2): its
+// size descriptor (SD: dtype, shape, byte strides, offset) and the task of the
+// op that configures it while the SD is incomplete. One per array and per
+// view, created by the main thread with the array, from a pool. The array and
+// the operands of tasks reading or writing it refer to it (atomic count), so
+// it is released on any thread; tasks reference the SD instead of copying it.
+// The SD never changes once complete. Phase 1 knows every SD at issue: the
+// main thread fills it and `task` stays null.
+class StoragePtr;
+
+class Storage {
+  public:
+    explicit Storage(const Layout& sd) : sd_(sd) {}
+    explicit Storage(Layout&& sd) : sd_(std::move(sd)) {}
+    Storage(const Storage&) = delete;
+    Storage& operator=(const Storage&) = delete;
+
+    const Layout& sd() const { return sd_; }
+    // The op configuring the SD, while it is incomplete; null otherwise.
+    const std::shared_ptr<Task>& task() const { return task_; }
+
+  private:
+    friend class StoragePtr;
+    friend StoragePtr make_storage(const Layout& sd);
+    friend StoragePtr make_storage(Layout&& sd);
+    // Destroys `s` and returns its memory to the pool (any thread).
+    static void destroy(const Storage* s);
+
+    Layout sd_;
+    std::shared_ptr<Task> task_;
+    mutable std::atomic<int> refs_{1}; // the creating reference
+};
+
+// Intrusive, atomically counted reference to a Storage: no control block, and
+// the first reference is the one make_storage() returns.
+class StoragePtr {
+  public:
+    StoragePtr() = default;
+    StoragePtr(std::nullptr_t) {}
+    StoragePtr(const StoragePtr& o) : p_(o.p_) {
+        if (p_ != nullptr) {
+            p_->refs_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    StoragePtr(StoragePtr&& o) noexcept : p_(std::exchange(o.p_, nullptr)) {}
+    StoragePtr& operator=(StoragePtr o) noexcept {
+        std::swap(p_, o.p_);
+        return *this;
+    }
+    ~StoragePtr() { reset(); }
+
+    void reset() {
+        const Storage* p = std::exchange(p_, nullptr);
+        if (p != nullptr && p->refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            Storage::destroy(p);
+        }
+    }
+    const Storage* get() const { return p_; }
+    const Storage& operator*() const { return *p_; }
+    const Storage* operator->() const { return p_; }
+    explicit operator bool() const { return p_ != nullptr; }
+
+  private:
+    friend StoragePtr make_storage(const Layout& sd);
+    friend StoragePtr make_storage(Layout&& sd);
+    explicit StoragePtr(const Storage* adopted) : p_(adopted) {}
+    const Storage* p_ = nullptr;
+};
+
+// A Storage from the per-thread pool (pool.hpp), with one reference.
+StoragePtr make_storage(const Layout& sd);
+StoragePtr make_storage(Layout&& sd);
+
+// One argument of a kernel call: the data version (CountableArray) captured
+// at issue time and the SD it is read or written with. Capturing the version
+// (not the array or its group) keeps readers on the data they were issued
+// against, even if the group switches to a new version later
+// (copy-on-write). `storage` keeps the SD alive; ops that run directly on the
+// main thread (Runtime::issue_direct) leave it null and point `sd` at the
+// array's SD, which outlives the call.
 struct Operand {
-    std::shared_ptr<Buffer> buffer;
-    Layout layout;
+    std::shared_ptr<CountableArray> buffer;
+    StoragePtr storage;
+    const Layout* sd = nullptr;
     // Input only: counted in buffer->async_reads. An op does not count reads
     // of the buffer it writes in place: every later writer waits for it as
-    // the storage's producer anyway.
+    // the group's last writer anyway.
     bool counted_read = true;
 
-    std::byte* first() const { return buffer->data() + layout.offset; }
+    Operand() = default;
+    Operand(std::shared_ptr<CountableArray> b, StoragePtr s, bool counted = true)
+        : buffer(std::move(b)), storage(std::move(s)), sd(&storage->sd()), counted_read(counted) {}
+    Operand(std::shared_ptr<CountableArray> b, const Layout& l, bool counted)
+        : buffer(std::move(b)), sd(&l), counted_read(counted) {}
+
+    const Layout& layout() const { return *sd; }
+    std::byte* first() const { return buffer->data() + sd->offset; }
 };
 
 // Operands of one task, inline up to a ternary op with one output.
@@ -215,7 +301,8 @@ class Task {
     // the caller counted. Decided as late as possible, right before the
     // kernel: if nothing else reads `from` any more, `to` takes its block
     // over instead of copying (design doc D8).
-    void add_copy_on_write(std::shared_ptr<Buffer> from, std::shared_ptr<Buffer> to) {
+    void add_copy_on_write(std::shared_ptr<CountableArray> from,
+                           std::shared_ptr<CountableArray> to) {
         copies_.push_back({std::move(from), std::move(to)});
     }
 
@@ -261,7 +348,7 @@ class Task {
     const char* issue_site_;
     std::uint64_t id_ = 0;
     struct Copy {
-        std::shared_ptr<Buffer> from, to;
+        std::shared_ptr<CountableArray> from, to;
     };
     std::vector<Copy> copies_; // copy-on-write, empty for most tasks
 

@@ -10,9 +10,9 @@ class AssignKernel : public Kernel {
   public:
     const char* name() const override { return "assignment (a[...] = v)"; }
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
-        const Layout& dst = outputs[0].layout;
+        const Layout& dst = outputs[0].layout();
         const std::size_t item = itemsize(dst.dtype);
-        std::vector<Layout> layouts{broadcast_to(inputs[0].layout, dst.shape), dst};
+        std::vector<Layout> layouts{broadcast_to(inputs[0].layout(), dst.shape), dst};
         OperandPointers base{reinterpret_cast<char*>(inputs[0].first()),
                              reinterpret_cast<char*>(outputs[0].first())};
         for_each_row(dst.shape, layouts, std::move(base),

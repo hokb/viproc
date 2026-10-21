@@ -46,18 +46,24 @@ to plain sequential NumPy execution.
   kernels: NumPy's elision at run time), else a block from the pool (one
   shared LIFO per size bin under a small lock: the most recently released
   block first, hot in cache; no per-thread caches). The
-  main thread creates the `Buffer` objects at issue (deferred, no memory);
+  main thread creates the `CountableArray` objects at issue (deferred, no memory);
   tasks reach `size_completed` at issue and `allocated` when they run.
   Pool allocations and releases happen on any thread
   (`docs/design/memory-management.md`, D3 and D11; D10, main-thread
   allocation at issue, made dependent chains 2-4x slower than NumPy: up to
   1000 cold output blocks in flight).
-- **Views share a storage.** A base array and all its views refer to one
-  shared *storage*, which holds the current buffer (data version) and the
-  last task writing it. Readiness, the producer and `async_reads` belong
-  to the storage: a write through one view makes the base and all other
-  views `pending`, and copy-on-write switches all of them together.
-  (Conservative: two views of disjoint regions are still ordered.)
+- **Data model** (`docs/design/array-data-model.md`): an `Array` holds
+  its `Storage` (size descriptor + the task configuring it, one per array
+  and view, atomic count, referenced by task operands) and its
+  `AliasGroup`; the group holds the current data version, a
+  `CountableArray` (one handle per device, `async_reads`, `host_views`).
+- **Views share an alias group.** A base array and all its views refer to
+  one shared *AliasGroup* (main thread only), which holds the current data
+  version and the last task writing it. Readiness and the producer belong
+  to the group, `async_reads` to its current version: a write through one
+  view makes the base and all other views `pending`, and copy-on-write
+  switches all of them together. (Conservative: two views of disjoint
+  regions are still ordered.)
 - Each storage buffer has a dedicated atomic counter **`async_reads`**: the
   number of issued, not yet completed tasks that read it as an input.
   - The main thread increments it when it issues a task reading the array.
@@ -82,7 +88,7 @@ to plain sequential NumPy execution.
   may skip states, never go back.
 - The task holds references to its input arrays, its output arrays and the
   resolved NumPy loop.
-- Tasks, buffers and array blocks come from per-thread memory pools
+- Tasks, CountableArrays, Storages and array blocks come from per-thread memory pools
   (`src/runtime/pool.hpp`), not malloc/free per op.
 
 ### Issuing an op (main thread)
@@ -172,9 +178,10 @@ memory pool, temporary reuse, NumPy interop) are collected in
 ownership, release or reuse of memory.
 
 - Tasks, arrays and array memory (buffers) are **reference counted**.
-  Tasks and buffers are shared across threads (`std::shared_ptr`, atomic
-  counts); arrays and storages are main-thread only (`Ref<T>`, plain int
-  counts, see "Implementation notes").
+  Tasks, CountableArrays (`std::shared_ptr`) and Storages (`StoragePtr`,
+  intrusive) are shared across threads (atomic counts); arrays and alias
+  groups are main-thread only (`Ref<T>`, plain int counts, see
+  "Implementation notes").
 - References: Python object → array; array → producer task (while
   `pending`); task → its input and output arrays; producer task →
   registered callbacks → consumer tasks.
@@ -223,7 +230,7 @@ ownership, release or reuse of memory.
 - Memory is handed to plain NumPy for *writing* only inside an eager
   fallback, after the buffer was made exclusive (no pending writer, no
   task reader, no live export); exports to the user are read-only and
-  count as readers (`Buffer::host_views`, design doc D7).
+  count as readers (`CountableArray::host_views`, design doc D7).
 
 ### Goals and non-goals
 
@@ -278,8 +285,9 @@ docs/design/           Design documents (decisions with rationale)
   goals.md             goals, non-goals, never-slower rule (G1-G3), roadmap
   error-handling.md    run-time errors on any thread, asynchronous reporting
   memory-management.md ownership, release, pools, NumPy interop, COW
-  array-model.md       target array data model: Array, Storage (SD + task),
-                       AliasGroup, CountableArray; lifecycle, checks per op (proposed)
+  array-data-model.md  array data model: Array, Storage (SD + task),
+                       AliasGroup, CountableArray; lifecycle, checks per op,
+                       figure (array-data-model.svg), evaluation
 docs/benchmarks.md     benchmark results: current breakdown per category and
                        case, progress per change, external machines,
                        shape map (images in docs/benchmarks/; reference
@@ -289,16 +297,18 @@ include/viproc/        Public C ABI (viproc.h). The only interface bridges may u
 src/runtime/           Runtime core, no Python dependency (library `viproc`)
   layout.*             DType, Layout (shape, byte strides, offset), broadcasting
   small_vector.hpp     inline-storage vectors (shapes/strides, task operands)
-  ref.hpp              Ref<T>: non-atomic intrusive refcount (Array, Storage)
-  pool.hpp             FixedPool / make_pooled: per-thread pools (Task, Buffer, …)
+  ref.hpp              Ref<T>: non-atomic intrusive refcount (Array, AliasGroup)
+  pool.hpp             FixedPool / make_pooled: per-thread pools (Task, CountableArray, …)
   offload.*            OffloadPolicy: inline vs. worker for ready tasks
   cpu.*                physical_core_count(): default worker count (one
                        per physical core, SMT siblings once, affinity)
   element_pool.*       ElementPool: process-wide pool for element memory
                        (quantized bins, LIFO, bound, huge pages)
-  buffer.*             Buffer: element memory (inline ≤ 128 B, else pool,
-                       deferred until the producing task runs); async_reads
-  task.*               Task: stages, consumer callbacks, execute(); Kernel interface
+  countable_array.*    CountableArray: one data version, one handle per device
+                       (inline ≤ 128 B, else pool, deferred until the
+                       producing task runs); async_reads, host_views
+  task.*               Task: stages, consumer callbacks, execute(); Kernel
+                       interface; Storage (SD + task), Operand
   runtime.*            Array (main-thread view), Runtime: issue protocol,
                        worker pool, trampoline, look-ahead limit, wait
   assign.*             element copy kernel (dst[...] = src)
@@ -979,18 +989,20 @@ Rules:
 
 ## Implementation notes (current code)
 
-- `Array` and `Storage` objects are **main-thread only**. Workers see only
-  `Task`s and the `Buffer`s captured in their operands. State is derived:
-  a storage is `pending` while its producer is set and not completed.
+- `Array` and `AliasGroup` objects are **main-thread only**. Workers see
+  only `Task`s and the `Storage`s and `CountableArray`s captured in their
+  operands. State is derived: a group is `pending` while its last writer is
+  set and not completed.
 - `Runtime::view(base, layout)` creates a view (metadata only, no task).
   The bridge must map NumPy views of one base onto runtime views of one
-  storage; wrapping two NumPy views separately would lose the aliasing.
-- After copy-on-write the storage no longer uses the wrapped NumPy memory;
+  alias group; wrapping two NumPy views separately would lose the aliasing.
+- After copy-on-write the group no longer uses the wrapped NumPy memory;
   the bridge must treat the runtime array, not the original ndarray
   memory, as the source of truth.
-- Operands capture the **buffer at issue time**, not the array, so a reader
-  keeps the data version it was issued against when an in/out op switches
-  the array to a new buffer (copy-on-write).
+- Operands capture the **CountableArray at issue time** (and the Storage
+  for the SD), not the array or its group, so a reader keeps the data
+  version it was issued against when an in/out op switches the group to a
+  new version (copy-on-write).
 - Tasks the **main thread** runs inline (`should_offload == false`) hand the
   consumers they unblock to the pool, so the main thread keeps issuing.
   Workers run one unblocked consumer as their continuation.
@@ -998,15 +1010,15 @@ Rules:
   sleeping; `enqueue()` wakes a sleeper only if nobody spins. This avoids a
   wake-up syscall per small task without taking cores from busy threads.
 - Per-op allocations: one pooled Task (operands inline up to 4), one
-  pooled Buffer (element memory inline up to 128 bytes, larger from the
+  pooled Storage per output, one pooled CountableArray (element memory inline up to 128 bytes, larger from the
   element pool when the task runs: no page faults once warm, or the dying
   input's block), one pooled
-  `ArrayBlock` (Array and its Storage), the Python object. Shapes/strides
+  `ArrayBlock` (Array and its AliasGroup), the Python object. Shapes/strides
   inline (`SmallVector`), one shared kernel object per resolved loop,
   interned issue sites.
-- `Array`/`Storage` use `Ref<T>` (`src/runtime/ref.hpp`): plain int counts,
+- `Array`/`AliasGroup` use `Ref<T>` (`src/runtime/ref.hpp`): plain int counts,
   legal because only the main thread creates, copies and releases them. An
-  `ArrayBlock` holds a base array and its storage; each object is destroyed
+  `ArrayBlock` holds a base array and its group; each object is destroyed
   with its last reference, the block when both are gone (views get a block
   of their own). The C ABI hands out `Array*` as `vp_array*`, one reference
   each.
