@@ -299,6 +299,19 @@ int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char
               int keepdims, PyObject* dtype, PyObject* identity, vp_array** result,
               const char* site, char* err, size_t errlen);
 
+/* Issues ufunc.accumulate(in, axis=axis) (np.cumsum, np.cumprod, ...) for a
+ * binary ufunc without casts: input and result have in's dtype, which must
+ * be the accumulator dtype NumPy picks (the caller casts first, as NumPy's
+ * iterator copies a cast input). The loop is the reduction loop called as
+ * PyUFunc_Accumulate calls it: per row along `axis`, the first element is
+ * copied, then one call over the rest of the row with args {out, in + 1,
+ * out + 1}. The result has NumPy's layout (C-contiguous for 1-d, else the
+ * input's axis order, as NumPy's iterator allocates it). Returns
+ * VP_UNSUPPORTED (reason in `err`) for an empty input, 0-d input, or a loop
+ * that is unavailable or needs the Python API; the caller then falls back. */
+int vp_accumulate(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, vp_array** result,
+                  const char* site, char* err, size_t errlen);
+
 /* Issues np.matmul(a, b) (the `@` operator) with NumPy's matmul gufunc loop
  * for (t, t) -> t, where t is the dtype of both operands; the loop is
  * called with the strides NumPy's gufunc machinery passes, so it makes the

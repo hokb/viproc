@@ -744,17 +744,24 @@ def _reshape(a, shape=None, order="C", *, newshape=None, copy=None):
 
 
 def _ravel(a, order="C"):
+    """PyArray_Ravel: a view where a is contiguous in the order (K: in C or
+    F order), else a copy in that order (NumPy's PyArray_Flatten), also for
+    a strided 1-d array that a reshape would only view."""
     if type(a) is not ndarray or order not in ("C", "F", "A", "K"):
         return _NOPE
-    if order == "K":  # PyArray_Ravel: K is C or F where the array is contiguous so
-        if a._c_contiguous or a.ndim <= 1:
-            order = "C"  # (1-d strided: NumPy's K copy is the C copy)
-        elif np.lib.stride_tricks.as_strided(np.empty(1, a.dtype), a.shape,
-                                             a.strides).flags.f_contiguous:
-            order = "F"
-        else:
+    if a._c_contiguous and order != "F":
+        return _reshape(a, -1, "C")
+    f = np.lib.stride_tricks.as_strided(np.empty(1, a.dtype), a.shape,
+                                        a.strides).flags.f_contiguous
+    if order == "A":
+        order = "F" if f else "C"
+    elif order == "K":
+        if not f and a.ndim > 1:
             return _NOPE  # a view in memory order, or a K-order copy
-    return _reshape(a, -1, order)
+        order = "F" if f else "C"  # 1-d strided: the K copy is the C copy
+    if order == "C":
+        return a.astype(a.dtype, order="C").reshape(-1)
+    return _reshape(a if f else a.astype(a.dtype, order="F"), -1, "F")
 
 
 _VIEW_HANDLERS = {
@@ -1187,7 +1194,8 @@ class ndarray(_viproc._Array):
             args[0][...] = args[1]
             return None
         handler = (_REDUCTIONS.get(func) or _VIEW_HANDLERS.get(func) or _PRODUCTS.get(func)
-                   or _COMPOSITIONS.get(func) or _JOINING.get(func) or _INDEXING.get(func))
+                   or _COMPOSITIONS.get(func) or _JOINING.get(func) or _INDEXING.get(func)
+                   or _ACCUMULATING.get(func))
         if handler is not None:
             try:
                 r = handler(*args, **kwargs)
@@ -1546,8 +1554,9 @@ _PRODUCTS = {np.dot: _dot}
 
 
 def _fallback_ufunc(ufunc, method, inputs, kwargs):
-    """ufunc.reduce and matmul asynchronously where possible; anything else
-    syncs and runs eagerly in NumPy (in place for out= and ufunc.at)."""
+    """ufunc.reduce, accumulate, outer and matmul asynchronously where
+    possible; anything else syncs and runs eagerly in NumPy (in place for
+    out= and ufunc.at)."""
     if method == "__call__" and ufunc is np.matmul and not kwargs:
         r = _matmul(*inputs) if len(inputs) == 2 else None
         if r is not None:
@@ -1558,6 +1567,10 @@ def _fallback_ufunc(ufunc, method, inputs, kwargs):
         except TypeError:
             r = None
         if r is not None:
+            return r
+    if method in ("accumulate", "outer"):
+        r = getattr(_ufuncs, method)(ufunc, inputs, kwargs)
+        if r is not _NOPE:
             return r
     return _host_call(getattr(ufunc, method), inputs, kwargs)
 
@@ -1761,3 +1774,5 @@ def workers():
 from ._compose import COMPOSITIONS as _COMPOSITIONS  # noqa: E402 (uses this module)
 from ._join import JOINING as _JOINING  # noqa: E402
 from ._indexing import INDEXING as _INDEXING  # noqa: E402
+from . import _ufuncs  # noqa: E402
+from ._ufuncs import ACCUMULATING as _ACCUMULATING  # noqa: E402

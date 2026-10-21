@@ -229,6 +229,79 @@ std::shared_ptr<Kernel> make_reduce_kernel(const UfuncLoop* loop, ReducePlan pla
 
 namespace {
 
+class AccumulateKernel : public Kernel {
+  public:
+    AccumulateKernel(const UfuncLoop* loop, int axis) : loop_(loop), axis_(axis) {}
+    const char* name() const override { return name_.c_str(); }
+
+    KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
+        const Layout& il = inputs[0].layout();
+        const Layout& ol = outputs[0].layout();
+        const std::size_t isz = itemsize(ol.dtype);
+        const std::size_t nd = il.shape.size();
+        const auto ax = static_cast<std::size_t>(axis_);
+        const std::intptr_t n = static_cast<std::intptr_t>(il.shape[ax]);
+        const std::intptr_t sin = static_cast<std::intptr_t>(il.strides[ax]);
+        const std::intptr_t sout = static_cast<std::intptr_t>(ol.strides[ax]);
+        const std::intptr_t strides[3] = {sout, sin, sout};
+        if (ol.size() == 0) {
+            return {};
+        }
+        char* in = reinterpret_cast<char*>(inputs[0].first());
+        char* out = reinterpret_cast<char*>(outputs[0].first());
+        // The rows along the axis, one per position of the other axes (any
+        // order: rows are independent).
+        SmallVector<std::int64_t, kInlineRank> idx(nd, 0);
+        for (;;) {
+            std::memmove(out, in, isz);
+            if (n > 1) {
+                std::intptr_t count = n - 1;
+                char* data[3] = {out, in + sin, out + sout};
+                if (loop_->call(data, &count, strides) != 0) {
+                    return KernelResult{1, "NumPy accumulation loop failed", 0};
+                }
+            }
+            std::size_t k = nd;
+            for (;;) {
+                if (k == 0) {
+                    return {};
+                }
+                --k;
+                if (k == ax) {
+                    continue;
+                }
+                if (++idx[k] < il.shape[k]) {
+                    in += il.strides[k];
+                    out += ol.strides[k];
+                    break;
+                }
+                in -= (il.shape[k] - 1) * il.strides[k];
+                out -= (ol.shape[k] - 1) * ol.strides[k];
+                idx[k] = 0;
+            }
+        }
+    }
+
+  private:
+    const UfuncLoop* loop_;
+    int axis_;
+    // "add.reduce" (the reduction loop's name) -> "add.accumulate"
+    std::string name_ = accumulate_name(loop_->name());
+
+    static std::string accumulate_name(std::string n) {
+        const std::size_t p = n.rfind(".reduce");
+        return p == std::string::npos ? n + ".accumulate" : n.replace(p, 7, ".accumulate");
+    }
+};
+
+} // namespace
+
+std::shared_ptr<Kernel> make_accumulate_kernel(const UfuncLoop* loop, int axis) {
+    return std::make_shared<AccumulateKernel>(loop, axis);
+}
+
+namespace {
+
 // op_axes entry of a reduction axis (NumPy's NPY_ITER_REDUCTION_AXIS, which
 // its public headers do not export; the encoding is part of the nditer API).
 constexpr int reduction_axis(int axis) { return axis + (1 << (NPY_BITSOF_INT - 2)); }
