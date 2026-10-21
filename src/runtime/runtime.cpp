@@ -214,8 +214,9 @@ void Runtime::issue_group_copy(AliasGroup& g) {
     active_.fetch_add(1, std::memory_order_acq_rel);
     auto task = make_pooled<Task>(std::make_shared<CopyKernel>(), "copy-on-write");
     old->async_reads.fetch_add(1, std::memory_order_relaxed);
-    task->operands_for_issue().push_back({old, make_metadata(bytes_of(*old))});
-    task->operands_for_issue().push_back({fresh, make_metadata(bytes_of(*fresh))});
+    MetadataPtr meta = make_metadata(bytes_of(*old)); // same bytes for both versions
+    task->operands_for_issue().push_back({old, meta});
+    task->operands_for_issue().push_back({fresh, std::move(meta)});
     task->set_ninputs(1);
     if (failed) {
         task->add_upstream_error(failed);

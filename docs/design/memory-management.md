@@ -14,8 +14,7 @@ Status labels:
 Object names follow `array-data-model.md`: an `Array` holds its `Metadata`
 (size descriptor) and its `AliasGroup` (shared by a base and its views:
 current data version, last writer); a data version is a `CountableArray`
-(element memory, one handle per device). Below, "storage" in lower case
-means the alias group's current data version as a whole.
+(element memory, one handle per device).
 - **Proposed** — worked out, waiting for a decision.
 
 ## Summary
@@ -136,7 +135,7 @@ float64):
 (At 1e5 the reused buffer is also cache-warm; a LIFO pool has the same
 advantage.)
 
-**Design** (implemented: `src/runtime/element_pool.*`, `buffer.*`):
+**Design** (implemented: `src/runtime/element_pool.*`, `countable_array.*`):
 
 - **Where it plugs in.** The task producing a buffer takes its block when
   it runs, on whatever thread runs it (D11; ops run directly by the main
@@ -301,11 +300,11 @@ An operand qualifies when, at issue time on the main thread:
    `viproc._viproc.elision_mode()` reports the mode, `_viproc.elided()`
    counts elided ops.
 
-**Views.** Rule 2 works on the storage, not on the Python object, so views
+**Views.** Rule 2 works on the alias group, not on the Python object, so views
 are covered: a temporary view of a named array (`x[::2] + 1`) shares its
-storage with `x` and is never reused; neither is a temporary whose storage
+alias group with `x` and is never reused; neither is a temporary whose alias group
 still has another view (e.g. one kept in a list). A view that is the only
-array left on its storage and covers its buffer contiguously from offset 0
+array left on its alias group and covers its buffer contiguously from offset 0
 (`(x * 2)[:] + 1`) is reused, correctly: nothing else can see that buffer.
 Offset or strided views are not reused (conservative). Buffers exported to
 NumPy (D7) fail rule 2: a live export counts as a reader. Read-only viproc
@@ -314,7 +313,7 @@ arrays (D7, "Eager fallbacks") are never reused either.
 Then the op is issued with the operand as its `out=` array: an in/out op
 writing in place. That needed one change to D8's accounting: an op does not
 count its reads of the buffer it writes in place in `async_reads`
-(`Operand::counted_read`); every later writer waits for it as the storage's
+(`Operand::counted_read`); every later writer waits for it as the alias group's
 producer anyway. Before, a pending in-place op made the next in-place op on
 the same array copy-on-write, and blocked the next elision.
 
@@ -500,12 +499,12 @@ provably have no other user:
 | Unsupported dtypes / layouts | stay NumPy arrays (eager NumPy) |
 
 **Considered, not taken:** sharing a user-held ndarray and running every
-op on that storage synchronously while the ndarray is referenced outside
+op on that alias group synchronously while the ndarray is referenced outside
 viproc (refcount check per op). Correct, but `x = viproc.asarray(a)` with
 `a` still in scope (the common case) would lose all asynchrony for `x`;
 one copy at import is cheaper than that. Writable exports *to the user*
 with the same rule were rejected for the same reason and because
-copy-on-write would have to be replaced by input copies for such storages.
+copy-on-write would have to be replaced by input copies for such alias groups.
 Writable exports exist only for the duration of an eager fallback, while
 the main thread issues nothing (above).
 
@@ -515,18 +514,18 @@ the main thread issues nothing (above).
 buffer counts its issued, not yet completed readers (`async_reads`). An op
 writing an array in place (in-place operators, `out=`, `__setitem__`)
 writes the current buffer only if nobody still reads it and no input of the
-op overlaps it through another view; otherwise the storage switches to a
+op overlaps it through another view; otherwise the alias group switches to a
 new buffer and the old one lives on through its readers' references.
-Single-view storages are *consolidated* (the op writes a fresh buffer with
+Single-view alias groups are *consolidated* (the op writes a fresh buffer with
 the array's layout, no copy) when the op writes every element
-(`Kernel::writes_all`); storages with views, and ops that write only some
+(`Kernel::writes_all`); alias groups with views, and ops that write only some
 elements (scatter, masked assignment), get a copy task first (without it,
 `x[x > 1.4] = 0.6` on an `x` with pending readers left the other elements
 as fresh memory).
 
 The copy is made **as late as possible, by the writing task itself**
 (`Task::add_copy_on_write`, `Task::copy_on_write`): issue time only
-switches the storage to a new deferred buffer and counts the writer's read
+switches the alias group to a new deferred buffer and counts the writer's read
 of the old one; right before its kernel, the writer either takes the old
 block over or copies it, and reads its in/out from the new buffer. By then
 the writer's inputs are complete. In a recurrence (`x[i] = cos(x[i-1]) *
@@ -552,7 +551,7 @@ part and number of readers. Needs a case in the shape map first.
 
 An op's reads
 of the buffer it writes in place are not counted (D5): later writers wait
-for it as the producer anyway. Whether the storage switches is decided at
+for it as the producer anyway. Whether the alias group switches is decided at
 issue time on the main thread, so layouts never change after they were
 communicated. Arrays keep their strides, as in NumPy: until reductions ran
 asynchronously, consolidation switched to a C-contiguous layout, which made
@@ -583,7 +582,7 @@ directly, bypassing every sync point:
    TLB shootdowns on all worker cores, which defeats small and medium
    arrays.
 3. **Copy-on-write would break.** An ndarray has a fixed data pointer that
-   C code may keep; viproc switches a storage to a new buffer when an
+   C code may keep; viproc switches an alias group to a new buffer when an
    in-place write meets pending readers (D8), and consolidates layouts.
 4. **Unsafe by default.** A subclass inherits hundreds of C methods that
    work on the memory directly (`.sum`, `.copy`, `.tobytes`, `.fill`,
@@ -592,7 +591,7 @@ directly, bypassing every sync point:
    raises or goes through `__array__`, a clean sync point.
 5. **Views created in C.** NumPy creates subclass views itself (slicing,
    `reshape`, `.T`) without telling viproc, which would lose the mapping
-   onto shared storages.
+   onto shared alias groups.
 
 **Consequences.**
 
@@ -684,7 +683,7 @@ memory, D3; runtime objects, D4):
 
 **Decision.** A buffer a task produces is created *deferred* at issue: the
 `CountableArray` object exists (consumers capture it, count their reads on it,
-the storage refers to it), but its element memory does not. The task takes
+the alias group refers to it), but its element memory does not. The task takes
 the memory right before its kernel runs, on the thread that runs it:
 
 1. **From a dying input** (kernels with `Kernel::in_place_ok()`: NumPy's
@@ -705,7 +704,7 @@ Inline buffers (≤ 128 bytes) have their memory at once. Ops the main thread
 runs directly (`Runtime::issue_direct`) allocate there, right before they
 run. `size_completed` is still reached at issue (phase 1: shapes are known),
 `allocated` now when the task runs. Copy-on-write buffers (consolidated new
-buffer, storage copies) are deferred as well.
+buffer, alias group copies) are deferred as well.
 
 **Why.** Measured (4-vCPU VM, Release, one worker, µs per op, `x =
 np.abs(x)` repeated; NumPy in brackets): with the main thread allocating at

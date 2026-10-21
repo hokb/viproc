@@ -58,6 +58,11 @@ class Metadata {
     static void destroy(const Metadata* s);
 
     Layout sd_;
+    // Strong, but no leak: the task's output operand refers back to this
+    // Metadata only until the task completes (Task::execute clears all
+    // operands). Main thread only, like AliasGroup::last_writer: it registers
+    // on the task's stages and drops the task once it sees it completed
+    // (docs/design/array-data-model.md, "Cycles"). Workers never read it.
     std::shared_ptr<Task> task_;
     mutable std::atomic<int> refs_{1}; // the creating reference
 };
@@ -172,7 +177,7 @@ struct TaskError {
 class ErrorTable;
 
 // A reference to a failed op's record in the runtime's ErrorTable; empty for
-// ops that did not fail. Tasks and storages hold only this, never the error
+// ops that did not fail. Tasks and alias groups hold only this, never the error
 // itself: the record exists once, in the runtime, and every thread reads it
 // from there. Copies and destruction lock the table, so they cost something
 // only for failed ops (an empty reference is a null check).

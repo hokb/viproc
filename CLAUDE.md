@@ -64,13 +64,13 @@ to plain sequential NumPy execution.
   view makes the base and all other views `pending`, and copy-on-write
   switches all of them together. (Conservative: two views of disjoint
   regions are still ordered.)
-- Each storage buffer has a dedicated atomic counter **`async_reads`**: the
+- Each data version (`CountableArray`) has a dedicated atomic counter **`async_reads`**: the
   number of issued, not yet completed tasks that read it as an input.
   - The main thread increments it when it issues a task reading the array.
   - The reading task decrements it when it has finished reading (at the
     latest on `completed`), on whatever thread it runs.
   - An op's reads of the buffer it writes in place are not counted: every
-    later writer waits for it as the storage's producer anyway.
+    later writer waits for it as the alias group's last writer anyway.
   - Only the main thread increments, so **`async_reads == 0` seen by the
     main thread stays 0** until the main thread itself issues a new reader
     (same reasoning as `ready`, see "Thread rules").
@@ -191,15 +191,15 @@ ownership, release or reuse of memory.
 - **Write-after-read safety via `async_reads` (copy-on-write).** Only
   relevant for in/out argument semantics (an op that writes into an
   existing array: in-place operators like `a += b`, `out=`). When the main
-  thread issues such a task, it checks the in/out array's storage:
+  thread issues such a task, it checks the in/out array's alias group:
   - No pending readers (`async_reads == 0`) and no input of this op reads
-    the storage through a *different* view: write in place.
+    the group through a *different* view: write in place.
   - Otherwise the old data is still needed (by pending readers, or by this
     op's own overlapping inputs, e.g. `a += a[::-1]`, where NumPy requires
-    all inputs to be read before the output is written). The storage
-    switches to a new buffer; the op's inputs read the old one. The old
+    all inputs to be read before the output is written). The group
+    switches to a new data version; the op's inputs read the old one. The old
     buffer stays alive through its readers' references.
-    - **Consolidated** (array is the only view of its storage, covers
+    - **Consolidated** (array is the only view of its group, covers
       all of it, and the op writes every element: `Kernel::writes_all`,
       false for scatter and masked assignment): no copy at all. The op reads the old buffer and writes
       the new one, with the **same layout** (as in NumPy, the array keeps
@@ -213,7 +213,7 @@ ownership, release or reuse of memory.
       feed the write (`x[i] = f(x[i-1])`) have finished; if nothing reads
       the old buffer any more, the new buffer takes its block over
       instead of copying (the elision check of `Task::allocate_outputs`).
-      Issue time decides only *that* the storage switches; the task
+      Issue time decides only *that* the group switches; the task
       decides *how*. Independent readers alternating with writes still
       cost one copy per write (open, design doc D8).
 - **Consolidation is decided at issue time, on the main thread.** Layout
@@ -865,7 +865,7 @@ Rules:
   copy-on-write if read-only exports are alive), so `out=`, mutating
   functions (`np.put`, `np.place`, …) and overlap work in place. Results
   are mapped back: an argument returned as is → that viproc array; a view
-  of an argument (by memory overlap) → a viproc view of its storage
+  of an argument (by memory overlap) → a viproc view of its alias group
   (`vp_array_view`, dtype views, read-only if NumPy made it read-only); a
   NumPy argument → unchanged; fresh memory → adopted; else copied.
   `np.copyto(dst, src)` maps to assignment.
@@ -941,7 +941,7 @@ Rules:
   `OPENBLAS_NUM_THREADS=1` so idle BLAS threads do not blur the counts):
   viproc ~5,400 instructions, ~0.65 µs; NumPy ~4,650, ~0.4 µs. History:
   ~10,500 → ~7,100 (C lookup tables instead of dicts, flat loop calls)
-  → ~6,600 (array and storage in one block, intrusive non-atomic refs,
+  → ~6,600 (array and its alias group in one block, intrusive non-atomic refs,
   `vp_array*` is the `Array*`, small element memory inline in the Buffer)
   → ~5,800 (operands built in place in the task, no lock to read the
   upstream error, inline `itemsize`) → ~5,400 (pooled Task/Buffer/block

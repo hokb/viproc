@@ -1,7 +1,7 @@
 // Intrusive reference counting for main-thread-only objects (Array, AliasGroup).
 //
-// Arrays and storages are created, referenced and released by the main thread
-// only (workers see Tasks and Buffers), so their counts are plain ints: no
+// Arrays and alias groups are created, referenced and released by the main
+// thread only (workers see Tasks, Metadata and CountableArrays), so their counts are plain ints: no
 // atomic read-modify-write per copy, unlike std::shared_ptr.
 #pragma once
 

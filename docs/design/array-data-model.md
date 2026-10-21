@@ -228,7 +228,12 @@ has a plain one.
 | Task T | main thread, at issue, one per op, from the pool (the direct path for small ready data creates none) | main thread: issue, callback registration, waits at sync points; workers (or the main thread inline): advance stages, run the kernel | callbacks of its inputs (as consumer), the Metadata objects of its outputs, G as `last_writer`, the thread running it | any thread, with the last reference; on *completed* T releases its operands (`async_reads` −−) and callbacks, S and G drop T once they see it completed; back to the pool |
 
 **Cycles.** M ↔ T (T holds M as an output, M holds T as its task) breaks
-on *completed*: T drops its operands, M drops T.
+on *completed*: T drops all its operands, outputs included, so nothing is
+leaked even while M still holds T. `M.task` is a strong reference and is
+read and written by the main thread only (like `G.last_writer`): it
+registers on T's stages through it and drops T once it sees T completed,
+at the latest when M dies. Workers learn about stages through callbacks
+and never read `M.task`. So a weak or raw pointer is not needed.
 
 ### A5: the Array holds the AliasGroup
 

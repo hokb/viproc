@@ -76,8 +76,8 @@ class AliasGroup : public MainThreadCounted {
 
 // An array as seen by the main thread (docs/design/array-data-model.md, A1): its
 // Metadata (size descriptor) and its AliasGroup (data). Main-thread only:
-// workers never touch Array or AliasGroup objects, only the Storages,
-// CountableArrays and Tasks they refer to. The array, not its Metadata, holds
+// workers never touch Array or AliasGroup objects, only the Metadata
+// objects, CountableArrays and Tasks they refer to. The array, not its Metadata, holds
 // the group (A5): a task's operand keeps the Metadata alive, and must not keep
 // the group's current version alive with it (run-time elision, D11).
 class Array : public MainThreadCounted {
