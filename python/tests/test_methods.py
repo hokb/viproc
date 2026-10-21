@@ -215,14 +215,26 @@ def test_metadata_methods_issue_nothing(det):
     assert assert_async(v.to_device, "cpu", ops=0) is v
 
 
+@pytest.mark.parametrize("call, ops", [
+    (lambda a: a.round(), 1), (lambda a: a.round(2), 3), (lambda a: a.clip(0.7, 1.2), 1),
+    (lambda a: a.clip(max=1.0), 1),
+])
+def test_composed_methods_take_async_path(det, call, ops):
+    x, v = big()
+    same(assert_async(call, v, ops=ops), call(x))
+
+
+def test_trace_takes_async_path(det):
+    x = rng.random((3000, 3000))
+    v = pending(viproc.asarray(x))
+    same(assert_async(v.trace), x.trace())
+
+
 # Methods whose function form still falls back: each step of #25 that makes
 # the function asynchronous turns its entry green (strict xfail).
 FALLING_BACK = [
-    ("round", lambda a: a.round(), 1),
-    ("clip", lambda a: a.clip(0.7, 1.2), 1),
     ("cumsum", lambda a: a.cumsum(), 1),
     ("cumprod", lambda a: a.cumprod(), 1),
-    ("trace", lambda a: a.reshape(50, 100).trace(), 1),
     ("take", lambda a: a.take([0, 5, 9]), 1),
     ("repeat", lambda a: a.repeat(2), 1),
     ("compress", lambda a: a.compress(np.arange(SIZE) % 2 == 0), 1),

@@ -333,6 +333,9 @@ python/viproc/         Python package
                        methods, NumPy delegate for small ready data)
   _ndarray.py          viproc.ndarray(_Array): fallbacks, __array_function__,
                        indexing, sync points; registers hooks with setup()
+  _compose.py          NumPy functions composed of async ops, ported from
+                       NumPy's code without its asanyarray (clip, round,
+                       isclose, nan*, norm, triu, *_like, ...)
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -871,6 +874,22 @@ Rules:
   (`vp_array_view`, dtype views, read-only if NumPy made it read-only); a
   NumPy argument → unchanged; fresh memory → adopted; else copied.
   `np.copyto(dst, src)` maps to assignment.
+- **Compositions** (`_compose.py`, `COMPOSITIONS`, looked up by
+  `_array_function` after reductions, views and products): NumPy functions
+  whose NumPy implementation is a sequence of ufunc calls, reductions,
+  assignments and views issue the same sequence (NumPy's code ported
+  without the `asanyarray` that would sync; `round` follows
+  `PyArray_Round`, `trace` `PyArray_Trace`): `clip`, `round`/`around`,
+  `angle`, `sinc`, `nan_to_num`, `isclose`, `allclose`, `array_equal`,
+  `polyval`, `ptp`, `trace`, `average`, `diff`, `nansum`, `nanprod`,
+  `nanmin`/`nanmax`, `nanmean`, `nanvar`/`nanstd`, `nanargmin`/`nanargmax`,
+  vector and Frobenius `linalg.norm`, `outer`, `inner` of vectors, `copy`,
+  `imag`, `*_like` (NumPy's function on a one-element probe with the
+  layout, adopted: no sync), `triu`/`tril`, `diag`, `broadcast_arrays`,
+  `meshgrid`, `split`/`array_split`. Where NumPy decides from the data (a
+  warning for an all-NaN slice, `allclose`'s bool) the handler syncs on that
+  small result only. Fuzzed in `python/tests/test_compositions.py`
+  (values, dtypes, layouts, warnings).
 - **ndarray methods:** every method and attribute of `numpy.ndarray`
   except `base` (views do not track their Python base object) and `ctypes`
   (a raw pointer would bypass the runtime). The ones with a NumPy function

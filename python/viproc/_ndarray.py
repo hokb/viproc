@@ -744,8 +744,16 @@ def _reshape(a, shape=None, order="C", *, newshape=None, copy=None):
 
 
 def _ravel(a, order="C"):
-    if type(a) is not ndarray or order not in ("C", "F", "A"):
+    if type(a) is not ndarray or order not in ("C", "F", "A", "K"):
         return _NOPE
+    if order == "K":  # PyArray_Ravel: K is C or F where the array is contiguous so
+        if a._c_contiguous or a.ndim <= 1:
+            order = "C"  # (1-d strided: NumPy's K copy is the C copy)
+        elif np.lib.stride_tricks.as_strided(np.empty(1, a.dtype), a.shape,
+                                             a.strides).flags.f_contiguous:
+            order = "F"
+        else:
+            return _NOPE  # a view in memory order, or a K-order copy
     return _reshape(a, -1, order)
 
 
@@ -1177,7 +1185,8 @@ class ndarray(_viproc._Array):
         if func is np.copyto and len(args) >= 2 and isinstance(args[0], ndarray) and not kwargs:
             args[0][...] = args[1]
             return None
-        handler = _REDUCTIONS.get(func) or _VIEW_HANDLERS.get(func) or _PRODUCTS.get(func)
+        handler = (_REDUCTIONS.get(func) or _VIEW_HANDLERS.get(func) or _PRODUCTS.get(func)
+                   or _COMPOSITIONS.get(func))
         if handler is not None:
             try:
                 r = handler(*args, **kwargs)
@@ -1746,3 +1755,6 @@ def shutdown():
 def workers():
     _ensure_runtime()
     return _viproc.workers()
+
+
+from ._compose import COMPOSITIONS as _COMPOSITIONS  # noqa: E402 (uses this module)
