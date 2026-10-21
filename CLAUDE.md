@@ -339,6 +339,8 @@ python/viproc/         Python package
                        isclose, nan*, norm, triu, *_like, ...)
   _join.py             concatenate/stack/tile/repeat/pad/roll/delete/insert
                        as one placement task each (vp_place)
+  _indexing.py         take, put, *_along_axis, compress, extract, place,
+                       select, copyto(where=) on gather/scatter/select tasks
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -910,6 +912,19 @@ Rules:
   thread); `diff`'s `prepend`/`append` concatenate. Empty results, `out=`,
   `repeat` with per-element counts and `insert` at several indices fall
   back. Fuzzed in `python/tests/test_joining.py`.
+- **Indexing functions** (`_indexing.py`, `INDEXING`): `take` (a gather
+  with NumPy's C-ordered result; the modes `wrap`/`clip` are the gather's
+  and scatter's `IndexMode`, applied only to indices outside [0, n)), `put`
+  (a scatter into the C-ordered flat view; values
+  repeated by a gather when shorter, as `PyArray_PutTo`; a non-C-contiguous
+  target falls back), `take_along_axis`/`put_along_axis` (NumPy's fancy
+  index), `compress`/`extract`/`place` (sync on the condition only: its
+  True positions decide the shape, as boolean indexing), `select` (nested
+  `where`s, C order as NumPy's `np.full` result), `copyto(where=)`
+  (`dst[...] = where(mask, src, dst)`). `a[mask] = array` takes the scatter
+  (the mask syncs for its count). `choose` (NumPy raises ValueError for an
+  invalid entry: no async equivalent yet) and `isin` (sort-based) still
+  fall back. Fuzzed in `python/tests/test_indexing_functions.py`.
 - **ndarray methods:** every method and attribute of `numpy.ndarray`
   except `base` (views do not track their Python base object) and `ctypes`
   (a raw pointer would bypass the runtime). The ones with a NumPy function

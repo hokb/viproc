@@ -1032,8 +1032,9 @@ def _as_values(value, dtype):
 
 
 def _scatter(a, key, value):
+    vdim = value.ndim if isinstance(value, ndarray) else np.ndim(value)  # np.ndim would export
     if isinstance(key, (ndarray, np.ndarray)) and key.dtype == np.bool_ and (
-            np.ndim(value) == 0 and key.ndim and key.shape == a.shape[:key.ndim]):
+            vdim == 0 and key.ndim and key.shape == a.shape[:key.ndim]):
         # a[mask] = scalar: no count needed (where-assignment, mask broadcast
         # over the remaining axes)
         m = key if isinstance(key, ndarray) else asarray(key)
@@ -1186,7 +1187,7 @@ class ndarray(_viproc._Array):
             args[0][...] = args[1]
             return None
         handler = (_REDUCTIONS.get(func) or _VIEW_HANDLERS.get(func) or _PRODUCTS.get(func)
-                   or _COMPOSITIONS.get(func) or _JOINING.get(func))
+                   or _COMPOSITIONS.get(func) or _JOINING.get(func) or _INDEXING.get(func))
         if handler is not None:
             try:
                 r = handler(*args, **kwargs)
@@ -1355,7 +1356,7 @@ class ndarray(_viproc._Array):
         _host_call(lambda a, v: a.setfield(v, dtype, offset), (self, val), {})
 
     def fill(self, value):
-        if np.ndim(value) != 0:  # NumPy's error for a sequence
+        if (value.ndim if isinstance(value, ndarray) else np.ndim(value)) != 0:  # NumPy's error
             _host_call(lambda a: a.fill(value), (self,), {})
             return
         self[...] = value  # an assignment task (vp_assign), as NumPy casts
@@ -1759,3 +1760,4 @@ def workers():
 
 from ._compose import COMPOSITIONS as _COMPOSITIONS  # noqa: E402 (uses this module)
 from ._join import JOINING as _JOINING  # noqa: E402
+from ._indexing import INDEXING as _INDEXING  # noqa: E402
