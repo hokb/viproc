@@ -341,8 +341,9 @@ python/viproc/         Python package
                        as one placement task each (vp_place)
   _indexing.py         take, put, *_along_axis, compress, extract, place,
                        select, copyto(where=) on gather/scatter/select tasks
-  _ufuncs.py           ufunc.accumulate (cumsum, cumprod, nancum*) and
-                       ufunc.outer
+  _ufuncs.py           ufunc calls the C fast path leaves out (several
+                       outputs, dtype=/signature=/casting=, cast out=),
+                       ufunc.accumulate (cumsum, cumprod, nancum*), outer
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -927,6 +928,22 @@ Rules:
   (the mask syncs for its count). `choose` (NumPy raises ValueError for an
   invalid entry: no async equivalent yet) and `isin` (sort-based) still
   fall back. Fuzzed in `python/tests/test_indexing_functions.py`.
+- **ufunc calls beyond the fast path** (`_ufuncs.call`, from
+  `_fallback_ufunc`): ufuncs with several outputs (`divmod`, `modf`,
+  `frexp`; `vp_ufunc_multi`: NumPy never takes its trivial loop for them,
+  so the loop runs on NumPy's iterator, which allocates the results in
+  order K; `out=` for them falls back), `dtype=`, `signature=`, `casting=`
+  and an `out=` array of another dtype (`ufunc_typed`: `vp_ufunc_loop` for
+  exactly the dtypes `ufunc.resolve_dtypes` gives, with the out dtype in
+  the request as NumPy's dispatch has it; NumPy's casting errors come from
+  that call and leave the call to NumPy; `vp_ufunc_issue` casts into `out`
+  in the iterator's buffers). Small 0-d/1-d inputs of another dtype are
+  cast into copies first for any ufunc (`check_for_trivial_loop` runs for
+  every one). Python scalars are converted to their loop dtype (NEP 50).
+  NumPy's `ComplexWarning` comes once per complex-to-real cast and call:
+  viproc warns in Python and silences the iterator template, which is made
+  once. `where=` and the remaining keywords fall back. Fuzzed in
+  `python/tests/test_ufunc_calls.py`.
 - **Accumulation and outer** (`_ufuncs.py`): `ufunc.accumulate`,
   `cumsum`/`cumprod` (`axis=None`: the C-ordered `ravel`) and
   `nancumsum`/`nancumprod` (NaNs replaced by a `where` first) as one task
@@ -1122,7 +1139,7 @@ Rules:
 - Python objects whose memory a task still uses are released only on the
   main thread with the GIL: a worker dropping the last reference parks
   the object in a graveyard drained at the next C ABI call.
-- Not implemented yet: casting into `out=` of another dtype, gufuncs
+- Not implemented yet: gufuncs
   (linalg, fft; matmul with casts or `out=`), FP-flag reporting to
   Python (NumPy warnings / `np.errstate`).
 

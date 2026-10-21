@@ -2600,6 +2600,140 @@ static PyObject* m_reduce(PyObject* self, PyObject* args) {
     return wrap_array(res);
 }
 
+static PyObject* m_ufunc_typed(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *ufunc, *ins, *codes, *out;
+    if (!PyArg_ParseTuple(args, "OO!O!O", &ufunc, &PyTuple_Type, &ins, &PyTuple_Type, &codes,
+                          &out) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    const Py_ssize_t nin = PyTuple_GET_SIZE(ins);
+    if (nin < 1 || nin > MAXIN || PyTuple_GET_SIZE(codes) != nin + 1 ||
+        (out != Py_None && !is_array(out))) {
+        Py_RETURN_NONE;
+    }
+    vp_array* in[MAXIN];
+    vp_dtype dts[MAXIN + 1];
+    int64_t shape[MAXDIMS];
+    int ndim = 0;
+    for (Py_ssize_t i = 0; i <= nin; ++i) {
+        const long c = PyLong_AsLong(PyTuple_GET_ITEM(codes, i));
+        if (c < 0 || c > 6) {
+            if (PyErr_Occurred()) {
+                return NULL;
+            }
+            Py_RETURN_NONE;
+        }
+        dts[i] = (vp_dtype)c;
+    }
+    for (Py_ssize_t i = 0; i < nin; ++i) {
+        PyObject* x = PyTuple_GET_ITEM(ins, i);
+        if (!is_array(x)) {
+            Py_RETURN_NONE;
+        }
+        in[i] = array_of(x);
+        const int nd = vp_array_ndim(in[i]);
+        if (nd > MAXDIMS || broadcast_into(shape, &ndim, nd, vp_array_shape(in[i])) < 0) {
+            Py_RETURN_NONE; /* NumPy raises its error in the fallback */
+        }
+    }
+    vp_array* o = NULL;
+    if (out != Py_None) {
+        /* the inputs broadcast to out's shape, which must not change */
+        o = array_of(out);
+        const int nd = vp_array_ndim(o);
+        const int64_t* os = vp_array_shape(o);
+        if (((ArrayObject*)out)->readonly || nd > MAXDIMS ||
+            broadcast_into(shape, &ndim, nd, os) < 0 || ndim != nd ||
+            memcmp(shape, os, (size_t)nd * sizeof(int64_t)) != 0) {
+            Py_RETURN_NONE;
+        }
+    }
+    const vp_loop* loop = NULL;
+    char err[ERRLEN] = "";
+    int status = vp_ufunc_loop(g_rt, ufunc, (int)nin, dts, &loop, err, sizeof err);
+    vp_array* res = NULL;
+    if (status == VP_OK) {
+        status =
+            vp_ufunc_issue(g_rt, loop, in, ndim, shape, o, &res, issue_site(), err, sizeof err);
+    }
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    return o != NULL ? Py_NewRef(out) : wrap_array(res);
+}
+
+static PyObject* m_ufunc_multi(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *ufunc, *ins, *codes;
+    if (!PyArg_ParseTuple(args, "OO!O!", &ufunc, &PyTuple_Type, &ins, &PyTuple_Type, &codes) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    const Py_ssize_t nin = PyTuple_GET_SIZE(ins);
+    const Py_ssize_t nop = PyTuple_GET_SIZE(codes);
+    if (nin < 1 || nop <= nin || nop > 8) {
+        Py_RETURN_NONE;
+    }
+    vp_array* in[8];
+    vp_dtype dts[8];
+    int64_t shape[MAXDIMS];
+    int ndim = 0;
+    for (Py_ssize_t i = 0; i < nin; ++i) {
+        PyObject* x = PyTuple_GET_ITEM(ins, i);
+        if (!is_array(x)) {
+            Py_RETURN_NONE;
+        }
+        in[i] = array_of(x);
+        const int nd = vp_array_ndim(in[i]);
+        if (nd > MAXDIMS || broadcast_into(shape, &ndim, nd, vp_array_shape(in[i])) < 0) {
+            Py_RETURN_NONE; /* NumPy raises its error in the fallback */
+        }
+    }
+    for (Py_ssize_t i = 0; i < nop; ++i) {
+        const long c = PyLong_AsLong(PyTuple_GET_ITEM(codes, i));
+        if (c < 0 || c > 6) {
+            if (PyErr_Occurred()) {
+                return NULL;
+            }
+            Py_RETURN_NONE;
+        }
+        dts[i] = (vp_dtype)c;
+    }
+    vp_array* res[8] = {NULL};
+    char err[ERRLEN] = "";
+    const int status = vp_ufunc_multi(g_rt, ufunc, (int)nin, in, (int)(nop - nin), dts, ndim, shape,
+                                      res, issue_site(), err, sizeof err);
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    PyObject* t = PyTuple_New(nop - nin);
+    for (Py_ssize_t j = 0; j < nop - nin; ++j) {
+        PyObject* w = NULL;
+        if (t != NULL) {
+            w = wrap_array(res[j]); /* releases res[j] on failure */
+        } else {
+            vp_array_release(res[j]);
+        }
+        if (w == NULL) {
+            for (Py_ssize_t k = j + 1; k < nop - nin; ++k) {
+                vp_array_release(res[k]);
+            }
+            Py_XDECREF(t);
+            return NULL;
+        }
+        PyTuple_SET_ITEM(t, j, w);
+    }
+    return t;
+}
+
 static PyObject* m_accumulate(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *ufunc, *a;
@@ -3740,6 +3874,11 @@ static PyMethodDef methods[] = {
      "astype(a, code, order): async cast (order 'K', 'C' or 'F'), or None if unsupported"},
     {"setup_reductions", m_setup_reductions, METH_VARARGS,
      "setup_reductions(entries, array_function, novalue, async_ok)"},
+    {"ufunc_typed", m_ufunc_typed, METH_VARARGS,
+     "ufunc_typed(ufunc, inputs, dtype codes, out): async ufunc with the loop for exactly "
+     "these dtypes (inputs cast, out= of any dtype), or None"},
+    {"ufunc_multi", m_ufunc_multi, METH_VARARGS,
+     "ufunc_multi(ufunc, inputs, dtype codes): async ufunc with several outputs, or None"},
     {"accumulate", m_accumulate, METH_VARARGS,
      "accumulate(ufunc, a, axis): async ufunc.accumulate without casts, or None"},
     {"reduce", m_reduce, METH_VARARGS,

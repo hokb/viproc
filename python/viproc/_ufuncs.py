@@ -1,6 +1,7 @@
-"""ufunc methods beyond __call__ and reduce (hokb/viproc#25, step 5):
-ufunc.accumulate (np.cumsum, np.cumprod, np.nancumsum, np.nancumprod) and
-ufunc.outer.
+"""ufunc calls and methods the C fast path does not take (hokb/viproc#25,
+step 5): ufuncs with several outputs, dtype=, signature=, casting=, out= of
+another dtype; ufunc.accumulate (np.cumsum, np.cumprod, np.nancumsum,
+np.nancumprod) and ufunc.outer.
 
 accumulate follows NumPy's PyUFunc_Accumulate (ufunc_object.c,
 BSD-3-Clause): the accumulator dtype is NumPy's (taken from NumPy itself,
@@ -52,6 +53,85 @@ def _acc_dtype(ufunc, dtype, req):
         r = None
     _acc_dtypes[key] = r
     return r
+
+
+_CALL_KEYWORDS = frozenset(("out", "dtype", "signature", "casting"))
+_PY_SCALARS = (bool, int, float, complex)
+
+
+def call(ufunc, inputs, kwargs):
+    """ufunc(*inputs, **kwargs) for what the C fast path leaves out: several
+    outputs (divmod, modf, frexp), dtype=, signature=, casting= and an out=
+    array of another dtype (NumPy casts into it in its iterator's buffers;
+    so does viproc's kernel). The dtypes are NumPy's (ufunc.resolve_dtypes,
+    which also raises NumPy's casting errors: then NumPy runs the call);
+    inputs of another dtype are cast as NumPy casts them (vp_ufunc_issue,
+    vp_ufunc_multi). Returns _NOPE where NumPy has to run it."""
+    nin, nout = ufunc.nin, ufunc.nout
+    if (ufunc.signature is not None or len(inputs) != nin or not kwargs.keys() <= _CALL_KEYWORDS
+            or nin > 3):
+        return _NOPE
+    out = kwargs.get("out")
+    if out is not None:
+        out = out if isinstance(out, tuple) else (out,)
+        # several outputs into given arrays: not yet (they may alias)
+        if nout != 1 or len(out) != 1 or type(out[0]) is not ndarray or out[0]._readonly:
+            return _NOPE
+    spec = []
+    for x in inputs:
+        if isinstance(x, (ndarray, np.ndarray, np.generic)):
+            spec.append(x.dtype)
+        elif type(x) in _PY_SCALARS:
+            spec.append(type(x))  # weak (NEP 50)
+        else:
+            return _NOPE
+    spec += [o.dtype for o in out] if out is not None else [None] * nout
+    signature = kwargs.get("signature")
+    dtype = kwargs.get("dtype")
+    if dtype is not None:
+        if signature is not None:
+            return _NOPE  # NumPy's TypeError
+        signature = (None,) * nin + (dtype,) * nout
+    resolve_kw = {} if signature is None else {"signature": signature}
+    if "casting" in kwargs:
+        resolve_kw["casting"] = kwargs["casting"]
+    try:
+        dtypes = ufunc.resolve_dtypes(tuple(spec), **resolve_kw)
+    except (TypeError, ValueError):
+        return _NOPE
+    codes = tuple(_nd._CODES.get(d) for d in dtypes)
+    if None in codes:
+        return _NOPE
+    ins = []
+    for x, d in zip(inputs, dtypes):
+        if type(x) in _PY_SCALARS:
+            try:
+                x = np.asarray(x, d)  # NumPy converts a weak scalar to the loop's dtype
+            except (OverflowError, ValueError, TypeError):
+                return _NOPE
+        if not isinstance(x, ndarray):
+            x = _nd.asarray(x)
+            if not isinstance(x, ndarray):
+                return _NOPE
+        ins.append(x)
+    if out is None and all(x.ndim == 0 for x in ins):
+        return _NOPE  # NumPy's scalars
+    # NumPy warns once per cast of complex to real values it sets up (each
+    # call); viproc's iterator templates are made once: warn here, quiet there
+    discards = sum(a.kind == "c" and b.kind in "iuf" for a, b in
+                   [(x.dtype, d) for x, d in zip(ins, dtypes)]
+                   + ([(dtypes[-1], out[0].dtype)] if out is not None else []))
+    for _ in range(discards):
+        warnings.warn("Casting complex values to real discards the imaginary part",
+                      np.exceptions.ComplexWarning, stacklevel=3)
+    with warnings.catch_warnings():
+        if discards:
+            warnings.simplefilter("ignore", np.exceptions.ComplexWarning)
+        if nout == 1:
+            r = _viproc.ufunc_typed(ufunc, tuple(ins), codes, None if out is None else out[0])
+        else:
+            r = _viproc.ufunc_multi(ufunc, tuple(ins), codes)
+    return _NOPE if r is None else r
 
 
 def _accumulate(ufunc, a, axis=0, dtype=None, out=None):

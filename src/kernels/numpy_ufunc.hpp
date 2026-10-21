@@ -134,12 +134,13 @@ class LoopCache {
     // iterator must not reverse axes, as NumPy's would not with an output it
     // allocates itself. Returns nullptr (reason in `error`, Python error
     // cleared) if NumPy cannot. Main thread with the GIL.
-    // `dtypes`: the loop's operand dtypes (inputs, then the output); inputs
+    // `dtypes`: the loop's operand dtypes (inputs, then the outputs); inputs
     // of another dtype are cast in the iterator's buffers, as NumPy does.
+    // `outs`: one layout per output of the ufunc (divmod, modf, frexp: two).
     std::shared_ptr<Kernel> iter_elementwise(const UfuncLoop* loop, std::span<const DType> dtypes,
-                                             std::span<const Layout> inputs, const Layout& out,
-                                             bool out_given, DeferRelease defer,
-                                             std::string& error);
+                                             std::span<const Layout> inputs,
+                                             std::span<const Layout> outs, bool out_given,
+                                             DeferRelease defer, std::string& error);
 
     // Reduction driven by NumPy's own iterator, for what ReducePlan does not
     // cover (numpy_reduce.hpp): casts, initial=, reduced axes that do not
