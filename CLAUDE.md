@@ -53,7 +53,7 @@ to plain sequential NumPy execution.
   allocation at issue, made dependent chains 2-4x slower than NumPy: up to
   1000 cold output blocks in flight).
 - **Data model** (`docs/design/array-data-model.md`): an `Array` holds
-  its `Storage` (size descriptor + the task configuring it, one per array
+  its `Metadata` (size descriptor + the task configuring it, one per array
   and view, atomic count, referenced by task operands) and its
   `AliasGroup`; the group holds the current data version, a
   `CountableArray` (one handle per device, `async_reads`, `host_views`).
@@ -88,7 +88,7 @@ to plain sequential NumPy execution.
   may skip states, never go back.
 - The task holds references to its input arrays, its output arrays and the
   resolved NumPy loop.
-- Tasks, CountableArrays, Storages and array blocks come from per-thread memory pools
+- Tasks, CountableArrays, Metadata objects and array blocks come from per-thread memory pools
   (`src/runtime/pool.hpp`), not malloc/free per op.
 
 ### Issuing an op (main thread)
@@ -178,7 +178,7 @@ memory pool, temporary reuse, NumPy interop) are collected in
 ownership, release or reuse of memory.
 
 - Tasks, arrays and array memory (buffers) are **reference counted**.
-  Tasks, CountableArrays (`std::shared_ptr`) and Storages (`StoragePtr`,
+  Tasks, CountableArrays (`std::shared_ptr`) and Metadata objects (`MetadataPtr`,
   intrusive) are shared across threads (atomic counts); arrays and alias
   groups are main-thread only (`Ref<T>`, plain int counts, see
   "Implementation notes").
@@ -285,7 +285,7 @@ docs/design/           Design documents (decisions with rationale)
   goals.md             goals, non-goals, never-slower rule (G1-G3), roadmap
   error-handling.md    run-time errors on any thread, asynchronous reporting
   memory-management.md ownership, release, pools, NumPy interop, COW
-  array-data-model.md  array data model: Array, Storage (SD + task),
+  array-data-model.md  array data model: Array, Metadata (SD + task),
                        AliasGroup, CountableArray; lifecycle, checks per op,
                        figure (array-data-model.svg), evaluation
 docs/benchmarks.md     benchmark results: current breakdown per category and
@@ -308,7 +308,7 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
                        (inline ≤ 128 B, else pool, deferred until the
                        producing task runs); async_reads, host_views
   task.*               Task: stages, consumer callbacks, execute(); Kernel
-                       interface; Storage (SD + task), Operand
+                       interface; Metadata (SD + task), Operand
   runtime.*            Array (main-thread view), Runtime: issue protocol,
                        worker pool, trampoline, look-ahead limit, wait
   assign.*             element copy kernel (dst[...] = src)
@@ -990,7 +990,7 @@ Rules:
 ## Implementation notes (current code)
 
 - `Array` and `AliasGroup` objects are **main-thread only**. Workers see
-  only `Task`s and the `Storage`s and `CountableArray`s captured in their
+  only `Task`s and the `Metadata` objects and `CountableArray`s captured in their
   operands. State is derived: a group is `pending` while its last writer is
   set and not completed.
 - `Runtime::view(base, layout)` creates a view (metadata only, no task).
@@ -999,7 +999,7 @@ Rules:
 - After copy-on-write the group no longer uses the wrapped NumPy memory;
   the bridge must treat the runtime array, not the original ndarray
   memory, as the source of truth.
-- Operands capture the **CountableArray at issue time** (and the Storage
+- Operands capture the **CountableArray at issue time** (and the Metadata
   for the SD), not the array or its group, so a reader keeps the data
   version it was issued against when an in/out op switches the group to a
   new version (copy-on-write).
@@ -1010,7 +1010,7 @@ Rules:
   sleeping; `enqueue()` wakes a sleeper only if nobody spins. This avoids a
   wake-up syscall per small task without taking cores from busy threads.
 - Per-op allocations: one pooled Task (operands inline up to 4), one
-  pooled Storage per output, one pooled CountableArray (element memory inline up to 128 bytes, larger from the
+  pooled Metadata per output, one pooled CountableArray (element memory inline up to 128 bytes, larger from the
   element pool when the task runs: no page faults once warm, or the dying
   input's block), one pooled
   `ArrayBlock` (Array and its AliasGroup), the Python object. Shapes/strides

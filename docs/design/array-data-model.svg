@@ -15,7 +15,7 @@ text { font-family: "IBM Plex Sans", "Segoe UI", Helvetica, Arial, sans-serif; f
   <!-- column labels -->
   <text x="20" y="22" class="small">Python</text>
   <text x="110" y="22" class="small">Array (main thread)</text>
-  <text x="300" y="22" class="small">Storage: one per array / view</text>
+  <text x="300" y="22" class="small">Metadata: one per array / view</text>
   <text x="545" y="22" class="small">shared by base + views</text>
   <text x="735" y="22" class="small">data version</text>
 
@@ -37,16 +37,16 @@ text { font-family: "IBM Plex Sans", "Segoe UI", Helvetica, Arial, sans-serif; f
 
   <!-- storages -->
   <rect x="300" y="40" width="228" height="104" rx="5" fill="#e8eefb" stroke="#2f55b5"/>
-  <text x="312" y="62" class="ttl">Storage S_A</text>
+  <text x="312" y="62" class="ttl">Metadata M_A</text>
   <text x="312" y="82" class="mono">SD f8 · ndim 2 · offset 0</text>
   <text x="312" y="98" class="mono">shape [3,4] · strides [32,8]</text>
-  <text x="312" y="116" class="small">task: op configuring S_A</text>
+  <text x="312" y="116" class="small">task: op configuring M_A</text>
   <text x="312" y="132" class="small">ref count (atomic)</text>
   <rect x="300" y="200" width="228" height="104" rx="5" fill="#e8eefb" stroke="#2f55b5"/>
-  <text x="312" y="222" class="ttl">Storage S_B</text>
+  <text x="312" y="222" class="ttl">Metadata M_B</text>
   <text x="312" y="242" class="mono">SD f8 · ndim 2 · offset 0</text>
   <text x="312" y="258" class="mono">shape [3,2] · strides [32,16]</text>
-  <text x="312" y="276" class="small">task: op configuring S_B</text>
+  <text x="312" y="276" class="small">task: op configuring M_B</text>
   <text x="312" y="292" class="small">ref count (atomic)</text>
 
   <!-- data slot -->
@@ -77,8 +77,8 @@ text { font-family: "IBM Plex Sans", "Segoe UI", Helvetica, Arial, sans-serif; f
   <!-- task -->
   <rect x="300" y="352" width="405" height="70" rx="5" fill="#f1e9fa" stroke="#7a3fb0"/>
   <text x="312" y="374" class="ttl">Task T = awaiter, one per NumPy op</text>
-  <text x="312" y="393" class="small">operand = (Storage → SD, CountableArray of the version at issue)</text>
-  <text x="312" y="410" class="small">configures the Storages of its outputs: size, device, memory, strides</text>
+  <text x="312" y="393" class="small">operand = (Metadata → SD, CountableArray of the version at issue)</text>
+  <text x="312" y="410" class="small">configures the Metadata of its outputs: size, device, memory, strides</text>
 
   <!-- references -->
   <path class="arr" d="M74,89 L108,89" marker-end="url(#ah)"/>

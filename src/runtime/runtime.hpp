@@ -75,18 +75,18 @@ class AliasGroup : public MainThreadCounted {
 };
 
 // An array as seen by the main thread (docs/design/array-data-model.md, A1): its
-// Storage (size descriptor) and its AliasGroup (data). Main-thread only:
+// Metadata (size descriptor) and its AliasGroup (data). Main-thread only:
 // workers never touch Array or AliasGroup objects, only the Storages,
-// CountableArrays and Tasks they refer to. The array, not its Storage, holds
-// the group (A5): a task's operand keeps the Storage alive, and must not keep
+// CountableArrays and Tasks they refer to. The array, not its Metadata, holds
+// the group (A5): a task's operand keeps the Metadata alive, and must not keep
 // the group's current version alive with it (run-time elision, D11).
 class Array : public MainThreadCounted {
   public:
-    Array(StoragePtr storage, Ref<AliasGroup> group, ArrayBlock* block)
-        : storage_(std::move(storage)), group_(std::move(group)), block_(block) {}
+    Array(MetadataPtr meta, Ref<AliasGroup> group, ArrayBlock* block)
+        : meta_(std::move(meta)), group_(std::move(group)), block_(block) {}
 
-    const Layout& layout() const { return storage_->sd(); }
-    const StoragePtr& storage() const { return storage_; }
+    const Layout& layout() const { return meta_->sd(); }
+    const MetadataPtr& meta() const { return meta_; }
     const Ref<AliasGroup>& group() const { return group_; }
     // The current data version.
     const std::shared_ptr<CountableArray>& buffer() const { return group_->current(); }
@@ -98,7 +98,7 @@ class Array : public MainThreadCounted {
   private:
     friend class Runtime;
 
-    StoragePtr storage_;
+    MetadataPtr meta_;
     Ref<AliasGroup> group_;
     ArrayBlock* block_;
 };
@@ -139,8 +139,8 @@ class Runtime {
 
     // A ready array over existing memory.
     ArrayPtr wrap(Layout layout, std::shared_ptr<CountableArray> buffer);
-    // A view of `base`: same storage, different layout (shape, strides,
-    // offset into the storage's buffer). Metadata only, no task.
+    // A view of `base`: same alias group, different layout (shape, strides,
+    // offset into its current data version). Metadata only, no task.
     ArrayPtr view(const ArrayPtr& base, Layout&& layout);
 
     // Issues one array op and returns immediately.
@@ -181,7 +181,7 @@ class Runtime {
     ErrorRef wait(Array& a);
     // Sync point before NumPy code on the main thread writes `a`'s buffer
     // directly (design doc D7): waits for `a`'s producer; if NumPy views of
-    // the buffer are alive (host_views), switches the storage to a copy first
+    // the buffer are alive (host_views), switches the group to a copy first
     // (copy-on-write, so those views keep their data); then waits until no
     // issued task reads the buffer. Afterwards nothing but the caller touches
     // the buffer until the main thread issues the next op.

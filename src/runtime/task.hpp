@@ -37,81 +37,81 @@ class Task;
 // it is released on any thread; tasks reference the SD instead of copying it.
 // The SD never changes once complete. Phase 1 knows every SD at issue: the
 // main thread fills it and `task` stays null.
-class StoragePtr;
+class MetadataPtr;
 
-class Storage {
+class Metadata {
   public:
-    explicit Storage(const Layout& sd) : sd_(sd) {}
-    explicit Storage(Layout&& sd) : sd_(std::move(sd)) {}
-    Storage(const Storage&) = delete;
-    Storage& operator=(const Storage&) = delete;
+    explicit Metadata(const Layout& sd) : sd_(sd) {}
+    explicit Metadata(Layout&& sd) : sd_(std::move(sd)) {}
+    Metadata(const Metadata&) = delete;
+    Metadata& operator=(const Metadata&) = delete;
 
     const Layout& sd() const { return sd_; }
     // The op configuring the SD, while it is incomplete; null otherwise.
     const std::shared_ptr<Task>& task() const { return task_; }
 
   private:
-    friend class StoragePtr;
-    friend StoragePtr make_storage(const Layout& sd);
-    friend StoragePtr make_storage(Layout&& sd);
+    friend class MetadataPtr;
+    friend MetadataPtr make_metadata(const Layout& sd);
+    friend MetadataPtr make_metadata(Layout&& sd);
     // Destroys `s` and returns its memory to the pool (any thread).
-    static void destroy(const Storage* s);
+    static void destroy(const Metadata* s);
 
     Layout sd_;
     std::shared_ptr<Task> task_;
     mutable std::atomic<int> refs_{1}; // the creating reference
 };
 
-// Intrusive, atomically counted reference to a Storage: no control block, and
-// the first reference is the one make_storage() returns.
-class StoragePtr {
+// Intrusive, atomically counted reference to a Metadata: no control block, and
+// the first reference is the one make_metadata() returns.
+class MetadataPtr {
   public:
-    StoragePtr() = default;
-    StoragePtr(std::nullptr_t) {}
-    StoragePtr(const StoragePtr& o) : p_(o.p_) {
+    MetadataPtr() = default;
+    MetadataPtr(std::nullptr_t) {}
+    MetadataPtr(const MetadataPtr& o) : p_(o.p_) {
         if (p_ != nullptr) {
             p_->refs_.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    StoragePtr(StoragePtr&& o) noexcept : p_(std::exchange(o.p_, nullptr)) {}
-    StoragePtr& operator=(StoragePtr o) noexcept {
+    MetadataPtr(MetadataPtr&& o) noexcept : p_(std::exchange(o.p_, nullptr)) {}
+    MetadataPtr& operator=(MetadataPtr o) noexcept {
         std::swap(p_, o.p_);
         return *this;
     }
-    ~StoragePtr() { reset(); }
+    ~MetadataPtr() { reset(); }
 
     void reset() {
-        const Storage* p = std::exchange(p_, nullptr);
+        const Metadata* p = std::exchange(p_, nullptr);
         if (p != nullptr && p->refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            Storage::destroy(p);
+            Metadata::destroy(p);
         }
     }
-    const Storage* get() const { return p_; }
-    const Storage& operator*() const { return *p_; }
-    const Storage* operator->() const { return p_; }
+    const Metadata* get() const { return p_; }
+    const Metadata& operator*() const { return *p_; }
+    const Metadata* operator->() const { return p_; }
     explicit operator bool() const { return p_ != nullptr; }
 
   private:
-    friend StoragePtr make_storage(const Layout& sd);
-    friend StoragePtr make_storage(Layout&& sd);
-    explicit StoragePtr(const Storage* adopted) : p_(adopted) {}
-    const Storage* p_ = nullptr;
+    friend MetadataPtr make_metadata(const Layout& sd);
+    friend MetadataPtr make_metadata(Layout&& sd);
+    explicit MetadataPtr(const Metadata* adopted) : p_(adopted) {}
+    const Metadata* p_ = nullptr;
 };
 
-// A Storage from the per-thread pool (pool.hpp), with one reference.
-StoragePtr make_storage(const Layout& sd);
-StoragePtr make_storage(Layout&& sd);
+// A Metadata from the per-thread pool (pool.hpp), with one reference.
+MetadataPtr make_metadata(const Layout& sd);
+MetadataPtr make_metadata(Layout&& sd);
 
 // One argument of a kernel call: the data version (CountableArray) captured
 // at issue time and the SD it is read or written with. Capturing the version
 // (not the array or its group) keeps readers on the data they were issued
 // against, even if the group switches to a new version later
-// (copy-on-write). `storage` keeps the SD alive; ops that run directly on the
+// (copy-on-write). `meta` keeps the SD alive; ops that run directly on the
 // main thread (Runtime::issue_direct) leave it null and point `sd` at the
 // array's SD, which outlives the call.
 struct Operand {
     std::shared_ptr<CountableArray> buffer;
-    StoragePtr storage;
+    MetadataPtr meta;
     const Layout* sd = nullptr;
     // Input only: counted in buffer->async_reads. An op does not count reads
     // of the buffer it writes in place: every later writer waits for it as
@@ -119,8 +119,8 @@ struct Operand {
     bool counted_read = true;
 
     Operand() = default;
-    Operand(std::shared_ptr<CountableArray> b, StoragePtr s, bool counted = true)
-        : buffer(std::move(b)), storage(std::move(s)), sd(&storage->sd()), counted_read(counted) {}
+    Operand(std::shared_ptr<CountableArray> b, MetadataPtr s, bool counted = true)
+        : buffer(std::move(b)), meta(std::move(s)), sd(&meta->sd()), counted_read(counted) {}
     Operand(std::shared_ptr<CountableArray> b, const Layout& l, bool counted)
         : buffer(std::move(b)), sd(&l), counted_read(counted) {}
 

@@ -12,20 +12,20 @@
 namespace viproc {
 
 namespace {
-using StoragePool = FixedPool<sizeof(Storage), alignof(Storage)>;
+using MetadataPool = FixedPool<sizeof(Metadata), alignof(Metadata)>;
 }
 
-StoragePtr make_storage(const Layout& sd) {
-    return StoragePtr(::new (StoragePool::allocate()) Storage(sd));
+MetadataPtr make_metadata(const Layout& sd) {
+    return MetadataPtr(::new (MetadataPool::allocate()) Metadata(sd));
 }
 
-StoragePtr make_storage(Layout&& sd) {
-    return StoragePtr(::new (StoragePool::allocate()) Storage(std::move(sd)));
+MetadataPtr make_metadata(Layout&& sd) {
+    return MetadataPtr(::new (MetadataPool::allocate()) Metadata(std::move(sd)));
 }
 
-void Storage::destroy(const Storage* s) {
-    s->~Storage();
-    StoragePool::deallocate(const_cast<Storage*>(s));
+void Metadata::destroy(const Metadata* s) {
+    s->~Metadata();
+    MetadataPool::deallocate(const_cast<Metadata*>(s));
 }
 
 Task::Task(std::shared_ptr<Kernel> kernel, const char* issue_site)

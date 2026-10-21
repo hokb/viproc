@@ -11,7 +11,7 @@ Status labels:
 - **Decided** — agreed, not implemented yet.
 - **Implemented** — in the code (file references given).
 
-Object names follow `array-data-model.md`: an `Array` holds its `Storage`
+Object names follow `array-data-model.md`: an `Array` holds its `Metadata`
 (size descriptor) and its `AliasGroup` (shared by a base and its views:
 current data version, last writer); a data version is a `CountableArray`
 (element memory, one handle per device). Below, "storage" in lower case
@@ -25,7 +25,7 @@ means the alias group's current data version as a whole.
 | D1 | No dedicated (temporary) array types; one `viproc.ndarray` type | Decided |
 | D2 | Deterministic memory management through reference counting | Decided; implemented for objects |
 | D3 | Own memory pool for element memory in the viproc layer | Implemented |
-| D4 | Pools for the per-op runtime objects (Task, Storage, CountableArray, ArrayBlock) | Implemented |
+| D4 | Pools for the per-op runtime objects (Task, Metadata, CountableArray, ArrayBlock) | Implemented |
 | D5 | Reuse the buffer of a temporary input for the output | Implemented |
 | D6 | Ownership: Python owns objects, the runtime owns element memory | Implemented |
 | D7 | Array conversions viproc ↔ ndarray: copy-free export, copy-free import of fresh memory, eager fallbacks with NumPy's semantics | Implemented |
@@ -88,7 +88,7 @@ reference goes, never by a collector or at an unknown later time.
 |--------|-----------|----------|
 | `viproc.ndarray` (Python object) | CPython refcount | when the program drops it |
 | `Array`, `AliasGroup` (runtime, main thread only) | `Ref<T>`, plain int (`src/runtime/ref.hpp`) | with the last Python object / view referring to them |
-| `Storage` (size descriptor) | `StoragePtr`, intrusive atomic | when no array and no issued task (operand) refers to it |
+| `Metadata` (size descriptor) | `MetadataPtr`, intrusive atomic | when no array and no issued task (operand) refers to it |
 | `Task` | `std::shared_ptr` (atomic) | after completion, when no array names it as producer |
 | `CountableArray` (element memory) | `std::shared_ptr` (atomic) | when no array and no issued task (operand) refers to it |
 
@@ -229,7 +229,7 @@ above).
 ## D4 — Pools for the per-op runtime objects
 
 **Implemented** (`src/runtime/pool.hpp`). `Task`, `CountableArray` objects and
-`Storage`s and `ArrayBlock`s (an `Array` and its `AliasGroup` in one allocation) come from
+`Metadata` objects and `ArrayBlock`s (an `Array` and its `AliasGroup` in one allocation) come from
 fixed-size pools: per-thread free lists without atomics for the allocating
 thread; other threads return blocks through a lock-free stack, which an
 allocating thread takes over as a whole (exchange, so no ABA). The pools
@@ -335,7 +335,7 @@ and viproc writes in place, saving memory bandwidth).
   allocated it or adopted it from a NumPy array. Adopted memory stays
   alive through a reference to its ndarray held by the `CountableArray`.
 - **`Array` / `AliasGroup`** are runtime objects reachable only from the
-  main thread; workers see `Task`s, `Storage`s and `CountableArray`s only.
+  main thread; workers see `Task`s, `Metadata` objects and `CountableArray`s only.
 - **The C ABI** hands out `Array*` as `vp_array*`, one reference each;
   bridges never see C++ ownership types.
 

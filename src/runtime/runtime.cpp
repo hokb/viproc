@@ -122,23 +122,23 @@ void Array::last_ref_dropped(Array* a) {
 namespace {
 
 // A base array with a new group, both in one block.
-ArrayPtr new_array(StoragePtr storage, std::shared_ptr<CountableArray> buffer,
+ArrayPtr new_array(MetadataPtr meta, std::shared_ptr<CountableArray> buffer,
                    std::shared_ptr<Task> last_writer) {
     ArrayBlock* block = new_block(2); // owned by the references from here on
     AliasGroup& g = block->group.emplace(std::move(buffer), std::move(last_writer), block);
-    Array& a = block->array.emplace(std::move(storage), Ref<AliasGroup>(&g), block);
+    Array& a = block->array.emplace(std::move(meta), Ref<AliasGroup>(&g), block);
     return ArrayPtr(&a);
 }
 
 } // namespace
 
 ArrayPtr Runtime::wrap(Layout layout, std::shared_ptr<CountableArray> buffer) {
-    return new_array(make_storage(std::move(layout)), std::move(buffer), nullptr);
+    return new_array(make_metadata(std::move(layout)), std::move(buffer), nullptr);
 }
 
 ArrayPtr Runtime::view(const ArrayPtr& base, Layout&& layout) {
     ArrayBlock* block = new_block(1);
-    Array& a = block->array.emplace(make_storage(std::move(layout)), base->group_, block);
+    Array& a = block->array.emplace(make_metadata(std::move(layout)), base->group_, block);
     return ArrayPtr(&a);
 }
 
@@ -214,8 +214,8 @@ void Runtime::issue_group_copy(AliasGroup& g) {
     active_.fetch_add(1, std::memory_order_acq_rel);
     auto task = make_pooled<Task>(std::make_shared<CopyKernel>(), "copy-on-write");
     old->async_reads.fetch_add(1, std::memory_order_relaxed);
-    task->operands_for_issue().push_back({old, make_storage(bytes_of(*old))});
-    task->operands_for_issue().push_back({fresh, make_storage(bytes_of(*fresh))});
+    task->operands_for_issue().push_back({old, make_metadata(bytes_of(*old))});
+    task->operands_for_issue().push_back({fresh, make_metadata(bytes_of(*fresh))});
     task->set_ninputs(1);
     if (failed) {
         task->add_upstream_error(failed);
@@ -268,7 +268,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         } else if (g.last_error_ && !failed_input) {
             failed_input = g.last_error_;
         }
-        in_ops.push_back({g.current_, a.storage_});
+        in_ops.push_back({g.current_, a.meta_});
     };
     for (const ArrayPtr& a : inputs) {
         snapshot(*a);
@@ -309,7 +309,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
             g.current_ =
                 make_pooled<CountableArray>(g.current_->nbytes(), CountableArray::deferred);
         } else {
-            // Views share the storage (or the op writes only part of it, or
+            // Views share the group (or the op writes only part of it, or
             // only some of its elements): the whole old data goes into the new
             // buffer first, views keep their layouts. Not a task of its own:
             // this op does it right before its kernel, when its inputs (the
@@ -342,18 +342,18 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     const std::size_t ninputs = in_ops.size();
     for (const ArrayPtr& ap : inouts) {
         AliasGroup& g = *ap->group_;
-        // A storage copy issued in step 2 must finish before this op writes.
+        // A group copy issued in step 2 must finish before this op writes.
         if (g.last_writer_ && g.last_writer_ != task &&
             std::find(producers.begin(), producers.end(), g.last_writer_) == producers.end()) {
             producers.push_back(g.last_writer_);
         }
         g.last_writer_ = task;
-        in_ops.push_back({g.current_, ap->storage_});
+        in_ops.push_back({g.current_, ap->meta_});
     }
     for (std::size_t i = 0; i < new_outputs.size(); ++i) {
         const Layout& l = new_outputs[i];
         if (i < output_buffers.size() && output_buffers[i]) {
-            StoragePtr st = make_storage(l);
+            MetadataPtr st = make_metadata(l);
             in_ops.push_back({output_buffers[i], st});
             results[i] = new_array(std::move(st), output_buffers[i], task);
             continue;
@@ -363,7 +363,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         Layout contiguous = l.dense() ? l : Layout::contiguous(l.dtype, l.shape);
         // The task takes the memory when it runs (D11).
         auto buffer = make_pooled<CountableArray>(contiguous.nbytes(), CountableArray::deferred);
-        StoragePtr st = make_storage(std::move(contiguous));
+        MetadataPtr st = make_metadata(std::move(contiguous));
         in_ops.push_back({buffer, st});
         results[i] = new_array(std::move(st), std::move(buffer), task);
     }
@@ -418,14 +418,14 @@ bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<cons
     for (std::size_t i = 0; i < new_outputs.size(); ++i) {
         const Layout& l = new_outputs[i];
         if (i < output_buffers.size() && output_buffers[i]) {
-            StoragePtr st = make_storage(l);
+            MetadataPtr st = make_metadata(l);
             ops.push_back({output_buffers[i], st, false});
             results[i] = new_array(std::move(st), output_buffers[i], nullptr);
             continue;
         }
         Layout contiguous = l.dense() ? l : Layout::contiguous(l.dtype, l.shape);
         auto buffer = make_pooled<CountableArray>(contiguous.nbytes());
-        StoragePtr st = make_storage(std::move(contiguous));
+        MetadataPtr st = make_metadata(std::move(contiguous));
         ops.push_back({buffer, st, false});
         results[i] = new_array(std::move(st), std::move(buffer), nullptr);
     }
