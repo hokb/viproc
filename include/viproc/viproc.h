@@ -91,6 +91,13 @@ void vp_offload_counts(const vp_runtime* rt, uint64_t* inline_ops, uint64_t* off
 /* Ops that ran directly on the main thread, without a task (small, all
  * inputs ready; Runtime::issue). */
 uint64_t vp_direct_count(const vp_runtime* rt);
+/* Tasks issued so far (main thread): every op that did not run directly,
+ * whether its inputs were ready or pending, and copy-on-write copies. */
+uint64_t vp_task_count(const vp_runtime* rt);
+/* Sync points so far that found their array pending, so the main thread
+ * blocked (vp_array_wait, vp_array_prepare_write, ...; vp_wait_all is not
+ * counted). Waits on ready arrays (to read their error) are no syncs. */
+uint64_t vp_sync_count(const vp_runtime* rt);
 size_t vp_active_tasks(const vp_runtime* rt);
 
 /* --- Element memory pool (process-wide; docs/design/memory-management.md) */

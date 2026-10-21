@@ -1502,8 +1502,12 @@ def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
 
 
 def offload_stats():
-    """{'inline': n, 'offloaded': m, 'direct': d}: ready ops run inline as a task /
-    handed to workers / run directly without a task (small, inputs ready)."""
+    """{'inline': n, 'offloaded': m, 'direct': d, 'tasks': t, 'syncs': s}:
+    ready ops run inline as a task / handed to workers / run directly without
+    a task (small, inputs ready); t counts every task issued, whether its
+    inputs were ready or pending (inline and offloaded count only the ready
+    ones); s counts sync points that found their array pending (the main
+    thread blocked; wait_all() not counted)."""
     _ensure_runtime()
     return _viproc.offload_counts()
 

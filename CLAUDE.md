@@ -339,6 +339,8 @@ python/viproc/         Python package
 python/_viproc_hook.py import numpy -> viproc for user code (python -m viproc,
                        VIPROC=1 via viproc.pth, installed by pip next to it)
 python/tests/          pytest tests of the bridge (bit-identical to NumPy)
+  async_path.py        assert_async(): an op took the asynchronous path
+                       (offload_stats counters: tasks, no fallback, no sync)
 python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
                        (per-op issue times: main-thread stalls, pool misses)
   suite.py             benchmark suite: runner, machine detection, score
@@ -1051,7 +1053,12 @@ Rules:
 - Thread safety is part of every runtime API. Document which thread may
   call it and which locks it takes.
 - Every new instruction needs a test that compares the asynchronous result
-  with NumPy executing the same ops eagerly.
+  with NumPy executing the same ops eagerly, and a test that it actually
+  takes the asynchronous path (`python/tests/async_path.py`:
+  `assert_async(fn, *args, ops=n)` inside `deterministic()`, data above
+  `sync_below`, pending inputs: exactly n tasks, none on the main thread,
+  no fallback, no blocking sync; `offload_stats()["tasks"]` counts every
+  task issued, `["syncs"]` the waits that found their array pending).
 - **Every change to a kernel, the issue path or the bridge's per-op code is
   a performance change** (G3): measure it against `main` before pushing
   (callgrind instructions per op, timings for data-sized costs) and give
