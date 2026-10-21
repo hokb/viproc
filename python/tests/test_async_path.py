@@ -87,7 +87,7 @@ def test_in_place_and_out():
     (lambda a: a.sum(), 1), (lambda a: np.sum(a), 1), (lambda a: a.sum(axis=0), 1),
     (lambda a: a.sum(axis=1), 1), (lambda a: a.prod(axis=1), 1), (lambda a: np.max(a), 1),
     (lambda a: a.min(axis=0, keepdims=True), 1), (lambda a: np.add.reduce(a, axis=0), 1),
-    (lambda a: np.maximum.reduce(a, axis=1), 1), (lambda a: a.argmax(axis=1), 1),
+    (lambda a: np.maximum.reduce(a, axis=1), 1),
     (lambda a: (a > 1).any(axis=0), 2), (lambda a: (a > 0).all(), 2),  # comparison + reduction
 ])
 def test_reduction(call, ops):
@@ -96,10 +96,12 @@ def test_reduction(call, ops):
 
 
 @pytest.mark.xfail(strict=True, reason="argmin/argmax decide the direct path by their output "
-                   "size (vp_arg_reduce passes no work size, vp_reduce passes the input's): a "
-                   "full argmax of ready data runs on the main thread (hokb/viproc#25)")
-@pytest.mark.parametrize("call", [lambda a: a.argmax(), lambda a: np.argmin(a)])
-def test_full_argmax_of_ready_data(call):
+                   "size (vp_arg_reduce passes no work size, vp_reduce passes the input's): an "
+                   "argmax of ready data with a small result runs on the main thread "
+                   "(hokb/viproc#25)")
+@pytest.mark.parametrize("call", [lambda a: a.argmax(), lambda a: np.argmin(a),
+                                  lambda a: a.argmax(axis=1)])
+def test_argmax_of_ready_data(call):
     x, v = data((100, 100))
     v.wait()
     same(assert_async(call, v), call(x))
