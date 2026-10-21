@@ -3375,6 +3375,81 @@ static PyObject* m_scatter(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+/* place(dtype, shape, strides, parts): a new array of `dtype` and `shape`
+ * with the dense byte `strides` (None: C order), assembled from `parts`, a
+ * sequence of (src, shape, strides, offset): src copied into the result's
+ * view with that shape, byte strides and byte offset (vp_place). */
+static PyObject* m_place(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *dtype, *shape_o, *strides_o, *parts_o;
+    if (!PyArg_ParseTuple(args, "OOOO", &dtype, &shape_o, &strides_o, &parts_o) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    const int code = dtype_code(dtype);
+    int64_t shape[MAXDIMS], strides[MAXDIMS];
+    const int nd = read_dims(shape_o, shape);
+    if (code < 0 || nd < 0 || (strides_o != Py_None && read_dims(strides_o, strides) != nd)) {
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_ValueError, "place: unsupported dtype or wrong strides");
+        }
+        return NULL;
+    }
+    PyObject* parts = PySequence_Fast(parts_o, "place: parts must be a sequence");
+    if (parts == NULL) {
+        return NULL;
+    }
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(parts);
+    vp_array** srcs = PyMem_Malloc((size_t)(n + 1) * sizeof(vp_array*));
+    int* pnd = PyMem_Malloc((size_t)(n + 1) * sizeof(int));
+    int64_t* pshapes = PyMem_Malloc((size_t)(n * MAXDIMS + 1) * sizeof(int64_t));
+    int64_t* pstrides = PyMem_Malloc((size_t)(n * MAXDIMS + 1) * sizeof(int64_t));
+    int64_t* poffsets = PyMem_Malloc((size_t)(n + 1) * sizeof(int64_t));
+    PyObject* result = NULL;
+    if (srcs == NULL || pnd == NULL || pshapes == NULL || pstrides == NULL || poffsets == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    int64_t at = 0;
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject *src, *ps, *pst;
+        long long off;
+        if (!PyArg_ParseTuple(PySequence_Fast_GET_ITEM(parts, i),
+                              "O!OOL;place: a part is "
+                              "(src, shape, strides, offset)",
+                              &ArrayType, &src, &ps, &pst, &off)) {
+            goto done;
+        }
+        const int k = read_dims(ps, pshapes + at);
+        if (k < 0 || read_dims(pst, pstrides + at) != k) {
+            if (!PyErr_Occurred()) {
+                PyErr_SetString(PyExc_ValueError, "place: shape and strides differ in length");
+            }
+            goto done;
+        }
+        srcs[i] = array_of(src);
+        pnd[i] = k;
+        poffsets[i] = off;
+        at += k;
+    }
+    vp_array* r = NULL;
+    char err[ERRLEN] = "";
+    const int status =
+        vp_place(g_rt, (vp_dtype)code, nd, shape, strides_o == Py_None ? NULL : strides, (int)n,
+                 srcs, pnd, pshapes, pstrides, poffsets, &r, issue_site(), err, sizeof err);
+    if (raise_status(status, err) == 0) {
+        result = wrap_array(r);
+    }
+done:
+    PyMem_Free(srcs);
+    PyMem_Free(pnd);
+    PyMem_Free(pshapes);
+    PyMem_Free(pstrides);
+    PyMem_Free(poffsets);
+    Py_DECREF(parts);
+    return result;
+}
+
 /* matmul(a, b): np.matmul of two viproc arrays, or None if NumPy has to run
  * it. */
 static PyObject* m_matmul(PyObject* self, PyObject* args) {
@@ -3630,6 +3705,8 @@ static PyMethodDef methods[] = {
      "scatter(a, idx, idx_axes, result_axes, values): a[idx...] = values (vp_scatter)"},
     {"where", (PyCFunction)(void (*)(void))m_where, METH_FASTCALL | METH_KEYWORDS,
      "where(condition, [x, y]): numpy.where without NumPy's dispatch for viproc arrays"},
+    {"place", m_place, METH_VARARGS,
+     "place(dtype, shape, strides, parts): an array assembled from copies (vp_place)"},
     {"select", m_select, METH_VARARGS, "select(cond, x, y): np.where(cond, x, y) (vp_select)"},
     {"mask_assign", m_mask_assign, METH_VARARGS, "mask_assign(a, mask, value): a[mask] = value"},
     {"matmul", m_matmul, METH_VARARGS,

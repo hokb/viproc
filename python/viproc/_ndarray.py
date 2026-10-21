@@ -82,7 +82,7 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0, like=N
         if dtype is not None and np.dtype(dtype) != obj.dtype:
             r = obj.astype(dtype)
         if copy and r is obj:
-            r = obj.copy()
+            r = obj.copy(order=order)  # NumPy: order K keeps the layout
         if ndmin > r.ndim:
             r = r.reshape((1,) * (ndmin - r.ndim) + r.shape)
         return r
@@ -112,7 +112,7 @@ def fresh(r, args=(), kwargs=None):
     if r.dtype not in _CODES:
         return r
     if not r.flags.owndata:
-        r = r.copy()
+        r = r.copy(order="K")  # keeps NumPy's layout (a transposed result)
     return _adopt(r)
 
 
@@ -1186,7 +1186,7 @@ class ndarray(_viproc._Array):
             args[0][...] = args[1]
             return None
         handler = (_REDUCTIONS.get(func) or _VIEW_HANDLERS.get(func) or _PRODUCTS.get(func)
-                   or _COMPOSITIONS.get(func))
+                   or _COMPOSITIONS.get(func) or _JOINING.get(func))
         if handler is not None:
             try:
                 r = handler(*args, **kwargs)
@@ -1758,3 +1758,4 @@ def workers():
 
 
 from ._compose import COMPOSITIONS as _COMPOSITIONS  # noqa: E402 (uses this module)
+from ._join import JOINING as _JOINING  # noqa: E402

@@ -282,13 +282,27 @@ def _average(a, axis=None, weights=None, returned=False, *, keepdims=_NV):
 
 
 def _diff(a, n=1, axis=-1, prepend=_NV, append=_NV):
-    if not _vp(a) or prepend is not _NV or append is not _NV:
-        return _NOPE  # prepend/append concatenate
+    if not _vp(a):
+        return _NOPE
     if n == 0:
         return a
     if n < 0 or a.ndim == 0:
         return _NOPE
     axis = normalize_axis_index(axis, a.ndim)
+    def side(x):  # a 0-d prepend/append is broadcast to one slice along axis
+        x = _arr(x)
+        if x.ndim == 0:
+            shape = list(a.shape)
+            shape[axis] = 1
+            x = np.broadcast_to(x, tuple(shape))
+        return x
+
+    combined = [side(prepend)] if prepend is not _NV else []
+    combined.append(a)
+    if append is not _NV:
+        combined.append(side(append))
+    if len(combined) > 1:
+        a = np.concatenate(combined, axis)
     slice1 = [slice(None)] * a.ndim
     slice2 = [slice(None)] * a.ndim
     slice1[axis] = slice(1, None)
