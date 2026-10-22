@@ -13,6 +13,7 @@
 
 #include "viproc/viproc.h"
 
+#include <assert.h>
 #include <string.h>
 
 /* Temporary elision (docs/design/memory-management.md, D5) needs to know
@@ -891,10 +892,16 @@ static PyObject* elision_candidate(PyObject* const* inputs, vp_array* const* ins
  * reductions and scalar indexing return them, and ufuncs on 0-d arrays do
  * too). Its result is NumPy's: a NumPy scalar. Any n-d operand (even of one
  * element) keeps the array path, so NumPy's output shapes stay as they
- * are. Fills `out` with new references and returns 1, or 0 if an operand is
- * not a ready scalar. */
-static int scalars_of(PyObject* const* inputs, Py_ssize_t n, PyObject** out) {
-    if (g_rt == NULL || n > MAXIN) {
+ * are. Fills `out` (capacity `out_len` entries, at least `n`) with new
+ * references and returns 1, or 0 if an operand is not a ready scalar. Call it
+ * through SCALARS_OF, which passes the length of the `out` array. */
+static int scalars_of(PyObject* const* inputs, Py_ssize_t n, PyObject** out, Py_ssize_t out_len) {
+    if (n > MAXIN) {
+        return 0;
+    }
+    assert(n >= 0 && n <= out_len);
+    (void)out_len;
+    if (g_rt == NULL) {
         return 0;
     }
     for (Py_ssize_t i = 0; i < n; ++i) {
@@ -922,6 +929,10 @@ static int scalars_of(PyObject* const* inputs, Py_ssize_t n, PyObject** out) {
     }
     return 1;
 }
+
+/* `out` must be an array (not a pointer): its length is checked against n. */
+#define SCALARS_OF(inputs, n, out)                                                                 \
+    scalars_of((inputs), (n), (out), (Py_ssize_t)(sizeof(out) / sizeof((out)[0])))
 
 static void release_all(PyObject** objs, Py_ssize_t n) {
     for (Py_ssize_t i = 0; i < n; ++i) {
@@ -1187,6 +1198,8 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             temps[ntemps++] = t;
             ins[i] = t;
         }
+        /* Folds input i into the broadcast shape of inputs 0..i-1: after the
+         * loop, shape/ndim is the output shape. */
         if (broadcast_into(shape, &ndim, vp_array_ndim(ins[i]), vp_array_shape(ins[i])) < 0) {
             status = 1; /* not broadcastable: the fallback raises NumPy's error */
         }
@@ -1257,7 +1270,7 @@ static PyObject* Array_array_ufunc(PyObject* self, PyObject* const* args, Py_ssi
         }
         if (out == NULL) {
             PyObject* sc[MAXIN];
-            const int k = scalars_of(inputs, n, sc);
+            const int k = SCALARS_OF(inputs, n, sc);
             if (k < 0) {
                 return NULL;
             }
@@ -1346,7 +1359,7 @@ static PyObject* binop(const char* name, binaryfunc scalar_op, PyObject* a, PyOb
     }
     PyObject* sc[2];
     PyObject* in2[2] = {a, b};
-    const int k = scalar_op != NULL ? scalars_of(in2, 2, sc) : 0;
+    const int k = scalar_op != NULL ? SCALARS_OF(in2, 2, sc) : 0;
     if (k != 0) {
         PyObject* r = k > 0 ? scalar_op(sc[0], sc[1]) : NULL;
         if (k > 0) {
@@ -1394,11 +1407,11 @@ static PyObject* inplace_op(const char* name, binaryfunc scalar_op, PyObject* a,
 }
 
 static PyObject* unop(const char* name, unaryfunc scalar_op, PyObject* a) {
-    PyObject* sc;
-    const int k = scalars_of(&a, 1, &sc);
+    PyObject* sc[1];
+    const int k = SCALARS_OF(&a, 1, sc);
     if (k != 0) {
-        PyObject* r = k > 0 ? scalar_op(sc) : NULL;
-        Py_XDECREF(k > 0 ? sc : NULL);
+        PyObject* r = k > 0 ? scalar_op(sc[0]) : NULL;
+        Py_XDECREF(k > 0 ? sc[0] : NULL);
         return r;
     }
     PyObject* ufunc = op_ufunc(name);
@@ -3467,7 +3480,7 @@ static PyObject* UfuncProxy_vectorcall(PyObject* self, PyObject* const* args, si
         }
         if (any) {
             PyObject* sc[MAXIN];
-            const int k = scalars_of(args, n, sc);
+            const int k = SCALARS_OF(args, n, sc);
             if (k < 0) {
                 return NULL;
             }
