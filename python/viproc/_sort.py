@@ -9,9 +9,10 @@ maps heapsort to it), mergesort and stable its timsort/radix sort. np.sort
 is NumPy's `copy(order="K")` sorted in place: the result has the copy's
 layout; argsort's result is C-ordered intp. axis=None sorts the C-ordered
 flat copy. order= (structured dtypes) and other arguments fall back. Small
-ready data takes vp_sort's direct path too (no task). np.sort(a[, axis])
-of a C-contiguous array and np.argsort(a[, axis]) skip this module:
-_Array.__array_function__ issues them in C (sort_call in _viproc.c).
+ready data takes vp_sort's direct path too (no task). The common calls
+(a, int axis, kind, stable; axis=None of a C-contiguous array) skip this
+module: _Array.__array_function__ issues them in C (sort_call in
+_viproc.c), a.sort/a.argsort are C methods (sort_method).
 """
 
 import numpy as np
