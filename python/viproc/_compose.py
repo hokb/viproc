@@ -40,8 +40,8 @@ def _arr(x):
 
 
 def _layout_flags(a):
-    """NumPy's flags for a's layout, from a probe over one element (no sync)."""
-    return np.lib.stride_tricks.as_strided(np.empty(1, a.dtype), a.shape, a.strides).flags
+    """NumPy's flags for a's layout (no sync: viproc computes them in C)."""
+    return a.flags
 
 
 def _is_fortran(a):  # PyArray_ISFORTRAN
