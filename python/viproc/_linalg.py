@@ -261,10 +261,13 @@ def _svdvals(x, /):
 def _small_ready(func, handler):
     """Small ready inputs (at most sync_below elements together): nothing to
     overlap, NumPy's own function runs right away on read-only exports (its
-    results are fresh memory, adopted); else the handler's task."""
+    results are fresh memory, adopted); else the handler's task. Not with a
+    viproc array beyond the first two arguments (out=)."""
     def h(*args, **kwargs):
         arrays = [x for x in args[:2] if type(x) is ndarray]
         if (arrays and sum(x.size for x in arrays) <= _nd._small_ops[0]
+                and not any(type(x) is ndarray for x in args[2:])
+                and not any(type(x) is ndarray for x in kwargs.values())
                 and all(_viproc.ready(x) for x in arrays)):
             r = func(*[np.asarray(x) if type(x) is ndarray else x for x in args], **kwargs)
             if isinstance(r, tuple):

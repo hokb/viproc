@@ -378,9 +378,10 @@ int vp_ufunc_at(vp_runtime* rt, const vp_loop* loop, vp_array* a, vp_array* indi
  *    a label only an output has needs its size from the caller or `outs`.
  *  - Inputs of another dtype are cast into copies first, laid out as
  *    NumPy's iterator lays them out.
- *  - outs == NULL or outs[0] == NULL: new outputs in NumPy's layout (the
- *    iterator's order, or C order with VP_GUFUNC_C_ORDER in `flags`), into
- *    results[0..nout).
+ *  - outs == NULL or outs[0] == NULL: new outputs into results[0..nout), in
+ *    NumPy's iterator's layout, or, with order_n > 0, dense with their axes
+ *    in `out_order` (order_n entries, outermost first; every output has
+ *    order_n axes): numpy.fft allocates `out` with empty_like (order K).
  *    Otherwise all outputs are given (in/out semantics, exactly the loop's
  *    dtypes and the batch shape) and results[] are set to NULL.
  *  - `invalid_error` (or NULL): the loop reports failure through the
@@ -397,12 +398,12 @@ int vp_ufunc_at(vp_runtime* rt, const vp_loop* loop, vp_array* a, vp_array* indi
  * operand for another reason (misaligned, out= overlapping an input, out=
  * of another dtype or shape, shapes that do not match); the caller then
  * falls back to NumPy. */
-enum { VP_GUFUNC_C_ORDER = 1, VP_GUFUNC_CHECK_FINITE = 2, VP_GUFUNC_SERIAL = 4 };
+enum { VP_GUFUNC_CHECK_FINITE = 2, VP_GUFUNC_SERIAL = 4 };
 int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, int nout,
               vp_array* const* outs, const vp_dtype* dtypes, const int* core_n,
-              const int* core_axes, int nlabels, int64_t* sizes, int flags,
-              const char* invalid_error, int64_t work, vp_array** results, const char* site,
-              char* err, size_t errlen);
+              const int* core_axes, int nlabels, int64_t* sizes, int flags, int order_n,
+              const int* out_order, const char* invalid_error, int64_t work, vp_array** results,
+              const char* site, char* err, size_t errlen);
 
 /* Issues np.matmul(a, b) (the `@` operator) with NumPy's matmul gufunc loop
  * for (t, t) -> t, where t is the dtype of both operands; the loop is

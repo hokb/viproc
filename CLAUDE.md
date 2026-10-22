@@ -351,6 +351,8 @@ python/viproc/         Python package
                        (vp_gufunc: casts, out=, axes=/axis=, 1-d matmul)
   _linalg.py           numpy.linalg wrappers ported onto vp_gufunc (det, inv,
                        solve, cholesky, eig*, svd; AsyncLinAlgError)
+  _fft.py              numpy.fft wrappers ported onto vp_gufunc (fft, rfft,
+                       irfft, hfft, n-d transforms)
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -754,10 +756,24 @@ Rules:
   swapped, which CBLAS maps onto the same kernel). Fuzzed in
   `python/tests/test_matmul.py` (dtypes, broadcasting, 1-d operands,
   transposed/stepped/reversed/broadcast operands, sizes OpenBLAS threads).
-- **FFT:** the Python wrappers in `numpy/fft/_pocketfft.py` handle `n`
-  (padding/truncation), `axis`, `norm` (passed as the scalar `fct`
-  argument) and the choice between `rfft_n_even`/`rfft_n_odd`. We port that
-  logic into the bridge and issue the gufunc as an instruction.
+- **FFT** (`_fft.py`, `FFT`): `fft`, `ifft`, `rfft`, `irfft`, `hfft`,
+  `ihfft` and the n-d transforms NumPy composes of them (`fftn`, `ifftn`,
+  `fft2`, `ifft2`, `rfftn`, `irfftn`, `rfft2`, `irfft2`), ported from
+  `numpy/fft/_pocketfft.py`: its checks and errors, `norm` as the scalar
+  `fct` (computed on the main thread as NumPy computes it),
+  `rfft_n_even`/`rfft_n_odd` by the parity of n, the gufunc called as
+  `ufunc(a, fct, axes=[(axis,), (), (axis,)], out=out)` through
+  `vp_gufunc` (the loop pads/truncates to n itself; the output label's
+  size passed in). The loop is NumPy's for (a, fct, out): a Python int
+  `fct` (norm "backward") makes NumPy pick the **double** loop also for
+  float32/complex64 data and cast into the single-precision `out`; viproc
+  runs that loop and casts the result (an `astype` task), bit-identical.
+  NumPy allocates `out` with `empty_like(a, shape=...)` (order K:
+  `PyArray_NewLikeArrayWithShape`); viproc gives the result that layout
+  (`vp_gufunc`'s `out_order`). pocketfft makes its plan per call
+  (`POCKETFFT_CACHE_SIZE` 0 in NumPy's build): thread-safe. n-d transforms
+  with `out=` and the deprecated `s`/`axes` forms fall back. Fuzzed in
+  `python/tests/test_fft.py`.
 - **Dtype semantics follow NumPy exactly:** promotion, `divide` on integers
   yielding `float64`, overflow wrap-around, NaN handling.
 - **Broadcasting and scalars:** NumPy broadcasting rules apply to all
@@ -897,7 +913,7 @@ Rules:
 - **Fallback (sync + eager NumPy on viproc memory, `_Host`):** everything
   else (`nonzero`, `flatnonzero`, `argwhere`, `count_nonzero` sync on their
   argument and run in NumPy on a read-only export, without the general
-  fallback's wait for readers): other reductions (`out=`, `where=`), fft,
+  fallback's wait for readers): other reductions (`out=`, `where=`),
   `qr`/`lstsq`/`pinv` and other linalg functions not in `LINALG`, `np.dot` of n-d
   operands, empty advanced-index results, 0-d boolean indices,
   `ufunc.at`, other NumPy functions. NumPy's semantics exactly (design doc
@@ -1218,7 +1234,7 @@ Rules:
 - Python objects whose memory a task still uses are released only on the
   main thread with the GIL: a worker dropping the last reference parks
   the object in a graveyard drained at the next C ABI call.
-- Not implemented yet: the fft gufuncs, FP-flag reporting to
+- Not implemented yet: FP-flag reporting to
   Python (NumPy warnings / `np.errstate`).
 
 ## Conventions
@@ -1349,7 +1365,7 @@ code, comments, docs and commit messages in English.
       queued task itself was decided against, see "Dispatch decision").
 - [x] `matmul`/`dot` asynchronously (NumPy's matmul loop; `matmul_batch`
       has no fallbacks left).
-- [ ] The fft gufuncs and the remaining linalg functions (`qr`, `lstsq`,
+- [ ] The remaining linalg functions (`qr`, `lstsq`,
       `pinv`, ...; the generic gufunc path exists: `vp_gufunc`).
 - [ ] Scaling beyond 4 cores: on a 20-core i7-12700K (8 P + 4 E cores,
       HT) the suite scores 22 with medium/large at 11 (`chains_wide`

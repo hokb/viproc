@@ -986,14 +986,25 @@ int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_arra
 
 int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, int nout,
               vp_array* const* outs, const vp_dtype* dtypes, const int* core_n,
-              const int* core_axes, int nlabels, int64_t* sizes, int flags,
-              const char* invalid_error, int64_t work, vp_array** results, const char* site,
-              char* err, size_t errlen) {
+              const int* core_axes, int nlabels, int64_t* sizes, int flags, int order_n,
+              const int* out_order, const char* invalid_error, int64_t work, vp_array** results,
+              const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     constexpr int kMax = 8;
     if (nin < 1 || nout < 1 || nin + nout > kMax || nlabels < 0) {
         set_error(err, errlen, "unsupported number of operands");
         return VP_UNSUPPORTED;
+    }
+    if (order_n > 0) { // a permutation of the outputs' axes
+        std::vector<bool> seen(static_cast<std::size_t>(order_n), false);
+        for (int k = 0; k < order_n; ++k) {
+            if (out_order[k] < 0 || out_order[k] >= order_n ||
+                seen[static_cast<std::size_t>(out_order[k])]) {
+                set_error(err, errlen, "gufunc: out_order is no permutation");
+                return VP_UNSUPPORTED;
+            }
+            seen[static_cast<std::size_t>(out_order[k])] = true;
+        }
     }
     const auto ni = static_cast<std::size_t>(nin);
     const auto no = static_cast<std::size_t>(nout);
@@ -1201,8 +1212,22 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
         for (std::size_t a = 0; a < nc; ++a) {
             shape.push_back(iter_shape[first + a]);
         }
-        if ((flags & VP_GUFUNC_C_ORDER) != 0) {
-            ol[j] = Layout::contiguous(d[ni + j], std::move(shape));
+        if (order_n > 0) {
+            if (static_cast<std::size_t>(order_n) != shape.size()) {
+                set_error(err, errlen, "gufunc: out_order does not match the outputs");
+                return VP_UNSUPPORTED;
+            }
+            Layout l;
+            l.dtype = d[ni + j];
+            l.strides = Strides(shape.size(), 0);
+            std::int64_t step = static_cast<std::int64_t>(itemsize(l.dtype));
+            for (int k = order_n - 1; k >= 0; --k) {
+                const auto a = static_cast<std::size_t>(out_order[k]);
+                l.strides[a] = step;
+                step *= shape[a];
+            }
+            l.shape = std::move(shape);
+            ol[j] = std::move(l);
             continue;
         }
         Layout l;
