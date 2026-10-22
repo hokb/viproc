@@ -161,8 +161,9 @@ static PyObject* s_out = NULL;  /* "out" */
 
 typedef struct {
     PyObject_HEAD vp_array* a;
-    int readonly; /* NumPy's WRITEABLE == False (e.g. views NumPy made read-only) */
-    int scalar;   /* 0-d result NumPy returns as a scalar (reductions, a[i]) */
+    int readonly;   /* NumPy's WRITEABLE == False (e.g. views NumPy made read-only) */
+    int scalar;     /* 0-d result NumPy returns as a scalar (reductions, a[i]) */
+    PyObject* base; /* ndarray.base: the array a view was made from, else NULL */
 } ArrayObject;
 
 static PyTypeObject ArrayType; /* forward */
@@ -171,6 +172,7 @@ static void Array_dealloc(ArrayObject* self) {
     if (self->a != NULL) {
         vp_array_release(self->a);
     }
+    Py_XDECREF(self->base);
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
@@ -279,7 +281,16 @@ static PyObject* Array_get_c_contiguous(ArrayObject* self, void* c) {
     return PyBool_FromLong(c_contiguous(self->a));
 }
 
+static PyObject* Array_get_base(ArrayObject* self, void* c) {
+    (void)c;
+    return Py_NewRef(self->base != NULL ? self->base : Py_None);
+}
+
 static PyGetSetDef Array_getset[] = {
+    {"base", (getter)Array_get_base, NULL,
+     "The array a view was made from (the first array of a chain of views, as NumPy's "
+     "PyArray_SetBaseObject collapses it), None for an array that is no view.",
+     NULL},
     {"size", (getter)Array_get_size, NULL, "Number of elements (no sync).", NULL},
     {"_c_contiguous", (getter)Array_get_c_contiguous, NULL,
      "C-contiguous, as NumPy's flag (no sync).", NULL},
@@ -2004,6 +2015,16 @@ static PyObject* m_from_ndarray(PyObject* self, PyObject* arr) {
 
 /* --- views: NumPy's metadata rules, computed here ------------------------- */
 
+/* Sets view `v`'s base to `a`, or to a's base if `a` is a view itself (as
+ * NumPy's PyArray_SetBaseObject collapses chains of views); v may be NULL. */
+static PyObject* set_base(PyObject* v, PyObject* a) {
+    if (v != NULL) {
+        PyObject* b = ((ArrayObject*)a)->base;
+        ((ArrayObject*)v)->base = Py_NewRef(b != NULL ? b : a);
+    }
+    return v;
+}
+
 /* A view of `a` with this layout (offset relative to a's first element),
  * read-only if `a` is; new reference or NULL. */
 static PyObject* make_view(PyObject* a, vp_dtype dtype, int nd, const int64_t* shape,
@@ -2012,7 +2033,7 @@ static PyObject* make_view(PyObject* a, vp_dtype dtype, int nd, const int64_t* s
     if (v != NULL) {
         ((ArrayObject*)v)->readonly = ((ArrayObject*)a)->readonly || readonly;
     }
-    return v;
+    return set_base(v, a);
 }
 
 /* Basic indexing (ints, slices, None, one Ellipsis) as NumPy's
@@ -2234,7 +2255,18 @@ static PyObject* reshape_view(PyObject* a, int64_t* dims, int nd, int order) {
     if (v != NULL) {
         ((ArrayObject*)v)->readonly = ((ArrayObject*)a)->readonly;
     }
-    return v;
+    return set_base(v, a);
+}
+
+/* own(v): v with its base cleared, for a view of a copy only v references
+ * (NumPy's ravel/flatten copy straight into an array owning its data). */
+static PyObject* m_own(PyObject* self, PyObject* v) {
+    (void)self;
+    if (array_of(v) == NULL) {
+        return NULL;
+    }
+    Py_CLEAR(((ArrayObject*)v)->base);
+    return Py_NewRef(v);
 }
 
 static PyObject* m_reshape(PyObject* self, PyObject* args) {
@@ -2408,7 +2440,7 @@ static PyObject* m_view(PyObject* self, PyObject* args) {
     if (v != NULL) {
         ((ArrayObject*)v)->readonly = ((ArrayObject*)base)->readonly; /* as NumPy views */
     }
-    return v;
+    return set_base(v, base);
 }
 
 static PyObject* m_scalar(PyObject* self, PyObject* a) {
@@ -4072,6 +4104,7 @@ static PyMethodDef methods[] = {
      "basic_view(a, key): a[key] for ints, slices, None, Ellipsis as a view, else None"},
     {"transpose", (PyCFunction)(void (*)(void))m_transpose, METH_FASTCALL,
      "transpose(a, axes): view, None if axes invalid"},
+    {"own", m_own, METH_O, "own(v): v with base None (a view of a copy only v references)"},
     {"reshape", m_reshape, METH_VARARGS,
      "reshape(a, shape, order): view as NumPy's reshape, None if NumPy would copy"},
     {"broadcast_to", m_broadcast_to, METH_VARARGS,
