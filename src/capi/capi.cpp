@@ -1203,7 +1203,7 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
         return VP_OK;
     }
     // New outputs: NumPy's iterator allocates each over the batch axes and
-    // its own core axes in the iteration order (C order with c_order).
+    // its own core axes in the iteration order (or in out_order).
     Layout ol[kMax];
     for (std::size_t j = 0; j < no; ++j) {
         Shape shape = batch;
