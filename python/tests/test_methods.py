@@ -401,6 +401,7 @@ def test_resize_is_async(det):
     x, v = big()
     v2 = v * 1.0  # owns its data, pending
     del v
-    assert_async(lambda: v2.resize(SIZE + 10), ops=2)  # copy, zeros
-    r = np.concatenate([x, np.zeros(10)])
+    # copy, zeros (both large: a small zero fill may run directly)
+    assert_async(lambda: v2.resize(2 * SIZE), ops=2)
+    r = np.concatenate([x, np.zeros(SIZE)])
     same(v2, r)
