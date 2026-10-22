@@ -2,6 +2,7 @@
 
 #include "viproc/viproc.h"
 
+#include "kernels/numpy_gufunc.hpp"
 #include "kernels/numpy_matmul.hpp"
 #include "kernels/numpy_reduce.hpp"
 #include "kernels/numpy_ufunc.hpp"
@@ -12,8 +13,10 @@
 
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -119,6 +122,10 @@ struct vp_runtime {
     std::shared_ptr<Graveyard> graveyard = std::make_shared<Graveyard>();
     // One matmul kernel per resolved loop.
     std::unordered_map<const numpy::UfuncLoop*, std::shared_ptr<Kernel>> matmul_kernels;
+    // One gufunc kernel per (loop, core axes, invalid_error).
+    std::map<std::tuple<const numpy::UfuncLoop*, std::vector<std::vector<int>>, std::string>,
+             std::shared_ptr<Kernel>>
+        gufunc_kernels;
 };
 
 // A vp_array* is an Array* holding one reference (no wrapper allocation).
@@ -974,6 +981,252 @@ int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_arra
     ArrayPtr res;
     rt->rt->issue(kernel, ins, {}, std::span(&out, 1), site, std::span(&res, 1), work);
     *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
+int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, int nout,
+              vp_array* const* outs, const vp_dtype* dtypes, const int* core_n,
+              const int* core_axes, int nlabels, int64_t* sizes, int c_order,
+              const char* invalid_error, int64_t work, vp_array** results, const char* site,
+              char* err, size_t errlen) {
+    rt->graveyard->drain();
+    constexpr int kMax = 8;
+    if (nin < 1 || nout < 1 || nin + nout > kMax || nlabels < 0) {
+        set_error(err, errlen, "unsupported number of operands");
+        return VP_UNSUPPORTED;
+    }
+    const auto ni = static_cast<std::size_t>(nin);
+    const auto no = static_cast<std::size_t>(nout);
+    const std::size_t nop = ni + no;
+    std::vector<DType> d;
+    for (std::size_t i = 0; i < nop; ++i) {
+        d.push_back(to_dtype(dtypes[i]));
+    }
+    std::string e;
+    const numpy::UfuncLoop* loop = rt->loops->get(ufunc, d, e);
+    if (loop == nullptr || loop->nin() != nin || loop->nout() != nout) {
+        PyErr_Clear();
+        set_error(err, errlen, loop == nullptr ? e : "wrong number of operands");
+        return VP_UNSUPPORTED;
+    }
+    numpy::GufuncCore core;
+    core.nlabels = nlabels;
+    for (std::size_t i = 0, k = 0; i < nop; ++i) {
+        core.axes.emplace_back(core_axes + k, core_axes + k + core_n[i]);
+        k += static_cast<std::size_t>(core_n[i]);
+    }
+    const bool given = outs != nullptr && outs[0] != nullptr;
+    const Layout* ls[kMax];
+    for (std::size_t i = 0; i < nop; ++i) {
+        if (i >= ni && !given) {
+            ls[i] = nullptr;
+            continue;
+        }
+        const Array& a = arr(i < ni ? inputs[i] : outs[i - ni]);
+        ls[i] = &a.layout();
+        if (!numpy_aligned(a)) {
+            set_error(err, errlen, "gufunc: misaligned operand (NumPy copies it)");
+            return VP_UNSUPPORTED;
+        }
+        if (i >= ni && ls[i]->dtype != d[i]) {
+            set_error(err, errlen, "gufunc: out= of another dtype");
+            return VP_UNSUPPORTED;
+        }
+        for (std::size_t j = 0; i >= ni && j < ni; ++j) {
+            if (arr(inputs[j]).group() == a.group()) {
+                set_error(err, errlen, "gufunc: out= overlaps an input (NumPy copies it)");
+                return VP_UNSUPPORTED;
+            }
+        }
+    }
+    // Core dimension sizes (no broadcasting of core dimensions) and the
+    // broadcast batch shape.
+    Shape batch;
+    for (std::size_t i = 0; i < nop; ++i) {
+        if (ls[i] == nullptr) {
+            continue;
+        }
+        const Layout& l = *ls[i];
+        const std::size_t nc = core.present(i);
+        if (l.shape.size() < nc) {
+            set_error(err, errlen, "gufunc: operand has too few dimensions");
+            return VP_UNSUPPORTED;
+        }
+        std::size_t ax = l.shape.size() - nc;
+        for (int label : core.axes[i]) {
+            if (label < 0) {
+                continue;
+            }
+            int64_t& size = sizes[label];
+            if (size >= 0 && size != l.shape[ax]) {
+                set_error(err, errlen, "gufunc: core dimension mismatch");
+                return VP_UNSUPPORTED;
+            }
+            size = l.shape[ax++];
+        }
+        Shape b;
+        if (!broadcast_shapes(batch, Shape(l.shape.begin(), l.shape.end() - nc), b)) {
+            set_error(err, errlen, "gufunc: batch shapes do not broadcast");
+            return VP_UNSUPPORTED;
+        }
+        batch = std::move(b);
+    }
+    for (int i = 0; i < nlabels; ++i) {
+        if (sizes[i] < 0) {
+            set_error(err, errlen, "gufunc: output core dimension of unknown size");
+            return VP_UNSUPPORTED;
+        }
+    }
+    const std::size_t nb = batch.size();
+    // The iteration space of NumPy's iterator: the batch axes, then each
+    // output's core axes. Inputs have stride 0 along all output core axes;
+    // given outputs along the other outputs' ones.
+    Shape iter_shape = batch;
+    std::vector<std::size_t> out_first(no);
+    for (std::size_t j = 0; j < no; ++j) {
+        out_first[j] = iter_shape.size();
+        for (int label : core.axes[ni + j]) {
+            if (label >= 0) {
+                iter_shape.push_back(sizes[label]);
+            }
+        }
+    }
+    const std::size_t nit = iter_shape.size();
+    std::vector<Layout> iter_ops;
+    for (std::size_t i = 0; i < nop; ++i) {
+        if (ls[i] == nullptr) {
+            continue;
+        }
+        const Layout& l = *ls[i];
+        Layout it;
+        it.dtype = l.dtype;
+        it.shape = Shape(nit, 1);
+        it.strides = Strides(nit, 0);
+        const std::size_t lb = l.shape.size() - core.present(i);
+        for (std::size_t a = 0; a < lb; ++a) {
+            it.shape[nb - lb + a] = l.shape[a];
+            it.strides[nb - lb + a] = l.strides[a];
+        }
+        if (i >= ni) {
+            for (std::size_t a = lb; a < l.shape.size(); ++a) {
+                it.shape[out_first[i - ni] + a - lb] = l.shape[a];
+                it.strides[out_first[i - ni] + a - lb] = l.strides[a];
+            }
+        }
+        if (i >= ni && Shape(l.shape.begin(), l.shape.begin() + lb) != batch) {
+            set_error(err, errlen, "gufunc: out= does not have the batch shape");
+            return VP_UNSUPPORTED;
+        }
+        iter_ops.push_back(std::move(it));
+    }
+    const std::vector<std::size_t> perm = Layout::iteration_order(iter_shape, iter_ops);
+    // Inputs of another dtype: NumPy's iterator casts them into copies
+    // (npyiter_new_temp_array: batch axes in the iteration order, core
+    // axes C-contiguous innermost).
+    ArrayPtr ins[kMax];
+    for (std::size_t i = 0; i < ni; ++i) {
+        ins[i] = ref(inputs[i]);
+        const Layout& l = *ls[i];
+        if (l.dtype == d[i]) {
+            continue;
+        }
+        const std::size_t nd = l.shape.size();
+        const std::size_t lb = nd - core.present(i);
+        Layout dst;
+        dst.dtype = d[i];
+        dst.shape = l.shape;
+        dst.strides = Strides(nd, 0);
+        std::vector<bool> set(nd, false);
+        std::int64_t step = static_cast<std::int64_t>(itemsize(d[i]));
+        for (std::size_t ax : perm) {
+            if (ax < nb && ax >= nb - lb) {
+                const std::size_t a = ax - (nb - lb);
+                dst.strides[a] = step;
+                set[a] = true;
+                step *= l.shape[a];
+            }
+        }
+        std::int64_t factor = 1;
+        for (std::size_t a = nd; a-- > 0;) {
+            if (!set[a]) {
+                dst.strides[a] = factor * static_cast<std::int64_t>(itemsize(d[i]));
+                factor *= l.shape[a];
+            }
+        }
+        for (std::size_t a = 0; a < nd; ++a) {
+            if (set[a]) {
+                dst.strides[a] *= factor;
+            }
+        }
+        if (l.size() == 0) {
+            set_error(err, errlen, "gufunc: empty cast");
+            return VP_UNSUPPORTED;
+        }
+        std::shared_ptr<Kernel> k = numpy::make_cast_kernel(l, dst, rt->loops->buffersize(),
+                                                            defer_release(rt->graveyard), e);
+        if (!k) {
+            PyErr_Clear();
+            set_error(err, errlen, e);
+            return VP_UNSUPPORTED;
+        }
+        ArrayPtr res;
+        const ArrayPtr in[] = {ins[i]};
+        rt->rt->issue(k, in, {}, std::span(&dst, 1), site, std::span(&res, 1));
+        ins[i] = std::move(res);
+    }
+    std::shared_ptr<Kernel>& kernel =
+        rt->gufunc_kernels[{loop, core.axes, invalid_error != nullptr ? invalid_error : ""}];
+    if (!kernel) {
+        kernel = numpy::make_gufunc_kernel(loop, core, invalid_error ? invalid_error : "");
+    }
+    if (given) {
+        ArrayPtr io[kMax];
+        for (std::size_t j = 0; j < no; ++j) {
+            io[j] = ref(outs[j]);
+            results[j] = nullptr;
+        }
+        rt->rt->issue(kernel, std::span(ins, ni), std::span(io, no), {}, site, {}, work);
+        return VP_OK;
+    }
+    // New outputs: NumPy's iterator allocates each over the batch axes and
+    // its own core axes in the iteration order (C order with c_order).
+    Layout ol[kMax];
+    for (std::size_t j = 0; j < no; ++j) {
+        Shape shape = batch;
+        const std::size_t first = out_first[j];
+        const std::size_t nc = core.present(ni + j);
+        for (std::size_t a = 0; a < nc; ++a) {
+            shape.push_back(iter_shape[first + a]);
+        }
+        if (c_order != 0) {
+            ol[j] = Layout::contiguous(d[ni + j], std::move(shape));
+            continue;
+        }
+        Layout l;
+        l.dtype = d[ni + j];
+        l.strides = Strides(shape.size(), 0);
+        std::int64_t step = static_cast<std::int64_t>(itemsize(l.dtype));
+        for (std::size_t ax : perm) {
+            std::size_t a;
+            if (ax < nb) {
+                a = ax;
+            } else if (ax >= first && ax < first + nc) {
+                a = nb + ax - first;
+            } else {
+                continue;
+            }
+            l.strides[a] = step;
+            step *= shape[a];
+        }
+        l.shape = std::move(shape);
+        ol[j] = std::move(l);
+    }
+    ArrayPtr res[kMax];
+    rt->rt->issue(kernel, std::span(ins, ni), {}, std::span(ol, no), site, std::span(res, no),
+                  work);
+    for (std::size_t j = 0; j < no; ++j) {
+        results[j] = hand_out(std::move(res[j]));
+    }
     return VP_OK;
 }
 

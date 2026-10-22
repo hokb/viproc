@@ -21,7 +21,8 @@ Layout Layout::contiguous(DType dtype, Shape shape) {
     return l;
 }
 
-Layout Layout::keep_order(DType dtype, Shape shape, std::span<const Layout> inputs) {
+std::vector<std::size_t> Layout::iteration_order(const Shape& shape,
+                                                 std::span<const Layout> inputs) {
     const std::size_t nd = shape.size();
     // Strides of each input along the result's axes; 0 where it broadcasts
     // and along extent-1 axes (as NumPy's iterator sets them).
@@ -75,6 +76,12 @@ Layout Layout::keep_order(DType dtype, Shape shape, std::span<const Layout> inpu
             perm[ipos] = moved;
         }
     }
+    return perm;
+}
+
+Layout Layout::keep_order(DType dtype, Shape shape, std::span<const Layout> inputs) {
+    const std::size_t nd = shape.size();
+    const std::vector<std::size_t> perm = iteration_order(shape, inputs);
     Layout l;
     l.dtype = dtype;
     l.strides.resize(nd);

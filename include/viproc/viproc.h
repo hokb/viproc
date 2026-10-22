@@ -366,6 +366,36 @@ int vp_reduceat(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, const i
 int vp_ufunc_at(vp_runtime* rt, const vp_loop* loop, vp_array* a, vp_array* indices,
                 vp_array* values, const char* site, char* err, size_t errlen);
 
+/* Issues a generalized ufunc (`ufunc.signature` set: vecdot, matvec, vecmat,
+ * numpy.linalg's and numpy.fft's gufuncs) with NumPy's loop for exactly
+ * `dtypes` (nin inputs, then nout outputs), called as
+ * PyUFunc_GeneralizedFunctionInternal calls it (src/kernels/numpy_gufunc.hpp).
+ *  - Operands have their core axes last (the caller applies axes=/axis=).
+ *    `core_n[i]` is the number of core axes of operand i in the signature,
+ *    `core_axes` (concatenated) their label indices, or -1 - label for a
+ *    missing flexible dimension (`m?` of a 1-d matmul operand).
+ *  - `sizes` (nlabels entries, -1 if unknown) receives each label's size;
+ *    a label only an output has needs its size from the caller or `outs`.
+ *  - Inputs of another dtype are cast into copies first, laid out as
+ *    NumPy's iterator lays them out.
+ *  - outs == NULL or outs[0] == NULL: new outputs in NumPy's layout (the
+ *    iterator's order, or C order if c_order), into results[0..nout).
+ *    Otherwise all outputs are given (in/out semantics, exactly the loop's
+ *    dtypes and the batch shape) and results[] are set to NULL.
+ *  - `invalid_error` (or NULL): the loop reports failure through the
+ *    floating-point invalid flag (numpy.linalg); the op then fails with this
+ *    message ("LinAlgError: Singular matrix").
+ *  - `work` sizes the op for the dispatch policy (element-wise op units).
+ * Returns VP_UNSUPPORTED (reason in `err`) where NumPy raises or copies an
+ * operand for another reason (misaligned, out= overlapping an input, out=
+ * of another dtype or shape, shapes that do not match); the caller then
+ * falls back to NumPy. */
+int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, int nout,
+              vp_array* const* outs, const vp_dtype* dtypes, const int* core_n,
+              const int* core_axes, int nlabels, int64_t* sizes, int c_order,
+              const char* invalid_error, int64_t work, vp_array** results, const char* site,
+              char* err, size_t errlen);
+
 /* Issues np.matmul(a, b) (the `@` operator) with NumPy's matmul gufunc loop
  * for (t, t) -> t, where t is the dtype of both operands; the loop is
  * called with the strides NumPy's gufunc machinery passes, so it makes the

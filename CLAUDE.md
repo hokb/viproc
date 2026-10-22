@@ -323,6 +323,9 @@ src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
                        element-wise and reduction kernels)
   numpy_matmul.*       matmul kernel: NumPy's matmul gufunc loop with the
                        strides NumPy's gufunc machinery passes
+  numpy_gufunc.*       generic gufunc kernel (vecdot, matvec, vecmat, matmul
+                       with casts/out=): NumPy's gufunc loop called per inner
+                       batch row as PyUFunc_GeneralizedFunctionInternal
 src/capi/capi.cpp      Implementation of the C ABI (library `viproc_capi`)
 src/viproc_python.h    the only way to include Python.h (MSVC debug fix)
 python/viproc/         Python package
@@ -344,7 +347,8 @@ python/viproc/         Python package
   _ufuncs.py           ufunc calls the C fast path leaves out (several
                        outputs, dtype=/signature=/casting=, cast out=),
                        ufunc.accumulate (cumsum, cumprod, nancum*), outer,
-                       where=, ufunc.at, ufunc.reduceat
+                       where=, ufunc.at, ufunc.reduceat, gufunc calls
+                       (vp_gufunc: casts, out=, axes=/axis=, 1-d matmul)
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -871,7 +875,7 @@ Rules:
   else (`nonzero`, `flatnonzero`, `argwhere`, `count_nonzero` sync on their
   argument and run in NumPy on a read-only export, without the general
   fallback's wait for readers): other reductions (`out=`, `where=`), gufuncs
-  (linalg, fft; `matmul` with mixed dtypes or `out=`), `np.dot` of n-d
+  (linalg, fft), `np.dot` of n-d
   operands, empty advanced-index results, 0-d boolean indices,
   `ufunc.at`, other NumPy functions. NumPy's semantics exactly (design doc
   D7, "Eager fallbacks"): each viproc argument becomes a writable NumPy
@@ -995,6 +999,25 @@ Rules:
   where a reshape could view (a strided 1-d array): the copy's strides
   decide later loop calls (complex64 `np.outer`). Fuzzed in
   `python/tests/test_accumulate.py`.
+- **Generalized ufuncs** (`_ufuncs.gufunc`, `vp_gufunc`,
+  `src/kernels/numpy_gufunc.*`): a call of a ufunc with a core signature
+  (`vecdot`, `matvec`, `vecmat`; `matmul` with casts, `dtype=`, `out=` or
+  `axes=`, which `vp_matmul` leaves out) runs NumPy's gufunc loop as
+  `PyUFunc_GeneralizedFunctionInternal` does: dtypes from
+  `ufunc.resolve_dtypes`; inputs of another dtype cast first (a task, with
+  the layout `npyiter_new_temp_array` gives the copy); outputs allocated as
+  NumPy's iterator allocates them (batch axes in the iterator's order over
+  all operands, `Layout::iteration_order`, core axes C-contiguous
+  innermost); one loop call per inner batch row with `dims = {count, label
+  sizes}` and the core strides (0 for extent 1 and missing flexible
+  dimensions: matmul's 1-d operands). `axes=`/`axis=` are transposed views
+  moving the core axes last (NumPy's remap), the result transposed back.
+  `out=` of exactly the loop dtype and not sharing memory with an input is
+  the task's in/out; others, `keepdims=` and NumPy's errors fall back. The
+  loops compute each outer index on their own (a dot per index), so the
+  split into calls does not matter. Per call the Python side is one dict
+  lookup per (ufunc, input dtypes and shapes) for calls without keywords
+  (`_gufunc_plans`). Fuzzed in `python/tests/test_gufunc.py`.
 - **ndarray methods:** every method and attribute of `numpy.ndarray`
   except `base` (views do not track their Python base object) and `ctypes`
   (a raw pointer would bypass the runtime). The ones with a NumPy function
@@ -1172,8 +1195,7 @@ Rules:
 - Python objects whose memory a task still uses are released only on the
   main thread with the GIL: a worker dropping the last reference parks
   the object in a graveyard drained at the next C ABI call.
-- Not implemented yet: gufuncs
-  (linalg, fft; matmul with casts or `out=`), FP-flag reporting to
+- Not implemented yet: the linalg and fft gufuncs, FP-flag reporting to
   Python (NumPy warnings / `np.errstate`).
 
 ## Conventions
@@ -1304,7 +1326,8 @@ code, comments, docs and commit messages in English.
       queued task itself was decided against, see "Dispatch decision").
 - [x] `matmul`/`dot` asynchronously (NumPy's matmul loop; `matmul_batch`
       has no fallbacks left).
-- [ ] The other gufuncs (linalg, fft) and `matmul` with casts or `out=`.
+- [ ] The linalg and fft gufuncs (the generic gufunc path exists:
+      `vp_gufunc`).
 - [ ] Scaling beyond 4 cores: on a 20-core i7-12700K (8 P + 4 E cores,
       HT) the suite scores 22 with medium/large at 11 (`chains_wide`
       medium 6.2x of ideal 20x, large 1.2–3.9x): find out whether memory

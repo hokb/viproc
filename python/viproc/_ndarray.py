@@ -1580,7 +1580,11 @@ def _fallback_ufunc(ufunc, method, inputs, kwargs):
         if r is not None:
             return r
     if method in ("__call__", "accumulate", "outer", "reduceat", "at"):
-        r = getattr(_ufuncs, "call" if method == "__call__" else method)(ufunc, inputs, kwargs)
+        if method == "__call__":
+            handler = _ufuncs.call if ufunc.signature is None else _ufuncs.gufunc
+        else:
+            handler = getattr(_ufuncs, method)
+        r = handler(ufunc, inputs, kwargs)
         if r is not _NOPE:
             return r
     return _host_call(getattr(ufunc, method), inputs, kwargs)
