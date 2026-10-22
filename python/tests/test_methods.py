@@ -382,21 +382,26 @@ def test_resize(case, dtype):
 def test_resize_keeps_identity_and_references():
     import weakref
 
+    messages = {}
     for mod in (np, viproc):
         a = mod.arange(6.0)
         a.resize(8)
         assert a.shape == (8,)
         b = a[:]  # a view references the array: refcheck refuses
-        with pytest.raises(ValueError, match="referenced"):
+        with pytest.raises(ValueError, match="referenced") as e1:
             a.resize(3)
+        with pytest.raises(ValueError, match="own its data") as e2:
+            b.resize(3)
         a.resize(3, refcheck=False)  # NumPy's view b dangles; viproc's keeps the old data
         if mod is viproc:
             assert b.tolist() == [0, 1, 2, 3, 4, 5, 0, 0] and a.tolist() == [0, 1, 2]
         c = mod.arange(4.0)
         w = weakref.ref(c)
-        with pytest.raises(ValueError, match="referenced"):
-            c.resize(5)
+        with pytest.raises(ValueError, match="referenced") as e3:
+            c.resize(5, refcheck=False)  # weak references refuse even then
         assert w() is c
+        messages[mod] = [str(e.value) for e in (e1, e2, e3)]
+    assert messages[np] == messages[viproc]
 
 
 def test_resize_is_async(det):
