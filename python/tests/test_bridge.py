@@ -415,7 +415,10 @@ def test_temporary_elision_and_views():
         (lambda: (x * 2.0)[1:] + 1.0, (xn * 2.0)[1:] + 1.0, 0),  # offset: not the whole buffer
         (lambda: (x * 2.0)[::2] + 1.0, (xn * 2.0)[::2] + 1.0, 0),  # strided
         (lambda: stash(x * 2.0) + 1.0, xn * 2.0 + 1.0, 0),  # storage still has a view
-        (lambda: (x * 2.0)[:] + 1.0, xn * 2.0 + 1.0, 1),  # only array on its storage
+        # the view's base keeps the temporary alive (NumPy does not elide a
+        # view either: can_elide_temp needs OWNDATA)
+        (lambda: (x * 2.0)[:] + 1.0, xn * 2.0 + 1.0, 0),
+        (lambda: (x * 2.0) + 1.0, xn * 2.0 + 1.0, 1),  # only array on its storage
     ]
     for f, expected, elisions in cases:
         e0 = viproc._viproc.elided()
