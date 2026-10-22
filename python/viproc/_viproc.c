@@ -160,8 +160,8 @@ static PyObject* s_out = NULL;  /* "out" */
 
 typedef struct {
     PyObject_HEAD vp_array* a;
-    int readonly; /* NumPy's WRITEABLE == False (e.g. views NumPy made read-only) */
-    int scalar;   /* 0-d result NumPy returns as a scalar (reductions, a[i]) */
+    int readonly;   /* NumPy's WRITEABLE == False (e.g. views NumPy made read-only) */
+    int scalar;     /* 0-d result NumPy returns as a scalar (reductions, a[i]) */
     PyObject* base; /* ndarray.base: the array a view was made from, else NULL */
 } ArrayObject;
 
