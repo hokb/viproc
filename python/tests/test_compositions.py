@@ -301,3 +301,51 @@ def test_async_path(det, call, inputs, ops, small_steps, syncs, min_tasks):
         got = assert_async(call, *(v for _, v in pairs), ops=ops, small_steps=small_steps,
                            syncs=syncs, min_tasks=min_tasks)
     same(got, want)
+
+
+# broadcast_arrays' views of writable arrays are writable and carry NumPy's
+# WARN_ON_WRITE: reading flags.writeable warns (FutureWarning), the first
+# write warns (DeprecationWarning) and clears the flag; views inherit it.
+WARN_CASES = {
+    "flags_read": lambda xp, a, b: (
+        b.flags.writeable, b.flags["W"], b.flags.behaved, b.flags.carray, b.flags.farray,
+        b.flags._writeable_no_warn),
+    "setitem_basic": lambda xp, a, b: b.__setitem__((0, 1), 7.0),
+    "setitem_twice": lambda xp, a, b: (b.__setitem__((0, 1), 7.0), b.__setitem__((1, 2), 5.0)),
+    "setitem_adv": lambda xp, a, b: b.__setitem__((np.array([0]), np.array([2])), 9.0),
+    "setitem_mask": lambda xp, a, b: b.__setitem__(np.asarray(b) > 1, 9.0),
+    "fill": lambda xp, a, b: b.fill(4.0),
+    "iadd": lambda xp, a, b: (b.__iadd__(1.0), None)[1],
+    "ufunc_out": lambda xp, a, b: xp.add(b, 1.0, out=b) is b,
+    "copyto": lambda xp, a, b: xp.copyto(b, 2.0),
+    "sort": lambda xp, a, b: b.sort(axis=0),
+    "view_T": lambda xp, a, b: (b.T.flags.num, b.T.flags.writeable),
+    "view_slice": lambda xp, a, b: (b[1:].flags.num, b[0].flags.writeable),
+    "view_dtype": lambda xp, a, b: b.view(np.int64).flags.num,
+    "copy": lambda xp, a, b: b.copy().flags.num,
+    "write_view": lambda xp, a, b: (b.T.__setitem__((0, 0), 3.0), b.flags.num),
+    "setflags_write": lambda xp, a, b: (b.setflags(write=True), b.flags.num),
+    "setflags_readonly": lambda xp, a, b: (b.setflags(write=False), b.flags.num),
+    "setflags_align": lambda xp, a, b: (b.setflags(align=True), b.flags.num),
+    "flags_eq": lambda xp, a, b: b.flags == a.flags,
+    "readonly_source": lambda xp, a, b: (lambda r: (r.flags.num, r.flags.writeable))(
+        xp.broadcast_arrays(xp.broadcast_to(a, (3,)), xp.asarray(np.zeros((2, 3))))[0]),
+    "meshgrid": lambda xp, a, b: [m.flags.num for m in xp.meshgrid(a, a, copy=False)],
+    "numpy_argument": lambda xp, a, b: (lambda r: (r[0].flags.num, type(r[0]) is np.ndarray))(
+        xp.broadcast_arrays(np.arange(3.0), xp.asarray(np.zeros((2, 3))))),
+}
+
+
+@pytest.mark.parametrize("case", WARN_CASES)
+def test_broadcast_arrays_warn_on_write(case):
+    def run(xp):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            a = xp.asarray(np.arange(3.0))
+            c = xp.asarray(np.zeros((2, 3)))
+            b, d = xp.broadcast_arrays(a, c)
+            out = [d is c, WARN_CASES[case](xp, a, b), b.flags.num, repr(b.flags),
+                   np.array(a).tolist(), np.array(b).tolist()]
+        return out, [(x.category, str(x.message)) for x in w]
+
+    assert run(viproc) == run(np)

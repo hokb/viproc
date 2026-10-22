@@ -178,7 +178,13 @@ class _Host:
 
     def done(self, result):
         r = self._map(result)
-        for e, _ in self.exports.values():
+        for e, x in self.exports.values():
+            if x._warn_on_write and not e.flags.num & _WARN_ON_WRITE:
+                # NumPy wrote to it (and warned): the flag is gone, as on the
+                # array and its base in NumPy.
+                x._warn_on_write = False
+                if isinstance(x.base, ndarray):
+                    x.base._warn_on_write = False
             e.flags.writeable = False  # in case NumPy code kept a reference
         return r
 
@@ -199,9 +205,10 @@ class _Host:
                     return _adopt(r.copy())  # a view viproc cannot express
                 offset = r.__array_interface__["data"][0] - e.__array_interface__["data"][0]
                 w = _viproc.view(v, r.shape, r.strides, offset, code)
-                with warnings.catch_warnings():  # broadcast_arrays warns on reading it
-                    warnings.simplefilter("ignore", FutureWarning)
-                    w._readonly = not r.flags.writeable
+                if r.flags.num & _WARN_ON_WRITE:  # writable, warns on the first write
+                    w._warn_on_write = True
+                else:
+                    w._readonly = not r.flags._writeable_no_warn
                 return w
         for p in self.plain.values():
             if r is p or np.may_share_memory(r, p):
@@ -210,6 +217,9 @@ class _Host:
             return _adopt(r)  # fresh memory nobody else holds
         return _adopt(r.copy())
 
+
+# NPY_ARRAY_WARN_ON_WRITE in flags.num (broadcast_arrays' results).
+_WARN_ON_WRITE = 1 << 31
 
 # Eager fallbacks run so far (each one is a sync point); read by benchmarks.
 fallback_calls = 0
@@ -1661,7 +1671,14 @@ def _setitem(self, key, value):
         _host_call(assign, (self, key, value), {})
         return
     if self._readonly:
-        raise ValueError("assignment destination is read-only")
+        if not self._warn_on_write:
+            raise ValueError("assignment destination is read-only")
+
+        def assign(a, k, v):  # NumPy warns and clears the flag
+            a[k] = v
+
+        _host_call(assign, (self, key, value), {})
+        return
     target = self._view(key)
     if isinstance(value, ndarray):
         src = value  # another dtype: cast in the assignment (vp_assign)
