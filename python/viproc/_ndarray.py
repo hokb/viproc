@@ -1495,7 +1495,11 @@ class ndarray(_viproc._Array):
             raise ValueError("cannot set WRITEBACKIFCOPY flag to True")
         # align: viproc's memory is always aligned; NumPy accepts both values.
         if write is not None:
-            if write and self._readonly:
+            # _IsWriteable: an array owning its data may always be made
+            # writeable again, a view if its base (collapsed: the array
+            # owning the data) is writeable.
+            base = self.base
+            if write and self._readonly and base is not None and base._readonly:
                 raise ValueError("cannot set WRITEABLE flag to True of this array")
             self._readonly = not write
 
@@ -1515,18 +1519,25 @@ class _Flags:
     """ndarray.flags of a viproc array, from its layout (no sync): NumPy's
     flags of a probe with the same shape and strides over one element, with
     WRITEABLE from the viproc array (settable, as NumPy's) and OWNDATA as
-    NumPy has it: True unless the array is a view (`base` is set)."""
+    NumPy has it: True unless the array is a view (`base` is set). Created
+    per access and a snapshot, as NumPy's flags object."""
 
-    __slots__ = ("_a", "_f")
+    __slots__ = ("_a", "_f", "_w", "_o")
 
     def __init__(self, a):
+        # The probe's shape and strides describe more than its one element:
+        # it only yields the layout flags and is never read or exposed.
         probe = np.lib.stride_tricks.as_strided(np.empty(1, a.dtype), a.shape, a.strides)
         object.__setattr__(self, "_a", a)
         object.__setattr__(self, "_f", probe.flags)
+        # A snapshot, as NumPy's flags object: later changes of the array
+        # (setflags, resize, also through this object's setter) do not show.
+        object.__setattr__(self, "_w", not a._readonly)
+        object.__setattr__(self, "_o", a.base is None)
 
     @property
     def writeable(self):
-        return not self._a._readonly
+        return self._w
 
     @writeable.setter
     def writeable(self, value):
@@ -1534,7 +1545,7 @@ class _Flags:
 
     @property
     def owndata(self):
-        return self._a.base is None
+        return self._o
 
     def __getattr__(self, name):
         return getattr(self._f, name)
