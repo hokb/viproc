@@ -883,6 +883,28 @@ Rules:
   (`vp_array_view`, dtype views, read-only if NumPy made it read-only); a
   NumPy argument → unchanged; fresh memory → adopted; else copied.
   `np.copyto(dst, src)` maps to assignment.
+- **ndarray methods:** every method and attribute of `numpy.ndarray`
+  except `ctypes` (a raw pointer would bypass the runtime). `base`: views
+  made in C (`set_base` in `_viproc.c`: basic indexing, transpose, reshape
+  views, `_viproc.view`) hold the array they were made from, collapsed to
+  the first array of a chain of views (`PyArray_SetBaseObject`); ravel and
+  flatten copies own their data (`_viproc.own`); `flags.owndata` is
+  `base is None`. A view keeps its base alive, so a view of a temporary is
+  not elided (NumPy's `can_elide_temp` needs OWNDATA too). The ones with a NumPy function
+  form delegate to it (`a.clip(...)` is `np.clip(a, ...)`), so they take
+  the function's path; in-place ones without one (`sort`, `partition`,
+  `setfield`, `flat[...] = v`) run NumPy's method in the eager
+  fallback; `fill` is an assignment; `resize` is NumPy's `PyArray_Resize`
+  ported (`_Array.resize` in C takes the reference count where NumPy takes
+  it, `_resize_py` checks as NumPy does and raises NumPy's messages, taken
+  from the installed NumPy once at import (their text changed in 2.5); the data step is a copy and a zero fill as tasks; the
+  object keeps its identity, its runtime array is swapped); arrays take
+  weak references, as NumPy's do; `flags` is NumPy's flags object ported
+  to C (`FlagsType` in `_viproc.c`: a snapshot per access, bits from the
+  layout as `_UpdateContiguousFlags`/`IsAligned` compute them, ALIGNED from
+  `vp_array_offset` and the strides; no probe array, ~70 ns, NumPy ~50 ns),
+  `setflags` is `array_setflags` in C (`readonly`, `unaligned`), both
+  without a sync (`python/tests/test_methods.py`).
 - **Read-only viproc arrays** (`_readonly`, e.g. from `broadcast_to`):
   writes raise NumPy's errors; never reused by temporary elision.
 - **Entry: `python -m viproc prog.py`** (`__main__.py`, also `-m mod`, `-c
@@ -1058,6 +1080,13 @@ Rules:
 
 ## Conventions
 
+- **viproc is a semantic drop-in for NumPy, without surprises.** Every
+  function, method and attribute behaves exactly as NumPy's: values,
+  dtypes, shapes, strides, flags, `base`, identity (`is`), in-place
+  effects, warnings, and errors (type and message). Where NumPy's own
+  code cannot run on viproc memory, port it; never replace NumPy's
+  behavior with a viproc-specific error, a "not supported" or a different
+  result. Test every case against NumPy running the same code.
 - Language for code, comments, docs and commit messages: **English**.
 - C ABI symbols use the `vp_` prefix; C++ code lives in `namespace viproc`.
 - C++: RAII, no raw `new`/`delete`, no exceptions across the C ABI (convert

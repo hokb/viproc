@@ -13,7 +13,9 @@ module adds everything else and the fallbacks the C code calls.
 import builtins
 import operator
 import os
+import sys
 import warnings
+import weakref
 
 import numpy as np
 from numpy.lib.array_utils import normalize_axis_index, normalize_axis_tuple
@@ -746,7 +748,10 @@ def _reshape(a, shape=None, order="C", *, newshape=None, copy=None):
 def _ravel(a, order="C"):
     if type(a) is not ndarray or order not in ("C", "F", "A"):
         return _NOPE
-    return _reshape(a, -1, order)
+    r = _reshape(a, -1, order)
+    if r is not _NOPE and r.base is not (a if a.base is None else a.base):
+        _viproc.own(r)  # a copy: PyArray_Ravel's copy owns its data
+    return r
 
 
 _VIEW_HANDLERS = {
@@ -1074,6 +1079,43 @@ def _is_basic_index(key):
     return True
 
 
+
+def _numpy_error(fn):
+    try:
+        fn()
+    except Exception as e:
+        return str(e)
+    raise AssertionError("NumPy raised no error")
+
+
+# ndarray.resize: NumPy's messages, and its strides (_array_fill_strides).
+_MAX_INTP = np.iinfo(np.intp).max
+_RESIZE_SEGMENT = _numpy_error(lambda: np.empty(3)[::2].resize(1))
+_RESIZE_NEGATIVE = _numpy_error(lambda: np.empty(1).resize(-1))
+_RESIZE_NOT_OWNER = _numpy_error(lambda: np.empty(1)[:].resize(2))
+
+
+def _resize_referenced(weak):
+    a = np.empty(1)
+    b = weakref.ref(a) if weak else a  # noqa: F841 (alive during the call)
+    a.resize(2)
+
+
+# The text differs between NumPy versions (2.5: "another object", before:
+# "another array"), so it is taken from the installed NumPy once.
+_RESIZE_WEAKREF = _numpy_error(lambda: _resize_referenced(True))
+_RESIZE_REFS = _numpy_error(lambda: _resize_referenced(False))
+
+
+def _fill_strides(shape, itemsize, fortran):
+    strides = [0] * len(shape)
+    for i in range(len(shape)) if fortran else reversed(range(len(shape))):
+        strides[i] = itemsize
+        if shape[i]:
+            itemsize *= shape[i]
+    return tuple(strides)
+
+
 class ndarray(_viproc._Array):
     """Array whose ops run asynchronously in the viproc runtime.
 
@@ -1220,7 +1262,7 @@ class ndarray(_viproc._Array):
 
     def flatten(self, order="C"):
         if order == "C" and type(self) is ndarray:
-            return self.astype(self.dtype, order="C").reshape(-1)  # always a copy
+            return _viproc.own(self.astype(self.dtype, order="C").reshape(-1))  # a copy
         return _host_call(lambda a: a.flatten(order), (self,), {})
 
     @property
@@ -1270,6 +1312,206 @@ class ndarray(_viproc._Array):
 
     def dot(self, b, out=None):
         return np.dot(self, b, out=out)
+
+    # --- the other ndarray methods ---------------------------------------------
+    # Delegates to NumPy's function forms, so they take whatever path the
+    # function takes (asynchronous where viproc supports it, else the eager
+    # fallback) and get faster with it. In-place methods without a function
+    # form run NumPy's method in the fallback, on the writable view it makes
+    # after waiting for readers (vp_array_prepare_write).
+    def conj(self):
+        # PyArray_Conjugate: a real array is returned as is (no copy).
+        return np.conjugate(self) if self.dtype.kind == "c" else self
+
+    def conjugate(self):
+        return np.conjugate(self) if self.dtype.kind == "c" else self
+
+    def round(self, decimals=0, out=None):
+        return np.round(self, decimals, out)
+
+    def clip(self, min=None, max=None, out=None, **kwargs):
+        return np.clip(self, min, max, out, **kwargs)
+
+    def cumsum(self, axis=None, dtype=None, out=None):
+        return np.cumsum(self, axis, dtype, out)
+
+    def cumprod(self, axis=None, dtype=None, out=None):
+        return np.cumprod(self, axis, dtype, out)
+
+    def trace(self, offset=0, axis1=0, axis2=1, dtype=None, out=None):
+        return np.trace(self, offset, axis1, axis2, dtype, out)
+
+    def nonzero(self):
+        return np.nonzero(self)
+
+    def argsort(self, *args, **kwargs):
+        return np.argsort(self, *args, **kwargs)
+
+    def argpartition(self, *args, **kwargs):
+        return np.argpartition(self, *args, **kwargs)
+
+    def searchsorted(self, v, side="left", sorter=None):
+        return np.searchsorted(self, v, side, sorter)
+
+    def take(self, indices, axis=None, out=None, mode="raise"):
+        return np.take(self, indices, axis, out, mode)
+
+    def put(self, indices, values, mode="raise"):
+        np.put(self, indices, values, mode)
+
+    def choose(self, choices, out=None, mode="raise"):
+        return np.choose(self, choices, out, mode)
+
+    def compress(self, condition, axis=None, out=None):
+        return np.compress(condition, self, axis, out)
+
+    def repeat(self, repeats, axis=None):
+        return np.repeat(self, repeats, axis)
+
+    def sort(self, *args, **kwargs):
+        _host_call(lambda a, *ar, **kw: a.sort(*ar, **kw), (self,) + args, kwargs)
+
+    def partition(self, *args, **kwargs):
+        _host_call(lambda a, *ar, **kw: a.partition(*ar, **kw), (self,) + args, kwargs)
+
+    def _resize_py(self, args, kwargs, refs):  # behind _Array.resize (C)
+        # NumPy's array_resize and PyArray_Resize, on viproc data. NumPy
+        # parses the arguments and raises its errors on tiny NumPy probes in
+        # the same state (contiguity, sizes, OWNDATA, weak references,
+        # reference count), so they are NumPy's in every version; the data
+        # step is asynchronous. `refs`: the object's reference count, taken
+        # where NumPy takes it (in the C method).
+        dt = self.dtype
+        kwargs = kwargs or {}
+        try:  # parses as NumPy does, then stops at the single-segment check
+            np.empty(3, dt)[::2].resize(*args, **kwargs)
+            return None  # no shape (a.resize(), a.resize(None)): nothing to do
+        except ValueError as e:
+            if str(e) != _RESIZE_SEGMENT:
+                raise
+            segment = e
+        refcheck = operator.index(kwargs.get("refcheck", 1))  # NumPy accepted it
+        shape = args[0] if len(args) == 1 else args
+        try:
+            shape = (operator.index(shape),)
+        except TypeError:
+            shape = tuple(operator.index(n) for n in shape)
+        c, f = self._c_contiguous, self.T._c_contiguous
+        if not (c or f):
+            raise segment
+        size = 1
+        for n in shape:
+            if n == 0:
+                size = 0
+                break
+            if n < 0 or size * n > _MAX_INTP:
+                np.empty(1, dt).resize(shape)  # NumPy's error: fails before allocating
+            size *= n
+        itemsize = dt.itemsize
+        if size * itemsize > _MAX_INTP:
+            np.empty(1, dt).resize(shape)  # MemoryError
+        if any(n < 0 for n in shape):
+            # NumPy accepts a negative extent after a zero one (its size loop
+            # stops at the zero); viproc's layouts cannot hold it.
+            raise ValueError(_RESIZE_NEGATIVE)
+        strides = _fill_strides(shape, itemsize, f and not c)
+        if size == self.size:  # same bytes: only shape and strides change
+            return _viproc.view(self, shape, strides, 0)
+        if self.base is not None:  # not OWNDATA
+            raise ValueError(_RESIZE_NOT_OWNER)
+        if weakref.getweakrefcount(self):
+            raise ValueError(_RESIZE_WEAKREF)
+        if refcheck and (refs != 1 if sys.version_info >= (3, 14) else refs > 2):
+            raise ValueError(_RESIZE_REFS)
+        # PyDataMem_UserRENEW and zeros: the old bytes in memory order first.
+        m = min(size, self.size)
+        flat = _viproc.view(self, (self.size,), (itemsize,), 0)
+        out = _wrap_numpy(np.empty(size, dt))
+        if m:
+            out[:m] = flat[:m]
+        if size > m:
+            out[m:] = 0
+        return _viproc.view(out, shape, strides, 0)
+
+    def byteswap(self, inplace=False):
+        return _host_call(lambda a: a.byteswap(inplace), (self,), {})
+
+    def getfield(self, dtype, offset=0):
+        return _host_call(lambda a: a.getfield(dtype, offset), (self,), {})
+
+    def setfield(self, val, dtype, offset=0):
+        _host_call(lambda a, v: a.setfield(v, dtype, offset), (self, val), {})
+
+    def fill(self, value):
+        if np.ndim(value) != 0:  # NumPy's error for a sequence
+            _host_call(lambda a: a.fill(value), (self,), {})
+            return
+        self[...] = value  # an assignment task (vp_assign), as NumPy casts
+
+    # Sync points: they read the data.
+    @property
+    def flat(self):
+        return _FlatIter(self)
+
+    @property
+    def data(self):
+        return self.numpy().data  # read-only, as every export
+
+    def tobytes(self, order="C"):
+        return self.numpy().tobytes(order)
+
+    def tofile(self, fid, sep="", format="%s"):
+        self.numpy().tofile(fid, sep, format)
+
+    def dumps(self):
+        return self.numpy().dumps()
+
+    def dump(self, file):
+        self.numpy().dump(file)
+
+    # Metadata (no sync): flags, setflags and base are C (_Array).
+    @property
+    def device(self):
+        return "cpu"
+
+    def to_device(self, device, /, *, stream=None):
+        if stream is not None:
+            raise ValueError("The stream argument in to_device() is not supported")
+        if device != "cpu":
+            raise ValueError(f"Unsupported device {device!r}. Only 'cpu' is accepted.")
+        return self
+
+
+class _FlatIter:
+    """a.flat of a viproc array: reading syncs (NumPy's flatiter on the
+    read-only export), assigning runs NumPy's in the eager fallback."""
+
+    __slots__ = ("base",)
+
+    def __init__(self, a):
+        self.base = a
+
+    def __len__(self):
+        return self.base.size
+
+    def __iter__(self):
+        return iter(self.base.numpy().flat)
+
+    def __getitem__(self, key):
+        r = self.base.numpy().flat[_numpy_key(key)]
+        return _adopt(r) if isinstance(r, np.ndarray) else r  # NumPy copies
+
+    def __setitem__(self, key, value):
+        def assign(a, k, v):
+            a.flat[k] = v
+
+        _host_call(assign, (self.base, key, value), {})
+
+    def __array__(self, dtype=None, copy=None):
+        return np.asarray(self.base.numpy().flat.copy(), dtype=dtype)
+
+    def copy(self):
+        return self.base.flatten()
 
 
 def _ufunc_reduce(ufunc, a, axis=0, dtype=None, out=None, keepdims=False, initial=_NV,
