@@ -20,6 +20,7 @@ import operator
 import warnings
 
 import numpy as np
+from numpy.lib import _stride_tricks_impl as _stride_tricks
 from numpy.lib.array_utils import normalize_axis_index, normalize_axis_tuple
 
 from . import _ndarray as _nd
@@ -581,7 +582,18 @@ def _broadcast_arrays(*args, subok=False):
         return _NOPE
     args = [a if isinstance(a, ndarray) else np.array(a, copy=None, subok=subok) for a in args]
     shape = np.broadcast_shapes(*(a.shape for a in args))
-    return tuple(a if a.shape == shape else np.broadcast_to(a, shape) for a in args)
+    return tuple(a if a.shape == shape else _broadcast_to(a, shape, subok) for a in args)
+
+
+def _broadcast_to(a, shape, subok):
+    """NumPy's _broadcast_to(..., readonly=False): the view of a writable
+    array is writable and warns on the first write (WARN_ON_WRITE)."""
+    if not _vp(a):
+        return _stride_tricks._broadcast_to(a, shape, subok=subok, readonly=False)
+    r = np.broadcast_to(a, shape)
+    if a.flags._writeable_no_warn:
+        r._warn_on_write = True
+    return r
 
 
 def _meshgrid(*xi, copy=True, sparse=False, indexing="xy"):
