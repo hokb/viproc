@@ -1305,10 +1305,11 @@ class ndarray(_viproc._Array):
     # form run NumPy's method in the fallback, on the writable view it makes
     # after waiting for readers (vp_array_prepare_write).
     def conj(self):
-        return np.conjugate(self)
+        # PyArray_Conjugate: a real array is returned as is (no copy).
+        return np.conjugate(self) if self.dtype.kind == "c" else self
 
     def conjugate(self):
-        return np.conjugate(self)
+        return np.conjugate(self) if self.dtype.kind == "c" else self
 
     def round(self, decimals=0, out=None):
         return np.round(self, decimals, out)
