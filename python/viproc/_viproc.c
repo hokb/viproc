@@ -2408,7 +2408,11 @@ static PyObject* m_from_ndarray(PyObject* self, PyObject* arr) {
 /* --- views: NumPy's metadata rules, computed here ------------------------- */
 
 /* Sets view `v`'s base to `a`, or to a's base if `a` is a view itself (as
- * NumPy's PyArray_SetBaseObject collapses chains of views); v may be NULL. */
+ * NumPy's PyArray_SetBaseObject collapses chains of views); v may be NULL.
+ * Invariant: a base is always an array owning its data (base == NULL). This
+ * function and m_own are the only writers of `base`, and every array starts
+ * with base == NULL: a's base was set here, so it owns its data, and one
+ * step reaches the first array of the chain. */
 static PyObject* set_base(PyObject* v, PyObject* a) {
     if (v != NULL) {
         PyObject* b = ((ArrayObject*)a)->base;
