@@ -51,6 +51,8 @@ def test_square(shape, dtype, path):
         check(f, a)
     check(lambda x: L.eigh(x, UPLO="u"), a)
     check(lambda x: L.eigvalsh(x, "U"), a)
+    check(lambda x: L.svd(x, hermitian=True), a)
+    check(lambda x: L.svd(x, compute_uv=False, hermitian=True), a)
     if a.size and np.dtype(dtype).kind != "b":
         h = hermitian_pd(a)
         check(L.cholesky, h)
@@ -104,6 +106,9 @@ ASYNC = [  # name, call, matrices, tasks
     ("eigvalsh", L.eigvalsh, (60, 10, 10), 1),
     ("svd", L.svd, (60, 10, 8), 1),
     ("svdvals", L.svdvals, (60, 8, 10), 1),
+    # eigh, copysign, abs, argsort, 3 take_along_axis, multiply, conjugate
+    ("svd_hermitian", lambda a: L.svd(a, hermitian=True), (60, 10, 10), 9),
+    ("svd_hermitian_s", lambda a: L.svd(a, compute_uv=False, hermitian=True), (60, 10, 10), 3),
     # single precision: the input cast to double first, the results cast back
     ("inv_f4", L.inv, (60, 10, 10, "f4"), 3),
     ("solve_f4", lambda a: L.solve(a, a[..., :4]), (60, 10, 10, "f4"), 4),

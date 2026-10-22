@@ -60,6 +60,8 @@ static PyObject* g_internal_dirs = NULL; /* tuple of path prefixes skipped for i
 static PyObject* g_np_ndarray = NULL;    /* numpy.ndarray */
 static PyObject* g_np_generic = NULL;    /* numpy.generic */
 static PyObject* g_where_func = NULL;    /* numpy.where */
+static PyObject* g_sort_func = NULL;     /* numpy.sort */
+static PyObject* g_argsort_func = NULL;  /* numpy.argsort */
 static PyObject* g_where_impl = NULL;    /* numpy.where._implementation */
 static PyObject* g_np_integer = NULL;    /* numpy.integer */
 static PyObject* g_ops = NULL;           /* dict: operator name -> ufunc */
@@ -1536,6 +1538,10 @@ static PyObject* Array_reshape(PyObject* self, PyObject* const* args, Py_ssize_t
                                PyObject* kwnames);
 static PyObject* Array_swapaxes(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
                                 PyObject* kwnames);
+static PyObject* Array_sort(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
+                            PyObject* kwnames);
+static PyObject* Array_argsort(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
+                               PyObject* kwnames);
 
 static PyMethodDef Array_methods[] = {
     {"__array_ufunc__", (PyCFunction)(void (*)(void))Array_array_ufunc,
@@ -1552,6 +1558,10 @@ static PyMethodDef Array_methods[] = {
      "As NumPy's ndarray.reshape(): a view in C, copies in _ndarray.py."},
     {"swapaxes", (PyCFunction)(void (*)(void))Array_swapaxes, METH_FASTCALL | METH_KEYWORDS,
      "As NumPy's ndarray.swapaxes()."},
+    {"sort", (PyCFunction)(void (*)(void))Array_sort, METH_FASTCALL | METH_KEYWORDS,
+     "As NumPy's ndarray.sort(): a task in C (vp_sort), else _sort_py."},
+    {"argsort", (PyCFunction)(void (*)(void))Array_argsort, METH_FASTCALL | METH_KEYWORDS,
+     "As NumPy's ndarray.argsort(): a task in C (vp_sort), else np.argsort."},
     // clang-format on
     {NULL, NULL, 0, NULL},
 };
@@ -1832,8 +1842,11 @@ static PyObject* m_setup(PyObject* self, PyObject* args) {
     Py_XSETREF(g_where_impl, g_where_func != NULL
                                  ? PyObject_GetAttrString(g_where_func, "_implementation")
                                  : NULL);
+    Py_XSETREF(g_sort_func, np != NULL ? PyObject_GetAttrString(np, "sort") : NULL);
+    Py_XSETREF(g_argsort_func, np != NULL ? PyObject_GetAttrString(np, "argsort") : NULL);
     Py_XDECREF(np);
-    if (g_np_integer == NULL || g_where_func == NULL || g_where_impl == NULL) {
+    if (g_np_integer == NULL || g_where_func == NULL || g_where_impl == NULL ||
+        g_sort_func == NULL || g_argsort_func == NULL) {
         return NULL;
     }
     Py_RETURN_NONE;
@@ -3469,6 +3482,155 @@ static PyObject* where_delegate(PyObject* fargs, PyObject* fkw) {
     return r;
 }
 
+/* NumPy's sort table index of (kind, stable) (_sort._kind), or -1 for
+ * what the handlers in _sort.py pass on to NumPy. */
+static int sort_kind(PyObject* kind, PyObject* stable) {
+    if (stable != NULL && stable != Py_None) {
+        if (kind != NULL && kind != Py_None) {
+            return -1; /* NumPy's ValueError */
+        }
+        return stable == Py_True ? 2 : stable == Py_False ? 0 : -1;
+    }
+    if (kind == NULL || kind == Py_None) {
+        return 0;
+    }
+    if (!PyUnicode_CheckExact(kind)) {
+        return -1;
+    }
+    static const char* const names[] = {"quicksort", "heapsort", "mergesort", "stable"};
+    for (int i = 0; i < 4; ++i) {
+        if (PyUnicode_CompareWithASCIIString(kind, names[i]) == 0) {
+            return i < 2 ? 0 : 2; /* NumPy 2 maps heapsort to its introsort */
+        }
+    }
+    return -1;
+}
+
+/* np.sort / np.argsort (a, axis=-1, kind=None, order=None, *, stable=None)
+ * and a.sort(...) (`in_place`) with an int axis and order None as vp_sort:
+ * the result (None for a.sort), or NULL without an error for every other
+ * call (the handlers in _sort.py: axis=None, conversions, NumPy's errors).
+ * pos[0] is `a`; nkw keywords kwn/kwv. */
+static PyObject* sort_issue(PyObject* const* pos, Py_ssize_t npos, PyObject* const* kwn,
+                            PyObject* const* kwv, Py_ssize_t nkw, int arg, int in_place) {
+    if (npos < 1 || npos > 4 || !is_array(pos[0]) || check_runtime() < 0) {
+        PyErr_Clear();
+        return NULL;
+    }
+    PyObject* v[5] = {NULL, NULL, NULL, NULL, NULL}; /* a, axis, kind, order, stable */
+    for (Py_ssize_t i = 0; i < npos; ++i) {
+        v[i] = pos[i];
+    }
+    static const char* const kw[] = {"axis", "kind", "order", "stable"};
+    for (Py_ssize_t i = 0; i < nkw; ++i) {
+        int k = 0;
+        while (k < 4 &&
+               (!PyUnicode_Check(kwn[i]) || PyUnicode_CompareWithASCIIString(kwn[i], kw[k]))) {
+            ++k;
+        }
+        if (k == 4 || v[k + 1] != NULL) {
+            return NULL; /* NumPy's TypeError */
+        }
+        v[k + 1] = kwv[i];
+    }
+    const int kind = sort_kind(v[2], v[4]);
+    ArrayObject* ao = (ArrayObject*)v[0];
+    if (kind < 0 || (v[3] != NULL && v[3] != Py_None) || (in_place && ao->readonly)) {
+        return NULL;
+    }
+    vp_array* a = ao->a;
+    vp_array* flat = NULL; /* axis=None: NumPy's flatten(), here a view where it is one */
+    if (v[1] == Py_None && !in_place) {
+        int64_t size = 1;
+        for (int i = 0; i < vp_array_ndim(a); ++i) {
+            size *= vp_array_shape(a)[i];
+        }
+        if ((flat = vp_array_reshape(g_rt, a, 1, &size, 'C')) == NULL) {
+            return NULL; /* the copy in _sort.py */
+        }
+        a = flat;
+        v[1] = NULL;
+    }
+    const int nd = vp_array_ndim(a);
+    long axis = -1;
+    if (v[1] != NULL) {
+        if (!PyLong_CheckExact(v[1])) {
+            return NULL;
+        }
+        axis = PyLong_AsLong(v[1]);
+        if (axis == -1 && PyErr_Occurred()) {
+            PyErr_Clear();
+            return NULL;
+        }
+    }
+    if (nd == 0 || axis < -nd || axis >= nd) {
+        return NULL; /* NumPy's AxisError */
+    }
+    vp_array* r = NULL;
+    char err[ERRLEN] = "";
+    const int status = vp_sort(g_rt, a, axis < 0 ? (int)axis + nd : (int)axis, kind, arg, in_place,
+                               0, NULL, &r, issue_site(), err, sizeof err);
+    if (flat != NULL) {
+        vp_array_release(flat);
+    }
+    if (status != VP_OK) {
+        return NULL;
+    }
+    return in_place ? Py_NewRef(Py_None) : wrap_array(r);
+}
+
+static PyObject* sort_call(PyObject* fargs, PyObject* fkw, int arg) {
+    PyObject* kwn[8];
+    PyObject* kwv[8];
+    Py_ssize_t it = 0, n = 0;
+    PyObject *key, *value;
+    while (PyDict_Next(fkw, &it, &key, &value)) {
+        if (n == 8) {
+            return NULL;
+        }
+        kwn[n] = key;
+        kwv[n++] = value;
+    }
+    return sort_issue(&PyTuple_GET_ITEM(fargs, 0), PyTuple_GET_SIZE(fargs), kwn, kwv, n, arg, 0);
+}
+
+/* a.sort(...) and a.argsort(...): sort_issue, else the Python method
+ * (`name`: _sort_py, or NumPy's function for argsort). */
+static PyObject* sort_method(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
+                             PyObject* kwnames, int arg) {
+    PyObject* stack[8];
+    const Py_ssize_t nkw = kwnames != NULL ? PyTuple_GET_SIZE(kwnames) : 0;
+    if (nargs + nkw >= 8) {
+        PyErr_SetString(PyExc_TypeError, "sort: too many arguments");
+        return NULL;
+    }
+    stack[0] = self;
+    memcpy(stack + 1, args, (size_t)(nargs + nkw) * sizeof(PyObject*));
+    PyObject* r = sort_issue(stack, nargs + 1, nkw > 0 ? &PyTuple_GET_ITEM(kwnames, 0) : NULL,
+                             stack + nargs + 1, nkw, arg, !arg);
+    if (r != NULL || PyErr_Occurred()) {
+        return r;
+    }
+    if (arg) {
+        return PyObject_Vectorcall(g_argsort_func, stack, (size_t)(nargs + 1), kwnames);
+    }
+    static PyObject* name = NULL;
+    if (name == NULL && (name = PyUnicode_InternFromString("_sort_py")) == NULL) {
+        return NULL;
+    }
+    return PyObject_VectorcallMethod(name, stack, (size_t)(nargs + 1), kwnames);
+}
+
+static PyObject* Array_sort(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
+                            PyObject* kwnames) {
+    return sort_method(self, args, nargs, kwnames, 0);
+}
+
+static PyObject* Array_argsort(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
+                               PyObject* kwnames) {
+    return sort_method(self, args, nargs, kwnames, 1);
+}
+
 /* _Array.__array_function__(self, func, types, args, kwargs): NumPy's
  * reductions as the methods above, np.where of small ready data by NumPy;
  * every other function in _ndarray.py. */
@@ -3481,6 +3643,12 @@ static PyObject* Array_array_function(PyObject* self, PyObject* const* args, Py_
         return NULL;
     }
     PyObject *func = args[0], *fargs = args[2], *fkw = args[3];
+    if (func == g_sort_func || func == g_argsort_func) {
+        PyObject* r = sort_call(fargs, fkw, func == g_argsort_func);
+        if (r != NULL || PyErr_Occurred()) {
+            return r;
+        }
+    }
     if (func == g_where_func) {
         PyObject* r = where_select(fargs, fkw);
         if (r == NULL && !PyErr_Occurred()) {
@@ -3631,6 +3799,36 @@ static PyObject* m_astype(PyObject* self, PyObject* args) {
     }
     if (raise_status(status, err) < 0) {
         return NULL;
+    }
+    return wrap_array(res);
+}
+
+static PyObject* m_sort(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *a, *order_t;
+    int axis, kind, arg, in_place;
+    if (!PyArg_ParseTuple(args, "O!iiipO!", &ArrayType, &a, &axis, &kind, &arg, &in_place,
+                          &PyTuple_Type, &order_t) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    int order[MAXDIMS];
+    const int order_n = int_tuple(order_t, order, MAXDIMS);
+    if (order_n < 0 || (in_place && ((ArrayObject*)a)->readonly)) {
+        Py_RETURN_NONE;
+    }
+    vp_array* res = NULL;
+    char err[ERRLEN] = "";
+    const int status = vp_sort(g_rt, array_of(a), axis, kind, arg, in_place, order_n, order, &res,
+                               issue_site(), err, sizeof err);
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    if (res == NULL) {
+        Py_RETURN_TRUE;
     }
     return wrap_array(res);
 }
@@ -4102,6 +4300,9 @@ static PyMethodDef methods[] = {
      "for exactly these dtypes (inputs cast, out= of any dtype, a bool where= mask), or None"},
     {"ufunc_multi", m_ufunc_multi, METH_VARARGS,
      "ufunc_multi(ufunc, inputs, dtype codes): async ufunc with several outputs, or None"},
+    {"sort", m_sort, METH_VARARGS,
+     "sort(a, axis, kind, arg, in_place, out_order): async sort/argsort along axis (vp_sort): "
+     "the result, True (in place) or None if unsupported"},
     {"gufunc", m_gufunc, METH_VARARGS,
      "gufunc(ufunc, inputs, outs|None, dtype codes, core_n, core_axes, label sizes, flags, "
      "out_order, "

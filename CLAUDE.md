@@ -326,6 +326,8 @@ src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
   numpy_gufunc.*       generic gufunc kernel (vecdot, matvec, vecmat, matmul
                        with casts/out=): NumPy's gufunc loop called per inner
                        batch row as PyUFunc_GeneralizedFunctionInternal
+  numpy_sort.*         sort/argsort kernel: NumPy's per-dtype sort functions
+                       (ArrFuncs->sort/argsort), one call per row
 src/capi/capi.cpp      Implementation of the C ABI (library `viproc_capi`)
 src/viproc_python.h    the only way to include Python.h (MSVC debug fix)
 python/viproc/         Python package
@@ -353,6 +355,8 @@ python/viproc/         Python package
                        solve, cholesky, eig*, svd; AsyncLinAlgError)
   _fft.py              numpy.fft wrappers ported onto vp_gufunc (fft, rfft,
                        irfft, hfft, n-d transforms)
+  _sort.py             np.sort/np.argsort/a.sort beyond the C path (axis=None
+                       copies, kinds, NumPy's errors)
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -697,8 +701,8 @@ Rules:
   `PyDataType_GetArrFuncs(descr)->argmax` / `->argmin`
   (`int f(void *data, npy_intp n, npy_intp *index, void *arr)`).
 - **Linalg** (`_linalg.py`, `LINALG`): `det`, `slogdet`, `inv`, `solve`,
-  `cholesky`, `eig`, `eigh`, `eigvals`, `eigvalsh`, `svd` (not
-  `hermitian=True`), `svdvals`. NumPy's wrappers are ported: the same
+  `cholesky`, `eig`, `eigh`, `eigvals`, `eigvalsh`, `svd` (`hermitian=True`
+  as NumPy composes it: eigh, argsort, take_along_axis), `svdvals`. NumPy's wrappers are ported: the same
   argument checks (`LinAlgError` at the call), `_commonType` (computation
   in double/cdouble, the input cast first, results cast back), the same
   gufunc and signature, run through `vp_gufunc` (labels only outputs have,
@@ -710,7 +714,7 @@ Rules:
   `_assert_finite` (eig, eigvals) runs in the kernel before the loop
   (`VP_GUFUNC_CHECK_FINITE`), no sync. `qr` (its `qr_r_raw` writes its
   input), `lstsq` (data-dependent residual shape), `pinv`, `matrix_rank`,
-  `cond`, `matrix_power` and `svd(hermitian=True)` still fall back. Linalg
+  `cond` and `matrix_power` still fall back. Linalg
   loops call LAPACK, which OpenBLAS threads itself for larger matrices:
   matrices of >= 64 x 64 elements run one loop call at a time
   (`VP_GUFUNC_SERIAL`, a process-wide mutex; `_linalg.SERIAL_FROM`).
@@ -774,6 +778,33 @@ Rules:
   (`POCKETFFT_CACHE_SIZE` 0 in NumPy's build): thread-safe. n-d transforms
   with `out=` and the deprecated `s`/`axes` forms fall back. Fuzzed in
   `python/tests/test_fft.py`.
+- **Sort** (`src/kernels/numpy_sort.*`, `vp_sort`): `np.sort`,
+  `np.argsort`, `a.sort()`, `a.argsort()` on NumPy's per-dtype sort
+  functions (`PyDataType_GetArrFuncs(descr)->sort[kind]` /
+  `->argsort[kind]`: the introsort, timsort and radix sort instances
+  NumPy's sort ArrayMethods call, SIMD dispatch included). NumPy
+  (`_new_sortlike`, `_new_argsortlike`) sorts each row along the axis on
+  its own, in place when the row is contiguous and aligned, else through a
+  contiguous buffer; argsort fills 0..n-1 and sorts the indices by the
+  row. A row's result depends only on its values and the function, so the
+  kernel's calls give NumPy's results, also the order of equal elements,
+  NaNs and signed zeros. Kinds: quicksort and heapsort are table index 0
+  (NumPy 2 maps heapsort to its introsort), mergesort/stable/`stable=True`
+  2. `np.sort` is NumPy's `copy(order="K")` sorted in place: the result has
+  `empty_like(a)`'s layout (order K, computed in `vp_sort`); a dense input
+  is copied in one pass first, as NumPy does, then each row sorted in
+  place. argsort's result is C-ordered intp. `axis=None` sorts the
+  C-ordered flat copy (a reshape view where there is one). The common
+  calls (`a`, int `axis`, `kind`, `stable`, also `axis=None` of a
+  C-contiguous array) are parsed in C (`sort_call` in
+  `_Array.__array_function__`, `a.sort`/`a.argsort` as C methods) and
+  issued directly, small ready data on the direct path: `np.sort` of 10
+  elements 0.76 µs (NumPy 0.79), `np.argsort` 0.75 µs (NumPy 1.3),
+  `a.sort()` 0.6 µs (NumPy 0.38); the rest goes to `_sort.py`; `order=`
+  falls back. `partition`, `argpartition` and `searchsorted` stay on the
+  fallback: NumPy's introselect and binsearch functions are not reachable
+  through its C API (`get_partition_func`, `get_binsearch_func` are
+  internal). Fuzzed in `python/tests/test_sort.py`.
 - **Dtype semantics follow NumPy exactly:** promotion, `divide` on integers
   yielding `float64`, overflow wrap-around, NaN handling.
 - **Broadcasting and scalars:** NumPy broadcasting rules apply to all
@@ -1061,9 +1092,9 @@ Rules:
   except `base` (views do not track their Python base object) and `ctypes`
   (a raw pointer would bypass the runtime). The ones with a NumPy function
   form delegate to it (`a.clip(...)` is `np.clip(a, ...)`), so they take
-  the function's path; in-place ones without one (`sort`, `partition`,
-  `resize`, `setfield`, `flat[...] = v`) run NumPy's method in the eager
-  fallback; `fill` is an assignment; `flags` and `setflags` work on the
+  the function's path; `sort` is a task (`vp_sort`, in place); the other
+  in-place ones without a function form (`partition`, `resize`,
+  `setfield`, `flat[...] = v`) run NumPy's method in the eager fallback; `fill` is an assignment; `flags` and `setflags` work on the
   layout and `_readonly` without a sync (`python/tests/test_methods.py`).
 - **Read-only viproc arrays** (`_readonly`, e.g. from `broadcast_to`):
   writes raise NumPy's errors; never reused by temporary elision.

@@ -1203,7 +1203,8 @@ class ndarray(_viproc._Array):
             return None
         handler = (_REDUCTIONS.get(func) or _VIEW_HANDLERS.get(func) or _PRODUCTS.get(func)
                    or _COMPOSITIONS.get(func) or _JOINING.get(func) or _INDEXING.get(func)
-                   or _ACCUMULATING.get(func) or _LINALG.get(func) or _FFT.get(func))
+                   or _ACCUMULATING.get(func) or _LINALG.get(func) or _FFT.get(func)
+                   or _SORTING.get(func))
         if handler is not None:
             try:
                 r = handler(*args, **kwargs)
@@ -1327,8 +1328,6 @@ class ndarray(_viproc._Array):
     def nonzero(self):
         return np.nonzero(self)
 
-    def argsort(self, *args, **kwargs):
-        return np.argsort(self, *args, **kwargs)
 
     def argpartition(self, *args, **kwargs):
         return np.argpartition(self, *args, **kwargs)
@@ -1351,7 +1350,11 @@ class ndarray(_viproc._Array):
     def repeat(self, repeats, axis=None):
         return np.repeat(self, repeats, axis)
 
-    def sort(self, *args, **kwargs):
+    # sort and argsort are _Array's C methods (vp_sort); this is the Python
+    # path behind sort.
+    def _sort_py(self, *args, **kwargs):
+        if _sort.sort_in_place(self, *args, **kwargs):
+            return
         _host_call(lambda a, *ar, **kw: a.sort(*ar, **kw), (self,) + args, kwargs)
 
     def partition(self, *args, **kwargs):
@@ -1792,5 +1795,7 @@ from ._join import JOINING as _JOINING  # noqa: E402
 from ._indexing import INDEXING as _INDEXING  # noqa: E402
 from ._linalg import LINALG as _LINALG  # noqa: E402
 from ._fft import FFT as _FFT  # noqa: E402
+from . import _sort  # noqa: E402
+from ._sort import SORTING as _SORTING  # noqa: E402
 from . import _ufuncs  # noqa: E402
 from ._ufuncs import ACCUMULATING as _ACCUMULATING  # noqa: E402
