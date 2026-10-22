@@ -84,8 +84,19 @@ to plain sequential NumPy execution.
   - `size_completed`: output shape (and dtype) is known.
   - `allocated`: output element memory exists.
   - `completed`: output data is computed; the outputs become `ready`.
-- A task passes through each state **at most once and only forward**. It
-  may skip states, never go back.
+- A task passes through each state **exactly once, in increasing order**
+  (`docs/design/pipelining.md`, S1): a stage with nothing to do is still
+  reached and signalled; handlers may rely on it, and a skipped stage can
+  deadlock its waiters. Today's code still skips `DeviceSelected` (no
+  callbacks on it yet) and the direct path creates ready outputs without
+  a task.
+- Full stage pipelining (Accelerator; `docs/design/pipelining.md`, not
+  implemented yet): six array stages (created, size completed, device
+  selected, allocated, completed, disposed), each reached exactly once, in
+  increasing order; the main thread guarantees only
+  `created`, tasks advance the rest on their inputs' stage events. Today
+  every task reaches `size_completed` at issue; pending size arguments
+  (`np.zeros(n)` with pending `n`) are to issue a task instead of syncing.
 - The task holds references to its input arrays, its output arrays and the
   resolved NumPy loop.
 - Tasks, CountableArrays, Metadata objects and array blocks come from per-thread memory pools
@@ -285,6 +296,7 @@ docs/design/           Design documents (decisions with rationale)
   goals.md             goals, non-goals, never-slower rule (G1-G3), roadmap
   error-handling.md    run-time errors on any thread, asynchronous reporting
   memory-management.md ownership, release, pools, NumPy interop, COW
+  pipelining.md        array stages, partial completion, pending sizes (roadmap)
   array-data-model.md  array data model: Array, Metadata (SD + task),
                        AliasGroup, CountableArray; lifecycle, checks per op,
                        figure (array-data-model.svg), evaluation
