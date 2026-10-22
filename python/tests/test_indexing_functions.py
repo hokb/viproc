@@ -234,3 +234,37 @@ def test_async_path(det, call, inputs, tasks, syncs):
     same(got, want) if want is not None else None
     for (_, v), w in zip(pairs, want_args):
         same(v, w)  # the arrays the call wrote
+
+
+@pytest.mark.parametrize("vals", [
+    np.array([1.5, 2.5]), np.array(1.5), np.array([1, 2], np.int64), np.array([1, 2], np.uint64),
+    np.array([1, 2], np.int16), np.float64(1.5), [1.5, 2.5], 1.5])
+@pytest.mark.parametrize("viproc_vals", [False, True])
+def test_place_casts_array_values_safely(vals, viproc_vals):
+    """NumPy's arr_place converts array values with safe casting (TypeError),
+    Python and NumPy scalars and sequences as they come (#30 review)."""
+    if viproc_vals and not isinstance(vals, np.ndarray):
+        pytest.skip("only arrays become viproc arrays")
+    mask = np.arange(SIZE) % 2 == 0
+
+    def run(xp):
+        a = xp.asarray(np.zeros(SIZE, np.int32))
+        v = viproc.asarray(vals) if viproc_vals and xp is viproc else vals
+        try:
+            xp.place(a, mask, v)
+        except Exception as e:
+            return type(e), str(e)
+        return np.array(a)
+
+    expected, got = run(np), run(viproc)
+    if isinstance(expected, tuple):
+        assert got == expected
+    else:
+        np.testing.assert_array_equal(got, expected)
+
+
+def test_take_scalar_index_owns_its_data():
+    x = np.arange(2.0 * SIZE).reshape(2, -1)
+    r, e = np.take(viproc.asarray(x), 1, axis=0), np.take(x, 1, axis=0)
+    assert (r.flags.owndata, r.base is None, r.strides) == (e.flags.owndata, e.base is None, e.strides)
+    same(r, e)
