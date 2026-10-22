@@ -107,7 +107,8 @@ ASYNC = [  # name, call, matrices, tasks
     ("svd", L.svd, (60, 10, 8), 1),
     ("svdvals", L.svdvals, (60, 8, 10), 1),
     # eigh, copysign, abs, argsort, 3 take_along_axis, multiply, conjugate
-    ("svd_hermitian", lambda a: L.svd(a, hermitian=True), (60, 10, 10), 9),
+    # vt's conjugate() copies only complex data (a real array is returned as is)
+    ("svd_hermitian", lambda a: L.svd(a, hermitian=True), (60, 10, 10), {"f": 8, "c": 9}),
     ("svd_hermitian_s", lambda a: L.svd(a, compute_uv=False, hermitian=True), (60, 10, 10), 3),
     # single precision: the input cast to double first, the results cast back
     ("inv_f4", L.inv, (60, 10, 10, "f4"), 3),
@@ -125,6 +126,8 @@ def test_async(call, shape, ops, dtype, det):
         shape, dtype = shape[:-1], shape[-1]
     a = matrices(shape, dtype)
     v = pending(viproc.asarray(a))
+    if isinstance(ops, dict):
+        ops = ops[np.dtype(dtype).kind]
     got = assert_async(call, v, ops=ops)
     same(got, call(a))
 
