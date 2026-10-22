@@ -10,6 +10,11 @@ Status labels:
 
 - **Decided** — agreed, not implemented yet.
 - **Implemented** — in the code (file references given).
+
+Object names follow `array-data-model.md`: an `Array` holds its `Metadata`
+(size descriptor) and its `AliasGroup` (shared by a base and its views:
+current data version, last writer); a data version is a `CountableArray`
+(element memory, one handle per device).
 - **Proposed** — worked out, waiting for a decision.
 
 ## Summary
@@ -19,7 +24,7 @@ Status labels:
 | D1 | No dedicated (temporary) array types; one `viproc.ndarray` type | Decided |
 | D2 | Deterministic memory management through reference counting | Decided; implemented for objects |
 | D3 | Own memory pool for element memory in the viproc layer | Implemented |
-| D4 | Pools for the per-op runtime objects (Task, Buffer, ArrayBlock) | Implemented |
+| D4 | Pools for the per-op runtime objects (Task, Metadata, CountableArray, ArrayBlock) | Implemented |
 | D5 | Reuse the buffer of a temporary input for the output | Implemented |
 | D6 | Ownership: Python owns objects, the runtime owns element memory | Implemented |
 | D7 | Array conversions viproc ↔ ndarray: copy-free export, copy-free import of fresh memory, eager fallbacks with NumPy's semantics | Implemented |
@@ -81,12 +86,13 @@ reference goes, never by a collector or at an unknown later time.
 | Object | Counted by | Released |
 |--------|-----------|----------|
 | `viproc.ndarray` (Python object) | CPython refcount | when the program drops it |
-| `Array`, `Storage` (runtime, main thread only) | `Ref<T>`, plain int (`src/runtime/ref.hpp`) | with the last Python object / view referring to them |
+| `Array`, `AliasGroup` (runtime, main thread only) | `Ref<T>`, plain int (`src/runtime/ref.hpp`) | with the last Python object / view referring to them |
+| `Metadata` (size descriptor) | `MetadataPtr`, intrusive atomic | when no array and no issued task (operand) refers to it |
 | `Task` | `std::shared_ptr` (atomic) | after completion, when no array names it as producer |
-| `Buffer` (element memory) | `std::shared_ptr` (atomic) | when no array and no issued task (operand) refers to it |
+| `CountableArray` (element memory) | `std::shared_ptr` (atomic) | when no array and no issued task (operand) refers to it |
 
 Asynchrony is part of the rule: a Python object can die while issued tasks
-still read its data. The tasks hold the `Buffer` through their operands, so
+still read its data. The tasks hold the `CountableArray` through their operands, so
 the memory lives exactly until the last reader completes, then it is
 released on that thread. Cycles between arrays and tasks are broken on
 `completed` (CLAUDE.md, "Reference counting").
@@ -129,13 +135,13 @@ float64):
 (At 1e5 the reused buffer is also cache-warm; a LIFO pool has the same
 advantage.)
 
-**Design** (implemented: `src/runtime/element_pool.*`, `buffer.*`):
+**Design** (implemented: `src/runtime/element_pool.*`, `countable_array.*`):
 
 - **Where it plugs in.** The task producing a buffer takes its block when
   it runs, on whatever thread runs it (D11; ops run directly by the main
-  thread take it there); `Buffer::~Buffer()` returns it, on whatever
+  thread take it there); `CountableArray::~CountableArray()` returns it, on whatever
   thread. Foreign memory (NumPy arrays) is never
-  pooled. Element memory up to 128 bytes stays inline in the `Buffer`
+  pooled. Element memory up to 128 bytes stays inline in the `CountableArray`
   (implemented).
 - **Matching: equal or larger, bounded excess — by quantized bins** (as
   ILNumerics.ONAL's `MemoryPool`). Requests are rounded up to a bin
@@ -147,7 +153,7 @@ advantage.)
   of two, 25 %) are a configuration choice, not a different design.
 - **LIFO per bin.** The most recently released block is reused first: it is
   most likely still in cache and its pages are mapped.
-- **Capacity vs. size.** A `Buffer` keeps its logical size (`nbytes()`,
+- **Capacity vs. size.** A `CountableArray` keeps its logical size (`nbytes()`,
   what the layout covers) and the capacity of its block. Everything about
   the array's data uses the logical size (copy-on-write's "covers the
   whole buffer" test, `CopyKernel`); only the pool sees the capacity.
@@ -221,14 +227,14 @@ above).
 
 ## D4 — Pools for the per-op runtime objects
 
-**Implemented** (`src/runtime/pool.hpp`). `Task`, `Buffer` objects and
-`ArrayBlock`s (an `Array` and its `Storage` in one allocation) come from
+**Implemented** (`src/runtime/pool.hpp`). `Task`, `CountableArray` objects and
+`Metadata` objects and `ArrayBlock`s (an `Array` and its `AliasGroup` in one allocation) come from
 fixed-size pools: per-thread free lists without atomics for the allocating
 thread; other threads return blocks through a lock-free stack, which an
 allocating thread takes over as a whole (exchange, so no ABA). The pools
 only grow, up to the peak number of live objects.
 
-Per op this leaves one pooled `Task`, one pooled `Buffer`, one pooled
+Per op this leaves one pooled `Task`, one pooled `CountableArray`, one pooled
 `ArrayBlock` and the Python object; together with D2's other measures the
 per-op cost dropped from ~7,100 to ~5,400 instructions (CLAUDE.md, "Python
 bridge").
@@ -249,7 +255,7 @@ An operand qualifies when, at issue time on the main thread:
    -wise loops read and write the same element in one call, as NumPy does
    in place);
 2. **the runtime may reuse its buffer** (`vp_array_reusable_bytes`): the
-   `Array` has no other reference and its `Storage` no other array (no
+   `Array` has no other reference and its `AliasGroup` no other array (no
    views), the buffer is pool memory (so never memory shared with NumPy),
    no issued task still reads it (`async_reads == 0`; a pending *producer*
    is fine, the op is its consumer), no read-only NumPy export of it is
@@ -294,11 +300,11 @@ An operand qualifies when, at issue time on the main thread:
    `viproc._viproc.elision_mode()` reports the mode, `_viproc.elided()`
    counts elided ops.
 
-**Views.** Rule 2 works on the storage, not on the Python object, so views
+**Views.** Rule 2 works on the alias group, not on the Python object, so views
 are covered: a temporary view of a named array (`x[::2] + 1`) shares its
-storage with `x` and is never reused; neither is a temporary whose storage
+alias group with `x` and is never reused; neither is a temporary whose alias group
 still has another view (e.g. one kept in a list). A view that is the only
-array left on its storage and covers its buffer contiguously from offset 0
+array left on its alias group and covers its buffer contiguously from offset 0
 (`(x * 2)[:] + 1`) is reused, correctly: nothing else can see that buffer.
 Offset or strided views are not reused (conservative). Buffers exported to
 NumPy (D7) fail rule 2: a live export counts as a reader. Read-only viproc
@@ -307,7 +313,7 @@ arrays (D7, "Eager fallbacks") are never reused either.
 Then the op is issued with the operand as its `out=` array: an in/out op
 writing in place. That needed one change to D8's accounting: an op does not
 count its reads of the buffer it writes in place in `async_reads`
-(`Operand::counted_read`); every later writer waits for it as the storage's
+(`Operand::counted_read`); every later writer waits for it as the alias group's
 producer anyway. Before, a pending in-place op made the next in-place op on
 the same array copy-on-write, and blocked the next elision.
 
@@ -324,11 +330,11 @@ and viproc writes in place, saving memory bandwidth).
 
 - **Python objects** (`viproc.ndarray`, `numpy.ndarray`) are owned by
   Python and its reference counting.
-- **Element memory** is owned by the runtime (`Buffer`), whether viproc
+- **Element memory** is owned by the runtime (`CountableArray`), whether viproc
   allocated it or adopted it from a NumPy array. Adopted memory stays
-  alive through a reference to its ndarray held by the `Buffer`.
-- **`Array` / `Storage`** are runtime objects reachable only from the main
-  thread; workers see `Task`s and `Buffer`s only.
+  alive through a reference to its ndarray held by the `CountableArray`.
+- **`Array` / `AliasGroup`** are runtime objects reachable only from the
+  main thread; workers see `Task`s, `Metadata` objects and `CountableArray`s only.
 - **The C ABI** hands out `Array*` as `vp_array*`, one reference each;
   bridges never see C++ ownership types.
 
@@ -359,8 +365,8 @@ rule for that outside access.
 `np.asarray(v)`, `v.__array__()` and `v.numpy()` wait for `v`'s producer,
 then return a **read-only** NumPy view of the buffer (shape, strides and
 offset of `v`; views of views work). Its base object holds the buffer and
-counts as **one reader** of it (`Buffer::host_views`, main thread only)
-until the last NumPy view on it is gone. `Buffer::has_readers()` is
+counts as **one reader** of it (`CountableArray::host_views`, main thread only)
+until the last NumPy view on it is gone. `CountableArray::has_readers()` is
 `host_views > 0 || async_reads > 0`; copy-on-write (D8) and temporary
 elision (D5) test that. Host views are kept apart from `async_reads`
 because a task's readers are waited for (a worker finishes them), host
@@ -435,7 +441,7 @@ viproc memory itself, not copies:
    for the array's producer; if read-only exports of the buffer are alive
    (`host_views > 0`), copy-on-write first (a copy task, then wait) so
    those exports keep their values; finally wait until no issued task
-   still reads the buffer (`Buffer::wait_task_readers`). From then on no
+   still reads the buffer (`CountableArray::wait_task_readers`). From then on no
    worker touches the buffer: the main thread issues nothing while NumPy
    runs. A writable export is not counted as a reader. Read-only viproc
    arrays get a read-only export (NumPy then raises its own error).
@@ -493,12 +499,12 @@ provably have no other user:
 | Unsupported dtypes / layouts | stay NumPy arrays (eager NumPy) |
 
 **Considered, not taken:** sharing a user-held ndarray and running every
-op on that storage synchronously while the ndarray is referenced outside
+op on that alias group synchronously while the ndarray is referenced outside
 viproc (refcount check per op). Correct, but `x = viproc.asarray(a)` with
 `a` still in scope (the common case) would lose all asynchrony for `x`;
 one copy at import is cheaper than that. Writable exports *to the user*
 with the same rule were rejected for the same reason and because
-copy-on-write would have to be replaced by input copies for such storages.
+copy-on-write would have to be replaced by input copies for such alias groups.
 Writable exports exist only for the duration of an eager fallback, while
 the main thread issues nothing (above).
 
@@ -508,18 +514,18 @@ the main thread issues nothing (above).
 buffer counts its issued, not yet completed readers (`async_reads`). An op
 writing an array in place (in-place operators, `out=`, `__setitem__`)
 writes the current buffer only if nobody still reads it and no input of the
-op overlaps it through another view; otherwise the storage switches to a
+op overlaps it through another view; otherwise the alias group switches to a
 new buffer and the old one lives on through its readers' references.
-Single-view storages are *consolidated* (the op writes a fresh buffer with
+Single-view alias groups are *consolidated* (the op writes a fresh buffer with
 the array's layout, no copy) when the op writes every element
-(`Kernel::writes_all`); storages with views, and ops that write only some
+(`Kernel::writes_all`); alias groups with views, and ops that write only some
 elements (scatter, masked assignment), get a copy task first (without it,
 `x[x > 1.4] = 0.6` on an `x` with pending readers left the other elements
 as fresh memory).
 
 The copy is made **as late as possible, by the writing task itself**
 (`Task::add_copy_on_write`, `Task::copy_on_write`): issue time only
-switches the storage to a new deferred buffer and counts the writer's read
+switches the alias group to a new deferred buffer and counts the writer's read
 of the old one; right before its kernel, the writer either takes the old
 block over or copies it, and reads its in/out from the new buffer. By then
 the writer's inputs are complete. In a recurrence (`x[i] = cos(x[i-1]) *
@@ -545,7 +551,7 @@ part and number of readers. Needs a case in the shape map first.
 
 An op's reads
 of the buffer it writes in place are not counted (D5): later writers wait
-for it as the producer anyway. Whether the storage switches is decided at
+for it as the producer anyway. Whether the alias group switches is decided at
 issue time on the main thread, so layouts never change after they were
 communicated. Arrays keep their strides, as in NumPy: until reductions ran
 asynchronously, consolidation switched to a C-contiguous layout, which made
@@ -576,7 +582,7 @@ directly, bypassing every sync point:
    TLB shootdowns on all worker cores, which defeats small and medium
    arrays.
 3. **Copy-on-write would break.** An ndarray has a fixed data pointer that
-   C code may keep; viproc switches a storage to a new buffer when an
+   C code may keep; viproc switches an alias group to a new buffer when an
    in-place write meets pending readers (D8), and consolidates layouts.
 4. **Unsafe by default.** A subclass inherits hundreds of C methods that
    work on the memory directly (`.sum`, `.copy`, `.tobytes`, `.fill`,
@@ -585,7 +591,7 @@ directly, bypassing every sync point:
    raises or goes through `__array__`, a clean sync point.
 5. **Views created in C.** NumPy creates subclass views itself (slicing,
    `reshape`, `.T`) without telling viproc, which would lose the mapping
-   onto shared storages.
+   onto shared alias groups.
 
 **Consequences.**
 
@@ -636,7 +642,7 @@ memory, D3; runtime objects, D4):
   stage at issue (it passes `size_completed` and `allocated` on the main
   thread). Kernels never allocate; `Task::execute()` finds its outputs
   allocated. This replaces the current lazy allocation by the producing
-  task (`Buffer::ensure_allocated()` on the worker). The copy-on-write
+  task (`CountableArray::ensure_allocated()` on the worker). The copy-on-write
   paths (consolidated new buffer, copy task) and scalar inputs are issued
   on the main thread already.
 - **Peak memory.** A pending output holds its memory from issue on instead
@@ -671,13 +677,13 @@ memory, D3; runtime objects, D4):
 
 ## D11 — Element memory as late as possible, taken by the producing task
 
-**Implemented** (`Buffer::Buffer(nbytes, Buffer::deferred)`,
+**Implemented** (`CountableArray::CountableArray(nbytes, CountableArray::deferred)`,
 `Task::allocate_outputs` in `src/runtime/task.cpp`,
 `src/runtime/element_pool.*`). Replaces D10 for element memory.
 
 **Decision.** A buffer a task produces is created *deferred* at issue: the
-`Buffer` object exists (consumers capture it, count their reads on it,
-the storage refers to it), but its element memory does not. The task takes
+`CountableArray` object exists (consumers capture it, count their reads on it,
+the alias group refers to it), but its element memory does not. The task takes
 the memory right before its kernel runs, on the thread that runs it:
 
 1. **From a dying input** (kernels with `Kernel::in_place_ok()`: NumPy's
@@ -698,7 +704,7 @@ Inline buffers (≤ 128 bytes) have their memory at once. Ops the main thread
 runs directly (`Runtime::issue_direct`) allocate there, right before they
 run. `size_completed` is still reached at issue (phase 1: shapes are known),
 `allocated` now when the task runs. Copy-on-write buffers (consolidated new
-buffer, storage copies) are deferred as well.
+buffer, alias group copies) are deferred as well.
 
 **Why.** Measured (4-vCPU VM, Release, one worker, µs per op, `x =
 np.abs(x)` repeated; NumPy in brackets): with the main thread allocating at

@@ -121,7 +121,7 @@ class ReduceKernel : public Kernel {
     const char* name() const override { return loop_->name(); }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
-        const Layout& out_layout = outputs[0].layout;
+        const Layout& out_layout = outputs[0].layout();
         const std::size_t isz = itemsize(out_layout.dtype);
         char* const in = reinterpret_cast<char*>(inputs[0].first());
         char* const out = reinterpret_cast<char*>(outputs[0].first());
@@ -628,7 +628,7 @@ class ArgReduceKernel : public Kernel {
     const char* name() const override { return argmax_ ? "numpy.argmax" : "numpy.argmin"; }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
-        const Layout& l = inputs[0].layout;
+        const Layout& l = inputs[0].layout();
         const npy_intp m = l.shape.empty() ? 1 : static_cast<npy_intp>(l.shape.back());
         const npy_intp rows = m == 0 ? 0 : static_cast<npy_intp>(l.size()) / m;
         const auto step = static_cast<npy_intp>(itemsize(l.dtype)) * m;

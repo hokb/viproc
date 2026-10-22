@@ -37,7 +37,7 @@ target_compile_options(viproc_warnings INTERFACE
 add_library(viproc
     src/runtime/version.cpp
     src/runtime/layout.cpp
-    src/runtime/buffer.cpp
+    src/runtime/countable_array.cpp
     src/runtime/cpu.cpp
     src/runtime/element_pool.cpp
     src/runtime/task.cpp

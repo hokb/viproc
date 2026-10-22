@@ -40,9 +40,9 @@ class MatmulKernel : public Kernel {
     const char* name() const override { return loop_->name(); }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
-        const Layout& a = inputs[0].layout;
-        const Layout& b = inputs[1].layout;
-        const Layout& o = outputs[0].layout;
+        const Layout& a = inputs[0].layout();
+        const Layout& b = inputs[1].layout();
+        const Layout& o = outputs[0].layout();
         const std::size_t na = a.shape.size();
         const std::size_t nbd = b.shape.size();
         const bool has_m = na >= 2;

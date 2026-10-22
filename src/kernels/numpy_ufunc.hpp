@@ -241,7 +241,7 @@ bool scalar_bytes(PyObject* value, DType dtype, std::vector<std::byte>& out);
 // Copy-free export (docs/design/memory-management.md, D7): a NumPy view of
 // `a`'s buffer, with `a`'s shape and strides. `a` must be ready.
 // - Read-only (writable == false): while the view (or any NumPy view of it)
-//   lives, it counts as a reader of the buffer (Buffer::host_views), so a later
+//   lives, it counts as a reader of the buffer (CountableArray::host_views), so a later
 //   in-place write to `a` switches `a` to a new buffer (copy-on-write) and the
 //   NumPy view keeps the data it showed: copy semantics without a copy.
 // - Writable: only after Runtime::prepare_host_write(a), for NumPy code the
