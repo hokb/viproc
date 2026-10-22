@@ -14,10 +14,9 @@ from async_path import SIZE, assert_async, deterministic, pending
 
 rng = np.random.default_rng(1)
 
-# Attributes of numpy.ndarray viproc does not offer: `base` (viproc does not
-# track which Python object a view came from) and `ctypes` (a raw pointer to
+# Attributes of numpy.ndarray viproc does not offer: `ctypes` (a raw pointer to
 # runtime memory would bypass the runtime).
-NOT_OFFERED = {"base", "ctypes"}
+NOT_OFFERED = {"ctypes"}
 
 
 def same(r, expected):
@@ -147,10 +146,12 @@ def test_resize_raises_numpys_error():
 def test_flags_without_sync():
     x, v = pair((4, 5))
     for a, b in [(x, v), (x.T, v.T), (x[::2], v[::2]), (x[:, 1], v[:, 1])]:
-        for name in ("c_contiguous", "f_contiguous", "contiguous", "aligned", "writeable"):
+        for name in ("c_contiguous", "f_contiguous", "contiguous", "aligned", "writeable",
+                     "owndata"):
             assert getattr(b.flags, name) == getattr(a.flags, name), name
-        for key in ("C_CONTIGUOUS", "F", "W", "WRITEABLE", "A"):
+        for key in ("C_CONTIGUOUS", "F", "W", "WRITEABLE", "A", "O", "OWNDATA"):
             assert b.flags[key] == a.flags[key], key
+        assert repr(b.flags) == repr(a.flags)
     assert "WRITEABLE : True" in repr(v.flags)
     v.flags.writeable = False
     assert not v.flags.writeable and "WRITEABLE : False" in repr(v.flags)
@@ -250,3 +251,66 @@ FALLING_BACK = [
 def test_method_takes_async_path(det, call, ops):
     x, v = big()
     assert_async(call, v, ops=ops)
+
+
+# ndarray.base: which array a result is a view of (None for an array owning
+# its data), as NumPy: the first array of a chain of views
+BASE_CASES = {
+    "slice": lambda a, c: a[1:],
+    "slice_of_slice": lambda a, c: a[1:][::2],
+    "int": lambda a, c: a[1],
+    "ellipsis": lambda a, c: a[...],
+    "T": lambda a, c: a.T,
+    "TT": lambda a, c: a.T.T,
+    "transpose": lambda a, c: np.transpose(a),
+    "swapaxes": lambda a, c: a.swapaxes(0, 1),
+    "moveaxis": lambda a, c: np.moveaxis(a, 0, 1),
+    "reshape_view": lambda a, c: a.reshape(6, 4),
+    "reshape_copy": lambda a, c: a.T.reshape(24),  # NumPy: a view of its copy
+    "ravel_view": lambda a, c: a.ravel(),
+    "ravel_copy": lambda a, c: a.T.ravel(),
+    "flatten": lambda a, c: a.flatten(),
+    "real": lambda a, c: c.real,
+    "imag": lambda a, c: c.imag,
+    "real_of_real": lambda a, c: a.real,  # the array itself
+    "conj_of_real": lambda a, c: a.conj(),
+    "diagonal": lambda a, c: a.diagonal(),
+    "broadcast_to": lambda a, c: np.broadcast_to(a[0], (3, 6)),
+    "expand_dims": lambda a, c: np.expand_dims(a, 0),
+    "squeeze": lambda a, c: a[:1].squeeze(),
+    "flip": lambda a, c: np.flip(a),
+    "rot90": lambda a, c: np.rot90(a),
+    "view_dtype": lambda a, c: a.view(np.int64),
+    "split": lambda a, c: np.split(a, 2)[1],
+    "atleast_3d": lambda a, c: np.atleast_3d(a),
+    "copy": lambda a, c: a.copy(),
+    "ufunc": lambda a, c: a + 1,
+    "reduction": lambda a, c: a.sum(0),
+}
+
+
+def _base_kind(r, a, c):
+    b = r.base
+    if b is None:
+        return None
+    if b is a or b is c:
+        return "a" if b is a else "c"
+    return ("other", b.shape, b.strides)
+
+
+@pytest.mark.parametrize("case", BASE_CASES.values(), ids=BASE_CASES.keys())
+def test_base(case):
+    x, xc = np.ones((4, 6)), np.ones((4, 6), complex)
+    v, vc = viproc.asarray(x), viproc.asarray(xc)
+    r, s = case(x, xc), case(v, vc)
+    assert _base_kind(s, v, vc) == _base_kind(r, x, xc)
+    assert s.flags.owndata == r.flags.owndata
+    assert v.base is None and v.flags.owndata
+
+
+def test_base_keeps_the_array_alive():
+    v = viproc.asarray(np.arange(6.0))
+    w = v[1:]
+    del v
+    assert w.base.shape == (6,)
+    same(w.base, np.arange(6.0))
