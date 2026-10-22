@@ -151,8 +151,8 @@ def test_flags_without_sync():
     assert not v.flags.writeable and "WRITEABLE : False" in repr(v.flags)
     with pytest.raises(ValueError):
         v[0, 0] = 1.0
-    with pytest.raises(ValueError):
-        v.setflags(write=True)
+    v.setflags(write=True)  # NumPy: an array owning its data may
+    assert v.flags.writeable
     w = viproc.asarray(np.ones(3))
     w.setflags(write=False)
     with pytest.raises(ValueError):
@@ -409,3 +409,52 @@ def test_resize_is_async(det):
     assert_async(lambda: v2.resize(2 * SIZE), ops=2)
     r = np.concatenate([x, np.zeros(SIZE)])
     same(v2, r)
+
+
+def test_flags_object_is_a_snapshot():
+    """NumPy's a.flags is a new object per access, holding the flags of that
+    moment; its setter changes the array, not the object."""
+    def run(a):
+        f = a.flags
+        g = a.flags
+        a.setflags(write=False)
+        h = a.flags
+        h.writeable = True
+        return (f is g, f.writeable, f["W"], h.writeable, a.flags.writeable,
+                f.owndata, f.c_contiguous)
+
+    x = np.ones(4)
+    assert run(viproc.asarray(x)) == run(x.copy())
+
+
+SETFLAGS_CASES = [
+    ("owner", lambda m: m.ones(3), lambda a: a),
+    ("view", lambda m: m.ones(3), lambda a: a[1:]),
+    ("view_of_readonly", lambda m: m.ones(3), lambda a: (a.setflags(write=False), a[1:])[1]),
+    ("broadcast", lambda m: m.ones(3), lambda a: m_of(a).broadcast_to(a, (2, 3))),
+    ("diagonal", lambda m: m.ones((3, 3)), lambda a: a.diagonal()),
+]
+
+
+def m_of(a):
+    return viproc if isinstance(a, viproc.ndarray) else np
+
+
+@pytest.mark.parametrize("case", SETFLAGS_CASES, ids=[c[0] for c in SETFLAGS_CASES])
+def test_setflags_writeable_again(case):
+    """NumPy's _IsWriteable: who may be made writeable after read-only."""
+    _, make, view = case
+
+    def run(m):
+        out = []
+        a = view(make(m))
+        out.append(a.flags.writeable)
+        for w in (False, True):
+            try:
+                a.setflags(write=w)
+                out.append(a.flags.writeable)
+            except ValueError as e:
+                out.append(str(e))
+        return out
+
+    assert run(viproc) == run(np)
