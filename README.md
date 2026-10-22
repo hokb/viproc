@@ -105,7 +105,7 @@ pip install .           # into the active Python environment (a venv, conda, ...
 ```
 
 viproc is a regular Python package: one extension module (`_viproc.*.pyd` / `.so`, runtime
-linked in statically) plus Python files. It needs Python >= 3.12 (64 bit), NumPy >= 2.0 and,
+linked in statically) plus Python files. It needs Python >= 3.12 (64 bit), NumPy >= 2.5 and,
 until there are prebuilt wheels, a C++20 compiler (Visual Studio with the C++ workload on
 Windows, GCC or Clang on Linux). NumPy itself is not modified: viproc arrays take part through
 NumPy's array protocols.
