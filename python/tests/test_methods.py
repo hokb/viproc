@@ -267,6 +267,8 @@ BASE_CASES = {
     "ellipsis": lambda a, c: a[...],
     "T": lambda a, c: a.T,
     "TT": lambda a, c: a.T.T,
+    "chain_mixed": lambda a, c: a[1:][:, ::2].T[1].view(np.int64)[None],
+    "chain_of_copy": lambda a, c: a.T.reshape(24)[::2][1:],  # base: the copy
     "transpose": lambda a, c: np.transpose(a),
     "swapaxes": lambda a, c: a.swapaxes(0, 1),
     "moveaxis": lambda a, c: np.moveaxis(a, 0, 1),
