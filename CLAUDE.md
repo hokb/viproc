@@ -282,8 +282,12 @@ execution.
   interfaces with NumPy's C sources. Same languages as NumPy (C) and
   Bohrium (C/C++).
 - **CMake ≥ 3.24** with Ninja.
-- **CPython ≥ 3.12 and NumPy ≥ 2.0** are runtime and build dependencies
-  (NumPy headers via `numpy.get_include()`). Phase 1 always runs inside a
+- **CPython ≥ 3.12 and NumPy ≥ 2.5** are runtime and build dependencies
+  (NumPy headers via `numpy.get_include()`). viproc reproduces NumPy's
+  calling patterns and result layouts, and those change between versions:
+  the test suite on the 2.1–2.3 wheels found 22–72 differences (eig
+  dtypes, svd(hermitian), heapsort of bool, layouts, reduction blocks),
+  so older versions are refused (`pyproject.toml`, CMake, import). Phase 1 always runs inside a
   Python process.
 - Tests: CTest. Plain C/C++ test executables for now; pytest once the
   Python bridge exists.

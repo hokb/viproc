@@ -2,7 +2,7 @@
 # package. Development loop: dev.cmd (Windows) / ./dev.sh (Linux): pull,
 # build into .venv, test.
 [build-system]
-requires = ["scikit-build-core>=0.10", "numpy>=2.0"]
+requires = ["scikit-build-core>=0.10", "numpy>=2.5"]
 build-backend = "scikit_build_core.build"
 
 [project]
@@ -11,7 +11,7 @@ dynamic = ["version"]
 description = "Instruction-level parallelism for the array instructions of NumPy programs"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["numpy>=2.0"]
+dependencies = ["numpy>=2.5"]
 
 [project.optional-dependencies]
 test = ["pytest"]
