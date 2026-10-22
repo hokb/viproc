@@ -201,6 +201,15 @@ def test_conj_is_an_async_ufunc(det):
     same(assert_async(v.conjugate), x.conjugate())
 
 
+@pytest.mark.parametrize("dtype", [bool, np.int32, np.float64])
+def test_conj_of_real_data_is_the_array(dtype):
+    """NumPy's conj()/conjugate() return a real array itself (no copy)."""
+    x = np.ones((3, 4), dtype)
+    v = viproc.asarray(x)
+    assert x.conj() is x and v.conj() is v and v.conjugate() is v
+    assert v[:, ::2].conj().shape == (3, 2)
+
+
 def test_fill_is_an_assignment_task(det):
     x, v = big()
     assert_async(v.fill, 1.5)
