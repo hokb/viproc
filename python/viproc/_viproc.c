@@ -160,14 +160,18 @@ static PyObject* s_out = NULL;  /* "out" */
 
 typedef struct {
     PyObject_HEAD vp_array* a;
-    int readonly;   /* NumPy's WRITEABLE == False (e.g. views NumPy made read-only) */
-    int scalar;     /* 0-d result NumPy returns as a scalar (reductions, a[i]) */
-    PyObject* base; /* ndarray.base: the array a view was made from, else NULL */
+    int readonly;       /* NumPy's WRITEABLE == False (e.g. views NumPy made read-only) */
+    int scalar;         /* 0-d result NumPy returns as a scalar (reductions, a[i]) */
+    PyObject* base;     /* ndarray.base: the array a view was made from, else NULL */
+    PyObject* weakrefs; /* weak references to this array, as NumPy's arrays allow */
 } ArrayObject;
 
 static PyTypeObject ArrayType; /* forward */
 
 static void Array_dealloc(ArrayObject* self) {
+    if (self->weakrefs != NULL) {
+        PyObject_ClearWeakRefs((PyObject*)self);
+    }
     if (self->a != NULL) {
         vp_array_release(self->a);
     }
@@ -1542,6 +1546,7 @@ RED_METHODS(X)
 static PyObject* Array_array_function(PyObject* self, PyObject* const* args, Py_ssize_t nargs);
 static PyObject* Array_reshape(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
                                PyObject* kwnames);
+static PyObject* Array_resize(PyObject* self, PyObject* args, PyObject* kwds);
 static PyObject* Array_swapaxes(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
                                 PyObject* kwnames);
 
@@ -1560,6 +1565,8 @@ static PyMethodDef Array_methods[] = {
      "As NumPy's ndarray.reshape(): a view in C, copies in _ndarray.py."},
     {"swapaxes", (PyCFunction)(void (*)(void))Array_swapaxes, METH_FASTCALL | METH_KEYWORDS,
      "As NumPy's ndarray.swapaxes()."},
+    {"resize", (PyCFunction)(void (*)(void))Array_resize, METH_VARARGS | METH_KEYWORDS,
+     "As NumPy's ndarray.resize(): in place, the object keeps its identity."},
     // clang-format on
     {NULL, NULL, 0, NULL},
 };
@@ -1798,6 +1805,7 @@ static PyTypeObject ArrayType = {
     .tp_as_number = &Array_as_number,
     .tp_as_mapping = &Array_as_mapping,
     .tp_richcompare = Array_richcompare,
+    .tp_weaklistoffset = offsetof(ArrayObject, weakrefs),
     .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
     .tp_doc = "Base class of viproc.ndarray: owns one runtime array.",
     .tp_methods = Array_methods,
@@ -2264,6 +2272,68 @@ static PyObject* m_own(PyObject* self, PyObject* v) {
     }
     Py_CLEAR(((ArrayObject*)v)->base);
     return Py_NewRef(v);
+}
+
+/* a.resize(...), NumPy's ndarray.resize (array_resize, PyArray_Resize). Its
+ * refcheck counts the references to the array object as NumPy counts them
+ * in its own C method, so the count is taken here, first. The method
+ * `_resize_py` (_ndarray.py) parses and checks as NumPy does and returns the
+ * runtime array the object holds from then on (other bytes: a new array
+ * with the old data and zeros; the same bytes: a view with the new shape),
+ * or None. The object keeps its identity and base; only its runtime array
+ * changes. Views made before keep the old data (NumPy's would dangle). */
+static PyObject* Array_resize(PyObject* self, PyObject* args, PyObject* kwds) {
+#if PY_VERSION_HEX >= 0x030E00B0
+    const Py_ssize_t refs = PyUnstable_Object_IsUniquelyReferenced(self) ? 1 : Py_REFCNT(self);
+#else
+    const Py_ssize_t refs = Py_REFCNT(self);
+#endif
+    if (check_runtime() < 0) {
+        return NULL;
+    }
+    PyObject* r =
+        PyObject_CallMethod(self, "_resize_py", "OOn", args, kwds != NULL ? kwds : Py_None, refs);
+    if (r == NULL || r == Py_None) {
+        return r;
+    }
+    if (!is_array(r)) {
+        Py_DECREF(r);
+        PyErr_SetString(PyExc_SystemError, "_resize_py must return a viproc array or None");
+        return NULL;
+    }
+    vp_array* old = ((ArrayObject*)self)->a;
+    ((ArrayObject*)self)->a = ((ArrayObject*)r)->a;
+    ((ArrayObject*)r)->a = old; /* released with r */
+    Py_DECREF(r);
+    Py_RETURN_NONE;
+}
+
+/* resize_refcheck(make_probe, refs, shape): make_probe().resize(shape) with
+ * the NumPy probe referenced exactly `refs` times, so NumPy raises its own
+ * refcheck error for an array referenced that often. */
+static PyObject* m_resize_refcheck(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *make, *shape;
+    Py_ssize_t refs;
+    if (!PyArg_ParseTuple(args, "OnO", &make, &refs, &shape)) {
+        return NULL;
+    }
+    PyObject* probe = PyObject_CallNoArgs(make); /* fresh: one reference */
+    if (probe == NULL) {
+        return NULL;
+    }
+    for (Py_ssize_t i = 1; i < refs; ++i) {
+        Py_INCREF(probe);
+    }
+    PyObject* name = PyUnicode_InternFromString("resize");
+    PyObject* call[2] = {probe, shape}; /* the method gets the probe borrowed */
+    PyObject* r = name != NULL ? PyObject_VectorcallMethod(name, call, 2, NULL) : NULL;
+    Py_XDECREF(name);
+    for (Py_ssize_t i = 1; i < refs; ++i) {
+        Py_DECREF(probe);
+    }
+    Py_DECREF(probe);
+    return r;
 }
 
 static PyObject* m_reshape(PyObject* self, PyObject* args) {
@@ -3731,6 +3801,8 @@ static PyMethodDef methods[] = {
     {"transpose", (PyCFunction)(void (*)(void))m_transpose, METH_FASTCALL,
      "transpose(a, axes): view, None if axes invalid"},
     {"own", m_own, METH_O, "own(v): v with base None (a view of a copy only v references)"},
+    {"resize_refcheck", m_resize_refcheck, METH_VARARGS,
+     "resize_refcheck(make_probe, refs, shape): NumPy's refcheck error of ndarray.resize"},
     {"reshape", m_reshape, METH_VARARGS,
      "reshape(a, shape, order): view as NumPy's reshape, None if NumPy would copy"},
     {"broadcast_to", m_broadcast_to, METH_VARARGS,

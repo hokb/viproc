@@ -137,12 +137,6 @@ def test_fill_casts_as_numpy_and_rejects_sequences():
         viproc.asarray(np.ones(3)).fill([1, 2, 3])
 
 
-def test_resize_raises_numpys_error():
-    v = viproc.asarray(np.arange(6.0))
-    with pytest.raises(ValueError):
-        v.resize(3)
-
-
 def test_flags_without_sync():
     x, v = pair((4, 5))
     for a, b in [(x, v), (x.T, v.T), (x[::2], v[::2]), (x[:, 1], v[:, 1])]:
@@ -322,3 +316,91 @@ def test_base_keeps_the_array_alive():
     del v
     assert w.base.shape == (6,)
     same(w.base, np.arange(6.0))
+
+
+def _f(x):
+    return np.asfortranarray(x)
+
+
+# (name, make(x) from a C-ordered NumPy array, resize(a)); the same code
+# runs on the NumPy array and on the viproc array, so references match.
+RESIZE_CASES = [
+    ("grow", lambda x: x.ravel().copy(), lambda a: a.resize(9)),
+    ("shrink", lambda x: x.ravel().copy(), lambda a: a.resize(4)),
+    ("2d_grow", lambda x: x.copy(), lambda a: a.resize(4, 2)),
+    ("2d_tuple", lambda x: x.copy(), lambda a: a.resize((3, 3))),
+    ("list", lambda x: x.copy(), lambda a: a.resize([2, 5])),
+    ("np_ints", lambda x: x.copy(), lambda a: a.resize(np.int64(2), np.int32(2))),
+    ("f_grow", _f, lambda a: a.resize(3, 3)),
+    ("f_shrink", _f, lambda a: a.resize(2, 2)),
+    ("f_to_1d", _f, lambda a: a.resize(7)),
+    ("to_zero", lambda x: x.copy(), lambda a: a.resize(0)),
+    ("zero_dims", lambda x: x.copy(), lambda a: a.resize((2, 0, 3))),
+    ("f_zero_dims", _f, lambda a: a.resize((0, 5))),
+    ("to_0d", lambda x: x.copy(), lambda a: a.resize(())),
+    ("ones", lambda x: x.copy(), lambda a: a.resize((2, 1, 4))),
+    ("same_size", lambda x: x.copy(), lambda a: a.resize(3, 2)),
+    ("same_size_view", lambda x: x[:], lambda a: a.resize(6)),
+    ("f_same_size", _f, lambda a: a.resize(3, 2)),
+    ("no_args", lambda x: x.copy(), lambda a: a.resize()),
+    ("none", lambda x: x.copy(), lambda a: a.resize(None)),
+    ("refcheck_false", lambda x: x.copy(), lambda a: a.resize(8, refcheck=False)),
+    ("refcheck_0", lambda x: x.copy(), lambda a: a.resize(8, refcheck=0)),
+    ("view", lambda x: x[:], lambda a: a.resize(7)),
+    ("strided", lambda x: x[:, ::2].copy()[:, ::-1], lambda a: a.resize(7)),
+    ("not_contiguous", lambda x: x.T.copy(order="C")[::2], lambda a: a.resize(7)),
+    ("negative", lambda x: x.copy(), lambda a: a.resize(2, -1)),
+    ("float", lambda x: x.copy(), lambda a: a.resize(2.0)),
+    ("str", lambda x: x.copy(), lambda a: a.resize("x")),
+    ("bad_keyword", lambda x: x.copy(), lambda a: a.resize(2, foo=1)),
+    ("bad_refcheck", lambda x: x.copy(), lambda a: a.resize(2, refcheck="x")),
+    ("too_big", lambda x: x.copy(), lambda a: a.resize(2**40, 2**40)),
+]
+
+
+def _resize_outcome(make, op, x):
+    a = make(x)
+    try:
+        r = op(a)
+    except Exception as e:
+        return type(e), str(e)
+    assert r is None
+    return (a.shape, a.strides, a.flags.c_contiguous, a.flags.f_contiguous, a.flags.owndata,
+            np.asarray(a).tolist())
+
+
+@pytest.mark.parametrize("dtype", [bool, np.int32, np.float64, np.complex128])
+@pytest.mark.parametrize("case", RESIZE_CASES, ids=[c[0] for c in RESIZE_CASES])
+def test_resize(case, dtype):
+    _, make, op = case
+    x = (np.arange(6).reshape(2, 3) + 1).astype(dtype)
+    assert _resize_outcome(make, op, viproc.asarray(x)) == _resize_outcome(make, op, x)
+
+
+def test_resize_keeps_identity_and_references():
+    import weakref
+
+    for mod in (np, viproc):
+        a = mod.arange(6.0)
+        a.resize(8)
+        assert a.shape == (8,)
+        b = a[:]  # a view references the array: refcheck refuses
+        with pytest.raises(ValueError, match="referenced"):
+            a.resize(3)
+        a.resize(3, refcheck=False)  # NumPy's view b dangles; viproc's keeps the old data
+        if mod is viproc:
+            assert b.tolist() == [0, 1, 2, 3, 4, 5, 0, 0] and a.tolist() == [0, 1, 2]
+        c = mod.arange(4.0)
+        w = weakref.ref(c)
+        with pytest.raises(ValueError, match="referenced"):
+            c.resize(5)
+        assert w() is c
+
+
+def test_resize_is_async(det):
+    x, v = big()
+    v2 = v * 1.0  # owns its data, pending
+    del v
+    assert_async(lambda: v2.resize(SIZE + 10), ops=2)  # copy, zeros
+    r = np.concatenate([x, np.zeros(10)])
+    same(v2, r)
