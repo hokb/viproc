@@ -17,8 +17,9 @@
 
 namespace viproc {
 
-// Stages of a task, in order. A task passes each stage at most once and only
-// forward; it may skip stages (DeviceSelected is unused in phase 1).
+// Stages of a task, in order. The design (docs/design/pipelining.md, S1)
+// requires each stage to be reached exactly once, in increasing order. Today
+// a task still skips DeviceSelected, which nothing waits for yet.
 enum class TaskState : std::uint8_t {
     Created,
     SizeCompleted,
