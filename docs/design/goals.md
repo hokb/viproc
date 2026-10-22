@@ -45,6 +45,13 @@ a little after its call returned, by design
 (`error-handling.md`, E7).
 Every benchmark case and every test must stay bit-identical.
 
+G2 covers the whole interface, not only computed values: viproc is a
+semantic drop-in for NumPy, without surprises. Every function, method and
+attribute behaves as NumPy's (flags, `base`, identity, in-place effects,
+warnings, errors). Where NumPy's own code cannot run on viproc memory
+(`ndarray.resize`: NumPy reallocates memory it owns), viproc ports it;
+a viproc-specific error or a different result is a defect.
+
 ## G3 — Never slower than NumPy
 
 **viproc may never be slower than NumPy (below 0.95x of NumPy's speed) for
