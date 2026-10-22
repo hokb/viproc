@@ -2667,8 +2667,14 @@ static PyObject* reshape_view(PyObject* a, int64_t* dims, int nd, int order) {
     return set_base(v, a);
 }
 
-/* own(v): v with its base cleared, for a view of a copy only v references
- * (NumPy's ravel/flatten copy straight into an array owning its data). */
+/* own(v): v with its base cleared, for a view of a copy only v references.
+ * NumPy's ravel/flatten copy straight into a new array owning its data
+ * (base None, OWNDATA). viproc has no copy into another shape, so it copies
+ * first (astype, order C) and views the copy (reshape(-1)), which gives the
+ * view base = the temporary copy; own() makes it the owner NumPy returns.
+ * Safe: the view holds its memory through its alias group in the runtime,
+ * not through the copy's Python object, and since nothing else references
+ * that copy, every base still owns its data (set_base's invariant). */
 static PyObject* m_own(PyObject* self, PyObject* v) {
     (void)self;
     if (array_of(v) == NULL) {
