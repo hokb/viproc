@@ -903,8 +903,8 @@ Rules:
   `setfield`, `flat[...] = v`) run NumPy's method in the eager
   fallback; `fill` is an assignment; `resize` is NumPy's `PyArray_Resize`
   ported (`_Array.resize` in C takes the reference count where NumPy takes
-  it, `_resize_py` checks on tiny NumPy probes in the same state, so the
-  errors are NumPy's; the data step is a copy and a zero fill as tasks; the
+  it, `_resize_py` checks as NumPy does and raises NumPy's messages, taken
+  from the installed NumPy once at import (their text changed in 2.5); the data step is a copy and a zero fill as tasks; the
   object keeps its identity, its runtime array is swapped); arrays take
   weak references, as NumPy's do; `flags` is NumPy's flags object ported
   to C (`FlagsType` in `_viproc.c`: a snapshot per access, bits from the
