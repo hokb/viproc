@@ -1098,8 +1098,14 @@ Rules:
   not elided (NumPy's `can_elide_temp` needs OWNDATA too). The ones with a NumPy function
   form delegate to it (`a.clip(...)` is `np.clip(a, ...)`), so they take
   the function's path; `sort` is a task (`vp_sort`, in place); the other
-  in-place ones without a function form (`partition`, `resize`,
-  `setfield`, `flat[...] = v`) run NumPy's method in the eager fallback; `fill` is an assignment; `flags` and `setflags` work on the
+  in-place ones without a function form (`partition`, `setfield`,
+  `flat[...] = v`) run NumPy's method in the eager fallback; `fill` is an
+  assignment; `resize` is NumPy's `PyArray_Resize`
+  ported (`_Array.resize` in C takes the reference count where NumPy takes
+  it, `_resize_py` checks on tiny NumPy probes in the same state, so the
+  errors are NumPy's; the data step is a copy and a zero fill as tasks; the
+  object keeps its identity, its runtime array is swapped); arrays take
+  weak references, as NumPy's do; `flags` and `setflags` work on the
   layout and `_readonly` without a sync (`python/tests/test_methods.py`).
 - **Read-only viproc arrays** (`_readonly`, e.g. from `broadcast_to`):
   writes raise NumPy's errors; never reused by temporary elision.
@@ -1275,6 +1281,13 @@ Rules:
 
 ## Conventions
 
+- **viproc is a semantic drop-in for NumPy, without surprises.** Every
+  function, method and attribute behaves exactly as NumPy's: values,
+  dtypes, shapes, strides, flags, `base`, identity (`is`), in-place
+  effects, warnings, and errors (type and message). Where NumPy's own
+  code cannot run on viproc memory, port it; never replace NumPy's
+  behavior with a viproc-specific error, a "not supported" or a different
+  result. Test every case against NumPy running the same code.
 - Language for code, comments, docs and commit messages: **English**.
 - C ABI symbols use the `vp_` prefix; C++ code lives in `namespace viproc`.
 - C++: RAII, no raw `new`/`delete`, no exceptions across the C ABI (convert
