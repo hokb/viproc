@@ -289,6 +289,7 @@ int vp_array_ndim(const vp_array* a) { return static_cast<int>(arr(a).layout().s
 const int64_t* vp_array_shape(const vp_array* a) { return arr(a).layout().shape.data(); }
 const int64_t* vp_array_strides(const vp_array* a) { return arr(a).layout().strides.data(); }
 vp_dtype vp_array_dtype(const vp_array* a) { return to_vp(arr(a).layout().dtype); }
+int64_t vp_array_offset(const vp_array* a) { return arr(a).layout().offset; }
 int vp_array_ready(vp_array* a) { return arr(a).ready() ? 1 : 0; }
 int vp_array_same_storage(const vp_array* a, const vp_array* b) {
     return arr(a).group() == arr(b).group() ? 1 : 0;
