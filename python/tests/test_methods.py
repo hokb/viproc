@@ -454,3 +454,112 @@ def test_setflags_writeable_again(case):
         return out
 
     assert run(viproc) == run(np)
+
+
+FLAG_ATTRS = ("c_contiguous", "f_contiguous", "contiguous", "fortran", "owndata", "writeable",
+              "aligned", "writebackifcopy", "behaved", "carray", "farray", "fnc", "forc", "num",
+              "_writeable_no_warn")
+FLAG_KEYS = ("C", "F", "W", "B", "O", "A", "X", "CA", "FA", "FNC", "FORC", "CARRAY", "FARRAY",
+             "FORTRAN", "BEHAVED", "OWNDATA", "ALIGNED", "WRITEABLE", "CONTIGUOUS",
+             "C_CONTIGUOUS", "F_CONTIGUOUS", "WRITEBACKIFCOPY", b"C", b"OWNDATA")
+
+FLAG_CASES = [
+    ("c", lambda a: a),
+    ("T", lambda a: a.T),
+    ("rows", lambda a: a[::2]),
+    ("cols", lambda a: a[:, 1]),
+    ("reversed", lambda a: a[::-1]),
+    ("empty", lambda a: a[:0]),
+    ("one_row", lambda a: a[1:2]),
+    ("one_col_T", lambda a: a[:, 1:2].T),
+    ("scalar", lambda a: a[1, 1:2].reshape(())),
+    ("f_copy", lambda a: a.copy(order="F")),
+    ("bool_unaligned", lambda a: (a > 0).ravel()[1:9].view(np.int32)),
+    ("bool_aligned", lambda a: (a > 0).ravel()[4:12].view(np.int32)),
+    ("real", lambda a: (a + 1j).real),
+    ("imag_T", lambda a: (a + 1j).T.imag),
+]
+
+
+def _flags_of(f):
+    return ([getattr(f, n) for n in FLAG_ATTRS], [f[k] for k in FLAG_KEYS], repr(f), str(f))
+
+
+@pytest.mark.parametrize("case", FLAG_CASES, ids=[c[0] for c in FLAG_CASES])
+def test_flags_as_numpy(case):
+    """Every attribute, key and the repr of a.flags as NumPy's (no probe:
+    the bits come from the layout, ALIGNED from offset and strides)."""
+    _, make = case
+    x = np.arange(48.0).reshape(6, 8).copy()  # owns its data, as viproc's copy
+    a, b = make(x), make(viproc.asarray(x))
+    assert isinstance(b, viproc.ndarray)
+    assert _flags_of(b.flags) == _flags_of(a.flags)
+    assert b.flags == a.flags and a.flags == b.flags and not (b.flags != a.flags)
+    assert b.flags is not b.flags  # a new object per access, as NumPy's
+    with pytest.raises(TypeError):
+        hash(b.flags)
+    for k in ("Q", "carray", 1, "WRITEABLE" * 3, "Ä"):
+        def err(f):
+            try:
+                f[k]
+            except Exception as e:
+                return type(e), str(e)
+        assert err(b.flags) == err(a.flags)
+
+
+SETFLAGS_CALLS = [
+    {"align": False}, {"align": True}, {"align": 0, "write": False}, {"uic": False},
+    {"uic": True}, {"write": False, "uic": True}, {"align": False, "uic": True},
+    {"foo": 1}, {"write": False, "align": False, "uic": False},
+]
+
+
+@pytest.mark.parametrize("case", [FLAG_CASES[0], FLAG_CASES[2], FLAG_CASES[10]],
+                         ids=["c", "rows", "bool_unaligned"])
+def test_setflags_as_numpy(case):
+    _, make = case
+    x = np.arange(48.0).reshape(6, 8)
+
+    def run(a):
+        out = []
+        for kw in SETFLAGS_CALLS:
+            try:
+                out.append(a.setflags(**kw))
+            except Exception as e:
+                out.append((type(e), str(e)))
+            out.append(repr(a.flags))
+            out.append(a[:].flags.aligned)  # a new view computes ALIGNED anew
+        try:
+            a.setflags(1, 2, 3, 4)
+        except TypeError as e:
+            out.append(str(e))
+        f = a.flags
+        f["A"] = False
+        f.writeable = False
+        out.append((f.aligned, f.writeable, a.flags.aligned, a.flags.writeable))
+        for bad in ("Q", "C"):
+            try:
+                f[bad] = True
+            except KeyError as e:
+                out.append(str(e))
+        try:
+            del f.writeable
+        except AttributeError as e:
+            out.append(str(e))
+        return out
+
+    assert run(make(viproc.asarray(x))) == run(make(x.copy()))
+
+
+def test_setflags_writeable_view_of_read_only_base():
+    def run(m):
+        a = m.ones(3)
+        v = a[:]
+        a.setflags(write=False)
+        try:
+            v.setflags(write=True)  # v is writeable, its base is not: NumPy refuses
+            return v.flags.writeable
+        except ValueError as e:
+            return str(e)
+
+    assert run(viproc) == run(np)

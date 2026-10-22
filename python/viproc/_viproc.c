@@ -52,6 +52,7 @@ static long long g_small = 2048;         /* the runtime's sync_below: ops this s
 /* Registered by _ndarray.py via _viproc.setup(). */
 static PyTypeObject* g_array_cls = NULL; /* viproc.ndarray */
 static PyObject* g_dtypes[7];            /* np.dtype per vp_dtype code */
+static int g_alignment[7];               /* np.dtype(...).alignment per vp_dtype code */
 static PyObject* g_matmul = NULL;        /* np.matmul */
 static PyObject* g_fallback = NULL;      /* fallback(ufunc, method, inputs, kwargs) */
 static PyObject* g_asarray = NULL;       /* asarray(ndarray) -> viproc.ndarray */
@@ -161,6 +162,7 @@ static PyObject* s_out = NULL;  /* "out" */
 typedef struct {
     PyObject_HEAD vp_array* a;
     int readonly;       /* NumPy's WRITEABLE == False (e.g. views NumPy made read-only) */
+    int unaligned;      /* ALIGNED cleared by setflags(align=False) */
     int scalar;         /* 0-d result NumPy returns as a scalar (reductions, a[i]) */
     PyObject* base;     /* ndarray.base: the array a view was made from, else NULL */
     PyObject* weakrefs; /* weak references to this array, as NumPy's arrays allow */
@@ -289,12 +291,385 @@ static PyObject* Array_get_base(ArrayObject* self, void* c) {
     return Py_NewRef(self->base != NULL ? self->base : Py_None);
 }
 
+/* --- ndarray.flags --------------------------------------------------------
+ * NumPy's flags object (flagsobject.c) ported, for a viproc array: the bits
+ * are computed from the layout as NumPy computes them
+ * (_UpdateContiguousFlags, IsAligned), no probe array. Like NumPy's, a new
+ * object per access holding the flags of that moment; its setters call the
+ * array's setflags(). */
+enum {
+    FL_C = 0x1, /* NumPy's NPY_ARRAY_* values: `num` is NumPy's */
+    FL_F = 0x2,
+    FL_OWNDATA = 0x4,
+    FL_ALIGNED = 0x100,
+    FL_WRITEABLE = 0x400,
+    FL_WRITEBACKIFCOPY = 0x2000,
+};
+
+typedef struct {
+    PyObject_HEAD PyObject* arr;
+    int flags;
+} FlagsObject;
+
+static PyTypeObject FlagsType; /* forward */
+
+/* F-contiguous (extent-1 dimensions may have any stride). */
+static int f_contiguous(const vp_array* a) {
+    const int nd = vp_array_ndim(a);
+    const int64_t* shape = vp_array_shape(a);
+    const int64_t* strides = vp_array_strides(a);
+    static const int64_t itemsizes[] = {1, 4, 8, 4, 8, 8, 16}; /* vp_dtype order */
+    int64_t step = itemsizes[vp_array_dtype(a)];
+    for (int i = 0; i < nd; ++i) {
+        if (shape[i] == 0) {
+            return 1;
+        }
+        if (shape[i] != 1) {
+            if (strides[i] != step) {
+                return 0;
+            }
+            step *= shape[i];
+        }
+    }
+    return 1;
+}
+
+/* NumPy's raw_array_is_aligned: the data address (storage aligned, plus the
+ * offset) and the strides of extents > 1, as multiples of the alignment. */
+static int aligned(const vp_array* a) {
+    const int alignment = g_alignment[vp_array_dtype(a)];
+    if (alignment <= 1) {
+        return 1;
+    }
+    const int nd = vp_array_ndim(a);
+    const int64_t* shape = vp_array_shape(a);
+    const int64_t* strides = vp_array_strides(a);
+    uint64_t check = (uint64_t)vp_array_offset(a);
+    for (int i = 0; i < nd; ++i) {
+        if (shape[i] > 1) {
+            check |= (uint64_t)strides[i];
+        } else if (shape[i] == 0) {
+            return 1;
+        }
+    }
+    return check % (uint64_t)alignment == 0;
+}
+
+static PyObject* Array_get_flags(ArrayObject* self, void* c) {
+    (void)c;
+    FlagsObject* f = PyObject_New(FlagsObject, &FlagsType);
+    if (f == NULL) {
+        return NULL;
+    }
+    f->arr = Py_NewRef((PyObject*)self);
+    f->flags = (c_contiguous(self->a) ? FL_C : 0) | (f_contiguous(self->a) ? FL_F : 0) |
+               (self->base == NULL ? FL_OWNDATA : 0) |
+               (!self->unaligned && aligned(self->a) ? FL_ALIGNED : 0) |
+               (self->readonly ? 0 : FL_WRITEABLE);
+    return (PyObject*)f;
+}
+
+static void Flags_dealloc(FlagsObject* self) {
+    Py_XDECREF(self->arr);
+    PyObject_Free(self);
+}
+
+#define FLAGS_GET(name, bits)                                                                      \
+    static PyObject* Flags_get_##name(FlagsObject* self, void* c) {                                \
+        (void)c;                                                                                   \
+        return PyBool_FromLong((self->flags & (bits)) == (bits));                                  \
+    }
+FLAGS_GET(contiguous, FL_C)
+FLAGS_GET(fortran, FL_F)
+FLAGS_GET(writebackifcopy, FL_WRITEBACKIFCOPY)
+FLAGS_GET(owndata, FL_OWNDATA)
+FLAGS_GET(aligned, FL_ALIGNED)
+FLAGS_GET(writeable, FL_WRITEABLE)
+FLAGS_GET(behaved, FL_ALIGNED | FL_WRITEABLE)
+FLAGS_GET(carray, FL_ALIGNED | FL_WRITEABLE | FL_C)
+#undef FLAGS_GET
+
+static PyObject* Flags_get_forc(FlagsObject* self, void* c) {
+    (void)c;
+    return PyBool_FromLong((self->flags & (FL_F | FL_C)) != 0);
+}
+
+static PyObject* Flags_get_fnc(FlagsObject* self, void* c) {
+    (void)c;
+    return PyBool_FromLong((self->flags & FL_F) && !(self->flags & FL_C));
+}
+
+static PyObject* Flags_get_farray(FlagsObject* self, void* c) {
+    (void)c; /* NumPy's test, as it is: any of the three bits, not C */
+    return PyBool_FromLong((self->flags & (FL_ALIGNED | FL_WRITEABLE | FL_F)) != 0 &&
+                           !(self->flags & FL_C));
+}
+
+static PyObject* Flags_get_num(FlagsObject* self, void* c) {
+    (void)c;
+    return PyLong_FromLong(self->flags);
+}
+
+/* setflags(write, align, uic) with one of them given, as NumPy's setters. */
+static int flags_set(FlagsObject* self, PyObject* value, int which, const char* name) {
+    if (value == NULL) {
+        PyErr_Format(PyExc_AttributeError, "Cannot delete flags %s attribute", name);
+        return -1;
+    }
+    const int t = PyObject_IsTrue(value);
+    if (t < 0) {
+        return -1;
+    }
+    PyObject* args[3] = {Py_None, Py_None, Py_None};
+    args[which] = t ? Py_True : Py_False;
+    PyObject* r = PyObject_CallMethod(self->arr, "setflags", "OOO", args[0], args[1], args[2]);
+    Py_XDECREF(r);
+    return r != NULL ? 0 : -1;
+}
+
+static int Flags_set_writeable(FlagsObject* self, PyObject* v, void* c) {
+    (void)c;
+    return flags_set(self, v, 0, "writeable");
+}
+
+static int Flags_set_aligned(FlagsObject* self, PyObject* v, void* c) {
+    (void)c;
+    return flags_set(self, v, 1, "aligned");
+}
+
+static int Flags_set_writebackifcopy(FlagsObject* self, PyObject* v, void* c) {
+    (void)c;
+    return flags_set(self, v, 2, "writebackifcopy");
+}
+
+static PyGetSetDef Flags_getset[] = {
+    {"contiguous", (getter)Flags_get_contiguous, NULL, NULL, NULL},
+    {"c_contiguous", (getter)Flags_get_contiguous, NULL, NULL, NULL},
+    {"f_contiguous", (getter)Flags_get_fortran, NULL, NULL, NULL},
+    {"fortran", (getter)Flags_get_fortran, NULL, NULL, NULL},
+    {"writebackifcopy", (getter)Flags_get_writebackifcopy, (setter)Flags_set_writebackifcopy, NULL,
+     NULL},
+    {"owndata", (getter)Flags_get_owndata, NULL, NULL, NULL},
+    {"aligned", (getter)Flags_get_aligned, (setter)Flags_set_aligned, NULL, NULL},
+    {"writeable", (getter)Flags_get_writeable, (setter)Flags_set_writeable, NULL, NULL},
+    {"_writeable_no_warn", (getter)Flags_get_writeable, NULL, NULL, NULL},
+    {"fnc", (getter)Flags_get_fnc, NULL, NULL, NULL},
+    {"forc", (getter)Flags_get_forc, NULL, NULL, NULL},
+    {"behaved", (getter)Flags_get_behaved, NULL, NULL, NULL},
+    {"carray", (getter)Flags_get_carray, NULL, NULL, NULL},
+    {"farray", (getter)Flags_get_farray, NULL, NULL, NULL},
+    {"num", (getter)Flags_get_num, NULL, NULL, NULL},
+    {NULL, NULL, NULL, NULL, NULL},
+};
+
+/* The key's bytes as NumPy reads them (an ASCII str or bytes): 1; 0: no
+ * key. A non-ASCII str raises its encoding error where NumPy's getitem
+ * does (`encode_error`), else it is no key either. */
+static int flags_key(PyObject* ind, const char** key, Py_ssize_t* n, int encode_error) {
+    if (PyUnicode_Check(ind)) {
+        if (!PyUnicode_IS_ASCII(ind)) {
+            if (encode_error) {
+                Py_XDECREF(PyUnicode_AsASCIIString(ind)); /* NumPy's error */
+                return -1;
+            }
+            return 0;
+        }
+        *key = (const char*)PyUnicode_DATA(ind); /* ASCII: one byte per character */
+        *n = PyUnicode_GET_LENGTH(ind);
+        return 1;
+    }
+    if (PyBytes_Check(ind)) {
+        *key = PyBytes_AS_STRING(ind);
+        *n = PyBytes_GET_SIZE(ind);
+        return 1;
+    }
+    return 0;
+}
+
+static int key_is(const char* key, Py_ssize_t n, const char* name) {
+    return (size_t)n == strlen(name) && memcmp(key, name, (size_t)n) == 0;
+}
+
+static PyObject* Flags_getitem(FlagsObject* self, PyObject* ind) {
+    static const struct {
+        const char* key;
+        PyObject* (*get)(FlagsObject*, void*);
+    } keys[] = {
+        {"C", Flags_get_contiguous},
+        {"F", Flags_get_fortran},
+        {"W", Flags_get_writeable},
+        {"B", Flags_get_behaved},
+        {"O", Flags_get_owndata},
+        {"A", Flags_get_aligned},
+        {"X", Flags_get_writebackifcopy},
+        {"CA", Flags_get_carray},
+        {"FA", Flags_get_farray},
+        {"FNC", Flags_get_fnc},
+        {"FORC", Flags_get_forc},
+        {"CARRAY", Flags_get_carray},
+        {"FARRAY", Flags_get_farray},
+        {"FORTRAN", Flags_get_fortran},
+        {"BEHAVED", Flags_get_behaved},
+        {"OWNDATA", Flags_get_owndata},
+        {"ALIGNED", Flags_get_aligned},
+        {"WRITEABLE", Flags_get_writeable},
+        {"CONTIGUOUS", Flags_get_contiguous},
+        {"C_CONTIGUOUS", Flags_get_contiguous},
+        {"F_CONTIGUOUS", Flags_get_fortran},
+        {"WRITEBACKIFCOPY", Flags_get_writebackifcopy},
+    };
+    const char* k;
+    Py_ssize_t n;
+    const int r = flags_key(ind, &k, &n, 1);
+    if (r < 0) {
+        return NULL;
+    }
+    for (size_t i = 0; r > 0 && i < sizeof keys / sizeof keys[0]; ++i) {
+        if (key_is(k, n, keys[i].key)) {
+            return keys[i].get(self, NULL);
+        }
+    }
+    PyErr_SetString(PyExc_KeyError, "Unknown flag");
+    return NULL;
+}
+
+static int Flags_setitem(FlagsObject* self, PyObject* ind, PyObject* value) {
+    static const char* const keys[][2] = {
+        {"W", "WRITEABLE"}, {"A", "ALIGNED"}, {"X", "WRITEBACKIFCOPY"}};
+    static const char* const names[] = {"writeable", "aligned", "writebackifcopy"};
+    const char* k;
+    Py_ssize_t n;
+    if (flags_key(ind, &k, &n, 0) > 0) {
+        for (int i = 0; i < 3; ++i) {
+            if (key_is(k, n, keys[i][0]) || key_is(k, n, keys[i][1])) {
+                return flags_set(self, value, i, names[i]);
+            }
+        }
+    }
+    PyErr_SetString(PyExc_KeyError, "Unknown flag");
+    return -1;
+}
+
+static const char* torf(int flags, int bit) { return (flags & bit) ? "True" : "False"; }
+
+static PyObject* Flags_repr(FlagsObject* self) {
+    const int f = self->flags;
+    return PyUnicode_FromFormat(
+        "  %s : %s\n  %s : %s\n  %s : %s\n  %s : %s\n  %s : %s\n  %s : %s\n", "C_CONTIGUOUS",
+        torf(f, FL_C), "F_CONTIGUOUS", torf(f, FL_F), "OWNDATA", torf(f, FL_OWNDATA), "WRITEABLE",
+        torf(f, FL_WRITEABLE), "ALIGNED", torf(f, FL_ALIGNED), "WRITEBACKIFCOPY",
+        torf(f, FL_WRITEBACKIFCOPY));
+}
+
+/* == and != as NumPy's: by the flags; also against NumPy's flags objects
+ * (their `num`), whose own comparison returns NotImplemented for ours. */
+static PyObject* Flags_richcompare(PyObject* self, PyObject* other, int op) {
+    if (op != Py_EQ && op != Py_NE) {
+        Py_RETURN_NOTIMPLEMENTED;
+    }
+    long theirs;
+    if (Py_TYPE(other) == &FlagsType) {
+        theirs = ((FlagsObject*)other)->flags;
+    } else {
+        const char* name = Py_TYPE(other)->tp_name;
+        const size_t n = strlen(name);
+        if (n < 9 || strcmp(name + n - 9, ".flagsobj") != 0) {
+            Py_RETURN_NOTIMPLEMENTED;
+        }
+        PyObject* num = PyObject_GetAttrString(other, "num");
+        if (num == NULL) {
+            return NULL;
+        }
+        theirs = PyLong_AsLong(num);
+        Py_DECREF(num);
+        if (theirs == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
+    }
+    const int eq = ((FlagsObject*)self)->flags == theirs;
+    return PyBool_FromLong(op == Py_EQ ? eq : !eq);
+}
+
+static PyMappingMethods Flags_as_mapping = {
+    .mp_subscript = (binaryfunc)Flags_getitem,
+    .mp_ass_subscript = (objobjargproc)Flags_setitem,
+};
+
+static PyTypeObject FlagsType = {
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "viproc._viproc.flagsobj",
+    .tp_basicsize = sizeof(FlagsObject),
+    .tp_dealloc = (destructor)Flags_dealloc,
+    .tp_repr = (reprfunc)Flags_repr,
+    .tp_str = (reprfunc)Flags_repr,
+    .tp_as_mapping = &Flags_as_mapping,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_doc = "ndarray.flags of a viproc array, as NumPy's flags object.",
+    .tp_richcompare = Flags_richcompare,
+    .tp_getset = Flags_getset,
+};
+
+/* a.setflags(write, align, uic): NumPy's array_setflags on the viproc
+ * array's flags (readonly, unaligned), in NumPy's order and with its
+ * messages; an error after a change restores the flags, as NumPy's does. */
+static PyObject* Array_setflags(ArrayObject* self, PyObject* args, PyObject* kwds) {
+    static char* kwlist[] = {"write", "align", "uic", NULL};
+    PyObject *write = Py_None, *align = Py_None, *uic = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|OOO:setflags", kwlist, &write, &align, &uic)) {
+        return NULL;
+    }
+    const int unaligned = self->unaligned;
+    if (align != Py_None) {
+        const int no = PyObject_Not(align);
+        if (no < 0) {
+            return NULL;
+        }
+        if (no) {
+            self->unaligned = 1;
+        } else if (aligned(self->a)) {
+            self->unaligned = 0;
+        } else {
+            PyErr_SetString(PyExc_ValueError,
+                            "cannot set aligned flag of mis-aligned array to True");
+            return NULL;
+        }
+    }
+    if (uic != Py_None) {
+        const int t = PyObject_IsTrue(uic);
+        if (t < 0) {
+            return NULL;
+        }
+        if (t) {
+            self->unaligned = unaligned;
+            PyErr_SetString(PyExc_ValueError, "cannot set WRITEBACKIFCOPY flag to True");
+            return NULL;
+        }
+    }
+    if (write != Py_None) {
+        const int t = PyObject_IsTrue(write);
+        if (t < 0) {
+            return NULL;
+        }
+        /* _IsWriteable: an array owning its data, or a view whose base (the
+         * array owning the data, collapsed) is writeable */
+        const ArrayObject* base = (const ArrayObject*)self->base;
+        if (t && base != NULL && base->readonly) {
+            self->unaligned = unaligned;
+            PyErr_SetString(PyExc_ValueError, "cannot set WRITEABLE flag to True of this array");
+            return NULL;
+        }
+        self->readonly = !t;
+    }
+    Py_RETURN_NONE;
+}
+
 static PyGetSetDef Array_getset[] = {
     {"base", (getter)Array_get_base, NULL,
      "The array a view was made from (the first array of a chain of views, as NumPy's "
      "PyArray_SetBaseObject collapses it), None for an array that is no view.",
      NULL},
     {"size", (getter)Array_get_size, NULL, "Number of elements (no sync).", NULL},
+    {"flags", (getter)Array_get_flags, NULL,
+     "NumPy's flags object of the layout (no sync): a new snapshot per access.", NULL},
     {"_c_contiguous", (getter)Array_get_c_contiguous, NULL,
      "C-contiguous, as NumPy's flag (no sync).", NULL},
     {"_scalar", (getter)Array_get_scalar, (setter)Array_set_scalar,
@@ -1547,6 +1922,7 @@ static PyObject* Array_array_function(PyObject* self, PyObject* const* args, Py_
 static PyObject* Array_reshape(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
                                PyObject* kwnames);
 static PyObject* Array_resize(PyObject* self, PyObject* args, PyObject* kwds);
+static PyObject* Array_setflags(ArrayObject* self, PyObject* args, PyObject* kwds);
 static PyObject* Array_swapaxes(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
                                 PyObject* kwnames);
 
@@ -1565,6 +1941,8 @@ static PyMethodDef Array_methods[] = {
      "As NumPy's ndarray.reshape(): a view in C, copies in _ndarray.py."},
     {"swapaxes", (PyCFunction)(void (*)(void))Array_swapaxes, METH_FASTCALL | METH_KEYWORDS,
      "As NumPy's ndarray.swapaxes()."},
+    {"setflags", (PyCFunction)(void (*)(void))Array_setflags, METH_VARARGS | METH_KEYWORDS,
+     "As NumPy's ndarray.setflags() (no sync)."},
     {"resize", (PyCFunction)(void (*)(void))Array_resize, METH_VARARGS | METH_KEYWORDS,
      "As NumPy's ndarray.resize(): in place, the object keeps its identity."},
     // clang-format on
@@ -1831,6 +2209,12 @@ static PyObject* m_setup(PyObject* self, PyObject* args) {
     Py_XSETREF(g_array_cls, (PyTypeObject*)Py_NewRef(cls));
     for (int c = 0; c < 7; ++c) {
         Py_XSETREF(g_dtypes[c], Py_NewRef(PyTuple_GET_ITEM(dtypes, c)));
+        PyObject* al = PyObject_GetAttrString(g_dtypes[c], "alignment");
+        g_alignment[c] = al != NULL ? (int)PyLong_AsLong(al) : -1;
+        Py_XDECREF(al);
+        if (g_alignment[c] < 0) {
+            return NULL;
+        }
     }
     Py_XSETREF(g_fallback, Py_NewRef(fallback));
     Py_XSETREF(g_asarray, Py_NewRef(asarray));
@@ -3843,7 +4227,8 @@ static struct PyModuleDef module = {
 };
 
 PyMODINIT_FUNC PyInit__viproc(void) {
-    if (PyType_Ready(&ArrayType) < 0 || PyType_Ready(&UfuncProxyType) < 0) {
+    if (PyType_Ready(&ArrayType) < 0 || PyType_Ready(&UfuncProxyType) < 0 ||
+        PyType_Ready(&FlagsType) < 0) {
         return NULL;
     }
     PyObject* m = PyModule_Create(&module);
