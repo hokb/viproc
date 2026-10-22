@@ -87,6 +87,13 @@ bool dtype_of(int type_num, DType& out) {
     return false;
 }
 
+// NumPy's descriptor `type_num` is viproc's `dtype` (NPY_INT and NPY_LONG
+// are both int32 on Windows: NumPy may resolve either, e.g. frexp's `d->di`).
+bool same_dtype(int type_num, DType dtype) {
+    DType d{};
+    return dtype_of(type_num, d) && d == dtype;
+}
+
 } // namespace
 
 std::string fetch_python_error() {
@@ -151,7 +158,7 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve(PyObject* ufunc, std::span<const D
     for (std::size_t i = 0; i < dtypes.size(); ++i) {
         auto* d =
             reinterpret_cast<PyArray_Descr*>(PyTuple_GetItem(resolved, static_cast<Py_ssize_t>(i)));
-        exact = exact && d->type_num == type_num(dtypes[i]);
+        exact = exact && same_dtype(d->type_num, dtypes[i]);
     }
     Py_DECREF(requested);
     if (!exact) {
@@ -219,7 +226,7 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve_reduction(PyObject* ufunc, DType d
     bool exact = true;
     for (Py_ssize_t i = 0; i < 3; ++i) {
         auto* d = reinterpret_cast<PyArray_Descr*>(PyTuple_GetItem(resolved, i));
-        exact = exact && d->type_num == type_num(dtype);
+        exact = exact && same_dtype(d->type_num, dtype);
     }
     if (!exact) {
         Py_DECREF(res);
