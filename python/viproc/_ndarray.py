@@ -13,7 +13,9 @@ module adds everything else and the fallbacks the C code calls.
 import builtins
 import operator
 import os
+import sys
 import warnings
+import weakref
 
 import numpy as np
 from numpy.lib.array_utils import normalize_axis_index, normalize_axis_tuple
@@ -1077,6 +1079,30 @@ def _is_basic_index(key):
     return True
 
 
+
+def _numpy_error(fn):
+    try:
+        fn()
+    except Exception as e:
+        return str(e)
+    raise AssertionError("NumPy raised no error")
+
+
+# ndarray.resize: NumPy's messages, and its strides (_array_fill_strides).
+_MAX_INTP = np.iinfo(np.intp).max
+_RESIZE_SEGMENT = _numpy_error(lambda: np.empty(3)[::2].resize(1))
+_RESIZE_NEGATIVE = _numpy_error(lambda: np.empty(1).resize(-1))
+
+
+def _fill_strides(shape, itemsize, fortran):
+    strides = [0] * len(shape)
+    for i in range(len(shape)) if fortran else reversed(range(len(shape))):
+        strides[i] = itemsize
+        if shape[i]:
+            itemsize *= shape[i]
+    return tuple(strides)
+
+
 class ndarray(_viproc._Array):
     """Array whose ops run asynchronously in the viproc runtime.
 
@@ -1335,10 +1361,67 @@ class ndarray(_viproc._Array):
     def partition(self, *args, **kwargs):
         _host_call(lambda a, *ar, **kw: a.partition(*ar, **kw), (self,) + args, kwargs)
 
-    def resize(self, *args, **kwargs):
-        # NumPy resizes only arrays that own their memory; viproc's memory
-        # belongs to the runtime, so NumPy raises its own error here.
-        _host_call(lambda a, *ar, **kw: a.resize(*ar, **kw), (self,) + args, kwargs)
+    def _resize_py(self, args, kwargs, refs):  # behind _Array.resize (C)
+        # NumPy's array_resize and PyArray_Resize, on viproc data. NumPy
+        # parses the arguments and raises its errors on tiny NumPy probes in
+        # the same state (contiguity, sizes, OWNDATA, weak references,
+        # reference count), so they are NumPy's in every version; the data
+        # step is asynchronous. `refs`: the object's reference count, taken
+        # where NumPy takes it (in the C method).
+        dt = self.dtype
+        kwargs = kwargs or {}
+        try:  # parses as NumPy does, then stops at the single-segment check
+            np.empty(3, dt)[::2].resize(*args, **kwargs)
+            return None  # no shape (a.resize(), a.resize(None)): nothing to do
+        except ValueError as e:
+            if str(e) != _RESIZE_SEGMENT:
+                raise
+            segment = e
+        refcheck = operator.index(kwargs.get("refcheck", 1))  # NumPy accepted it
+        shape = args[0] if len(args) == 1 else args
+        try:
+            shape = (operator.index(shape),)
+        except TypeError:
+            shape = tuple(operator.index(n) for n in shape)
+        c, f = self._c_contiguous, self.T._c_contiguous
+        if not (c or f):
+            raise segment
+        size = 1
+        for n in shape:
+            if n == 0:
+                size = 0
+                break
+            if n < 0 or size * n > _MAX_INTP:
+                np.empty(1, dt).resize(shape)  # NumPy's error: fails before allocating
+            size *= n
+        itemsize = dt.itemsize
+        if size * itemsize > _MAX_INTP:
+            np.empty(1, dt).resize(shape)  # MemoryError
+        if any(n < 0 for n in shape):
+            # NumPy accepts a negative extent after a zero one (its size loop
+            # stops at the zero); viproc's layouts cannot hold it.
+            raise ValueError(_RESIZE_NEGATIVE)
+        strides = _fill_strides(shape, itemsize, f and not c)
+        if size == self.size:  # same bytes: only shape and strides change
+            return _viproc.view(self, shape, strides, 0)
+        other = 2 if size == 1 else 1  # a probe size whose bytes differ, too
+        if self.base is not None:  # not OWNDATA
+            np.empty(other, dt)[:].resize(shape)
+        if weakref.getweakrefcount(self):
+            probe = np.empty(other, dt)
+            ref = weakref.ref(probe)  # noqa: F841 (alive during the call)
+            probe.resize(shape)
+        if refcheck and (refs != 1 if sys.version_info >= (3, 14) else refs > 2):
+            _viproc.resize_refcheck(lambda: np.empty(other, dt), refs, shape)
+        # PyDataMem_UserRENEW and zeros: the old bytes in memory order first.
+        m = min(size, self.size)
+        flat = _viproc.view(self, (self.size,), (itemsize,), 0)
+        out = _wrap_numpy(np.empty(size, dt))
+        if m:
+            out[:m] = flat[:m]
+        if size > m:
+            out[m:] = 0
+        return _viproc.view(out, shape, strides, 0)
 
     def byteswap(self, inplace=False):
         return _host_call(lambda a: a.byteswap(inplace), (self,), {})
