@@ -754,7 +754,10 @@ def _ravel(a, order="C"):
             order = "F"
         else:
             return _NOPE  # a view in memory order, or a K-order copy
-    return _reshape(a, -1, order)
+    r = _reshape(a, -1, order)
+    if r is not _NOPE and r.base is not (a if a.base is None else a.base):
+        _viproc.own(r)  # a copy: PyArray_Ravel's copy owns its data
+    return r
 
 
 _VIEW_HANDLERS = {
@@ -1230,7 +1233,7 @@ class ndarray(_viproc._Array):
 
     def flatten(self, order="C"):
         if order == "C" and type(self) is ndarray:
-            return self.astype(self.dtype, order="C").reshape(-1)  # always a copy
+            return _viproc.own(self.astype(self.dtype, order="C").reshape(-1))  # a copy
         return _host_call(lambda a: a.flatten(order), (self,), {})
 
     @property
@@ -1412,8 +1415,8 @@ class ndarray(_viproc._Array):
 class _Flags:
     """ndarray.flags of a viproc array, from its layout (no sync): NumPy's
     flags of a probe with the same shape and strides over one element, with
-    WRITEABLE from the viproc array (settable, as NumPy's). OWNDATA is False:
-    the memory belongs to the runtime."""
+    WRITEABLE from the viproc array (settable, as NumPy's) and OWNDATA as
+    NumPy has it: True unless the array is a view (`base` is set)."""
 
     __slots__ = ("_a", "_f")
 
@@ -1430,6 +1433,10 @@ class _Flags:
     def writeable(self, value):
         self._a.setflags(write=value)
 
+    @property
+    def owndata(self):
+        return self._a.base is None
+
     def __getattr__(self, name):
         return getattr(self._f, name)
 
@@ -1441,6 +1448,8 @@ class _Flags:
     def __getitem__(self, key):
         if key in ("W", "WRITEABLE"):
             return self.writeable
+        if key in ("O", "OWNDATA"):
+            return self.owndata
         return self._f[key]
 
     def __setitem__(self, key, value):
@@ -1453,6 +1462,7 @@ class _Flags:
 
     def __repr__(self):
         return repr(self._f).replace(
+            f"OWNDATA : {self._f.owndata}", f"OWNDATA : {self.owndata}").replace(
             f"WRITEABLE : {self._f.writeable}", f"WRITEABLE : {self.writeable}")
 
 

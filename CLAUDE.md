@@ -926,8 +926,13 @@ Rules:
   invalid entry: no async equivalent yet) and `isin` (sort-based) still
   fall back. Fuzzed in `python/tests/test_indexing_functions.py`.
 - **ndarray methods:** every method and attribute of `numpy.ndarray`
-  except `base` (views do not track their Python base object) and `ctypes`
-  (a raw pointer would bypass the runtime). The ones with a NumPy function
+  except `ctypes` (a raw pointer would bypass the runtime). `base`: views
+  made in C (`set_base` in `_viproc.c`: basic indexing, transpose, reshape
+  views, `_viproc.view`) hold the array they were made from, collapsed to
+  the first array of a chain of views (`PyArray_SetBaseObject`); ravel and
+  flatten copies own their data (`_viproc.own`); `flags.owndata` is
+  `base is None`. A view keeps its base alive, so a view of a temporary is
+  not elided (NumPy's `can_elide_temp` needs OWNDATA too). The ones with a NumPy function
   form delegate to it (`a.clip(...)` is `np.clip(a, ...)`), so they take
   the function's path; in-place ones without one (`sort`, `partition`,
   `resize`, `setfield`, `flat[...] = v`) run NumPy's method in the eager
