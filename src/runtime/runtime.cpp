@@ -479,6 +479,9 @@ ErrorRef Runtime::wait(Array& a) {
     AliasGroup& g = *a.group_;
     if (g.last_writer_) {
         Task& p = *g.last_writer_;
+        if (!p.completed()) {
+            ++syncs_; // the main thread blocks
+        }
         // Any access right after issuing counts, finished or not: async had
         // nothing to overlap with in between.
         if (p.mark_blocked()) {

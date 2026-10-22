@@ -1884,9 +1884,10 @@ static PyObject* m_offload_counts(PyObject* self, PyObject* noargs) {
     }
     uint64_t inl = 0, off = 0;
     vp_offload_counts(g_rt, &inl, &off);
-    return Py_BuildValue("{s:K,s:K,s:K}", "inline", (unsigned long long)inl, "offloaded",
-                         (unsigned long long)off, "direct",
-                         (unsigned long long)vp_direct_count(g_rt));
+    return Py_BuildValue(
+        "{s:K,s:K,s:K,s:K,s:K}", "inline", (unsigned long long)inl, "offloaded",
+        (unsigned long long)off, "direct", (unsigned long long)vp_direct_count(g_rt), "tasks",
+        (unsigned long long)vp_task_count(g_rt), "syncs", (unsigned long long)vp_sync_count(g_rt));
 }
 
 static PyObject* m_pool_stats(PyObject* self, PyObject* noargs) {

@@ -192,6 +192,10 @@ void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive) {
 
 uint64_t vp_direct_count(const vp_runtime* rt) { return rt->rt->direct_count(); }
 
+uint64_t vp_task_count(const vp_runtime* rt) { return rt->rt->task_count(); }
+
+uint64_t vp_sync_count(const vp_runtime* rt) { return rt->rt->sync_count(); }
+
 void vp_offload_counts(const vp_runtime* rt, uint64_t* inline_ops, uint64_t* offloaded_ops) {
     *inline_ops = rt->rt->offload_policy().inline_count();
     *offloaded_ops = rt->rt->offload_policy().offload_count();
