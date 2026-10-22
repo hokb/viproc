@@ -923,7 +923,13 @@ Rules:
   layout as `_UpdateContiguousFlags`/`IsAligned` compute them, ALIGNED from
   `vp_array_offset` and the strides; no probe array, ~70 ns, NumPy ~50 ns),
   `setflags` is `array_setflags` in C (`readonly`, `unaligned`), both
-  without a sync (`python/tests/test_methods.py`).
+  without a sync (`python/tests/test_methods.py`). NumPy's WARN_ON_WRITE
+  (`broadcast_arrays` views of writable arrays) is `_warn_on_write`: the
+  array is writable for `flags` (bit 31 in `flags.num`, the FutureWarning
+  on reading `writeable`, the repr note), inherited by views, cleared by
+  `setflags(write=...)`; it also sets `_readonly`, so every write takes the
+  eager fallback, where NumPy warns on the export and clears the flag
+  (`_Host.done` carries that back to the array and its base).
 - **Read-only viproc arrays** (`_readonly`, e.g. from `broadcast_to`):
   writes raise NumPy's errors; never reused by temporary elision.
 - **Entry: `python -m viproc prog.py`** (`__main__.py`, also `-m mod`, `-c
