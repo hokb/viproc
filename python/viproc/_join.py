@@ -144,13 +144,26 @@ class _Placer:
             return
         value = _as_dtype(value, self.dtype)
         if value.shape != shape and value.ndim:
-            np.broadcast_shapes(value.shape, shape)  # NumPy's error
+            extra = value.ndim - len(shape)
+            if extra > 0 and all(n == 1 for n in value.shape[:extra]):
+                value = value.reshape(value.shape[extra:])  # NumPy drops leading 1s
+            if value.ndim > len(shape) or any(
+                    n != 1 and n != m for n, m in zip(value.shape[::-1], shape[::-1])):
+                _assign_error(value, shape)
         self.parts.append((value, shape, tuple(strides) + self.strides[d:], offset))
 
     def result(self):
         if 0 in self.shape:
             return _NOPE  # empty: NumPy's own strides, no data to wait for
         return _viproc.place(self.dtype, self.shape, self.strides, self.parts)
+
+
+def _assign_error(value, shape):
+    """Raises NumPy's error for new[...] = value into a part of `shape`, on
+    zero-stride probes (no element memory)."""
+    dst = np.lib.stride_tricks.as_strided(np.empty(1, value.dtype), shape, (0,) * len(shape))
+    dst[...] = np.broadcast_to(np.empty(1, value.dtype), value.shape)
+    raise AssertionError("NumPy accepted the assignment")  # pragma: no cover
 
 
 # --- concatenate and stacking (shape_base.py, multiarraymodule.c) -------------------

@@ -190,3 +190,23 @@ def test_async_path(det, call, inputs, tasks):
         want = call(*(x for x, _ in pairs))
         got = assert_async(call, *(v for _, v in pairs), ops=tasks)
     same(got, want)
+
+
+@pytest.mark.parametrize("vshape", [(1, 1, 3), (1, 1, 1, 1), (2, 1, 3), (1, 2, 3), (1, 1, 2)])
+def test_insert_values_with_extra_axes(vshape):
+    """NumPy's assignment drops a value's leading length-1 axes and raises its
+    broadcast error otherwise (hokb/viproc#29 review)."""
+    x = np.arange(3000.0).reshape(1000, 3)
+    v = np.arange(np.prod(vshape), dtype=float).reshape(vshape) + 0.5
+
+    def run(xp, a):
+        try:
+            return xp.insert(a, 1, v, axis=0)
+        except Exception as e:
+            return type(e), str(e)
+
+    expected, got = run(np, x), run(viproc, viproc.asarray(x))
+    if isinstance(expected, tuple):
+        assert got == expected
+    else:
+        same(got, expected)

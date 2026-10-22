@@ -75,7 +75,10 @@ def _take(a, indices, axis=None, out=None, mode="raise"):
         return _NOPE
     if idx.ndim == 0:  # one index: NumPy's take of it (a scalar for a 1-d a)
         r = _take(a, idx.reshape(1), axis, mode=mode)
-        return r[(slice(None),) * axis + (0,)]
+        r = r[(slice(None),) * axis + (0,)]
+        if isinstance(r, ndarray) and r.base is not None:
+            _viproc.own(r)  # NumPy's result is a new array, no view
+        return r
     # NumPy's result: a new C-ordered array of a.shape[:axis] + idx.shape +
     # a.shape[axis + 1:]
     shape = a.shape[:axis] + idx.shape + a.shape[axis + 1:]
@@ -134,7 +137,7 @@ def _take_along_axis(arr, indices, axis=-1):
 
 def _put_along_axis(arr, indices, values, axis):
     if not _vp(arr) or axis is None:
-        return _NOPE  # axis=None: NumPy writes into a copy (no effect)
+        return _NOPE  # axis=None: NumPy writes through arr.flat (not yet)
     arr[_along_axis(arr, indices, axis)] = values
     return None
 
@@ -176,6 +179,8 @@ def _place(arr, mask, vals):
     idx = _condition_indices(m)
     if idx is None:
         return _NOPE
+    if isinstance(vals, (ndarray, np.ndarray)) and not np.can_cast(vals.dtype, arr.dtype, "safe"):
+        return _NOPE  # NumPy converts arrays with safe casting: its TypeError
     if idx.size == 0:
         return None
     return _put(arr, idx, vals.ravel() if _vp(vals) else np.ravel(vals))
