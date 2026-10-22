@@ -1485,24 +1485,7 @@ class ndarray(_viproc._Array):
     def dump(self, file):
         self.numpy().dump(file)
 
-    # Metadata (no sync).
-    @property
-    def flags(self):
-        return _Flags(self)
-
-    def setflags(self, write=None, align=None, uic=None):
-        if uic:
-            raise ValueError("cannot set WRITEBACKIFCOPY flag to True")
-        # align: viproc's memory is always aligned; NumPy accepts both values.
-        if write is not None:
-            # _IsWriteable: an array owning its data may always be made
-            # writeable again, a view if its base (collapsed: the array
-            # owning the data) is writeable.
-            base = self.base
-            if write and self._readonly and base is not None and base._readonly:
-                raise ValueError("cannot set WRITEABLE flag to True of this array")
-            self._readonly = not write
-
+    # Metadata (no sync): flags, setflags and base are C (_Array).
     @property
     def device(self):
         return "cpu"
@@ -1513,67 +1496,6 @@ class ndarray(_viproc._Array):
         if device != "cpu":
             raise ValueError(f"Unsupported device {device!r}. Only 'cpu' is accepted.")
         return self
-
-
-class _Flags:
-    """ndarray.flags of a viproc array, from its layout (no sync): NumPy's
-    flags of a probe with the same shape and strides over one element, with
-    WRITEABLE from the viproc array (settable, as NumPy's) and OWNDATA as
-    NumPy has it: True unless the array is a view (`base` is set). Created
-    per access and a snapshot, as NumPy's flags object."""
-
-    __slots__ = ("_a", "_f", "_w", "_o")
-
-    def __init__(self, a):
-        # The probe's shape and strides describe more than its one element:
-        # it only yields the layout flags and is never read or exposed.
-        probe = np.lib.stride_tricks.as_strided(np.empty(1, a.dtype), a.shape, a.strides)
-        object.__setattr__(self, "_a", a)
-        object.__setattr__(self, "_f", probe.flags)
-        # A snapshot, as NumPy's flags object: later changes of the array
-        # (setflags, resize, also through this object's setter) do not show.
-        object.__setattr__(self, "_w", not a._readonly)
-        object.__setattr__(self, "_o", a.base is None)
-
-    @property
-    def writeable(self):
-        return self._w
-
-    @writeable.setter
-    def writeable(self, value):
-        self._a.setflags(write=value)
-
-    @property
-    def owndata(self):
-        return self._o
-
-    def __getattr__(self, name):
-        return getattr(self._f, name)
-
-    def __setattr__(self, name, value):
-        if name != "writeable":
-            raise AttributeError(f"viproc: flag {name!r} cannot be set")
-        type(self).writeable.fset(self, value)
-
-    def __getitem__(self, key):
-        if key in ("W", "WRITEABLE"):
-            return self.writeable
-        if key in ("O", "OWNDATA"):
-            return self.owndata
-        return self._f[key]
-
-    def __setitem__(self, key, value):
-        if key not in ("W", "WRITEABLE"):
-            raise KeyError(f"viproc: flag {key!r} cannot be set")
-        self.writeable = value
-
-    def __eq__(self, other):
-        return repr(self) == repr(other)
-
-    def __repr__(self):
-        return repr(self._f).replace(
-            f"OWNDATA : {self._f.owndata}", f"OWNDATA : {self.owndata}").replace(
-            f"WRITEABLE : {self._f.writeable}", f"WRITEABLE : {self.writeable}")
 
 
 class _FlatIter:
