@@ -2705,34 +2705,6 @@ static PyObject* Array_resize(PyObject* self, PyObject* args, PyObject* kwds) {
     Py_RETURN_NONE;
 }
 
-/* resize_refcheck(make_probe, refs, shape): make_probe().resize(shape) with
- * the NumPy probe referenced exactly `refs` times, so NumPy raises its own
- * refcheck error for an array referenced that often. */
-static PyObject* m_resize_refcheck(PyObject* self, PyObject* args) {
-    (void)self;
-    PyObject *make, *shape;
-    Py_ssize_t refs;
-    if (!PyArg_ParseTuple(args, "OnO", &make, &refs, &shape)) {
-        return NULL;
-    }
-    PyObject* probe = PyObject_CallNoArgs(make); /* fresh: one reference */
-    if (probe == NULL) {
-        return NULL;
-    }
-    for (Py_ssize_t i = 1; i < refs; ++i) {
-        Py_INCREF(probe);
-    }
-    PyObject* name = PyUnicode_InternFromString("resize");
-    PyObject* call[2] = {probe, shape}; /* the method gets the probe borrowed */
-    PyObject* r = name != NULL ? PyObject_VectorcallMethod(name, call, 2, NULL) : NULL;
-    Py_XDECREF(name);
-    for (Py_ssize_t i = 1; i < refs; ++i) {
-        Py_DECREF(probe);
-    }
-    Py_DECREF(probe);
-    return r;
-}
-
 static PyObject* m_reshape(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *a, *shape_o;
@@ -4569,8 +4541,6 @@ static PyMethodDef methods[] = {
     {"transpose", (PyCFunction)(void (*)(void))m_transpose, METH_FASTCALL,
      "transpose(a, axes): view, None if axes invalid"},
     {"own", m_own, METH_O, "own(v): v with base None (a view of a copy only v references)"},
-    {"resize_refcheck", m_resize_refcheck, METH_VARARGS,
-     "resize_refcheck(make_probe, refs, shape): NumPy's refcheck error of ndarray.resize"},
     {"reshape", m_reshape, METH_VARARGS,
      "reshape(a, shape, order): view as NumPy's reshape, None if NumPy would copy"},
     {"broadcast_to", m_broadcast_to, METH_VARARGS,
