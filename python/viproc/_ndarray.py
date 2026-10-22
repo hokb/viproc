@@ -1115,6 +1115,19 @@ def _numpy_error(fn):
 _MAX_INTP = np.iinfo(np.intp).max
 _RESIZE_SEGMENT = _numpy_error(lambda: np.empty(3)[::2].resize(1))
 _RESIZE_NEGATIVE = _numpy_error(lambda: np.empty(1).resize(-1))
+_RESIZE_NOT_OWNER = _numpy_error(lambda: np.empty(1)[:].resize(2))
+
+
+def _resize_referenced(weak):
+    a = np.empty(1)
+    b = weakref.ref(a) if weak else a  # noqa: F841 (alive during the call)
+    a.resize(2)
+
+
+# The text differs between NumPy versions (2.5: "another object", before:
+# "another array"), so it is taken from the installed NumPy once.
+_RESIZE_WEAKREF = _numpy_error(lambda: _resize_referenced(True))
+_RESIZE_REFS = _numpy_error(lambda: _resize_referenced(False))
 
 
 def _fill_strides(shape, itemsize, fortran):
@@ -1432,15 +1445,12 @@ class ndarray(_viproc._Array):
         strides = _fill_strides(shape, itemsize, f and not c)
         if size == self.size:  # same bytes: only shape and strides change
             return _viproc.view(self, shape, strides, 0)
-        other = 2 if size == 1 else 1  # a probe size whose bytes differ, too
         if self.base is not None:  # not OWNDATA
-            np.empty(other, dt)[:].resize(shape)
+            raise ValueError(_RESIZE_NOT_OWNER)
         if weakref.getweakrefcount(self):
-            probe = np.empty(other, dt)
-            ref = weakref.ref(probe)  # noqa: F841 (alive during the call)
-            probe.resize(shape)
+            raise ValueError(_RESIZE_WEAKREF)
         if refcheck and (refs != 1 if sys.version_info >= (3, 14) else refs > 2):
-            _viproc.resize_refcheck(lambda: np.empty(other, dt), refs, shape)
+            raise ValueError(_RESIZE_REFS)
         # PyDataMem_UserRENEW and zeros: the old bytes in memory order first.
         m = min(size, self.size)
         flat = _viproc.view(self, (self.size,), (itemsize,), 0)
