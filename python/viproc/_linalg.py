@@ -24,7 +24,7 @@ from numpy.linalg import LinAlgError, _umath_linalg
 from numpy.linalg._linalg import EighResult, EigResult, SlogdetResult, SVDResult
 
 from . import _ndarray as _nd
-from . import _ufuncs
+from . import _ufuncs, _viproc
 
 _NOPE = _nd._NOPE
 ndarray = _nd.ndarray
@@ -258,9 +258,26 @@ def _svdvals(x, /):
     return _svd(x, compute_uv=False, hermitian=False)
 
 
-LINALG = {
+def _small_ready(func, handler):
+    """Small ready inputs (at most sync_below elements together): nothing to
+    overlap, NumPy's own function runs right away on read-only exports (its
+    results are fresh memory, adopted); else the handler's task."""
+    def h(*args, **kwargs):
+        arrays = [x for x in args[:2] if type(x) is ndarray]
+        if (arrays and sum(x.size for x in arrays) <= _nd._small_ops[0]
+                and all(_viproc.ready(x) for x in arrays)):
+            r = func(*[np.asarray(x) if type(x) is ndarray else x for x in args], **kwargs)
+            if isinstance(r, tuple):
+                return type(r)(*[_nd.fresh(x) for x in r])
+            return _nd.fresh(r)
+        return handler(*args, **kwargs)
+
+    return h
+
+
+LINALG = {f: _small_ready(f, h) for f, h in {
     np.linalg.det: _det, np.linalg.slogdet: _slogdet, np.linalg.inv: _inv,
     np.linalg.solve: _solve, np.linalg.cholesky: _cholesky, np.linalg.eigvals: _eigvals,
     np.linalg.eig: _eig, np.linalg.eigvalsh: _eigvalsh, np.linalg.eigh: _eigh,
     np.linalg.svd: _svd, np.linalg.svdvals: _svdvals,
-}
+}.items()}

@@ -714,7 +714,9 @@ Rules:
   (`VP_GUFUNC_SERIAL`, a process-wide mutex; `_linalg.SERIAL_FROM`).
   Several threaded OpenBLAS calls at once oversubscribe its threads: 8
   concurrent 300 x 300 `inv` took 20 ms to 1.1 s (NumPy ~22 ms), serialized
-  17–47 ms. Fuzzed in `python/tests/test_linalg.py`.
+  17–47 ms. Small ready inputs (at most `sync_below` elements) run NumPy's
+  own function on read-only exports, results adopted (`_small_ready`, as
+  `_join.py`). Fuzzed in `python/tests/test_linalg.py`.
 - **BLAS threads decide BLAS results.** OpenBLAS (NumPy's wheels, 0.3.34)
   splits large products differently with 1, 2 or 4 threads, and the values
   differ (`a @ b` of 513 x 513 float64: three different results for

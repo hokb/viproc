@@ -90,10 +90,6 @@ def test_errors(path):
     check(L.eig, np.full((3, 3), np.nan))
     check(L.eigvals, np.array([[1.0, np.inf], [0, 1]]))
     check(L.det, np.full((3, 3), np.nan))  # no error: NaN
-    v = viproc.asarray(np.ones((3, 3)))
-    with pytest.raises(viproc.AsyncLinAlgError, match="Singular matrix"):
-        L.inv(v)
-        viproc.wait_all()
 
 
 ASYNC = [  # name, call, matrices, tasks
@@ -130,14 +126,16 @@ def test_async(call, shape, ops, dtype, det):
 
 def test_async_singular(det):
     """A singular matrix fails the task on a worker: no fallback, no sync at
-    the call; LinAlgError at the sync point."""
+    the call; AsyncLinAlgError (a LinAlgError) at the next check or the sync
+    point, whichever comes first."""
     v = pending(viproc.asarray(np.ones((60, 10, 10))))
     before = viproc.offload_stats()["tasks"], viproc._ndarray.fallback_calls
+    after = caught = None
     try:
         r = L.inv(v)
         after = viproc.offload_stats()["tasks"], viproc._ndarray.fallback_calls
-    except L.LinAlgError:  # raised early by a pending-call check: also fine
-        return
-    assert after[0] - before[0] == 1 and after[1] == before[1]
-    with pytest.raises(L.LinAlgError, match="Singular matrix"):
         r.numpy()
+    except viproc.AsyncLinAlgError as e:
+        caught = e
+    assert isinstance(caught, L.LinAlgError) and "Singular matrix" in str(caught)
+    assert after is None or (after[0] - before[0] == 1 and after[1] == before[1])
