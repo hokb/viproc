@@ -760,8 +760,7 @@ def _ravel(a, order="C"):
         return _NOPE
     if a._c_contiguous and order != "F":
         return _reshape(a, -1, "C")
-    f = np.lib.stride_tricks.as_strided(np.empty(1, a.dtype), a.shape,
-                                        a.strides).flags.f_contiguous
+    f = a.flags.f_contiguous
     if order == "A":
         order = "F" if f else "C"
     elif order == "K":
