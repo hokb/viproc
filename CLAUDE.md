@@ -282,8 +282,12 @@ execution.
   interfaces with NumPy's C sources. Same languages as NumPy (C) and
   Bohrium (C/C++).
 - **CMake ≥ 3.24** with Ninja.
-- **CPython ≥ 3.12 and NumPy ≥ 2.0** are runtime and build dependencies
-  (NumPy headers via `numpy.get_include()`). Phase 1 always runs inside a
+- **CPython ≥ 3.12 and NumPy ≥ 2.5** are runtime and build dependencies
+  (NumPy headers via `numpy.get_include()`). viproc reproduces NumPy's
+  calling patterns and result layouts, and those change between versions:
+  the test suite on the 2.1–2.3 wheels found 22–72 differences (eig
+  dtypes, svd(hermitian), heapsort of bool, layouts, reduction blocks),
+  so older versions are refused (`pyproject.toml`, CMake, import). Phase 1 always runs inside a
   Python process.
 - Tests: CTest. Plain C/C++ test executables for now; pytest once the
   Python bridge exists.
@@ -345,6 +349,9 @@ python/viproc/         Python package
                        methods, NumPy delegate for small ready data)
   _ndarray.py          viproc.ndarray(_Array): fallbacks, __array_function__,
                        indexing, sync points; registers hooks with setup()
+  _compose.py          NumPy functions composed of async ops, ported from
+                       NumPy's code without its asanyarray (clip, round,
+                       isclose, nan*, norm, triu, *_like, ...)
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -883,6 +890,22 @@ Rules:
   (`vp_array_view`, dtype views, read-only if NumPy made it read-only); a
   NumPy argument → unchanged; fresh memory → adopted; else copied.
   `np.copyto(dst, src)` maps to assignment.
+- **Compositions** (`_compose.py`, `COMPOSITIONS`, looked up by
+  `_array_function` after reductions, views and products): NumPy functions
+  whose NumPy implementation is a sequence of ufunc calls, reductions,
+  assignments and views issue the same sequence (NumPy's code ported
+  without the `asanyarray` that would sync; `round` follows
+  `PyArray_Round`, `trace` `PyArray_Trace`): `clip`, `round`/`around`,
+  `angle`, `sinc`, `nan_to_num`, `isclose`, `allclose`, `array_equal`,
+  `polyval`, `ptp`, `trace`, `average`, `diff`, `nansum`, `nanprod`,
+  `nanmin`/`nanmax`, `nanmean`, `nanvar`/`nanstd`, `nanargmin`/`nanargmax`,
+  vector and Frobenius `linalg.norm`, `outer`, `inner` of vectors, `copy`,
+  `imag`, `*_like` (NumPy's function on a one-element probe with the
+  layout, adopted: no sync), `triu`/`tril`, `diag`, `broadcast_arrays`,
+  `meshgrid`, `split`/`array_split`. Where NumPy decides from the data (a
+  warning for an all-NaN slice, `allclose`'s bool) the handler syncs on that
+  small result only. Fuzzed in `python/tests/test_compositions.py`
+  (values, dtypes, layouts, warnings).
 - **ndarray methods:** every method and attribute of `numpy.ndarray`
   except `ctypes` (a raw pointer would bypass the runtime). `base`: views
   made in C (`set_base` in `_viproc.c`: basic indexing, transpose, reshape
@@ -904,7 +927,13 @@ Rules:
   layout as `_UpdateContiguousFlags`/`IsAligned` compute them, ALIGNED from
   `vp_array_offset` and the strides; no probe array, ~70 ns, NumPy ~50 ns),
   `setflags` is `array_setflags` in C (`readonly`, `unaligned`), both
-  without a sync (`python/tests/test_methods.py`).
+  without a sync (`python/tests/test_methods.py`). NumPy's WARN_ON_WRITE
+  (`broadcast_arrays` views of writable arrays) is `_warn_on_write`: the
+  array is writable for `flags` (bit 31 in `flags.num`, the FutureWarning
+  on reading `writeable`, the repr note), inherited by views, cleared by
+  `setflags(write=...)`; it also sets `_readonly`, so every write takes the
+  eager fallback, where NumPy warns on the export and clears the flag
+  (`_Host.done` carries that back to the array and its base).
 - **Read-only viproc arrays** (`_readonly`, e.g. from `broadcast_to`):
   writes raise NumPy's errors; never reused by temporary elision.
 - **Entry: `python -m viproc prog.py`** (`__main__.py`, also `-m mod`, `-c

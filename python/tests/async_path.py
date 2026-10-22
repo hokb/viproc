@@ -44,17 +44,23 @@ def counters():
     return s
 
 
-def assert_async(fn, *args, ops=1, small_steps=False, **kwargs):
+def assert_async(fn, *args, ops=1, small_steps=False, syncs=0, min_tasks=1, **kwargs):
     """Runs fn(*args, **kwargs) and checks that it took the asynchronous path:
     `ops` ops issued as tasks, none run inline, no fallback to NumPy, no sync
     point, no NumPy array as a result. Returns the result.
+
+    syncs: the most blocking sync points allowed (a composition that decides
+    something from a small result, as NumPy's code does: allclose's bool, the
+    warning for an all-NaN slice). A sync on a result that happened to be
+    finished does not count, hence "at most".
 
     small_steps: the op is a composition with small intermediate results (the
     count of mean, the scalars of var): such a step takes the direct path, or
     NumPy's scalar math (no op at all), when its input happens to be finished
     already, or runs inline as a task (an in-place step on a buffer still being
     read). Then `ops` is the most ops the composition issues (tasks and direct
-    ops together) and at least one task must leave the main thread."""
+    ops together) and at least `min_tasks` tasks must leave the main thread
+    (0 where the op itself may run directly once its inputs are ready)."""
     before = counters()  # the inputs may be pending: a sync on them counts
     r = fn(*args, **kwargs)
     viproc.wait_all()  # not a sync point of its own (not counted)
@@ -67,9 +73,10 @@ def assert_async(fn, *args, ops=1, small_steps=False, **kwargs):
     # array; metadata (flags, device) are plain Python values.
     assert not any(isinstance(x, np.ndarray) for x in results), [type(x) for x in results]
     assert delta["fallbacks"] == 0, f"fell back to NumPy: {delta}"
-    assert delta["syncs"] == 0, f"synced an array: {delta}"
+    assert delta["syncs"] <= syncs, f"synced an array: {delta}"
     if small_steps:
-        assert delta["tasks"] - delta["inline"] >= 1, f"no task left the main thread: {delta}"
+        assert delta["tasks"] - delta["inline"] >= min_tasks, (
+            f"no task left the main thread: {delta}")
         assert delta["tasks"] + delta["direct"] <= ops, f"expected at most {ops} ops: {delta}"
     else:
         assert delta["inline"] == 0, f"ran inline on the main thread: {delta}"

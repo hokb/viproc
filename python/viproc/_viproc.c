@@ -14,6 +14,7 @@
 #include "viproc/viproc.h"
 
 #include <assert.h>
+#include <limits.h>
 #include <string.h>
 
 /* Temporary elision (docs/design/memory-management.md, D5) needs to know
@@ -162,7 +163,9 @@ static PyObject* s_out = NULL;  /* "out" */
 
 typedef struct {
     PyObject_HEAD vp_array* a;
-    int readonly;       /* NumPy's WRITEABLE == False (e.g. views NumPy made read-only) */
+    int readonly;       /* writes take NumPy's path: WRITEABLE == False, or warn_on_write */
+    int warn_on_write;  /* NumPy's WARN_ON_WRITE (broadcast_arrays): WRITEABLE, but NumPy warns
+                           on the first write, so writes run eagerly in NumPy (readonly set) */
     int unaligned;      /* ALIGNED cleared by setflags(align=False) */
     int scalar;         /* 0-d result NumPy returns as a scalar (reductions, a[i]) */
     PyObject* base;     /* ndarray.base: the array a view was made from, else NULL */
@@ -266,6 +269,30 @@ static int Array_set_readonly(ArrayObject* self, PyObject* v, void* c) {
         return -1;
     }
     self->readonly = t;
+    self->warn_on_write = 0;
+    return 0;
+}
+
+static PyObject* Array_get_warn_on_write(ArrayObject* self, void* c) {
+    (void)c;
+    return PyBool_FromLong(self->warn_on_write);
+}
+
+/* True: WRITEABLE with NumPy's warning on the first write; False: plainly
+ * writeable again (NumPy clears the flag on that write). */
+static int Array_set_warn_on_write(ArrayObject* self, PyObject* v, void* c) {
+    (void)c;
+    const int t = v != NULL ? PyObject_IsTrue(v) : 0;
+    if (t < 0) {
+        return -1;
+    }
+    if (t) {
+        self->readonly = 1;
+        self->warn_on_write = 1;
+    } else if (self->warn_on_write) {
+        self->readonly = 0;
+        self->warn_on_write = 0;
+    }
     return 0;
 }
 
@@ -299,6 +326,7 @@ static PyObject* Array_get_base(ArrayObject* self, void* c) {
  * object per access holding the flags of that moment; its setters call the
  * array's setflags(). */
 enum {
+    FL_WARN_ON_WRITE = INT_MIN, /* NPY_ARRAY_WARN_ON_WRITE, bit 31 */
     FL_C = 0x1, /* NumPy's NPY_ARRAY_* values: `num` is NumPy's */
     FL_F = 0x2,
     FL_OWNDATA = 0x4,
@@ -366,7 +394,8 @@ static PyObject* Array_get_flags(ArrayObject* self, void* c) {
     f->flags = (c_contiguous(self->a) ? FL_C : 0) | (f_contiguous(self->a) ? FL_F : 0) |
                (self->base == NULL ? FL_OWNDATA : 0) |
                (!self->unaligned && aligned(self->a) ? FL_ALIGNED : 0) |
-               (self->readonly ? 0 : FL_WRITEABLE);
+               (self->readonly && !self->warn_on_write ? 0 : FL_WRITEABLE) |
+               (self->warn_on_write ? FL_WARN_ON_WRITE : 0);
     return (PyObject*)f;
 }
 
@@ -385,10 +414,27 @@ FLAGS_GET(fortran, FL_F)
 FLAGS_GET(writebackifcopy, FL_WRITEBACKIFCOPY)
 FLAGS_GET(owndata, FL_OWNDATA)
 FLAGS_GET(aligned, FL_ALIGNED)
-FLAGS_GET(writeable, FL_WRITEABLE)
-FLAGS_GET(behaved, FL_ALIGNED | FL_WRITEABLE)
-FLAGS_GET(carray, FL_ALIGNED | FL_WRITEABLE | FL_C)
+FLAGS_GET(writeable_no_warn, FL_WRITEABLE)
 #undef FLAGS_GET
+
+/* Getters reading WRITEABLE warn while WARN_ON_WRITE is set, as NumPy's. */
+#define FLAGS_GET_WARN(name, bits)                                                                 \
+    static PyObject* Flags_get_##name(FlagsObject* self, void* c) {                                \
+        (void)c;                                                                                   \
+        if ((self->flags & FL_WARN_ON_WRITE) &&                                                    \
+            PyErr_WarnEx(PyExc_FutureWarning,                                                      \
+                         "future versions will not create a writeable array from "                 \
+                         "broadcast_array. Set the writable flag explicitly to avoid this "       \
+                         "warning.",                                                               \
+                         1) < 0) {                                                                 \
+            return NULL;                                                                           \
+        }                                                                                          \
+        return PyBool_FromLong((self->flags & (bits)) == (bits));                                  \
+    }
+FLAGS_GET_WARN(writeable, FL_WRITEABLE)
+FLAGS_GET_WARN(behaved, FL_ALIGNED | FL_WRITEABLE)
+FLAGS_GET_WARN(carray, FL_ALIGNED | FL_WRITEABLE | FL_C)
+#undef FLAGS_GET_WARN
 
 static PyObject* Flags_get_forc(FlagsObject* self, void* c) {
     (void)c;
@@ -453,7 +499,7 @@ static PyGetSetDef Flags_getset[] = {
     {"owndata", (getter)Flags_get_owndata, NULL, NULL, NULL},
     {"aligned", (getter)Flags_get_aligned, (setter)Flags_set_aligned, NULL, NULL},
     {"writeable", (getter)Flags_get_writeable, (setter)Flags_set_writeable, NULL, NULL},
-    {"_writeable_no_warn", (getter)Flags_get_writeable, NULL, NULL, NULL},
+    {"_writeable_no_warn", (getter)Flags_get_writeable_no_warn, NULL, NULL, NULL},
     {"fnc", (getter)Flags_get_fnc, NULL, NULL, NULL},
     {"forc", (getter)Flags_get_forc, NULL, NULL, NULL},
     {"behaved", (getter)Flags_get_behaved, NULL, NULL, NULL},
@@ -556,10 +602,10 @@ static const char* torf(int flags, int bit) { return (flags & bit) ? "True" : "F
 static PyObject* Flags_repr(FlagsObject* self) {
     const int f = self->flags;
     return PyUnicode_FromFormat(
-        "  %s : %s\n  %s : %s\n  %s : %s\n  %s : %s\n  %s : %s\n  %s : %s\n", "C_CONTIGUOUS",
+        "  %s : %s\n  %s : %s\n  %s : %s\n  %s : %s%s\n  %s : %s\n  %s : %s\n", "C_CONTIGUOUS",
         torf(f, FL_C), "F_CONTIGUOUS", torf(f, FL_F), "OWNDATA", torf(f, FL_OWNDATA), "WRITEABLE",
-        torf(f, FL_WRITEABLE), "ALIGNED", torf(f, FL_ALIGNED), "WRITEBACKIFCOPY",
-        torf(f, FL_WRITEBACKIFCOPY));
+        torf(f, FL_WRITEABLE), (f & FL_WARN_ON_WRITE) ? "  (with WARN_ON_WRITE=True)" : "",
+        "ALIGNED", torf(f, FL_ALIGNED), "WRITEBACKIFCOPY", torf(f, FL_WRITEBACKIFCOPY));
 }
 
 /* == and != as NumPy's: by the flags; also against NumPy's flags objects
@@ -653,12 +699,13 @@ static PyObject* Array_setflags(ArrayObject* self, PyObject* args, PyObject* kwd
         /* _IsWriteable: an array owning its data, or a view whose base (the
          * array owning the data, collapsed) is writeable */
         const ArrayObject* base = (const ArrayObject*)self->base;
-        if (t && base != NULL && base->readonly) {
+        if (t && base != NULL && base->readonly && !base->warn_on_write) {
             self->unaligned = unaligned;
             PyErr_SetString(PyExc_ValueError, "cannot set WRITEABLE flag to True of this array");
             return NULL;
         }
         self->readonly = !t;
+        self->warn_on_write = 0; /* set either way: NumPy clears WARN_ON_WRITE */
     }
     Py_RETURN_NONE;
 }
@@ -678,7 +725,13 @@ static PyGetSetDef Array_getset[] = {
      "scalars",
      NULL},
     {"_readonly", (getter)Array_get_readonly, (setter)Array_set_readonly,
-     "True if writes raise, as for a NumPy array with WRITEABLE == False.", NULL},
+     "True if writes take NumPy's path: they raise (WRITEABLE == False) or warn first "
+     "(_warn_on_write). Setting it clears _warn_on_write.",
+     NULL},
+    {"_warn_on_write", (getter)Array_get_warn_on_write, (setter)Array_set_warn_on_write,
+     "NumPy's WARN_ON_WRITE (broadcast_arrays results): writeable, NumPy warns on the first "
+     "write.",
+     NULL},
     {"shape", (getter)Array_get_shape, NULL, "Shape (no sync).", NULL},
     {"strides", (getter)Array_get_strides, NULL, "Byte strides (no sync).", NULL},
     {"ndim", (getter)Array_get_ndim, NULL, "Number of dimensions (no sync).", NULL},
@@ -2126,6 +2179,9 @@ static int Array_ass_subscript(PyObject* self, PyObject* key, PyObject* value) {
         return -1;
     }
     if (((ArrayObject*)self)->readonly) {
+        if (((ArrayObject*)self)->warn_on_write) {
+            return call_setitem_hook(self, key, value); /* NumPy warns and writes */
+        }
         PyErr_SetString(PyExc_ValueError, "assignment destination is read-only");
         return -1;
     }
@@ -2438,6 +2494,7 @@ static PyObject* make_view(PyObject* a, vp_dtype dtype, int nd, const int64_t* s
     PyObject* v = wrap_array(vp_array_view(g_rt, array_of(a), dtype, nd, shape, strides, offset));
     if (v != NULL) {
         ((ArrayObject*)v)->readonly = ((ArrayObject*)a)->readonly || readonly;
+        ((ArrayObject*)v)->warn_on_write = !readonly && ((ArrayObject*)a)->warn_on_write;
     }
     return set_base(v, a);
 }
@@ -2660,6 +2717,7 @@ static PyObject* reshape_view(PyObject* a, int64_t* dims, int nd, int order) {
     PyObject* v = wrap_array(r);
     if (v != NULL) {
         ((ArrayObject*)v)->readonly = ((ArrayObject*)a)->readonly;
+        ((ArrayObject*)v)->warn_on_write = ((ArrayObject*)a)->warn_on_write;
     }
     return set_base(v, a);
 }
@@ -2885,6 +2943,7 @@ static PyObject* m_view(PyObject* self, PyObject* args) {
         wrap_array(vp_array_view(g_rt, array_of(base), (vp_dtype)code, nd, shape, strides, offset));
     if (v != NULL) {
         ((ArrayObject*)v)->readonly = ((ArrayObject*)base)->readonly; /* as NumPy views */
+        ((ArrayObject*)v)->warn_on_write = ((ArrayObject*)base)->warn_on_write;
     }
     return set_base(v, base);
 }
@@ -2998,7 +3057,8 @@ static PyObject* m_export(PyObject* self, PyObject* args) {
         return NULL;
     }
     vp_array* a = array_of(o);
-    writable = writable && !((ArrayObject*)o)->readonly;
+    const int warn = ((ArrayObject*)o)->warn_on_write;
+    writable = writable && (!((ArrayObject*)o)->readonly || warn);
     if (writable) {
         char err[ERRLEN] = "";
         int status;
@@ -3011,7 +3071,15 @@ static PyObject* m_export(PyObject* self, PyObject* args) {
     } else if (wait_array(a) < 0) {
         return NULL;
     }
-    return vp_array_export(a, writable);
+    PyObject* e = vp_array_export(a, writable);
+    if (e != NULL && writable && warn) { /* NumPy warns on the first write */
+        PyObject* flags = PyObject_GetAttrString(e, "flags");
+        if (flags == NULL || PyObject_SetAttrString(flags, "_warn_on_write", Py_True) < 0) {
+            Py_CLEAR(e);
+        }
+        Py_XDECREF(flags);
+    }
+    return e;
 }
 
 static PyObject* m_assign(PyObject* self, PyObject* args) {
