@@ -45,9 +45,10 @@
 static vp_runtime* g_rt = NULL;
 static unsigned long g_main_thread = 0;
 static PyObject* AsyncError = NULL;
-static PyObject* AsyncIndexError = NULL; /* AsyncError and IndexError */
-static PyObject* AsyncValueError = NULL; /* AsyncError and ValueError */
-static long long g_small = 2048;         /* the runtime's sync_below: ops this small run directly */
+static PyObject* AsyncIndexError = NULL;  /* AsyncError and IndexError */
+static PyObject* AsyncValueError = NULL;  /* AsyncError and ValueError */
+static PyObject* AsyncLinAlgError = NULL; /* AsyncError and numpy.linalg.LinAlgError */
+static long long g_small = 2048; /* the runtime's sync_below: ops this small run directly */
 
 /* Registered by _ndarray.py via _viproc.setup(). */
 static PyTypeObject* g_array_cls = NULL; /* viproc.ndarray */
@@ -333,6 +334,8 @@ static void raise_async(const char* err) {
         PyErr_SetString(AsyncIndexError, err + 12);
     } else if (strncmp(err, "ValueError: ", 12) == 0) {
         PyErr_SetString(AsyncValueError, err + 12);
+    } else if (strncmp(err, "LinAlgError: ", 13) == 0) {
+        PyErr_SetString(AsyncLinAlgError, err + 13);
     } else {
         PyErr_SetString(AsyncError, err);
     }
@@ -2768,11 +2771,11 @@ static int int_tuple(PyObject* t, int* out, Py_ssize_t max) {
 static PyObject* m_gufunc(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *ufunc, *ins, *outs, *codes, *core_n_t, *core_axes_t, *sizes_t, *invalid;
-    int c_order;
+    int flags;
     long long work;
     if (!PyArg_ParseTuple(args, "OO!OO!O!O!O!iOL", &ufunc, &PyTuple_Type, &ins, &outs,
                           &PyTuple_Type, &codes, &PyTuple_Type, &core_n_t, &PyTuple_Type,
-                          &core_axes_t, &PyTuple_Type, &sizes_t, &c_order, &invalid, &work) ||
+                          &core_axes_t, &PyTuple_Type, &sizes_t, &flags, &invalid, &work) ||
         check_runtime() < 0) {
         return NULL;
     }
@@ -2829,8 +2832,8 @@ static PyObject* m_gufunc(PyObject* self, PyObject* args) {
     vp_array* res[MAXOP] = {NULL};
     char err[ERRLEN] = "";
     const int status = vp_gufunc(g_rt, ufunc, (int)nin, in, (int)nout, outs != Py_None ? out : NULL,
-                                 dts, core_n, core_axes, nlabels, sizes, c_order, inv,
-                                 (int64_t)work, res, issue_site(), err, sizeof err);
+                                 dts, core_n, core_axes, nlabels, sizes, flags, inv, (int64_t)work,
+                                 res, issue_site(), err, sizeof err);
     if (status == VP_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
@@ -4097,7 +4100,7 @@ static PyMethodDef methods[] = {
     {"ufunc_multi", m_ufunc_multi, METH_VARARGS,
      "ufunc_multi(ufunc, inputs, dtype codes): async ufunc with several outputs, or None"},
     {"gufunc", m_gufunc, METH_VARARGS,
-     "gufunc(ufunc, inputs, outs|None, dtype codes, core_n, core_axes, label sizes, c_order, "
+     "gufunc(ufunc, inputs, outs|None, dtype codes, core_n, core_axes, label sizes, flags, "
      "invalid_error|None, work): async generalized ufunc (vp_gufunc): the outputs (a tuple) "
      "or None"},
     {"reduceat", m_reduceat, METH_VARARGS,
@@ -4159,8 +4162,23 @@ PyMODINIT_FUNC PyInit__viproc(void) {
                                         bases, NULL)
             : NULL;
     Py_XDECREF(bases);
+    PyObject* linalg = PyImport_ImportModule("numpy.linalg");
+    PyObject* lin_err = linalg != NULL ? PyObject_GetAttrString(linalg, "LinAlgError") : NULL;
+    Py_XDECREF(linalg);
+    bases = AsyncError != NULL && lin_err != NULL ? PyTuple_Pack(2, AsyncError, lin_err) : NULL;
+    Py_XDECREF(lin_err);
+    AsyncLinAlgError =
+        bases != NULL
+            ? PyErr_NewExceptionWithDoc("viproc._viproc.AsyncLinAlgError",
+                                        "A numpy.linalg op that ran asynchronously failed (as "
+                                        "NumPy's LinAlgError: singular matrix, no convergence).",
+                                        bases, NULL)
+            : NULL;
+    Py_XDECREF(bases);
     if (s_call == NULL || s_out == NULL || AsyncError == NULL || AsyncIndexError == NULL ||
-        AsyncValueError == NULL || PyModule_AddObjectRef(m, "AsyncError", AsyncError) < 0 ||
+        AsyncValueError == NULL || AsyncLinAlgError == NULL ||
+        PyModule_AddObjectRef(m, "AsyncError", AsyncError) < 0 ||
+        PyModule_AddObjectRef(m, "AsyncLinAlgError", AsyncLinAlgError) < 0 ||
         PyModule_AddObjectRef(m, "AsyncIndexError", AsyncIndexError) < 0 ||
         PyModule_AddObjectRef(m, "AsyncValueError", AsyncValueError) < 0 ||
         PyModule_AddObjectRef(m, "_Array", (PyObject*)&ArrayType) < 0 ||

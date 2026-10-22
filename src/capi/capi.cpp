@@ -122,8 +122,8 @@ struct vp_runtime {
     std::shared_ptr<Graveyard> graveyard = std::make_shared<Graveyard>();
     // One matmul kernel per resolved loop.
     std::unordered_map<const numpy::UfuncLoop*, std::shared_ptr<Kernel>> matmul_kernels;
-    // One gufunc kernel per (loop, core axes, invalid_error).
-    std::map<std::tuple<const numpy::UfuncLoop*, std::vector<std::vector<int>>, std::string>,
+    // One gufunc kernel per (loop, core axes, invalid_error, options).
+    std::map<std::tuple<const numpy::UfuncLoop*, std::vector<std::vector<int>>, std::string, int>,
              std::shared_ptr<Kernel>>
         gufunc_kernels;
 };
@@ -986,7 +986,7 @@ int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_arra
 
 int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, int nout,
               vp_array* const* outs, const vp_dtype* dtypes, const int* core_n,
-              const int* core_axes, int nlabels, int64_t* sizes, int c_order,
+              const int* core_axes, int nlabels, int64_t* sizes, int flags,
               const char* invalid_error, int64_t work, vp_array** results, const char* site,
               char* err, size_t errlen) {
     rt->graveyard->drain();
@@ -1174,10 +1174,13 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
         rt->rt->issue(k, in, {}, std::span(&dst, 1), site, std::span(&res, 1));
         ins[i] = std::move(res);
     }
-    std::shared_ptr<Kernel>& kernel =
-        rt->gufunc_kernels[{loop, core.axes, invalid_error != nullptr ? invalid_error : ""}];
+    const int options = flags & (VP_GUFUNC_CHECK_FINITE | VP_GUFUNC_SERIAL);
+    static_assert(int{VP_GUFUNC_CHECK_FINITE} == int{numpy::kGufuncCheckFinite} &&
+                  int{VP_GUFUNC_SERIAL} == int{numpy::kGufuncSerial});
+    std::shared_ptr<Kernel>& kernel = rt->gufunc_kernels[{
+        loop, core.axes, invalid_error != nullptr ? invalid_error : "", options}];
     if (!kernel) {
-        kernel = numpy::make_gufunc_kernel(loop, core, invalid_error ? invalid_error : "");
+        kernel = numpy::make_gufunc_kernel(loop, core, invalid_error ? invalid_error : "", options);
     }
     if (given) {
         ArrayPtr io[kMax];
@@ -1198,7 +1201,7 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
         for (std::size_t a = 0; a < nc; ++a) {
             shape.push_back(iter_shape[first + a]);
         }
-        if (c_order != 0) {
+        if ((flags & VP_GUFUNC_C_ORDER) != 0) {
             ol[j] = Layout::contiguous(d[ni + j], std::move(shape));
             continue;
         }

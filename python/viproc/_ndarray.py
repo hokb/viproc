@@ -23,6 +23,7 @@ from . import _viproc
 AsyncError = _viproc.AsyncError
 AsyncIndexError = _viproc.AsyncIndexError
 AsyncValueError = _viproc.AsyncValueError
+AsyncLinAlgError = _viproc.AsyncLinAlgError
 
 # dtype <-> runtime dtype code (vp_dtype in viproc.h)
 _CODES = {
@@ -1202,7 +1203,7 @@ class ndarray(_viproc._Array):
             return None
         handler = (_REDUCTIONS.get(func) or _VIEW_HANDLERS.get(func) or _PRODUCTS.get(func)
                    or _COMPOSITIONS.get(func) or _JOINING.get(func) or _INDEXING.get(func)
-                   or _ACCUMULATING.get(func))
+                   or _ACCUMULATING.get(func) or _LINALG.get(func))
         if handler is not None:
             try:
                 r = handler(*args, **kwargs)
@@ -1789,5 +1790,6 @@ def workers():
 from ._compose import COMPOSITIONS as _COMPOSITIONS  # noqa: E402 (uses this module)
 from ._join import JOINING as _JOINING  # noqa: E402
 from ._indexing import INDEXING as _INDEXING  # noqa: E402
+from ._linalg import LINALG as _LINALG  # noqa: E402
 from . import _ufuncs  # noqa: E402
 from ._ufuncs import ACCUMULATING as _ACCUMULATING  # noqa: E402

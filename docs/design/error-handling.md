@@ -15,7 +15,7 @@ Status labels as in `memory-management.md` (Decided, Implemented, Proposed).
 | E1 | Issue-time errors are raised at the call; run-time errors may arise on any thread | Implemented |
 | E2 | One record per failed op, in the runtime; tasks and arrays only refer to it | Implemented |
 | E3 | Fail fast: the error is raised in the main thread as soon as the op failed | Implemented |
-| E4 | NumPy's exception types, as subclasses (`AsyncValueError`, `AsyncIndexError`) | Implemented |
+| E4 | NumPy's exception types, as subclasses (`AsyncValueError`, `AsyncIndexError`, `AsyncLinAlgError`) | Implemented |
 | E5 | Where: the exact issue site and the NumPy function, not the full call stack | Implemented |
 | E6 | Loops that raise through the Python API are watched on the thread that runs them | Implemented |
 | E7 | Accepted differences from NumPy | Decided |
@@ -124,7 +124,11 @@ catch around a sync point (`_ndarray.py`).
 
 `viproc.AsyncError` (a `RuntimeError`) is the base. Where the kernel names
 the type, viproc raises a subclass of both `AsyncError` and NumPy's type:
-`AsyncIndexError` (`IndexError`) and `AsyncValueError` (`ValueError`). User
+`AsyncIndexError` (`IndexError`), `AsyncValueError` (`ValueError`) and
+`AsyncLinAlgError` (`numpy.linalg.LinAlgError`: the linalg loops report a
+singular matrix or no convergence through the FP invalid flag, which
+NumPy's wrappers turn into `LinAlgError` with `errstate(invalid='call')`;
+the gufunc kernel checks the flag after each loop call). User
 code catching NumPy's exception (`except ValueError:`) keeps working; code
 that wants to know that the error came from an earlier op catches
 `AsyncError`. The message is NumPy's, followed by the op and where it was

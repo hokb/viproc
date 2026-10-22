@@ -200,8 +200,9 @@ def _core_signature(ufunc):
     return sig
 
 
-# (ufunc, (dtype, shape) per input) -> the arguments of _viproc.gufunc for a
-# call without keywords on viproc arrays (all of them depend only on the key)
+# (ufunc, signature, invalid, flags, (dtype, shape) per input) -> the
+# arguments of _viproc.gufunc for a call on viproc arrays without keywords
+# other than a signature tuple (all of them depend only on the key)
 _gufunc_plans = {}
 
 _GUFUNC_KEYWORDS = frozenset(("out", "dtype", "signature", "casting", "axes", "axis"))
@@ -239,17 +240,26 @@ def _remaps(ufunc, ops, ncore, axes, axis, bcast):
     return remaps
 
 
-def gufunc(ufunc, inputs, kwargs):
+def gufunc(ufunc, inputs, kwargs, label_sizes=None, invalid=None, flags=0,
+           given_work=None):
     """A generalized ufunc call (ufunc.signature set: matmul with casts or
     out=, vecdot, matvec, vecmat, ...) on NumPy's gufunc loop (vp_gufunc):
     NumPy's dtypes (ufunc.resolve_dtypes), inputs of another dtype cast as
     NumPy's iterator copies them, missing flexible dimensions (matmul's 1-d
     operands), axes=/axis= as views moving the core axes last, out= of the
     loop's dtype. Returns _NOPE where NumPy has to run it (keepdims=, out=
-    of another dtype or overlapping an input, NumPy's errors)."""
-    if not kwargs:
-        key = (ufunc,) + tuple((x.dtype, x.shape) for x in inputs if type(x) is ndarray)
-        plan = _gufunc_plans.get(key) if len(key) == len(inputs) + 1 else None
+    of another dtype or overlapping an input, NumPy's errors).
+
+    For numpy.linalg's wrappers (_linalg.py): `label_sizes` gives the sizes
+    of labels only outputs have (svd's `p`), `invalid` the LinAlgError
+    message for the loop's FP invalid flag, `flags` VP_GUFUNC_CHECK_FINITE
+    (NumPy's _assert_finite of the first input) and VP_GUFUNC_SERIAL,
+    `given_work` the
+    op's cost for the dispatch policy."""
+    if not kwargs or (len(kwargs) == 1 and type(kwargs.get("signature")) is tuple):
+        key = (ufunc, kwargs.get("signature"), invalid, flags) + tuple(
+            (x.dtype, x.shape) for x in inputs if type(x) is ndarray)
+        plan = _gufunc_plans.get(key) if len(key) == len(inputs) + 4 else None
         if plan is not None:  # the same call as before: all decisions taken
             codes, core_n, core_axes, sizes, work, discards = plan
             for _ in range(discards):
@@ -258,8 +268,8 @@ def gufunc(ufunc, inputs, kwargs):
             with warnings.catch_warnings():
                 if discards:
                     warnings.simplefilter("ignore", np.exceptions.ComplexWarning)
-                r = _viproc.gufunc(ufunc, tuple(inputs), None, codes, core_n, core_axes, sizes, 0,
-                                   None, work)
+                r = _viproc.gufunc(ufunc, tuple(inputs), None, codes, core_n, core_axes, sizes,
+                                   flags, invalid, work)
             if r is None:
                 return _NOPE
             res = [_nd._scalar_result(x) if x.ndim == 0 else x for x in r]
@@ -310,6 +320,8 @@ def gufunc(ufunc, inputs, kwargs):
     else:
         remaps = [None] * len(ops)
     sizes = [1 if label in missing else f for label, f in enumerate(fixed)]
+    for name, n in (label_sizes or {}).items():
+        sizes[labels.index(name)] = n
     core_axes = tuple(-1 - label if label in missing else label for c in core for label in c)
     # rough cost for the dispatch policy: the loop's index space per batch
     # element (vecdot: n multiply-adds; matmul: n*k*m, which BLAS runs about
@@ -324,17 +336,17 @@ def gufunc(ufunc, inputs, kwargs):
             present = [label for label in c if label not in missing]
             dims.update(zip(present, x.shape[x.ndim - len(present):]))
     work = batch * math.prod(dims.values())
-    work = max(work // 16 if ufunc is np.matmul else work, 1)
+    work = max(work // 16 if ufunc is np.matmul else work, 1) if given_work is None else given_work
     core_n = tuple(len(c) for c in core)
     discards = _complex_warnings(ins, dtypes, [])
     with warnings.catch_warnings():
         if discards:
             warnings.simplefilter("ignore", np.exceptions.ComplexWarning)
         r = _viproc.gufunc(ufunc, tuple(ops[:nin]), None if out is None else tuple(ops[nin:]),
-                           codes, core_n, core_axes, tuple(sizes), 0, None, work)
+                           codes, core_n, core_axes, tuple(sizes), flags, invalid, work)
     if r is None:
         return _NOPE
-    if key is not None and len(key) == nin + 1:
+    if key is not None and len(key) == nin + 4:
         if len(_gufunc_plans) >= 256:
             _gufunc_plans.clear()
         _gufunc_plans[key] = (codes, core_n, core_axes, tuple(sizes), work, discards)

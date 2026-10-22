@@ -1,6 +1,9 @@
 #include "kernels/numpy_gufunc.hpp"
 
 #include <cfenv>
+#include <cmath>
+#include <cstring>
+#include <mutex>
 
 namespace viproc::numpy {
 
@@ -14,10 +17,79 @@ std::size_t GufuncCore::present(std::size_t i) const {
 
 namespace {
 
+std::mutex& serial_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+// Whether every element of `l` at `base` is finite (floating point and
+// complex: every component; other dtypes are finite).
+bool all_finite(const Layout& l, const std::byte* base) {
+    std::size_t parts = 1;
+    bool single = false;
+    switch (l.dtype) {
+    case DType::Float32:
+        single = true;
+        break;
+    case DType::Float64:
+        break;
+    case DType::Complex64:
+        single = true;
+        parts = 2;
+        break;
+    case DType::Complex128:
+        parts = 2;
+        break;
+    default:
+        return true;
+    }
+    const std::size_t nd = l.shape.size();
+    for (std::int64_t n : l.shape) {
+        if (n == 0) {
+            return true;
+        }
+    }
+    std::vector<std::int64_t> idx(nd, 0);
+    for (;;) {
+        std::intptr_t off = 0;
+        for (std::size_t a = 0; a < nd; ++a) {
+            off += static_cast<std::intptr_t>(idx[a] * l.strides[a]);
+        }
+        const std::byte* p = base + off;
+        for (std::size_t c = 0; c < parts; ++c) {
+            if (single) {
+                float v;
+                std::memcpy(&v, p + c * sizeof v, sizeof v);
+                if (!std::isfinite(v)) {
+                    return false;
+                }
+            } else {
+                double v;
+                std::memcpy(&v, p + c * sizeof v, sizeof v);
+                if (!std::isfinite(v)) {
+                    return false;
+                }
+            }
+        }
+        std::size_t a = nd;
+        for (;;) {
+            if (a == 0) {
+                return true;
+            }
+            --a;
+            if (++idx[a] < l.shape[a]) {
+                break;
+            }
+            idx[a] = 0;
+        }
+    }
+}
+
 class GufuncKernel : public Kernel {
   public:
-    GufuncKernel(const UfuncLoop* loop, GufuncCore core, std::string invalid_error)
-        : loop_(loop), core_(std::move(core)), invalid_error_(std::move(invalid_error)) {
+    GufuncKernel(const UfuncLoop* loop, GufuncCore core, std::string invalid_error, int options)
+        : loop_(loop), core_(std::move(core)), invalid_error_(std::move(invalid_error)),
+          options_(options) {
         for (const std::vector<int>& a : core_.axes) {
             ncore_ += a.size();
         }
@@ -31,6 +103,10 @@ class GufuncKernel : public Kernel {
         std::vector<const Operand*> ops(nop);
         for (std::size_t i = 0; i < nop; ++i) {
             ops[i] = i < nin ? &inputs[i] : &outputs[i - nin];
+        }
+        if ((options_ & kGufuncCheckFinite) != 0 &&
+            !all_finite(inputs[0].layout(), inputs[0].first())) {
+            return KernelResult{1, "LinAlgError: Array must not contain infs or NaNs", 0};
         }
         // dims = {count, label sizes}; strides = {outer per operand, core}
         std::vector<std::intptr_t> dims(1 + static_cast<std::size_t>(core_.nlabels), 1);
@@ -57,6 +133,10 @@ class GufuncKernel : public Kernel {
         }
         if (total == 0) {
             return {}; // NumPy's iterator is empty: the loop is not called
+        }
+        std::unique_lock<std::mutex> serial;
+        if ((options_ & kGufuncSerial) != 0) {
+            serial = std::unique_lock<std::mutex>(serial_mutex());
         }
         std::vector<char*> base(nop);
         // batch strides per operand along the outputs' nb batch axes
@@ -126,14 +206,15 @@ class GufuncKernel : public Kernel {
     const UfuncLoop* loop_;
     GufuncCore core_;
     std::string invalid_error_;
+    int options_;
     std::size_t ncore_ = 0;
 };
 
 } // namespace
 
 std::shared_ptr<Kernel> make_gufunc_kernel(const UfuncLoop* loop, GufuncCore core,
-                                           std::string invalid_error) {
-    return std::make_shared<GufuncKernel>(loop, std::move(core), std::move(invalid_error));
+                                           std::string invalid_error, int options) {
+    return std::make_shared<GufuncKernel>(loop, std::move(core), std::move(invalid_error), options);
 }
 
 } // namespace viproc::numpy
