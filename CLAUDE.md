@@ -978,8 +978,12 @@ Rules:
   it, `_resize_py` checks on tiny NumPy probes in the same state, so the
   errors are NumPy's; the data step is a copy and a zero fill as tasks; the
   object keeps its identity, its runtime array is swapped); arrays take
-  weak references, as NumPy's do; `flags` and `setflags` work on the
-  layout and `_readonly` without a sync (`python/tests/test_methods.py`).
+  weak references, as NumPy's do; `flags` is NumPy's flags object ported
+  to C (`FlagsType` in `_viproc.c`: a snapshot per access, bits from the
+  layout as `_UpdateContiguousFlags`/`IsAligned` compute them, ALIGNED from
+  `vp_array_offset` and the strides; no probe array, ~70 ns, NumPy ~50 ns),
+  `setflags` is `array_setflags` in C (`readonly`, `unaligned`), both
+  without a sync (`python/tests/test_methods.py`).
 - **Read-only viproc arrays** (`_readonly`, e.g. from `broadcast_to`):
   writes raise NumPy's errors; never reused by temporary elision.
 - **Entry: `python -m viproc prog.py`** (`__main__.py`, also `-m mod`, `-c
