@@ -150,6 +150,8 @@ int vp_array_ndim(const vp_array* a);
 const int64_t* vp_array_shape(const vp_array* a);
 const int64_t* vp_array_strides(const vp_array* a);
 vp_dtype vp_array_dtype(const vp_array* a);
+/* Byte offset of the first element in the array's storage. */
+int64_t vp_array_offset(const vp_array* a);
 /* 1 if the data is final (no pending task writes it). */
 int vp_array_ready(vp_array* a);
 /* 1 if both arrays share their storage (base and views). */
