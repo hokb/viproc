@@ -49,7 +49,27 @@ def _keep_order(a):
     return sorted(range(a.ndim), key=lambda i: (-abs(a.strides[i]), i))
 
 
+# (dtype, shape, strides, n, axis, is_real, is_forward, norm) -> the gufunc
+# call of _raw_fft without out= (all of it depends only on the key): numpy.fft
+# in a loop issues one gufunc call per transform, no planning in Python.
+_fft_plans = {}
+
+
 def _raw_fft(a, n, axis, is_real, is_forward, norm, out=None):
+    if out is None:
+        try:
+            key = (a.dtype, a.shape, a.strides, n, axis, is_real, is_forward, norm)
+            plan = _fft_plans.get(key)
+        except TypeError:  # an unhashable norm: NumPy's error below
+            key = plan = None
+        if plan is not None:
+            ufunc, fct, sizes, work, order, kwargs, out_dtype = plan
+            r = _ufuncs.gufunc(ufunc, (a, fct), kwargs, sizes, None, 0, work, order)
+            if r is _NOPE or r.dtype == out_dtype:
+                return r
+            return r.astype(out_dtype)
+    else:
+        key = None
     if n < 1:
         raise ValueError(f"Invalid number of FFT data points ({n}) specified.")
     if not is_forward:
@@ -108,6 +128,14 @@ def _raw_fft(a, n, axis, is_real, is_forward, norm, out=None):
     kwargs = {"axes": [(axis,), (), (axis,)], "signature": signature}
     if out is not None:
         kwargs["out"] = out
+    elif key is not None:
+        # fct as a NumPy 0-d array of the loop's dtype (the value NumPy
+        # converts the scalar to), so the gufunc's own plan covers the call
+        # too; no viproc array in the plan: it would outlive its runtime.
+        fct = np.asarray(fct, dtype=signature[1])
+        if len(_fft_plans) >= 256:
+            _fft_plans.clear()
+        _fft_plans[key] = (ufunc, fct, sizes, work, order, kwargs, out_dtype)
     r = _ufuncs.gufunc(ufunc, (a, fct), kwargs, sizes, None, 0, work, order)
     if r is _NOPE or out is not None or r.dtype == out_dtype:
         return r

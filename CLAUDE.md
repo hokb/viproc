@@ -788,8 +788,15 @@ Rules:
   `PyArray_NewLikeArrayWithShape`); viproc gives the result that layout
   (`vp_gufunc`'s `out_order`). pocketfft makes its plan per call
   (`POCKETFFT_CACHE_SIZE` 0 in NumPy's build): thread-safe. n-d transforms
-  with `out=` and the deprecated `s`/`axes` forms fall back. Fuzzed in
-  `python/tests/test_fft.py`.
+  with `out=` and the deprecated `s`/`axes` forms fall back. A call
+  without `out=` is planned once per (dtype, shape, strides, n, axis,
+  kinds, norm) (`_fft_plans`: the gufunc call with `fct` as a NumPy 0-d
+  array of the loop's dtype, so `_gufunc_plans` covers it too). Before,
+  every call planned in Python (~70-100 µs of main-thread time, more than
+  pocketfft takes for 100 x 100), and ILNumerics' FFFT benchmark (100 x
+  `abs(ifft(fft(A)))`) ran at 0.65x of NumPy for n = 100; with the plans
+  an issue takes ~30 µs (2.7x at n = 100, 4.4-5.7x from n = 200 on 4
+  cores). Fuzzed in `python/tests/test_fft.py`.
 - **Dtype semantics follow NumPy exactly:** promotion, `divide` on integers
   yielding `float64`, overflow wrap-around, NaN handling.
 - **Broadcasting and scalars:** NumPy broadcasting rules apply to all
@@ -1071,8 +1078,9 @@ Rules:
   the task's in/out; others, `keepdims=` and NumPy's errors fall back. The
   loops compute each outer index on their own (a dot per index), so the
   split into calls does not matter. Per call the Python side is one dict
-  lookup per (ufunc, input dtypes and shapes) for calls without keywords
-  (`_gufunc_plans`). Fuzzed in `python/tests/test_gufunc.py`.
+  lookup per (ufunc, input dtypes and shapes, `signature`, `axes`, `axis`)
+  (`_gufunc_plans`, with the operands' remaps; NumPy arrays and scalars
+  among the inputs are imported per call). Fuzzed in `python/tests/test_gufunc.py`.
 - **ndarray methods:** every method and attribute of `numpy.ndarray`
   except `ctypes` (a raw pointer would bypass the runtime). `base`: views
   made in C (`set_base` in `_viproc.c`: basic indexing, transpose, reshape

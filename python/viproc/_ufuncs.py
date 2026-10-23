@@ -200,10 +200,39 @@ def _core_signature(ufunc):
     return sig
 
 
-# (ufunc, signature, invalid, flags, out_order, (dtype, shape) per input) -> the
-# arguments of _viproc.gufunc for a call on viproc arrays without keywords
-# other than a signature tuple (all of them depend only on the key)
+# (ufunc, signature, axes, axis, invalid, flags, out_order, label_sizes,
+# given_work, (dtype, shape) per input) -> the arguments of _viproc.gufunc
+# and the operands' axis remaps for a call on viproc arrays without keywords
+# other than a signature tuple, axes= and axis= (all of them depend only on
+# the key). numpy.fft passes axes= on every call: without the plan each call
+# planned again (~70 us on the main thread, more than an FFT of 100 points).
 _gufunc_plans = {}
+_PLAN_KEYWORDS = frozenset(("signature", "axes", "axis"))
+
+
+def _plan_key(ufunc, inputs, kwargs, label_sizes, invalid, flags, given_work, out_order):
+    """The _gufunc_plans key of a call, or None if it has none."""
+    if not kwargs.keys() <= _PLAN_KEYWORDS:
+        return None
+    sig = kwargs.get("signature")
+    if sig is not None and type(sig) is not tuple:
+        return None
+    # viproc arrays, and NumPy arrays or scalars (imported per call, as
+    # _typed_inputs imports them); not Python scalars (NEP 50: weak)
+    if any(type(x) is not ndarray and not isinstance(x, (np.ndarray, np.generic))
+           for x in inputs):
+        return None
+    axes = kwargs.get("axes")
+    try:
+        if axes is not None:
+            axes = tuple(tuple(e) if isinstance(e, (list, tuple)) else e for e in axes)
+        key = (ufunc, sig, axes, kwargs.get("axis"), invalid, flags, out_order,
+               None if label_sizes is None else tuple(sorted(label_sizes.items())),
+               given_work) + tuple((type(x) is ndarray, x.dtype, x.shape) for x in inputs)
+        hash(key)
+    except TypeError:
+        return None
+    return key
 
 _GUFUNC_KEYWORDS = frozenset(("out", "dtype", "signature", "casting", "axes", "axis"))
 
@@ -257,26 +286,34 @@ def gufunc(ufunc, inputs, kwargs, label_sizes=None, invalid=None, flags=0,
     `out_order` the outputs' axis order (numpy.fft: empty_like's order K),
     `given_work` the
     op's cost for the dispatch policy."""
-    if not kwargs or (len(kwargs) == 1 and type(kwargs.get("signature")) is tuple):
-        key = (ufunc, kwargs.get("signature"), invalid, flags, out_order) + tuple(
-            (x.dtype, x.shape) for x in inputs if type(x) is ndarray)
-        plan = _gufunc_plans.get(key) if len(key) == len(inputs) + 5 else None
-        if plan is not None:  # the same call as before: all decisions taken
-            codes, core_n, core_axes, sizes, work, discards = plan
-            for _ in range(discards):
-                warnings.warn("Casting complex values to real discards the imaginary part",
-                              np.exceptions.ComplexWarning, stacklevel=3)
+    key = _plan_key(ufunc, inputs, kwargs, label_sizes, invalid, flags, given_work, out_order)
+    plan = None if key is None else _gufunc_plans.get(key)
+    if plan is not None:  # the same call as before: all decisions taken
+        codes, core_n, core_axes, sizes, work, discards, remaps = plan
+        for _ in range(discards):
+            warnings.warn("Casting complex values to real discards the imaginary part",
+                          np.exceptions.ComplexWarning, stacklevel=3)
+        nin = len(inputs)
+        inputs = [x if type(x) is ndarray else _nd.asarray(x) for x in inputs]
+        if remaps is not None:
+            inputs = [x if m is None else x.transpose(m) for x, m in zip(inputs, remaps)]
+        if discards:
             with warnings.catch_warnings():
-                if discards:
-                    warnings.simplefilter("ignore", np.exceptions.ComplexWarning)
+                warnings.simplefilter("ignore", np.exceptions.ComplexWarning)
                 r = _viproc.gufunc(ufunc, tuple(inputs), None, codes, core_n, core_axes, sizes,
                                    flags, out_order, invalid, work)
-            if r is None:
-                return _NOPE
-            res = [_nd._scalar_result(x) if x.ndim == 0 else x for x in r]
-            return res[0] if len(res) == 1 else tuple(res)
-    else:
-        key = None
+        else:
+            r = _viproc.gufunc(ufunc, tuple(inputs), None, codes, core_n, core_axes, sizes,
+                               flags, out_order, invalid, work)
+        if r is None:
+            return _NOPE
+        res = []
+        for i, x in enumerate(r):
+            m = None if remaps is None else remaps[nin + i]
+            if m is not None:
+                x = x.transpose(np.argsort(m).tolist())
+            res.append(_nd._scalar_result(x) if x.ndim == 0 else x)
+        return res[0] if len(res) == 1 else tuple(res)
     nin, nout = ufunc.nin, ufunc.nout
     if len(inputs) != nin or not kwargs.keys() <= _GUFUNC_KEYWORDS or nin + nout > 8:
         return _NOPE
@@ -348,10 +385,11 @@ def gufunc(ufunc, inputs, kwargs, label_sizes=None, invalid=None, flags=0,
                            work)
     if r is None:
         return _NOPE
-    if key is not None and len(key) == nin + 5:
+    if key is not None and out is None:
         if len(_gufunc_plans) >= 256:
             _gufunc_plans.clear()
-        _gufunc_plans[key] = (codes, core_n, core_axes, tuple(sizes), work, discards)
+        _gufunc_plans[key] = (codes, core_n, core_axes, tuple(sizes), work, discards,
+                              None if all(m is None for m in remaps) else tuple(remaps))
     if out is not None:
         return out[0] if nout == 1 else out
     res = []
