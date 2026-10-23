@@ -3160,12 +3160,15 @@ static PyObject* m_assign(PyObject* self, PyObject* args) {
  * viproc cannot run it (the caller falls back to NumPy). */
 static PyObject* m_reduce(PyObject* self, PyObject* args) {
     (void)self;
-    PyObject *ufunc, *a, *axes, *dtype, *identity;
+    PyObject *ufunc, *a, *axes, *dtype, *identity, *out = Py_None;
     int keepdims;
-    if (!PyArg_ParseTuple(args, "OO!OpOO", &ufunc, &ArrayType, &a, &axes, &keepdims, &dtype,
-                          &identity) ||
+    if (!PyArg_ParseTuple(args, "OO!OpOO|O", &ufunc, &ArrayType, &a, &axes, &keepdims, &dtype,
+                          &identity, &out) ||
         check_runtime() < 0) {
         return NULL;
+    }
+    if (out != Py_None && (!is_array(out) || ((ArrayObject*)out)->readonly)) {
+        Py_RETURN_NONE;
     }
     vp_array* in = array_of(a);
     const int nd = vp_array_ndim(in);
@@ -3190,24 +3193,28 @@ static PyObject* m_reduce(PyObject* self, PyObject* args) {
     Py_DECREF(fast);
     vp_array* res = NULL;
     char err[ERRLEN] = "";
-    const int status = vp_reduce(g_rt, ufunc, in, flags, keepdims, dtype, identity, &res,
-                                 issue_site(), err, sizeof err);
+    const int status =
+        vp_reduce_out(g_rt, ufunc, in, flags, keepdims, dtype, identity,
+                      out != Py_None ? array_of(out) : NULL, &res, issue_site(), err, sizeof err);
     if (status == VP_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
     if (raise_status(status, err) < 0) {
         return NULL;
     }
-    return wrap_array(res);
+    return out != Py_None ? Py_NewRef(out) : wrap_array(res);
 }
 
 static PyObject* m_ufunc_typed(PyObject* self, PyObject* args) {
     (void)self;
-    PyObject *ufunc, *ins, *codes, *out;
-    if (!PyArg_ParseTuple(args, "OO!O!O", &ufunc, &PyTuple_Type, &ins, &PyTuple_Type, &codes,
-                          &out) ||
+    PyObject *ufunc, *ins, *codes, *out, *where = Py_None;
+    if (!PyArg_ParseTuple(args, "OO!O!O|O", &ufunc, &PyTuple_Type, &ins, &PyTuple_Type, &codes,
+                          &out, &where) ||
         check_runtime() < 0) {
         return NULL;
+    }
+    if (where != Py_None && !is_array(where)) {
+        Py_RETURN_NONE;
     }
     const Py_ssize_t nin = PyTuple_GET_SIZE(ins);
     if (nin < 1 || nin > MAXIN || PyTuple_GET_SIZE(codes) != nin + 1 ||
@@ -3239,6 +3246,12 @@ static PyObject* m_ufunc_typed(PyObject* self, PyObject* args) {
             Py_RETURN_NONE; /* NumPy raises its error in the fallback */
         }
     }
+    vp_array* mask = where != Py_None ? array_of(where) : NULL;
+    if (mask != NULL &&
+        (vp_array_ndim(mask) > MAXDIMS ||
+         broadcast_into(shape, &ndim, vp_array_ndim(mask), vp_array_shape(mask)) < 0)) {
+        Py_RETURN_NONE;
+    }
     vp_array* o = NULL;
     if (out != Py_None) {
         /* the inputs broadcast to out's shape, which must not change */
@@ -3256,8 +3269,10 @@ static PyObject* m_ufunc_typed(PyObject* self, PyObject* args) {
     int status = vp_ufunc_loop(g_rt, ufunc, (int)nin, dts, &loop, err, sizeof err);
     vp_array* res = NULL;
     if (status == VP_OK) {
-        status =
-            vp_ufunc_issue(g_rt, loop, in, ndim, shape, o, &res, issue_site(), err, sizeof err);
+        status = mask != NULL ? vp_ufunc_issue_masked(g_rt, loop, in, mask, ndim, shape, o, &res,
+                                                      issue_site(), err, sizeof err)
+                              : vp_ufunc_issue(g_rt, loop, in, ndim, shape, o, &res, issue_site(),
+                                               err, sizeof err);
     }
     if (status == VP_UNSUPPORTED) {
         Py_RETURN_NONE;
@@ -3333,6 +3348,97 @@ static PyObject* m_ufunc_multi(PyObject* self, PyObject* args) {
         PyTuple_SET_ITEM(t, j, w);
     }
     return t;
+}
+
+static PyObject* m_reduceat(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *ufunc, *a, *indices, *strides;
+    int axis;
+    if (!PyArg_ParseTuple(args, "OO!iOO", &ufunc, &ArrayType, &a, &axis, &indices, &strides) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    int64_t st[MAXDIMS];
+    const int nd = vp_array_ndim(array_of(a));
+    if (strides != Py_None) {
+        PyObject* sf = PySequence_Fast(strides, "strides must be a sequence");
+        if (sf == NULL) {
+            return NULL;
+        }
+        if (PySequence_Fast_GET_SIZE(sf) != nd || nd > MAXDIMS) {
+            Py_DECREF(sf);
+            PyErr_SetString(PyExc_ValueError, "reduceat: one stride per dimension expected");
+            return NULL;
+        }
+        for (int i = 0; i < nd; ++i) {
+            st[i] = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(sf, i));
+        }
+        Py_DECREF(sf);
+        if (PyErr_Occurred()) {
+            return NULL;
+        }
+    }
+    /* the indices as int64 values in native byte order (bytes) */
+    Py_buffer view;
+    if (PyObject_GetBuffer(indices, &view, PyBUF_SIMPLE) < 0) {
+        return NULL;
+    }
+    const Py_ssize_t n = view.len / (Py_ssize_t)sizeof(int64_t);
+    int64_t* ind = n > 0 ? PyMem_Malloc((size_t)n * sizeof(int64_t)) : NULL;
+    if (n > 0 && ind == NULL) {
+        PyBuffer_Release(&view);
+        return PyErr_NoMemory();
+    }
+    if (n > 0) {
+        memcpy(ind, view.buf, (size_t)n * sizeof(int64_t));
+    }
+    PyBuffer_Release(&view);
+    vp_array* res = NULL;
+    char err[ERRLEN] = "";
+    const int status = n > INT_MAX ? VP_UNSUPPORTED
+                                   : vp_reduceat(g_rt, ufunc, array_of(a), axis, ind, (int)n,
+                                                 strides != Py_None ? st : NULL, &res, issue_site(),
+                                                 err, sizeof err);
+    PyMem_Free(ind);
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    return wrap_array(res);
+}
+
+static PyObject* m_ufunc_at(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *ufunc, *a, *idx, *values;
+    if (!PyArg_ParseTuple(args, "OO!O!O", &ufunc, &ArrayType, &a, &ArrayType, &idx, &values) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    if ((values != Py_None && !is_array(values)) || ((ArrayObject*)a)->readonly) {
+        Py_RETURN_NONE;
+    }
+    const int nin = values != Py_None ? 2 : 1;
+    vp_dtype dts[3];
+    for (int i = 0; i <= nin; ++i) {
+        dts[i] = vp_array_dtype(array_of(a));
+    }
+    const vp_loop* loop = NULL;
+    char err[ERRLEN] = "";
+    int status = vp_ufunc_loop(g_rt, ufunc, nin, dts, &loop, err, sizeof err);
+    if (status == VP_OK) {
+        status =
+            vp_ufunc_at(g_rt, loop, array_of(a), array_of(idx),
+                        values != Py_None ? array_of(values) : NULL, issue_site(), err, sizeof err);
+    }
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_FALSE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    Py_RETURN_TRUE;
 }
 
 static PyObject* m_accumulate(PyObject* self, PyObject* args) {
@@ -4477,14 +4583,20 @@ static PyMethodDef methods[] = {
     {"setup_reductions", m_setup_reductions, METH_VARARGS,
      "setup_reductions(entries, array_function, novalue, async_ok)"},
     {"ufunc_typed", m_ufunc_typed, METH_VARARGS,
-     "ufunc_typed(ufunc, inputs, dtype codes, out): async ufunc with the loop for exactly "
-     "these dtypes (inputs cast, out= of any dtype), or None"},
+     "ufunc_typed(ufunc, inputs, dtype codes, out[, where]): async ufunc with the loop "
+     "for exactly these dtypes (inputs cast, out= of any dtype, a bool where= mask), or None"},
     {"ufunc_multi", m_ufunc_multi, METH_VARARGS,
      "ufunc_multi(ufunc, inputs, dtype codes): async ufunc with several outputs, or None"},
+    {"reduceat", m_reduceat, METH_VARARGS,
+     "reduceat(ufunc, a, axis, indices (int64 bytes), strides|None): async ufunc.reduceat "
+     "without casts, or None"},
+    {"ufunc_at", m_ufunc_at, METH_VARARGS,
+     "ufunc_at(ufunc, a, indices, values|None): async ufunc.at along axis 0; False if unsupported"},
     {"accumulate", m_accumulate, METH_VARARGS,
      "accumulate(ufunc, a, axis): async ufunc.accumulate without casts, or None"},
     {"reduce", m_reduce, METH_VARARGS,
-     "reduce(ufunc, a, axes, keepdims, dtype, initial): async reduction, or None if unsupported"},
+     "reduce(ufunc, a, axes, keepdims, dtype, initial[, out]): async reduction (into out), or "
+     "None if unsupported"},
     {NULL, NULL, 0, NULL},
 };
 

@@ -79,6 +79,17 @@ std::shared_ptr<Kernel> make_reduce_kernel(const UfuncLoop* loop, ReducePlan pla
 // inputs = {in}, outputs = {result, in's shape}.
 std::shared_ptr<Kernel> make_accumulate_kernel(const UfuncLoop* loop, int axis);
 
+// ufunc.reduceat along `axis` with `indices` (checked: 0 <= i < extent), as
+// PyUFunc_Reduceat runs it: per lane and index i, the element at indices[i]
+// is copied to result i, then, if the segment up to the next index (the
+// extent for the last) has more elements, `loop` (the reduction loop,
+// fixed strides {0, in, 0}) is called once over the rest of it with args
+// {out_i, in + 1, out_i}, as a reduce call: float add sums it pairwise.
+// Input and result have the loop's dtype. Operands: inputs = {in},
+// outputs = {result: extent len(indices) along `axis`}.
+std::shared_ptr<Kernel> make_reduceat_kernel(const UfuncLoop* loop, int axis,
+                                             std::vector<std::int64_t> indices);
+
 // Reductions ReducePlan does not cover (casts, initial=, reduced axes that do
 // not coalesce, strided inputs) run on NumPy's own iterator:
 // LoopCache::iter_reduction() (numpy_ufunc.hpp), implemented in

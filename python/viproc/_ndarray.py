@@ -274,12 +274,17 @@ def _plan_reduce(ufunc, dtype, ndim, axis, keepdims, requested):
     return flags, bool(keepdims), None if requested is None else np.dtype(requested)
 
 
-def _reduce(ufunc, a, axis=None, keepdims=False, dtype=None, initial=_NV):
-    """ufunc.reduce(a, axis, dtype=..., keepdims=..., initial=...) issued
-    asynchronously, or None if viproc cannot run it (the caller falls back to
-    NumPy; empty inputs too, vp_reduce refuses them). Casting reductions and
-    strided ones NumPy buffers run on NumPy's own iterator (vp_reduce)."""
+def _reduce(ufunc, a, axis=None, keepdims=False, dtype=None, initial=_NV, out=None):
+    """ufunc.reduce(a, axis, dtype=..., keepdims=..., initial=..., out=...)
+    issued asynchronously, or None if viproc cannot run it (the caller falls
+    back to NumPy; empty inputs too, vp_reduce refuses them). Casting
+    reductions and strided ones NumPy buffers run on NumPy's own iterator
+    (vp_reduce). out=: a viproc array with the dtype and layout of the
+    result NumPy would allocate (vp_reduce_out), returned as NumPy returns
+    it."""
     if not _REDUCE_ASYNC or type(a) is not ndarray or ufunc not in _REDUCE_UFUNCS:
+        return None
+    if out is not None and (type(out) is not ndarray or out._readonly):
         return None
     try:
         key = (ufunc, a.dtype, a.ndim, axis, keepdims, dtype)
@@ -296,6 +301,8 @@ def _reduce(ufunc, a, axis=None, keepdims=False, dtype=None, initial=_NV):
         return None
     flags, keep, requested = plan
     start = ufunc.identity if initial is _NV else initial
+    if out is not None:
+        return _viproc.reduce(ufunc, a, flags, keep, requested, start, out)
     r = _viproc.reduce(ufunc, a, flags, keep, requested, start)
     return _scalar_result(r) if r is not None and r.ndim == 0 else r
 
@@ -331,9 +338,9 @@ def _sum_or_numpy(x, axis, keepdims):
 
 def _r_sum(ufunc):
     def handler(a, axis=None, dtype=None, out=None, keepdims=_NV, initial=_NV, where=_NV):
-        if out is not None or where is not _NV:
+        if where is not _NV:
             return _NOPE
-        r = _reduce(ufunc, a, axis, keepdims is True, dtype, initial)
+        r = _reduce(ufunc, a, axis, keepdims is True, dtype, initial, out)
         return _NOPE if r is None else r
 
     return handler
@@ -341,9 +348,9 @@ def _r_sum(ufunc):
 
 def _r_minmax(ufunc):
     def handler(a, axis=None, out=None, keepdims=_NV, initial=_NV, where=_NV):
-        if out is not None or where is not _NV:
+        if where is not _NV:
             return _NOPE
-        r = _reduce(ufunc, a, axis, keepdims is True, None, initial)
+        r = _reduce(ufunc, a, axis, keepdims is True, None, initial, out)
         return _NOPE if r is None else r
 
     return handler
@@ -1543,9 +1550,13 @@ class _FlatIter:
 
 def _ufunc_reduce(ufunc, a, axis=0, dtype=None, out=None, keepdims=False, initial=_NV,
                   where=True):
-    if out is not None or where is not True:
+    if isinstance(out, tuple):  # NumPy's normalized out=
+        if len(out) != 1:
+            return None
+        out = out[0]
+    if where is not True:
         return None
-    return _reduce(ufunc, a, axis, keepdims, dtype, initial)
+    return _reduce(ufunc, a, axis, keepdims, dtype, initial, out)
 
 
 def _product_operands(inputs):
@@ -1614,7 +1625,7 @@ def _fallback_ufunc(ufunc, method, inputs, kwargs):
             r = None
         if r is not None:
             return r
-    if method in ("__call__", "accumulate", "outer"):
+    if method in ("__call__", "accumulate", "outer", "reduceat", "at"):
         r = getattr(_ufuncs, "call" if method == "__call__" else method)(ufunc, inputs, kwargs)
         if r is not _NOPE:
             return r

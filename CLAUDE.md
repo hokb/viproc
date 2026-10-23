@@ -359,7 +359,8 @@ python/viproc/         Python package
                        select, copyto(where=) on gather/scatter/select tasks
   _ufuncs.py           ufunc calls the C fast path leaves out (several
                        outputs, dtype=/signature=/casting=, cast out=),
-                       ufunc.accumulate (cumsum, cumprod, nancum*), outer
+                       ufunc.accumulate (cumsum, cumprod, nancum*), outer,
+                       where=, ufunc.at, ufunc.reduceat
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -958,8 +959,40 @@ Rules:
   every one). Python scalars are converted to their loop dtype (NEP 50).
   NumPy's `ComplexWarning` comes once per complex-to-real cast and call:
   viproc warns in Python and silences the iterator template, which is made
-  once. `where=` and the remaining keywords fall back. Fuzzed in
+  once. The remaining keywords fall back. Fuzzed in
   `python/tests/test_ufunc_calls.py`.
+- **`where=`, `ufunc.at`, `ufunc.reduceat`, reductions into `out=`**
+  (`_ufuncs.py`, `python/tests/test_ufunc_methods.py`):
+  - `where=` (`vp_ufunc_issue_masked`): NumPy's masked iterator (mask
+    operand `READONLY | ARRAYMASK`, output `WRITEMASKED`), the loop called
+    once per run of True values as `generic_masked_strided_loop` calls it
+    (`IterElementwiseKernel::masked_call`); no trivial loop and no small
+    input copies (NumPy skips `check_for_trivial_loop` with a mask).
+    `writes_all` is false: a partial write keeps the old values
+    (copy-on-write copies). Without `out=` viproc gives NumPy's
+    `UserWarning`; masked-off elements are undefined, as in NumPy.
+    **NumPy bug:** `NpyIter_Copy` of a buffered masked iterator double-frees
+    its transfer data at shutdown, so masked templates build each iterator
+    fresh (`IterTemplate::fresh`, `NpyIter_AdvancedNew` with the stored
+    operands) instead of copying.
+  - `ufunc.at` (`vp_ufunc_at`, `make_at_kernel`): NumPy's `fast_iter` path,
+    one loop call per index and subspace element, args `{a, b, a}`; all
+    indices are checked before the first write (an out-of-bounds index
+    raises `AsyncIndexError` and changes nothing). Only where the loop's
+    dtypes are all `a.dtype` (Python scalars are *strong* in `ufunc.at`:
+    NumPy computes `float32 + 2.5` in float64) and not for 1-d `a` with
+    NumPy's indexed loops (add, subtract, multiply, divides, max/min,
+    fmax/fmin: a loop call per element was 4-5x slower): those run in NumPy.
+  - `ufunc.reduceat` (`vp_reduceat`, `make_reduceat_kernel`): per lane and
+    segment the first element copied, then one call with strides
+    `{0, sin, 0}` over the rest, as `PyUFunc_Reduceat`. Indices are host
+    data (int64 bytes, validated with NumPy's min/max). The result layout is
+    the iterator's (`npyiter_find_best_axis_ordering` over the input with
+    stride 0 along the axis and the indices along it only), ported to
+    `_reduceat_strides`: not order K.
+  - Reductions with `out=` (`vp_reduce_out`): `out` of exactly the dtype
+    and layout NumPy would allocate is written as the task's in/out
+    (also a view of the input: copy-on-write); others fall back.
 - **Accumulation and outer** (`_ufuncs.py`): `ufunc.accumulate`,
   `cumsum`/`cumprod` (`axis=None`: the C-ordered `ravel`) and
   `nancumsum`/`nancumprod` (NaNs replaced by a `where` first) as one task

@@ -218,6 +218,15 @@ int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, 
              int out_ndim, const int64_t* out_shape, vp_array* out, vp_array** result,
              const char* site, char* err, size_t errlen);
 
+/* vp_ufunc_issue() with where=`mask` (a bool array broadcasting to
+ * out_shape): as NumPy runs a masked ufunc, on its iterator (no copies of
+ * short inputs), the loop called once per run of True values. Elements
+ * where the mask is False keep the values of `out`; without `out` they are
+ * undefined, as in NumPy's freshly allocated result. */
+int vp_ufunc_issue_masked(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
+                          vp_array* mask, int out_ndim, const int64_t* out_shape, vp_array* out,
+                          vp_array** result, const char* site, char* err, size_t errlen);
+
 /* Issues `ufunc(inputs...)` for a ufunc with several outputs (divmod, modf,
  * frexp) with NumPy's loop for exactly `dtypes` (nin inputs, then nout
  * outputs). As NumPy runs such ufuncs (never its trivial loop), the loop is
@@ -327,6 +336,37 @@ int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char
  * that is unavailable or needs the Python API; the caller then falls back. */
 int vp_accumulate(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, vp_array** result,
                   const char* site, char* err, size_t errlen);
+
+/* vp_reduce() into an existing array `out` (in place, *result set to NULL):
+ * only where `out` has the dtype and layout of the result NumPy would
+ * allocate (strides of extents > 1), so the reduction iterates exactly as
+ * without out=; VP_UNSUPPORTED otherwise. */
+int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
+                  int keepdims, PyObject* dtype, PyObject* identity, vp_array* out,
+                  vp_array** result, const char* site, char* err, size_t errlen);
+
+/* Issues ufunc.reduceat(in, indices, axis) for a binary ufunc without casts
+ * (in has the reduction loop's dtype: the caller casts first), as
+ * PyUFunc_Reduceat runs it (make_reduceat_kernel). `indices` (host data,
+ * nindices >= 1) must lie in [0, extent); the result has extent nindices
+ * along `axis` and the dense byte strides `out_strides` (NumPy's layout,
+ * computed by the caller; NULL: C order). Returns
+ * VP_UNSUPPORTED (reason in `err`) for an index out of range, a 0-d input,
+ * an empty result or a loop that is not available; the caller then falls
+ * back (and NumPy raises its errors). */
+int vp_reduceat(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, const int64_t* indices,
+                int nindices, const int64_t* out_strides, vp_array** result, const char* site,
+                char* err, size_t errlen);
+
+/* Issues ufunc.at(a, indices, values) in place on `a` with `loop` (every
+ * operand of a's dtype; vp_ufunc_loop): `indices` a 1-d int32/int64 array
+ * into a's first axis, `values` (NULL for a unary ufunc) broadcasting to
+ * indices.shape + a.shape[1:]. Runs as NumPy's ufunc_at without casts
+ * (make_at_kernel): repeated indices accumulate; an index out of bounds
+ * fails the op (AsyncIndexError) before anything is written. Returns
+ * VP_UNSUPPORTED (reason in `err`) for other operands. */
+int vp_ufunc_at(vp_runtime* rt, const vp_loop* loop, vp_array* a, vp_array* indices,
+                vp_array* values, const char* site, char* err, size_t errlen);
 
 /* Issues np.matmul(a, b) (the `@` operator) with NumPy's matmul gufunc loop
  * for (t, t) -> t, where t is the dtype of both operands; the loop is

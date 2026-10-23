@@ -530,6 +530,67 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
     return VP_OK;
 }
 
+int vp_ufunc_issue_masked(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
+                          vp_array* mask, int out_ndim, const int64_t* out_shape, vp_array* out,
+                          vp_array** result, const char* site, char* err, size_t errlen) {
+    rt->graveyard->drain();
+    const int nin = loop->loop->nin();
+    if (nin > 3 || loop->loop->nout() != 1 || arr(mask).layout().dtype != DType::Bool) {
+        set_error(err, errlen, "unsupported masked ufunc");
+        return VP_UNSUPPORTED;
+    }
+    // no copies of small inputs: NumPy's masked execution skips
+    // check_for_trivial_loop
+    ArrayPtr ins[4];
+    Layout layouts[4];
+    for (int i = 0; i < nin; ++i) {
+        ins[i] = ref(inputs[i]);
+        layouts[i] = ins[i]->layout();
+    }
+    ins[nin] = ref(mask);
+    layouts[nin] = ins[nin]->layout();
+    const auto ni = static_cast<std::size_t>(nin);
+    const DType out_dtype = loop->dtypes[ni];
+    const Shape shape(out_shape, out_shape + out_ndim);
+    Layout ol;
+    if (out != nullptr) {
+        ol = arr(out).layout();
+        if (ol.shape != shape) {
+            set_error(err, errlen, "out= array has the wrong shape");
+            return VP_INVALID;
+        }
+    } else {
+        // the iterator allocates the output in order K over every operand,
+        // the mask included
+        bool all_c = true;
+        for (std::size_t i = 0; i <= ni; ++i) {
+            all_c = all_c && (layouts[i].c_contiguous() || layouts[i].size() <= 1);
+        }
+        ol = all_c ? Layout::contiguous(out_dtype, shape)
+                   : Layout::keep_order(out_dtype, shape, std::span(layouts, ni + 1));
+    }
+    std::string e;
+    std::shared_ptr<Kernel> k = rt->loops->iter_elementwise(
+        loop->loop, loop->dtypes, std::span(layouts, ni), std::span(&ol, 1), out != nullptr,
+        defer_release(rt->graveyard), e, &layouts[ni]);
+    if (!k) {
+        PyErr_Clear();
+        set_error(err, errlen, e);
+        return VP_UNSUPPORTED;
+    }
+    const std::span<const ArrayPtr> in_span(ins, ni + 1);
+    if (out != nullptr) {
+        const ArrayPtr o = ref(out);
+        rt->rt->issue(k, in_span, std::span(&o, 1), {}, site);
+        *result = nullptr;
+        return VP_OK;
+    }
+    ArrayPtr res;
+    rt->rt->issue(k, in_span, {}, std::span(&ol, 1), site, std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
 int vp_ufunc_multi(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, int nout,
                    const vp_dtype* dtypes, int out_ndim, const int64_t* out_shape,
                    vp_array** results, const char* site, char* err, size_t errlen) {
@@ -943,6 +1004,28 @@ int vp_arg_reduce(vp_runtime* rt, int argmax, vp_array* in, int out_ndim, const 
 int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
               int keepdims, PyObject* dtype, PyObject* identity, vp_array** result,
               const char* site, char* err, size_t errlen) {
+    return vp_reduce_out(rt, ufunc, in, axes, keepdims, dtype, identity, nullptr, result, site, err,
+                         errlen);
+}
+
+// The result layout NumPy would allocate, with out's dtype and the strides
+// of every axis of extent > 1: then NumPy's iteration with `out` given is
+// the one with the result it allocates.
+static bool same_result_layout(const Layout& out, const Layout& want) {
+    if (out.dtype != want.dtype || out.shape != want.shape) {
+        return false;
+    }
+    for (std::size_t i = 0; i < out.shape.size(); ++i) {
+        if (out.shape[i] != 1 && out.strides[i] != want.strides[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
+                  int keepdims, PyObject* dtype, PyObject* identity, vp_array* out,
+                  vp_array** result, const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout& l = arr(in).layout();
     if (l.size() == 0) {
@@ -992,6 +1075,16 @@ int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char
             return VP_UNSUPPORTED;
         }
         const ArrayPtr ins[] = {ref(in)};
+        if (out != nullptr) {
+            if (!same_result_layout(arr(out).layout(), rl)) {
+                set_error(err, errlen, "reduce: out= has another layout or dtype");
+                return VP_UNSUPPORTED;
+            }
+            const ArrayPtr io[] = {ref(out)};
+            rt->rt->issue(k, ins, io, {}, site, {}, l.size());
+            *result = nullptr;
+            return VP_OK;
+        }
         ArrayPtr res;
         rt->rt->issue(k, ins, {}, std::span(&rl, 1), site, std::span(&res, 1), l.size());
         *result = hand_out(std::move(res));
@@ -1003,6 +1096,17 @@ int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char
         return VP_PYERR;
     }
     const ArrayPtr ins[] = {ref(in)};
+    if (out != nullptr) {
+        if (!same_result_layout(arr(out).layout(), out_layout)) {
+            set_error(err, errlen, "reduce: out= has another layout or dtype");
+            return VP_UNSUPPORTED;
+        }
+        const ArrayPtr io[] = {ref(out)};
+        rt->rt->issue(numpy::make_reduce_kernel(loop, std::move(plan), std::move(init)), ins, io,
+                      {}, site, {}, l.size());
+        *result = nullptr;
+        return VP_OK;
+    }
     ArrayPtr res;
     rt->rt->issue(numpy::make_reduce_kernel(loop, std::move(plan), std::move(init)), ins, {},
                   std::span(&out_layout, 1), site, std::span(&res, 1), l.size());
@@ -1038,6 +1142,96 @@ int vp_accumulate(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, vp_ar
     rt->rt->issue(numpy::make_accumulate_kernel(loop, axis), ins, {}, std::span(&out, 1), site,
                   std::span(&res, 1), l.size());
     *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
+int vp_reduceat(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, const int64_t* indices,
+                int nindices, const int64_t* out_strides, vp_array** result, const char* site,
+                char* err, size_t errlen) {
+    rt->graveyard->drain();
+    const Layout& l = arr(in).layout();
+    const auto nd = static_cast<int>(l.shape.size());
+    if (nd == 0 || axis < 0 || axis >= nd || nindices <= 0) {
+        set_error(err, errlen, "reduceat: 0-d input or no indices");
+        return VP_UNSUPPORTED;
+    }
+    const auto ax = static_cast<std::size_t>(axis);
+    std::vector<std::int64_t> ind(indices, indices + nindices);
+    for (const std::int64_t i : ind) {
+        if (i < 0 || i >= l.shape[ax]) {
+            set_error(err, errlen, "reduceat: index out of range"); // NumPy raises it
+            return VP_UNSUPPORTED;
+        }
+    }
+    Shape shape = l.shape;
+    shape[ax] = nindices;
+    Layout out = Layout::contiguous(l.dtype, shape);
+    if (out_strides != nullptr) {
+        for (int i = 0; i < nd; ++i) {
+            out.strides[static_cast<std::size_t>(i)] = out_strides[i];
+        }
+        if (!out.dense()) {
+            set_error(err, errlen, "reduceat: result strides not dense");
+            return VP_INVALID;
+        }
+    }
+    if (out.size() == 0) {
+        set_error(err, errlen, "reduceat: empty result");
+        return VP_UNSUPPORTED;
+    }
+    std::string e;
+    const numpy::UfuncLoop* loop = rt->loops->get_reduction(
+        ufunc, l.dtype, {0, static_cast<std::intptr_t>(l.strides[ax]), 0}, e);
+    if (loop == nullptr) {
+        PyErr_Clear();
+        set_error(err, errlen, e);
+        return VP_UNSUPPORTED;
+    }
+    const ArrayPtr ins[] = {ref(in)};
+    ArrayPtr res;
+    rt->rt->issue(numpy::make_reduceat_kernel(loop, axis, std::move(ind)), ins, {},
+                  std::span(&out, 1), site, std::span(&res, 1), l.size());
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
+int vp_ufunc_at(vp_runtime* rt, const vp_loop* loop, vp_array* a, vp_array* indices,
+                vp_array* values, const char* site, char* err, size_t errlen) {
+    rt->graveyard->drain();
+    const Layout& al = arr(a).layout();
+    const Layout& xl = arr(indices).layout();
+    const int nin = loop->loop->nin();
+    bool same =
+        loop->loop->nout() == 1 && (nin == 1 || nin == 2) && (nin == 2) == (values != nullptr);
+    for (const DType d : loop->dtypes) {
+        same = same && d == al.dtype;
+    }
+    if (!same || al.shape.empty() || xl.shape.size() != 1 ||
+        (xl.dtype != DType::Int32 && xl.dtype != DType::Int64)) {
+        set_error(err, errlen, "ufunc.at: unsupported operands");
+        return VP_UNSUPPORTED;
+    }
+    if (values != nullptr) {
+        Shape full = al.shape;
+        full[0] = xl.shape[0];
+        Shape b;
+        const Layout& vl = arr(values).layout();
+        if (vl.dtype != al.dtype || !broadcast_shapes(vl.shape, full, b) || b != full) {
+            set_error(err, errlen, "ufunc.at: values do not broadcast");
+            return VP_UNSUPPORTED;
+        }
+    }
+    std::int64_t work = xl.shape[0];
+    for (std::size_t i = 1; i < al.shape.size(); ++i) {
+        work *= al.shape[i];
+    }
+    ArrayPtr ins[2] = {ref(indices)};
+    std::size_t nins = 1;
+    if (values != nullptr) {
+        ins[nins++] = ref(values);
+    }
+    const ArrayPtr io[] = {ref(a)};
+    rt->rt->issue(numpy::make_at_kernel(loop->loop), std::span(ins, nins), io, {}, site, {}, work);
     return VP_OK;
 }
 
