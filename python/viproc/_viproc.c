@@ -3371,12 +3371,13 @@ static int int_tuple(PyObject* t, int* out, Py_ssize_t max) {
 
 static PyObject* m_gufunc(PyObject* self, PyObject* args) {
     (void)self;
-    PyObject *ufunc, *ins, *outs, *codes, *core_n_t, *core_axes_t, *sizes_t, *invalid;
+    PyObject *ufunc, *ins, *outs, *codes, *core_n_t, *core_axes_t, *sizes_t, *order_t, *invalid;
     int flags;
     long long work;
-    if (!PyArg_ParseTuple(args, "OO!OO!O!O!O!iOL", &ufunc, &PyTuple_Type, &ins, &outs,
+    if (!PyArg_ParseTuple(args, "OO!OO!O!O!O!iO!OL", &ufunc, &PyTuple_Type, &ins, &outs,
                           &PyTuple_Type, &codes, &PyTuple_Type, &core_n_t, &PyTuple_Type,
-                          &core_axes_t, &PyTuple_Type, &sizes_t, &flags, &invalid, &work) ||
+                          &core_axes_t, &PyTuple_Type, &sizes_t, &flags, &PyTuple_Type, &order_t,
+                          &invalid, &work) ||
         check_runtime() < 0) {
         return NULL;
     }
@@ -3400,7 +3401,9 @@ static PyObject* m_gufunc(PyObject* self, PyObject* args) {
         Py_RETURN_NONE;
     }
     const int nlabels = int_tuple(sizes_t, labels, MAXCORE);
-    if (nlabels < 0) {
+    int order[64];
+    const int order_n = int_tuple(order_t, order, 64);
+    if (nlabels < 0 || order_n < 0) {
         Py_RETURN_NONE;
     }
     for (int i = 0; i < nlabels; ++i) {
@@ -3433,8 +3436,8 @@ static PyObject* m_gufunc(PyObject* self, PyObject* args) {
     vp_array* res[MAXOP] = {NULL};
     char err[ERRLEN] = "";
     const int status = vp_gufunc(g_rt, ufunc, (int)nin, in, (int)nout, outs != Py_None ? out : NULL,
-                                 dts, core_n, core_axes, nlabels, sizes, flags, inv, (int64_t)work,
-                                 res, issue_site(), err, sizeof err);
+                                 dts, core_n, core_axes, nlabels, sizes, flags, order_n, order, inv,
+                                 (int64_t)work, res, issue_site(), err, sizeof err);
     if (status == VP_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
@@ -4703,6 +4706,7 @@ static PyMethodDef methods[] = {
      "ufunc_multi(ufunc, inputs, dtype codes): async ufunc with several outputs, or None"},
     {"gufunc", m_gufunc, METH_VARARGS,
      "gufunc(ufunc, inputs, outs|None, dtype codes, core_n, core_axes, label sizes, flags, "
+     "out_order, "
      "invalid_error|None, work): async generalized ufunc (vp_gufunc): the outputs (a tuple) "
      "or None"},
     {"reduceat", m_reduceat, METH_VARARGS,
