@@ -734,6 +734,56 @@ int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* valu
     return VP_OK;
 }
 
+int vp_place(vp_runtime* rt, vp_dtype dtype, int ndim, const int64_t* shape, const int64_t* strides,
+             int nparts, vp_array* const* srcs, const int* part_ndim, const int64_t* part_shapes,
+             const int64_t* part_strides, const int64_t* part_offsets, vp_array** result,
+             const char* site, char* err, size_t errlen) {
+    rt->graveyard->drain();
+    Shape dims;
+    dims.assign(shape, shape + ndim);
+    Layout out = Layout::contiguous(to_dtype(dtype), std::move(dims));
+    if (strides != nullptr) {
+        out.strides.assign(strides, strides + ndim);
+        if (!out.dense() && out.size() != 0) {
+            set_error(err, errlen, "place: result strides are not dense");
+            return VP_INVALID;
+        }
+    }
+    const std::int64_t item = static_cast<std::int64_t>(itemsize(out.dtype));
+    const std::int64_t nbytes = out.size() * item;
+    std::vector<Part> parts(static_cast<std::size_t>(nparts));
+    std::vector<ArrayPtr> ins;
+    ins.reserve(parts.size());
+    for (int i = 0; i < nparts; ++i) {
+        Part& p = parts[i];
+        p.shape.assign(part_shapes, part_shapes + part_ndim[i]);
+        p.strides.assign(part_strides, part_strides + part_ndim[i]);
+        p.offset = part_offsets[i];
+        part_shapes += part_ndim[i];
+        part_strides += part_ndim[i];
+        // The part must lie within the result's elements.
+        std::int64_t lo = p.offset, hi = p.offset, size = 1;
+        for (int d = 0; d < part_ndim[i]; ++d) {
+            size *= p.shape[d];
+            const std::int64_t span = (p.shape[d] - 1) * p.strides[d];
+            (span < 0 ? lo : hi) += span;
+        }
+        const Layout& s = arr(srcs[i]).layout();
+        Shape b;
+        if (s.dtype != out.dtype || !broadcast_shapes(p.shape, s.shape, b) || b != p.shape ||
+            (size != 0 && (lo < 0 || hi + item > nbytes))) {
+            set_error(err, errlen, "place: a part has the wrong dtype, shape or position");
+            return VP_INVALID;
+        }
+        ins.push_back(ref(srcs[i]));
+    }
+    ArrayPtr res;
+    rt->rt->issue(make_place_kernel(std::move(parts)), ins, {}, std::span(&out, 1), site,
+                  std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
 namespace {
 // True if NumPy's gufunc iterator would take `a` as it is (NPY_ITER_ALIGNED):
 // the first element and every stride along an axis of extent > 1 are

@@ -53,8 +53,8 @@ def same(r, expected):
     got, want = np.asarray(r), np.asarray(expected)
     assert got.dtype == want.dtype and got.shape == want.shape
     assert np.array_equal(got, want, equal_nan=True)
-    # NumPy's layout (extent-1 axes may have any stride)
-    assert [s for s, n in zip(got.strides, got.shape) if n > 1] == [
+    # NumPy's layout (extent-1 axes may have any stride; empty arrays have none)
+    assert got.size == 0 or [s for s, n in zip(got.strides, got.shape) if n > 1] == [
         s for s, n in zip(want.strides, want.shape) if n > 1]
 
 

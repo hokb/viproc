@@ -327,7 +327,8 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
                        interface; Metadata (SD + task), Operand
   runtime.*            Array (main-thread view), Runtime: issue protocol,
                        worker pool, trampoline, look-ahead limit, wait
-  assign.*             element copy kernel (dst[...] = src)
+  assign.*             element copy kernels (dst[...] = src; a new array
+                       placed from parts: concatenate, tile, pad, ...)
   index.*              gather / scatter / masked assignment / select (indexing, np.where)
 src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
   numpy_ufunc.*        UfuncLoop / LoopCache (resolved NumPy loops),
@@ -352,6 +353,8 @@ python/viproc/         Python package
   _compose.py          NumPy functions composed of async ops, ported from
                        NumPy's code without its asanyarray (clip, round,
                        isclose, nan*, norm, triu, *_like, ...)
+  _join.py             concatenate/stack/tile/repeat/pad/roll/delete/insert
+                       as one placement task each (vp_place)
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -906,6 +909,23 @@ Rules:
   warning for an all-NaN slice, `allclose`'s bool) the handler syncs on that
   small result only. Fuzzed in `python/tests/test_compositions.py`
   (values, dtypes, layouts, warnings).
+- **Joining and copying** (`_join.py`, `JOINING`, after the
+  compositions): NumPy builds `concatenate`, `stack`, `hstack`, `vstack`,
+  `dstack`, `column_stack`, `append`, `tile`, `repeat` (one count),
+  `pad` (constant mode), `roll`, `delete` and `insert` (one index) by
+  assigning its inputs into views of a new array (`new[sl] = arr`). viproc
+  ports that code onto `_Placer`, which records each assignment as a part
+  (shape, byte strides and offset, computed on a one-element probe with the
+  result's layout) and issues all of them as **one task** (`vp_place`,
+  `make_place_kernel`: element copies in NumPy's order, later parts
+  overwrite earlier ones, as pad's corners). The result gets NumPy's layout
+  (`concatenate`: `PyArray_CreateMultiSortedStridePerm` over the inputs;
+  `roll`: `empty_like`, order K; `pad`/`delete`/`insert`: F if the input is
+  F- and not C-contiguous; `tile`/`repeat`: C). Inputs of another dtype are
+  cast first (`astype`, a task; NumPy's casting rule checked on the main
+  thread); `diff`'s `prepend`/`append` concatenate. Empty results, `out=`,
+  `repeat` with per-element counts and `insert` at several indices fall
+  back. Fuzzed in `python/tests/test_joining.py`.
 - **ndarray methods:** every method and attribute of `numpy.ndarray`
   except `ctypes` (a raw pointer would bypass the runtime). `base`: views
   made in C (`set_base` in `_viproc.c`: basic indexing, transpose, reshape

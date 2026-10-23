@@ -315,6 +315,20 @@ int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_arra
 int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, char* err,
               size_t errlen);
 
+/* Issues a new array (*result) of `dtype` and `shape` (`ndim` dimensions)
+ * with the dense byte `strides` (NULL: C order) assembled from `nparts`
+ * parts: part i is the view of the result with `part_ndim[i]` dimensions,
+ * the shapes and byte strides at `part_shapes` / `part_strides` (all parts'
+ * dimensions one after the other) and the byte offset `part_offsets[i]` from
+ * the result's first element; srcs[i] (`dtype`, broadcastable to the part's
+ * shape) is copied into it. One task copies all parts in order (a later part
+ * overwrites an earlier one); elements no part covers are undefined. Used for
+ * concatenate, stack, tile, repeat, pad, roll, delete and insert. */
+int vp_place(vp_runtime* rt, vp_dtype dtype, int ndim, const int64_t* shape, const int64_t* strides,
+             int nparts, vp_array* const* srcs, const int* part_ndim, const int64_t* part_shapes,
+             const int64_t* part_strides, const int64_t* part_offsets, vp_array** result,
+             const char* site, char* err, size_t errlen);
+
 #ifdef __cplusplus
 }
 #endif

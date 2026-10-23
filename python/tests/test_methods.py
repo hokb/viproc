@@ -240,7 +240,6 @@ FALLING_BACK = [
     ("cumsum", lambda a: a.cumsum(), 1),
     ("cumprod", lambda a: a.cumprod(), 1),
     ("take", lambda a: a.take([0, 5, 9]), 1),
-    ("repeat", lambda a: a.repeat(2), 1),
     ("compress", lambda a: a.compress(np.arange(SIZE) % 2 == 0), 1),
     ("argsort", lambda a: a.argsort(), 1),
     ("argpartition", lambda a: a.argpartition(5), 1),
