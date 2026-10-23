@@ -70,6 +70,31 @@ def test_ternary_ufunc_clip():
     same(assert_async(umath.clip, v, 0.7, 1.2), umath.clip(x, 0.7, 1.2))
 
 
+def test_scalar_operands_are_cached_per_object_and_dtype():
+    # Scalar operands are converted once per (object, dtype) into a small
+    # direct-mapped cache (hokb/viproc#47). Many distinct scalars, two per op,
+    # replace slots while an earlier operand of the same op still uses one.
+    from numpy._core import umath
+    x, v = data()
+    los = [float(f) for f in rng.random(300) * 0.5 + 0.4]
+    for lo in los:
+        hi = lo + 0.3
+        same(umath.clip(v, lo, hi), umath.clip(x, lo, hi))
+    # One object, several dtypes: one entry per dtype.
+    two = 2
+    for dtype in (np.int32, np.int64, np.float32, np.complex64):
+        y, w = data(dtype=dtype)
+        same(assert_async(operator.mul, w, two), y * two)
+    # A failed conversion raises NumPy's error and caches nothing.
+    y, w = data(dtype=np.int32)
+    with pytest.raises(OverflowError) as got:
+        w + 2**40
+    with pytest.raises(OverflowError) as want:
+        y + 2**40
+    assert str(got.value) == str(want.value)
+    same(w + 3, y + 3)
+
+
 def test_cast_of_an_input_is_a_task_of_its_own():
     (x, v), (y, w) = data(), data(dtype=np.float32)
     same(assert_async(operator.add, v, w, ops=2), x + y)

@@ -156,6 +156,58 @@ static void t_clear(Table* t) {
     PyMem_Free(e);
 }
 
+/* Scalar operands as ready 0-d runtime arrays, by (object, dtype code). A
+ * loop's constants (`x * 0.5`) are the same object in every iteration, so the
+ * conversion (a NumPy array built and freed per op: ~2,700 instructions) runs
+ * once. Direct-mapped: a miss replaces its slot, so the cache stays small
+ * whatever the program does. A slot holds a reference to its object (the
+ * address stays unique while cached) and to the array. Only immutable
+ * scalars are cached; the arrays are read by tasks, never written or handed
+ * to user code. */
+#define SCALAR_SLOTS 64
+typedef struct {
+    PyObject* obj; /* NULL: empty */
+    int code;
+    vp_array* a;
+} ScalarSlot;
+static ScalarSlot g_scalars[SCALAR_SLOTS];
+
+static void scalars_clear(void) {
+    for (size_t i = 0; i < SCALAR_SLOTS; ++i) {
+        ScalarSlot* s = &g_scalars[i];
+        if (s->obj != NULL) {
+            vp_array_release(s->a);
+            Py_DECREF(s->obj);
+            *s = (ScalarSlot){NULL, 0, NULL};
+        }
+    }
+}
+
+/* Returns the cached 0-d array of `x` as dtype `code` (borrowed), converting
+ * it on a miss; NULL with an exception set if NumPy's conversion fails. A
+ * miss that replaces a slot hands its array over in *evicted (else NULL): an
+ * earlier operand of the same op may still use it, so the caller releases it
+ * after the op is issued. */
+static vp_array* scalar_operand(PyObject* x, int code, vp_array** evicted) {
+    *evicted = NULL;
+    const unsigned long long h = (unsigned long long)(uintptr_t)x * 0x9E3779B97F4A7C15ull ^
+                                 (unsigned long long)code * 0xC2B2AE3D27D4EB4Full;
+    ScalarSlot* s = &g_scalars[(h ^ (h >> 31)) & (SCALAR_SLOTS - 1)];
+    if (s->obj == x && s->code == code) {
+        return s->a;
+    }
+    vp_array* a = NULL;
+    if (vp_array_from_scalar(g_rt, x, (vp_dtype)code, &a) != VP_OK) {
+        return NULL;
+    }
+    if (s->obj != NULL) {
+        *evicted = s->a;
+        Py_DECREF(s->obj);
+    }
+    *s = (ScalarSlot){Py_NewRef(x), code, a};
+    return a;
+}
+
 static PyObject* s_call = NULL; /* "__call__" */
 static PyObject* s_out = NULL;  /* "out" */
 
@@ -1613,11 +1665,12 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
         codes[i] = (int)((packed >> (8 * i)) & 0xff);
     }
 
-    /* Inputs as runtime arrays; scalars and NumPy arrays are converted. */
+    /* Inputs as runtime arrays; scalars (cached) and NumPy arrays are
+     * converted. */
     vp_array* ins[MAXIN];
-    vp_array* temps[MAXIN];
+    vp_array* evicted[MAXIN];
     PyObject* keep[MAXIN];
-    int ntemps = 0, nkeep = 0, status = 0;
+    int nevicted = 0, nkeep = 0, status = 0;
     int64_t shape[MAXDIMS];
     int ndim = 0;
     for (Py_ssize_t i = 0; i < n && status == 0; ++i) {
@@ -1633,13 +1686,11 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             keep[nkeep++] = w;
             ins[i] = ((ArrayObject*)w)->a;
         } else {
-            vp_array* t = NULL;
-            if (vp_array_from_scalar(g_rt, x, (vp_dtype)codes[i], &t) != VP_OK) {
+            if ((ins[i] = scalar_operand(x, codes[i], &evicted[nevicted])) == NULL) {
                 status = -1; /* e.g. OverflowError, as in NumPy */
                 break;
             }
-            temps[ntemps++] = t;
-            ins[i] = t;
+            nevicted += evicted[nevicted] != NULL;
         }
         /* Folds input i into the broadcast shape of inputs 0..i-1: after the
          * loop, shape/ndim is the output shape. */
@@ -1680,8 +1731,8 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             handled = -1;
         }
     }
-    for (int i = 0; i < ntemps; ++i) {
-        vp_array_release(temps[i]); /* the issued task keeps the data alive */
+    for (int i = 0; i < nevicted; ++i) {
+        vp_array_release(evicted[i]); /* an issued task keeps its data alive */
     }
     for (int i = 0; i < nkeep; ++i) {
         Py_DECREF(keep[i]);
@@ -2410,6 +2461,7 @@ static PyObject* m_shutdown(PyObject* self, PyObject* noargs) {
         g_rt = NULL;
         t_clear(&g_sites); /* interned in the runtime being destroyed */
         t_clear(&g_sigs);  /* holds its loop handles */
+        scalars_clear();   /* arrays of the runtime being destroyed */
         vp_runtime_destroy(rt);
         if (failed) {
             raise_async(err);

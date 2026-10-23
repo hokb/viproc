@@ -30,6 +30,10 @@ enum class TaskState : std::uint8_t {
 
 class Task;
 
+// Tasks a task hands on: its consumers, the consumers it unblocks. Inline for
+// the common one or two (no heap allocation per task), else on the heap.
+using TaskList = InlineVector<std::shared_ptr<Task>, 2>;
+
 // The layout of one array or view (docs/design/array-data-model.md, A1, A2): its
 // size descriptor (SD: dtype, shape, byte strides, offset) and the task of the
 // op that configures it while the SD is incomplete. One per array and per
@@ -330,7 +334,7 @@ class Task {
     // the calling thread schedules them as continuations. A kernel error is
     // recorded in `errors` (if given) before the task completes, so a sync
     // point that sees the failed task finds its record too.
-    std::vector<std::shared_ptr<Task>> execute(ErrorTable* errors = nullptr);
+    TaskList execute(ErrorTable* errors = nullptr);
 
   private:
     // Gives every output without memory its block: a dying input's (same
@@ -364,7 +368,7 @@ class Task {
     // completion notify. std::atomic::notify_all is not free even without
     // waiters (libstdc++ bumps a process-wide counter for 1-byte atomics).
     mutable bool waiters_ = false;
-    std::vector<std::shared_ptr<Task>> consumers_;
+    TaskList consumers_;
     ErrorRef upstream_error_;
 
     ErrorRef error_;
