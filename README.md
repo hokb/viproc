@@ -61,10 +61,20 @@ The execution model follows the
   ```
   `Parallel.For` gives wrong results here; the ILNumerics Accelerator runs the loop about 3x
   faster than sequentially (1500 x 1500), with correct results.
-- **Identical results.** Every instruction is computed by NumPy's own inner loops (including
-  their SIMD paths), called exactly as NumPy calls them. Results are bit-identical to plain
-  NumPy; whatever viproc cannot run asynchronously with NumPy's semantics falls back to
-  NumPy itself.
+- **Identical results, guaranteed (today).** viproc currently guarantees results that are
+  bit-identical to plain NumPy: values, dtypes, shapes, strides, warnings and errors.
+  Every instruction is computed by the installed NumPy version's own inner loops and
+  operators (including their SIMD paths), called exactly as NumPy calls them; whatever
+  viproc cannot run asynchronously with NumPy's semantics falls back to NumPy itself.
+  The price is a small overhead on small computations: the viproc layer (task, arrays,
+  dispatch) comes on top of NumPy's own work, while the kernels themselves cannot get
+  faster than NumPy's.
+- **Planned: faster, correct, not bit-identical (opt-in).** viproc is planned to become
+  configurable: a mode that allows results deviating from NumPy's in the last bits (still
+  correct, e.g. a different summation order) in exchange for speed, by further
+  (auto-)parallelization (splitting single operations), optimizations such as operator
+  fusion, automatic offloading to other devices and re-implementing parts of NumPy's
+  internals. The bit-identical mode stays available.
 - **Never slower than NumPy.** Array operations on medium-sized and large data viproc commonly runs
   efficiently in parallel. Small data and algorithms without much parallel potential must
   not get slower: viproc must not make any expression slower than NumPy (hard limit 0.95x;

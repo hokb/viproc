@@ -52,6 +52,16 @@ warnings, errors). Where NumPy's own code cannot run on viproc memory
 (`ndarray.resize`: NumPy reallocates memory it owns), viproc ports it;
 a viproc-specific error or a different result is a defect.
 
+The price of G2 is a small overhead on small computations: NumPy's own
+loops and operators do the work, and viproc's layer (tasks, arrays,
+dispatch) comes on top. **Planned:** viproc becomes configurable, with an
+opt-in mode that allows results deviating from NumPy's (still correct,
+e.g. another summation order or rounding) to be computed faster, by
+further (auto-)parallelization (splitting single ops), optimizations
+(fusion), automatic offloading and partially re-implementing NumPy's
+internals. Until that mode exists, G2 holds without exception, and the
+bit-identical mode stays available afterwards.
+
 ## G3 — Never slower than NumPy
 
 **viproc may never be slower than NumPy (below 0.95x of NumPy's speed) for
