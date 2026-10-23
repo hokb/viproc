@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import viproc
-from async_path import assert_async, pending
+from async_path import SYNC_BELOW, assert_async, pending
 from test_compositions import DTYPES, check, det, same, sample  # noqa: F401 (det: fixture)
 from test_joining import path  # noqa: F401 (fixture)
 
@@ -94,6 +94,22 @@ ASYNC = [  # name, call, shape, dtype, tasks
                          ids=[c[0] for c in ASYNC])
 def test_async(call, shape, dtype, ops, det):
     x = sample(shape, dtype, special=False)
-    v = pending(viproc.asarray(x))
-    got = assert_async(call, v, ops=ops)
-    same(got, call(x))
+    for _ in range(2):  # the second call runs on the plans of the first
+        v = pending(viproc.asarray(x))
+        got = assert_async(call, v, ops=ops)
+        same(got, call(x))
+
+
+def test_plans_survive_a_new_runtime(det):
+    # numpy.fft calls are planned once (_fft_plans, _gufunc_plans); a plan
+    # holds no viproc array, so it serves the next runtime too.
+    x = sample((64, 100), "c16", special=False)
+    for norm in (None, "ortho", "forward"):
+        for axis in (-1, 0):
+            same(F.fft(viproc.asarray(x), axis=axis, norm=norm), F.fft(x, axis=axis, norm=norm))
+    viproc.init(sync_below=SYNC_BELOW, adaptive=False)  # a new runtime (det restores)
+    for norm in (None, "ortho", "forward"):
+        for axis in (-1, 0):
+            v = pending(viproc.asarray(x))
+            got = assert_async(lambda a: F.fft(a, axis=axis, norm=norm), v, ops=1)
+            same(got, F.fft(x, axis=axis, norm=norm))

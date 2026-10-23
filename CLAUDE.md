@@ -159,6 +159,12 @@ reported with that issue site and the NumPy function it runs
   Registration is atomic with respect to the producer's state: if the
   producer already passed the stage, the registering thread learns that
   immediately and handles it itself; no event is lost or delivered twice.
+  Implemented without a lock (`Task::add_consumer`): a task's consumers
+  are a lock-free stack of nodes that live in the consumer tasks (one per
+  producer, inline up to 3), pushed by the main thread with a CAS and
+  closed by the completing thread with one exchange (`kClosed`: a later
+  push fails, and the main thread accounts for the producer itself); a
+  bit in the same word marks a waiter in `wait_completed`.
 - **Sync points** (reading data, `print`, `float(x)`, handing memory back to
   plain NumPy) wait for `completed` of the array's producer. Querying only
   metadata (`x.shape`, `x.dtype`) waits for `size_completed` only. Because
@@ -253,6 +259,17 @@ feed parallel hardware with it (strong scaling, array ILP only); G2, results ide
 to NumPy; G3, **never slower than NumPy** (hard: never below 0.95x for any
 expression; soft: at most 3% slower where there is no sufficient
 parallel potential).
+
+**Bit-identical results are mandatory (currently).** Every change must keep
+results bit-identical to plain NumPy of the installed version (values,
+dtypes, shapes, strides, warnings, errors), as the drop-in rule demands
+(see "Conventions"). Never trade bit-identity for speed: no own kernels, no
+reordered sums, no fusion or splitting of an op that changes rounding. The
+small per-op overhead on small data that this costs is accepted. A
+configurable mode that allows deviating but correct results (further
+(auto-)parallelization, optimizations, auto-offloading, partial
+re-implementation of NumPy internals) is planned (goals.md, G2), not
+started; it would be opt-in, and the bit-identical mode stays available.
 
 ### Phase 1 (current): MVP on CPUs
 
@@ -792,8 +809,15 @@ Rules:
   `PyArray_NewLikeArrayWithShape`); viproc gives the result that layout
   (`vp_gufunc`'s `out_order`). pocketfft makes its plan per call
   (`POCKETFFT_CACHE_SIZE` 0 in NumPy's build): thread-safe. n-d transforms
-  with `out=` and the deprecated `s`/`axes` forms fall back. Fuzzed in
-  `python/tests/test_fft.py`.
+  with `out=` and the deprecated `s`/`axes` forms fall back. A call
+  without `out=` is planned once per (dtype, shape, strides, n, axis,
+  kinds, norm) (`_fft_plans`: the gufunc call with `fct` as a NumPy 0-d
+  array of the loop's dtype, so `_gufunc_plans` covers it too). Before,
+  every call planned in Python (~70-100 µs of main-thread time, more than
+  pocketfft takes for 100 x 100), and ILNumerics' FFFT benchmark (100 x
+  `abs(ifft(fft(A)))`) ran at 0.65x of NumPy for n = 100; with the plans
+  an issue takes ~30 µs (2.7x at n = 100, 4.4-5.7x from n = 200 on 4
+  cores). Fuzzed in `python/tests/test_fft.py`.
 - **Sort** (`src/kernels/numpy_sort.*`, `vp_sort`): `np.sort`,
   `np.argsort`, `a.sort()`, `a.argsort()` on NumPy's per-dtype sort
   functions (`PyDataType_GetArrFuncs(descr)->sort[kind]` /
@@ -1102,8 +1126,9 @@ Rules:
   the task's in/out; others, `keepdims=` and NumPy's errors fall back. The
   loops compute each outer index on their own (a dot per index), so the
   split into calls does not matter. Per call the Python side is one dict
-  lookup per (ufunc, input dtypes and shapes) for calls without keywords
-  (`_gufunc_plans`). Fuzzed in `python/tests/test_gufunc.py`.
+  lookup per (ufunc, input dtypes and shapes, `signature`, `axes`, `axis`)
+  (`_gufunc_plans`, with the operands' remaps; NumPy arrays and scalars
+  among the inputs are imported per call). Fuzzed in `python/tests/test_gufunc.py`.
 - **ndarray methods:** every method and attribute of `numpy.ndarray`
   except `ctypes` (a raw pointer would bypass the runtime). `base`: views
   made in C (`set_base` in `_viproc.c`: basic indexing, transpose, reshape
@@ -1173,7 +1198,10 @@ Rules:
   incl. deferring to `__array_ufunc__ = None`), dtype resolution via
   NumPy's `ufunc.resolve_dtypes` cached per (ufunc, input kinds; Python
   scalars as weak NEP 50 kinds), scalar conversion (`vp_array_from_scalar`,
-  NumPy's conversion rules), broadcasting and the issue site. Whatever it
+  NumPy's conversion rules; cached per (object, dtype) in a direct-mapped
+  table of 64 ready 0-d arrays, `scalar_operand`: a loop's constants are
+  converted once, not ~2,700 instructions per op), broadcasting and the
+  issue site. Whatever it
   does not handle goes to the Python fallback, so NumPy semantics (errors
   included) stay NumPy's.
 - The issue site is the first stack frame outside viproc and NumPy. It is
@@ -1212,11 +1240,18 @@ Rules:
   memory). The bridge front end (~900) is cheaper than NumPy's own dispatch
   and dtype resolution (~2,500); what remains on top is the task protocol
   itself (task object, operand capture, async_reads, slot accounting,
-  completion under the task mutex) and the result's release.
+  completion) and the result's release.
+  Task path (`x = x * 0.5`, pending `x` of 1e4, #47): main thread ~5,100
+  instructions per op (was ~7,750: the scalar's conversion ~2,700, heap
+  vectors for producers/consumers), ~0.74 µs issue (was 1.21); worker
+  ~1,100 besides the kernel (was ~1,750). The lock-free consumer list
+  (#49) took the task mutex out: main thread ~50 instructions less per
+  op, worker ~180 less per task.
 - `std::atomic::notify_all` is not free without waiters: libstdc++ bumps a
   process-wide counter (a shared cache line) for atomics that are not
   4-byte futex words. Task completion and `run()` therefore notify only
-  when a waiter registered (`Task::waiters_`, `active_waiters_`).
+  when a waiter registered (`Task::kWaiter` in the consumer list's word,
+  `active_waiters_`).
 - **Element-wise loops are called exactly as NumPy calls them.** Their
   results depend on the strides of the call: NumPy's SIMD paths (complex
   multiply, float32 exp/sin/arctan2, ...) round differently from their
@@ -1273,13 +1308,23 @@ Rules:
 - Worker pool: at most one idle worker spins (50 µs, `pause`) before
   sleeping; `enqueue()` wakes a sleeper only if nobody spins. This avoids a
   wake-up syscall per small task without taking cores from busy threads.
+- Sync points spin too: the main thread spins up to 50 µs (`kSyncSpin`,
+  `pause`) for the producer's completion (`Runtime::wait`, `wait_all`)
+  before it registers as a waiter and sleeps. The back-pressure wait does
+  not spin: there all workers are busy, and a spinning main thread took a
+  core from them. A sleeping main thread cost the completing worker a
+  futex wake and itself a wake-up, 10-20 µs per sync: a single synced op
+  of 1e4 elements took 18.8 µs (NumPy 3.0), with the spin 6.8 µs (#45).
+  Chains continue on the worker as designed (one hand-off per chain); the
+  round trip at the sync was the medium-size overhead.
 - Per-op allocations: one pooled Task (operands inline up to 4), one
   pooled Metadata per output, one pooled CountableArray (element memory inline up to 128 bytes, larger from the
   element pool when the task runs: no page faults once warm, or the dying
   input's block), one pooled
   `ArrayBlock` (Array and its AliasGroup), the Python object. Shapes/strides
-  inline (`SmallVector`), one shared kernel object per resolved loop,
-  interned issue sites.
+  inline (`SmallVector`), producers, consumers and unblocked tasks inline
+  (`TaskList`, two), one shared kernel object per resolved loop, interned
+  issue sites.
 - `Array`/`AliasGroup` use `Ref<T>` (`src/runtime/ref.hpp`): plain int counts,
   legal because only the main thread creates, copies and releases them. An
   `ArrayBlock` holds a base array and its group; each object is destroyed

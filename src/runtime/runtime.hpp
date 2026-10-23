@@ -210,7 +210,7 @@ class Runtime {
   private:
     void worker_loop();
     // Executes `task` on the current thread and returns its runnable consumers.
-    std::vector<std::shared_ptr<Task>> run(const std::shared_ptr<Task>& task);
+    TaskList run(const std::shared_ptr<Task>& task);
     void enqueue(std::shared_ptr<Task> task);
     void trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t elements);
     // The direct path of issue(): see there.
@@ -220,8 +220,8 @@ class Runtime {
                       std::span<const std::shared_ptr<CountableArray>> output_buffers);
     void acquire_slot();
     // Registers `task` on its pending producers and triggers it if none.
-    void launch(const std::shared_ptr<Task>& task,
-                const std::vector<std::shared_ptr<Task>>& producers, std::int64_t elements);
+    void launch(const std::shared_ptr<Task>& task, const TaskList& producers,
+                std::int64_t elements);
     // Copy-on-write with views: switches `g` to a new version holding a copy of
     // the old data (issued as its own task); views keep their layouts.
     void issue_group_copy(AliasGroup& g);

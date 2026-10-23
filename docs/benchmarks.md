@@ -230,6 +230,12 @@ compare directly.
 | 10-14 | `5db8972` | views computed without ndarrays, `a[key]` in the C slot (2.80) | 100 | 64 | 1.62x | 0.87x | 85 | 49 | 78 | 55 | 53 | 71 | 96 | 62 | 72 | 48 | 79 |
 | 10-15 | `937393a` | same-VM baseline for matmul: state before it (2.10) | 100 | 72 | 1.77x | 0.90x | 87 | 58 | 87 | 58 | 59 | 93 | 117 | 71 | 74 | 57 | 80 |
 | 10-15 | `233fe84` | async `matmul` / `@` / `np.dot` with NumPy's matmul loop (2.10) | 100 | 68 | 1.73x | 0.90x | 89 | 52 | 78 | 61 | 58 | 76 | 80 | 64 | 72 | 56 | 79 |
+| 10-23 | `eb39c38` | same-VM baseline for the sync spin: `main` before it (2.10) | 100 | 78 | 2.00x | 1.10x | 94 | 65 | 99 | 73 | 67 | 76 | 93 | 68 | 86 | 70 | 80 |
+| 10-23 | `231f5fe` | main thread spins up to 50 µs at sync points before it sleeps (#45) (2.10) | 100 | 79 | 2.02x | 1.10x | 97 | 62 | 98 | 73 | 68 | 79 | 98 | 70 | 87 | 68 | 85 |
+| 10-23 | `aa39fda` | same-VM baseline for the per-op overhead: `main` with joining (#29) (2.10) | 100 | 79 | 2.00x | 1.11x | 97 | 61 | 94 | 75 | 66 | 89 | 117 | 71 | 85 | 69 | 80 |
+| 10-23 | `0ac2184` | scalar operands cached, task lists inline (#47) (2.10) | 100 | 81 | 2.03x | 1.16x | 99 | 66 | 93 | 78 | 64 | 90 | 96 | 82 | 93 | 68 | 81 |
+| 10-23 | `8e0fbd6` | same-VM baseline for the lock-free consumer list: `main` (2.10) | 100 | 83 | 2.11x | 1.20x | 104 | 71 | 86 | 77 | 70 | 94 | 97 | 94 | 95 | 69 | 89 |
+| 10-23 | this PR | lock-free consumer list, no mutex in the task (2.10) | 100 | 83 | 2.13x | 1.21x | 108 | 73 | 101 | 79 | 64 | 80 | 65 | 100 | 102 | 67 | 93 |
 
 View changes, same VM (`3111820` → `5db8972`): score 64.0 → 63.7,
 unchanged within noise; the programs dominated by slicing gained:
@@ -249,6 +255,39 @@ little. The score difference (72 → 68) is noise: the cases that moved
 most do not use matmul, and repeated runs of the scalar cases swing in
 both builds alike (`chain_serial` scalar: base 1.76x, 0.86x, 1.00x; new
 0.97x, 1.06x, 0.96x).
+
+Sync spin, same VM (`eb39c38` → `231f5fe`, builds `#21107aaf` /
+`#1440694e`): the suite is unchanged within noise (78 → 79). Its cases
+sync rarely, at the end of a program, while the change targets a result
+read right after a short computation. Deterministic mode (always async),
+`y = y * c` chains of 1e4 float64 synced after each program, extra time
+over NumPy per program: 12-18 µs → 1.5-3 µs for chains of 1 to 16 ops;
+a single synced op 18.8 → 6.8 µs at 1e4 (NumPy 3.0), 44 → 30 µs at 1e5
+(NumPy 31). Before, the worker's futex wake took 3-16 µs and the main
+thread's wake-up 5-8 µs per sync. Repeated filtered runs of the parallel
+cases (`chains_wide`, `gather`, `kmeans`, `softmax_rows`) show no change
+beyond noise. A first version also spun in the back-pressure wait; that
+competed with four busy workers for a core and was dropped.
+
+Per-op overhead, same VM (`aa39fda` → `0ac2184`, builds `#1a63616d` /
+`#632ad63e`): score 79 → 81, tiny 71 → 82, small 85 → 93, 1 worker
+1.11x → 1.16x. Callgrind, `x = x * 0.5` on a pending 1e4 float64 chain
+(deterministic): main thread 7,750 → 5,100 instructions per op, worker
+overhead besides the kernel 1,750 → 1,100. Issue time per op: `x * 0.5`
+1.21 → 0.74 µs, `np.abs(x)` 1.06-1.11 → 0.90-1.0 µs. Small ready data
+(direct path): `x * 0.5` 8 elements 0.82 → 0.55 µs (NumPy 0.63), `x + 1`
+0.84 → 0.53 µs (NumPy 0.85). `strong_scaling.py` 8 chains, 4 workers:
+1e4 2.81x → 3.58x, 1e3 0.93x → 1.01x.
+
+Lock-free consumer list, same VM (`8e0fbd6` → this PR, builds `#a1bec209`
+/ `#0a2ca351`): score 83 → 83. The category swings (reductions 86 → 101,
+scalars 94 → 80) are noise: refiltered runs of the scalar cases gave
+0.51x-1.05x for both builds (`chain_serial` scalar, `scalar_newton`).
+Callgrind, `x = x * 0.5` on a pending 1e4 float64 chain (deterministic):
+main thread ~50 instructions less per op (`add_consumer` 118 → 49, no
+mutex), worker ~180 less per task besides the kernel (~900 → ~720: no
+lock at completion, no lock for an upstream error). Issue time per op
+(best of 8): 1.02 → 0.87 µs, total 2.43 → 2.41 µs.
 
 The Windows build (Wine image) scored 46 (Linux 41 in the same Docker
 run) at `7b2846f` and 48 (Linux 42) with 89 cases: it tracks the Linux
