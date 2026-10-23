@@ -357,6 +357,8 @@ python/viproc/         Python package
                        as one placement task each (vp_place)
   _indexing.py         take, put, *_along_axis, compress, extract, place,
                        select, copyto(where=) on gather/scatter/select tasks
+  _ufuncs.py           ufunc.accumulate (cumsum, cumprod, nancum*) and
+                       ufunc.outer
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -941,6 +943,24 @@ Rules:
   (the mask syncs for its count). `choose` (NumPy raises ValueError for an
   invalid entry: no async equivalent yet) and `isin` (sort-based) still
   fall back. Fuzzed in `python/tests/test_indexing_functions.py`.
+- **Accumulation and outer** (`_ufuncs.py`): `ufunc.accumulate`,
+  `cumsum`/`cumprod` (`axis=None`: the C-ordered `ravel`) and
+  `nancumsum`/`nancumprod` (NaNs replaced by a `where` first) as one task
+  (`vp_accumulate`, `make_accumulate_kernel`), called as
+  `PyUFunc_Accumulate` calls the reduction loop: per row along the axis
+  the first element copied, then one call with args `{out, in + 1,
+  out + 1}` over the rest. The accumulator dtype is NumPy's, taken once per
+  (ufunc, dtype, `dtype=`) from NumPy accumulating a 2-element probe
+  (add/multiply of bool and small ints in intp); an input of another dtype
+  is cast first (`astype`, as NumPy's iterator copies it); only ufuncs
+  whose loop for it is the uniform `(R, R) -> R` qualify. Result layout: C
+  for 1-d, else order K of the input (NumPy's iterator allocates it).
+  `out=`, empty and 0-d inputs fall back. `ufunc.outer(a, b)` is NumPy's
+  `ufunc(a.reshape(a.shape + (1,) * b.ndim), b)`. `ravel` copies wherever
+  NumPy's `PyArray_Ravel` copies (not C-contiguous in the order), also
+  where a reshape could view (a strided 1-d array): the copy's strides
+  decide later loop calls (complex64 `np.outer`). Fuzzed in
+  `python/tests/test_accumulate.py`.
 - **ndarray methods:** every method and attribute of `numpy.ndarray`
   except `ctypes` (a raw pointer would bypass the runtime). `base`: views
   made in C (`set_base` in `_viproc.c`: basic indexing, transpose, reshape

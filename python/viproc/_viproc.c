@@ -3201,6 +3201,26 @@ static PyObject* m_reduce(PyObject* self, PyObject* args) {
     return wrap_array(res);
 }
 
+static PyObject* m_accumulate(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *ufunc, *a;
+    int axis;
+    if (!PyArg_ParseTuple(args, "OO!i", &ufunc, &ArrayType, &a, &axis) || check_runtime() < 0) {
+        return NULL;
+    }
+    vp_array* res = NULL;
+    char err[ERRLEN] = "";
+    const int status =
+        vp_accumulate(g_rt, ufunc, array_of(a), axis, &res, issue_site(), err, sizeof err);
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    return wrap_array(res);
+}
+
 /* --- reductions in C --------------------------------------------------------
  * a.sum(), np.sum(a), ... (also mean, var, std, argmax, argmin) without a
  * Python frame:
@@ -4322,6 +4342,8 @@ static PyMethodDef methods[] = {
      "astype(a, code, order): async cast (order 'K', 'C' or 'F'), or None if unsupported"},
     {"setup_reductions", m_setup_reductions, METH_VARARGS,
      "setup_reductions(entries, array_function, novalue, async_ok)"},
+    {"accumulate", m_accumulate, METH_VARARGS,
+     "accumulate(ufunc, a, axis): async ufunc.accumulate without casts, or None"},
     {"reduce", m_reduce, METH_VARARGS,
      "reduce(ufunc, a, axes, keepdims, dtype, initial): async reduction, or None if unsupported"},
     {NULL, NULL, 0, NULL},

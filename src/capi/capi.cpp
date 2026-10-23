@@ -944,6 +944,37 @@ int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char
     return VP_OK;
 }
 
+int vp_accumulate(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, vp_array** result,
+                  const char* site, char* err, size_t errlen) {
+    rt->graveyard->drain();
+    const Layout& l = arr(in).layout();
+    const auto nd = static_cast<int>(l.shape.size());
+    if (nd == 0 || axis < 0 || axis >= nd || l.size() == 0) {
+        set_error(err, errlen, "accumulate: empty or 0-d input");
+        return VP_UNSUPPORTED;
+    }
+    // NumPy allocates a 1-d result C-contiguous, an n-d one through its
+    // iterator in order K
+    Layout out = nd == 1 ? Layout::contiguous(l.dtype, l.shape)
+                         : Layout::keep_order(l.dtype, l.shape, std::span(&l, 1));
+    const auto ax = static_cast<std::size_t>(axis);
+    const auto sout = static_cast<std::intptr_t>(out.strides[ax]);
+    const auto sin = static_cast<std::intptr_t>(l.strides[ax]);
+    std::string e;
+    const numpy::UfuncLoop* loop = rt->loops->get_reduction(ufunc, l.dtype, {sout, sin, sout}, e);
+    if (loop == nullptr) {
+        PyErr_Clear();
+        set_error(err, errlen, e);
+        return VP_UNSUPPORTED;
+    }
+    const ArrayPtr ins[] = {ref(in)};
+    ArrayPtr res;
+    rt->rt->issue(numpy::make_accumulate_kernel(loop, axis), ins, {}, std::span(&out, 1), site,
+                  std::span(&res, 1), l.size());
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
 int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, char* err,
               size_t errlen) {
     rt->graveyard->drain();

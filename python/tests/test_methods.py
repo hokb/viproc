@@ -237,8 +237,6 @@ def test_trace_takes_async_path(det):
 # Methods whose function form still falls back: each step of #25 that makes
 # the function asynchronous turns its entry green (strict xfail).
 FALLING_BACK = [
-    ("cumsum", lambda a: a.cumsum(), 1),
-    ("cumprod", lambda a: a.cumprod(), 1),
     ("argsort", lambda a: a.argsort(), 1),
     ("argpartition", lambda a: a.argpartition(5), 1),
     ("searchsorted", lambda a: a.searchsorted(0.9), 1),
