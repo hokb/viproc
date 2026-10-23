@@ -230,6 +230,8 @@ compare directly.
 | 10-14 | `5db8972` | views computed without ndarrays, `a[key]` in the C slot (2.80) | 100 | 64 | 1.62x | 0.87x | 85 | 49 | 78 | 55 | 53 | 71 | 96 | 62 | 72 | 48 | 79 |
 | 10-15 | `937393a` | same-VM baseline for matmul: state before it (2.10) | 100 | 72 | 1.77x | 0.90x | 87 | 58 | 87 | 58 | 59 | 93 | 117 | 71 | 74 | 57 | 80 |
 | 10-15 | `233fe84` | async `matmul` / `@` / `np.dot` with NumPy's matmul loop (2.10) | 100 | 68 | 1.73x | 0.90x | 89 | 52 | 78 | 61 | 58 | 76 | 80 | 64 | 72 | 56 | 79 |
+| 10-23 | `eb39c38` | same-VM baseline for the sync spin: `main` before it (2.10) | 100 | 78 | 2.00x | 1.10x | 94 | 65 | 99 | 73 | 67 | 76 | 93 | 68 | 86 | 70 | 80 |
+| 10-23 | this PR | main thread spins up to 50 µs at sync points before it sleeps (#45) (2.10) | 100 | 79 | 2.02x | 1.10x | 97 | 62 | 98 | 73 | 68 | 79 | 98 | 70 | 87 | 68 | 85 |
 
 View changes, same VM (`3111820` → `5db8972`): score 64.0 → 63.7,
 unchanged within noise; the programs dominated by slicing gained:
@@ -249,6 +251,19 @@ little. The score difference (72 → 68) is noise: the cases that moved
 most do not use matmul, and repeated runs of the scalar cases swing in
 both builds alike (`chain_serial` scalar: base 1.76x, 0.86x, 1.00x; new
 0.97x, 1.06x, 0.96x).
+
+Sync spin, same VM (`eb39c38` → this PR, builds `#21107aaf` /
+`#1440694e`): the suite is unchanged within noise (78 → 79). Its cases
+sync rarely, at the end of a program, while the change targets a result
+read right after a short computation. Deterministic mode (always async),
+`y = y * c` chains of 1e4 float64 synced after each program, extra time
+over NumPy per program: 12-18 µs → 1.5-3 µs for chains of 1 to 16 ops;
+a single synced op 18.8 → 6.8 µs at 1e4 (NumPy 3.0), 44 → 30 µs at 1e5
+(NumPy 31). Before, the worker's futex wake took 3-16 µs and the main
+thread's wake-up 5-8 µs per sync. Repeated filtered runs of the parallel
+cases (`chains_wide`, `gather`, `kmeans`, `softmax_rows`) show no change
+beyond noise. A first version also spun in the back-pressure wait; that
+competed with four busy workers for a core and was dropped.
 
 The Windows build (Wine image) scored 46 (Linux 41 in the same Docker
 run) at `7b2846f` and 48 (Linux 42) with 89 cases: it tracks the Linux

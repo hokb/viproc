@@ -1074,6 +1074,15 @@ Rules:
 - Worker pool: at most one idle worker spins (50 µs, `pause`) before
   sleeping; `enqueue()` wakes a sleeper only if nobody spins. This avoids a
   wake-up syscall per small task without taking cores from busy threads.
+- Sync points spin too: the main thread spins up to 50 µs (`kSyncSpin`,
+  `pause`) for the producer's completion (`Runtime::wait`, `wait_all`)
+  before it registers as a waiter and sleeps. The back-pressure wait does
+  not spin: there all workers are busy, and a spinning main thread took a
+  core from them. A sleeping main thread cost the completing worker a
+  futex wake and itself a wake-up, 10-20 µs per sync: a single synced op
+  of 1e4 elements took 18.8 µs (NumPy 3.0), with the spin 6.8 µs (#45).
+  Chains continue on the worker as designed (one hand-off per chain); the
+  round trip at the sync was the medium-size overhead.
 - Per-op allocations: one pooled Task (operands inline up to 4), one
   pooled Metadata per output, one pooled CountableArray (element memory inline up to 128 bytes, larger from the
   element pool when the task runs: no page faults once warm, or the dying

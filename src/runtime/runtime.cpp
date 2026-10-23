@@ -33,6 +33,27 @@ inline void cpu_relax() {
 #endif
 }
 
+// How long the main thread spins at a sync point before it sleeps. Sleeping
+// costs the completing thread a futex wake (a syscall) and the main thread a
+// wake-up: 10-20 us together, several times a medium-sized op (issue #45).
+// Only sync points spin, where the main thread waits for one result.
+constexpr auto kSyncSpin = std::chrono::microseconds(50);
+
+// Spins until done() holds or kSyncSpin has passed; returns done().
+template <class Done> bool spin_until(Done done) {
+    using clock = std::chrono::steady_clock;
+    const auto until = clock::now() + kSyncSpin;
+    do {
+        for (int i = 0; i < 16; ++i) {
+            if (done()) {
+                return true;
+            }
+            cpu_relax();
+        }
+    } while (clock::now() < until);
+    return done();
+}
+
 } // namespace
 
 Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_(options_.offload) {
@@ -487,7 +508,11 @@ ErrorRef Runtime::wait(Array& a) {
         if (p.mark_blocked()) {
             policy_.on_blocked(p.blame(), seq_ - p.blame_seq());
         }
-        p.wait_completed();
+        // Spin first: a waiter that registers costs the completing thread a
+        // notify and itself a wake-up.
+        if (!spin_until([&] { return p.completed(); })) {
+            p.wait_completed();
+        }
     }
     g.ready();
     return g.last_error_;
@@ -504,7 +529,13 @@ ErrorRef Runtime::prepare_host_write(Array& a) {
     return e;
 }
 
-void Runtime::wait_all() { wait_active_below(1); }
+void Runtime::wait_all() {
+    // A sync point: spin first, as wait(). Back-pressure does not spin: it
+    // waits for many tasks while the workers use every core.
+    if (!spin_until([&] { return active_.load(std::memory_order_acquire) == 0; })) {
+        wait_active_below(1);
+    }
+}
 
 std::vector<std::shared_ptr<Task>> Runtime::run(const std::shared_ptr<Task>& task) {
     std::vector<std::shared_ptr<Task>> runnable = task->execute(errors_.get());
