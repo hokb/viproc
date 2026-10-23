@@ -1009,7 +1009,10 @@ Rules:
   incl. deferring to `__array_ufunc__ = None`), dtype resolution via
   NumPy's `ufunc.resolve_dtypes` cached per (ufunc, input kinds; Python
   scalars as weak NEP 50 kinds), scalar conversion (`vp_array_from_scalar`,
-  NumPy's conversion rules), broadcasting and the issue site. Whatever it
+  NumPy's conversion rules; cached per (object, dtype) in a direct-mapped
+  table of 64 ready 0-d arrays, `scalar_operand`: a loop's constants are
+  converted once, not ~2,700 instructions per op), broadcasting and the
+  issue site. Whatever it
   does not handle goes to the Python fallback, so NumPy semantics (errors
   included) stay NumPy's.
 - The issue site is the first stack frame outside viproc and NumPy. It is
@@ -1049,6 +1052,10 @@ Rules:
   and dtype resolution (~2,500); what remains on top is the task protocol
   itself (task object, operand capture, async_reads, slot accounting,
   completion under the task mutex) and the result's release.
+  Task path (`x = x * 0.5`, pending `x` of 1e4, #47): main thread ~5,100
+  instructions per op (was ~7,750: the scalar's conversion ~2,700, heap
+  vectors for producers/consumers), ~0.74 µs issue (was 1.21); worker
+  ~1,100 besides the kernel (was ~1,750).
 - `std::atomic::notify_all` is not free without waiters: libstdc++ bumps a
   process-wide counter (a shared cache line) for atomics that are not
   4-byte futex words. Task completion and `run()` therefore notify only
@@ -1123,8 +1130,9 @@ Rules:
   element pool when the task runs: no page faults once warm, or the dying
   input's block), one pooled
   `ArrayBlock` (Array and its AliasGroup), the Python object. Shapes/strides
-  inline (`SmallVector`), one shared kernel object per resolved loop,
-  interned issue sites.
+  inline (`SmallVector`), producers, consumers and unblocked tasks inline
+  (`TaskList`, two), one shared kernel object per resolved loop, interned
+  issue sites.
 - `Array`/`AliasGroup` use `Ref<T>` (`src/runtime/ref.hpp`): plain int counts,
   legal because only the main thread creates, copies and releases them. An
   `ArrayBlock` holds a base array and its group; each object is destroyed

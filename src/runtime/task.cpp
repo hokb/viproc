@@ -59,7 +59,7 @@ bool Task::add_consumer(const std::shared_ptr<Task>& consumer) {
     if (state_.load(std::memory_order_relaxed) == TaskState::Completed) {
         return false;
     }
-    consumers_.push_back(consumer);
+    consumers_.emplace_back(consumer);
     return true;
 }
 
@@ -288,7 +288,7 @@ std::size_t ErrorTable::size() const {
     return records_.size();
 }
 
-std::vector<std::shared_ptr<Task>> Task::execute(ErrorTable* errors) {
+TaskList Task::execute(ErrorTable* errors) {
     // No lock: every write of upstream_error_ happens before the release
     // decrement of pending_ by its writer, and this thread observed the final
     // decrement (or got the task from the thread that did).
@@ -332,19 +332,19 @@ std::vector<std::shared_ptr<Task>> Task::execute(ErrorTable* errors) {
     operands_.clear();
     kernel_.reset();
 
-    std::vector<std::shared_ptr<Task>> consumers;
+    TaskList consumers;
     bool notify;
     {
         std::lock_guard lock(mutex_);
         state_.store(TaskState::Completed, std::memory_order_release);
-        consumers.swap(consumers_);
+        consumers = std::move(consumers_);
         notify = waiters_;
     }
     if (notify) {
         state_.notify_all();
     }
 
-    std::vector<std::shared_ptr<Task>> runnable;
+    TaskList runnable;
     for (auto& c : consumers) {
         if (c->input_done(this)) {
             runnable.push_back(std::move(c));

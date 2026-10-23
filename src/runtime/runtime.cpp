@@ -195,8 +195,8 @@ void Runtime::acquire_slot() {
     active_.fetch_add(1, std::memory_order_acq_rel);
 }
 
-void Runtime::launch(const std::shared_ptr<Task>& task,
-                     const std::vector<std::shared_ptr<Task>>& producers, std::int64_t elements) {
+void Runtime::launch(const std::shared_ptr<Task>& task, const TaskList& producers,
+                     std::int64_t elements) {
     ++seq_;
     task->set_id(seq_);
     // While pending, the task's work is attributed to the decision that
@@ -222,10 +222,10 @@ void Runtime::issue_group_copy(AliasGroup& g) {
     std::shared_ptr<CountableArray> old = g.current_;
     auto fresh = make_pooled<CountableArray>(old->nbytes(),
                                              CountableArray::deferred); // the copy task allocates
-    std::vector<std::shared_ptr<Task>> producers;
+    TaskList producers;
     ErrorRef failed;
     if (!g.ready()) {
-        producers.push_back(g.last_writer_);
+        producers.emplace_back(g.last_writer_);
     } else {
         failed = g.last_error_;
     }
@@ -278,7 +278,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     // 1. Snapshot everything this op reads (inputs, then in/outs): buffer,
     //    layout and pending producer, before any copy-on-write switch. Reads
     //    always see the data as it was before this op.
-    std::vector<std::shared_ptr<Task>> producers;
+    TaskList producers;
     ErrorRef failed_input;
     // An error on an input or in/out passes to this op: data computed from a
     // failed op, or written into its result, is failed too (also when the op
@@ -286,7 +286,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     auto snapshot = [&](Array& a) {
         AliasGroup& g = *a.group_;
         if (!g.ready()) {
-            producers.push_back(g.last_writer_);
+            producers.emplace_back(g.last_writer_);
         } else if (g.last_error_ && !failed_input) {
             failed_input = g.last_error_;
         }
@@ -367,7 +367,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         // A group copy issued in step 2 must finish before this op writes.
         if (g.last_writer_ && g.last_writer_ != task &&
             std::find(producers.begin(), producers.end(), g.last_writer_) == producers.end()) {
-            producers.push_back(g.last_writer_);
+            producers.emplace_back(g.last_writer_);
         }
         g.last_writer_ = task;
         in_ops.push_back({g.current_, ap->meta_});
@@ -537,8 +537,8 @@ void Runtime::wait_all() {
     }
 }
 
-std::vector<std::shared_ptr<Task>> Runtime::run(const std::shared_ptr<Task>& task) {
-    std::vector<std::shared_ptr<Task>> runnable = task->execute(errors_.get());
+TaskList Runtime::run(const std::shared_ptr<Task>& task) {
+    TaskList runnable = task->execute(errors_.get());
     const std::size_t left = active_.fetch_sub(1, std::memory_order_seq_cst) - 1;
     if (active_waiters_.load(std::memory_order_seq_cst) > 0 &&
         left < wake_below_.load(std::memory_order_seq_cst)) {
@@ -616,10 +616,10 @@ void Runtime::worker_loop() {
         }
         // Trampoline: run() returns instead of calling consumers, so the stack
         // is unwound before the continuation starts.
-        std::vector<std::shared_ptr<Task>> runnable = run(next);
+        TaskList runnable = run(next);
         next.reset();
         if (!runnable.empty()) {
-            next = std::move(runnable.front());
+            next = std::move(runnable[0]);
             for (std::size_t i = 1; i < runnable.size(); ++i) {
                 enqueue(std::move(runnable[i]));
             }
