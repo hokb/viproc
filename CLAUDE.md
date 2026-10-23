@@ -254,6 +254,17 @@ to NumPy; G3, **never slower than NumPy** (hard: never below 0.95x for any
 expression; soft: at most 3% slower where there is no sufficient
 parallel potential).
 
+**Bit-identical results are mandatory (currently).** Every change must keep
+results bit-identical to plain NumPy of the installed version (values,
+dtypes, shapes, strides, warnings, errors), as the drop-in rule demands
+(see "Conventions"). Never trade bit-identity for speed: no own kernels, no
+reordered sums, no fusion or splitting of an op that changes rounding. The
+small per-op overhead on small data that this costs is accepted. A
+configurable mode that allows deviating but correct results (further
+(auto-)parallelization, optimizations, auto-offloading, partial
+re-implementation of NumPy internals) is planned (goals.md, G2), not
+started; it would be opt-in, and the bit-identical mode stays available.
+
 ### Phase 1 (current): MVP on CPUs
 
 Goal: autonomous, asynchronous execution of array instructions on
