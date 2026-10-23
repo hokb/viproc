@@ -87,6 +87,13 @@ bool dtype_of(int type_num, DType& out) {
     return false;
 }
 
+// NumPy's descriptor `type_num` is viproc's `dtype` (NPY_INT and NPY_LONG
+// are both int32 on Windows: NumPy may resolve either, e.g. frexp's `d->di`).
+bool same_dtype(int type_num, DType dtype) {
+    DType d{};
+    return dtype_of(type_num, d) && d == dtype;
+}
+
 } // namespace
 
 std::string fetch_python_error() {
@@ -151,7 +158,7 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve(PyObject* ufunc, std::span<const D
     for (std::size_t i = 0; i < dtypes.size(); ++i) {
         auto* d =
             reinterpret_cast<PyArray_Descr*>(PyTuple_GetItem(resolved, static_cast<Py_ssize_t>(i)));
-        exact = exact && d->type_num == type_num(dtypes[i]);
+        exact = exact && same_dtype(d->type_num, dtypes[i]);
     }
     Py_DECREF(requested);
     if (!exact) {
@@ -219,7 +226,7 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve_reduction(PyObject* ufunc, DType d
     bool exact = true;
     for (Py_ssize_t i = 0; i < 3; ++i) {
         auto* d = reinterpret_cast<PyArray_Descr*>(PyTuple_GetItem(resolved, i));
-        exact = exact && d->type_num == type_num(dtype);
+        exact = exact && same_dtype(d->type_num, dtype);
     }
     if (!exact) {
         Py_DECREF(res);
@@ -610,7 +617,9 @@ class IterElementwiseKernel : public Kernel {
         for (std::size_t i = 0; i < nin; ++i) {
             base[i] = reinterpret_cast<char*>(inputs[i].first());
         }
-        base[nin] = reinterpret_cast<char*>(outputs[0].first());
+        for (std::size_t j = 0; j < static_cast<std::size_t>(loop_->nout()); ++j) {
+            base[nin + j] = reinterpret_cast<char*>(outputs[j].first());
+        }
         char* errmsg = nullptr;
         clean_ = false;
         // Points the iterator at the buffers (no GIL: errmsg variant); with
@@ -883,11 +892,12 @@ long LoopCache::buffersize() {
 std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
                                                     std::span<const DType> dtypes,
                                                     std::span<const Layout> inputs,
-                                                    const Layout& out, bool out_given,
+                                                    std::span<const Layout> outs, bool out_given,
                                                     DeferRelease defer, std::string& error) {
     const std::size_t nin = inputs.size();
-    const std::size_t nop = nin + 1;
-    if (nop > kMaxOps || static_cast<int>(nin) != loop->nin() || loop->nout() != 1) {
+    const std::size_t nop = nin + outs.size();
+    if (nop > kMaxOps || static_cast<int>(nin) != loop->nin() ||
+        static_cast<int>(outs.size()) != loop->nout()) {
         error = "unsupported number of operands";
         return nullptr;
     }
@@ -898,7 +908,7 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
     put(out_given ? 1 : 0);
     put(bufsize);
     for (std::size_t i = 0; i < nop; ++i) {
-        const Layout& l = i < nin ? inputs[i] : out;
+        const Layout& l = i < nin ? inputs[i] : outs[i - nin];
         put(static_cast<std::int64_t>(l.shape.size()));
         put(static_cast<std::int64_t>(l.dtype));
         for (std::size_t d = 0; d < l.shape.size(); ++d) {
@@ -923,8 +933,8 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
         npy_uint32 op_flags[kMaxOps];
         bool ok = true;
         for (std::size_t i = 0; i < nop && ok; ++i) {
-            const Layout& l = i < nin ? inputs[i] : out;
-            op[i] = template_array(l, dummy, i == nin);
+            const Layout& l = i < nin ? inputs[i] : outs[i - nin];
+            op[i] = template_array(l, dummy, i >= nin);
             ok = op[i] != nullptr;
             // The loop's dtypes; operands of another dtype are cast in the
             // iterator's buffers, as in NumPy.

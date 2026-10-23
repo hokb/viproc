@@ -386,6 +386,9 @@ std::shared_ptr<Kernel> elementwise_kernel(vp_runtime* rt, const vp_loop& loop,
         ptrs[i] = &ins[i]->layout();
         cast = cast || ptrs[i]->dtype != loop.dtypes[i];
     }
+    // an out= array of another dtype: NumPy casts into it in its iterator's
+    // buffers (check_for_trivial_loop: no trivial loop)
+    cast = cast || out.dtype != loop.dtypes[ins.size()];
     std::intptr_t strides[4];
     if (out.size() == 0 ||
         (!cast && numpy::single_call(std::span(ptrs, ins.size()), out, strides))) {
@@ -398,7 +401,7 @@ std::shared_ptr<Kernel> elementwise_kernel(vp_runtime* rt, const vp_loop& loop,
     const std::span<const Layout> ls(layouts, ins.size());
     std::string e;
     std::shared_ptr<Kernel> k = rt->loops->iter_elementwise(
-        loop.loop, loop.dtypes, ls, out, out_given, defer_release(rt->graveyard), e);
+        loop.loop, loop.dtypes, ls, std::span(&out, 1), out_given, defer_release(rt->graveyard), e);
     if (!k) {
         PyErr_Clear();
         set_error(err, errlen, e);
@@ -469,8 +472,8 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
     const std::span<const ArrayPtr> in_span(ins, static_cast<std::size_t>(nin));
     if (out != nullptr) {
         const Layout& ol = arr(out).layout();
-        if (ol.shape != shape || ol.dtype != out_dtype) {
-            set_error(err, errlen, "out= array has the wrong shape or dtype");
+        if (ol.shape != shape) {
+            set_error(err, errlen, "out= array has the wrong shape");
             return VP_INVALID;
         }
         const ArrayPtr o = ref(out);
@@ -524,6 +527,69 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
     ArrayPtr res;
     rt->rt->issue(k, in_span, {}, std::span(&l, 1), site, std::span(&res, 1));
     *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
+int vp_ufunc_multi(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, int nout,
+                   const vp_dtype* dtypes, int out_ndim, const int64_t* out_shape,
+                   vp_array** results, const char* site, char* err, size_t errlen) {
+    rt->graveyard->drain();
+    constexpr int kMax = 8;
+    if (nin < 1 || nout < 1 || nin + nout > kMax) {
+        set_error(err, errlen, "unsupported number of operands");
+        return VP_UNSUPPORTED;
+    }
+    std::vector<DType> d;
+    for (int i = 0; i < nin + nout; ++i) {
+        d.push_back(to_dtype(dtypes[i]));
+    }
+    std::string e;
+    const numpy::UfuncLoop* loop = rt->loops->get(ufunc, d, e);
+    if (loop == nullptr || loop->nin() != nin || loop->nout() != nout) {
+        PyErr_Clear();
+        set_error(err, errlen, loop == nullptr ? e : "wrong number of operands");
+        return VP_UNSUPPORTED;
+    }
+    ArrayPtr ins[kMax];
+    for (int i = 0; i < nin; ++i) {
+        ins[i] = ref(inputs[i]);
+    }
+    // check_for_trivial_loop runs for every ufunc: small inputs of another
+    // dtype are cast into copies first here too
+    const vp_loop handle{loop, d};
+    if (!cast_small_inputs(rt, handle, std::span(ins, static_cast<std::size_t>(nin)), site, err,
+                           errlen)) {
+        return VP_UNSUPPORTED;
+    }
+    Layout in_layouts[kMax];
+    bool all_c = true;
+    for (int i = 0; i < nin; ++i) {
+        in_layouts[i] = ins[i]->layout();
+        all_c = all_c && (in_layouts[i].c_contiguous() || in_layouts[i].size() <= 1);
+    }
+    const auto ni = static_cast<std::size_t>(nin);
+    const auto no = static_cast<std::size_t>(nout);
+    // NumPy runs several outputs on its iterator (no trivial loop), which
+    // allocates them in order K over the inputs (C if all inputs are)
+    Layout outs[kMax];
+    const Shape shape(out_shape, out_shape + out_ndim);
+    for (std::size_t j = 0; j < no; ++j) {
+        outs[j] = all_c ? Layout::contiguous(d[ni + j], shape)
+                        : Layout::keep_order(d[ni + j], shape, std::span(in_layouts, ni));
+    }
+    std::shared_ptr<Kernel> k =
+        rt->loops->iter_elementwise(loop, d, std::span(in_layouts, ni), std::span(outs, no), false,
+                                    defer_release(rt->graveyard), e);
+    if (!k) {
+        PyErr_Clear();
+        set_error(err, errlen, e);
+        return VP_UNSUPPORTED;
+    }
+    ArrayPtr res[kMax];
+    rt->rt->issue(k, std::span(ins, ni), {}, std::span(outs, no), site, std::span(res, no));
+    for (std::size_t j = 0; j < no; ++j) {
+        results[j] = hand_out(std::move(res[j]));
+    }
     return VP_OK;
 }
 

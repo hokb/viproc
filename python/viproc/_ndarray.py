@@ -1600,9 +1600,9 @@ _PRODUCTS = {np.dot: _dot}
 
 
 def _fallback_ufunc(ufunc, method, inputs, kwargs):
-    """ufunc.reduce, accumulate, outer and matmul asynchronously where
-    possible; anything else syncs and runs eagerly in NumPy (in place for
-    out= and ufunc.at)."""
+    """ufunc calls the C fast path leaves out (_ufuncs.call), reduce,
+    accumulate, outer and matmul asynchronously where possible; anything
+    else syncs and runs eagerly in NumPy (in place for out= and ufunc.at)."""
     if method == "__call__" and ufunc is np.matmul and not kwargs:
         r = _matmul(*inputs) if len(inputs) == 2 else None
         if r is not None:
@@ -1614,8 +1614,8 @@ def _fallback_ufunc(ufunc, method, inputs, kwargs):
             r = None
         if r is not None:
             return r
-    if method in ("accumulate", "outer"):
-        r = getattr(_ufuncs, method)(ufunc, inputs, kwargs)
+    if method in ("__call__", "accumulate", "outer"):
+        r = getattr(_ufuncs, "call" if method == "__call__" else method)(ufunc, inputs, kwargs)
         if r is not _NOPE:
             return r
     return _host_call(getattr(ufunc, method), inputs, kwargs)

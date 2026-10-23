@@ -218,14 +218,28 @@ int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, 
              int out_ndim, const int64_t* out_shape, vp_array* out, vp_array** result,
              const char* site, char* err, size_t errlen);
 
+/* Issues `ufunc(inputs...)` for a ufunc with several outputs (divmod, modf,
+ * frexp) with NumPy's loop for exactly `dtypes` (nin inputs, then nout
+ * outputs). As NumPy runs such ufuncs (never its trivial loop), the loop is
+ * driven by NumPy's iterator, which casts inputs of another dtype in its
+ * buffers, and the results get the layout that iterator allocates (order
+ * K). Inputs broadcast to out_shape; results[0..nout) receive the new
+ * arrays. Returns VP_UNSUPPORTED (reason in `err`) if no matching loop
+ * exists or NumPy cannot run it so; the caller then falls back. */
+int vp_ufunc_multi(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, int nout,
+                   const vp_dtype* dtypes, int out_ndim, const int64_t* out_shape,
+                   vp_array** results, const char* site, char* err, size_t errlen);
+
 /* Resolves NumPy's loop for `ufunc` with exactly `dtypes` (nin inputs, then
  * the output) once; the handle stays valid until the runtime is destroyed.
  * vp_ufunc_issue() then issues ops without any lookup. Returns
  * VP_UNSUPPORTED (and a reason in `err`) like vp_ufunc(). */
 int vp_ufunc_loop(vp_runtime* rt, PyObject* ufunc, int nin, const vp_dtype* dtypes,
                   const vp_loop** loop, char* err, size_t errlen);
-/* Like vp_ufunc(), with a loop from vp_ufunc_loop(). The inputs must have the
- * loop's input dtypes. */
+/* Like vp_ufunc(), with a loop from vp_ufunc_loop(). Inputs of another dtype
+ * than the loop's are cast as NumPy casts them (short ones into copies
+ * first, others in the iterator's buffers); an `out` of another dtype gets
+ * the results cast into it, as NumPy's iterator does. */
 int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs, int out_ndim,
                    const int64_t* out_shape, vp_array* out, vp_array** result, const char* site,
                    char* err, size_t errlen);
