@@ -644,8 +644,8 @@ bool index_spec(const Layout& view, int nidx, vp_array* const* idx, const int* i
 extern "C" {
 
 int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, const int* idx_axes,
-              int nres, const int* result_axes, const int64_t* result_strides, vp_array** result,
-              const char* site, char* err, size_t errlen) {
+              int nres, const int* result_axes, const int64_t* result_strides, int mode,
+              vp_array** result, const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout& v = arr(src).layout();
     IndexSpec spec;
@@ -653,6 +653,11 @@ int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, con
     if (!index_spec(v, nidx, idx, idx_axes, nres, result_axes, spec, shape, err, errlen)) {
         return VP_INVALID;
     }
+    if (mode < VP_INDEX_RAISE || mode > VP_INDEX_CLIP) {
+        set_error(err, errlen, "indexing: unknown index mode");
+        return VP_INVALID;
+    }
+    spec.mode = static_cast<IndexMode>(mode);
     Layout out = Layout::contiguous(v.dtype, std::move(shape));
     if (result_strides != nullptr) {
         out.strides.assign(result_strides, result_strides + nres);
@@ -673,8 +678,8 @@ int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, con
 }
 
 int vp_scatter(vp_runtime* rt, vp_array* dst, int nidx, vp_array* const* idx, const int* idx_axes,
-               int nres, const int* result_axes, vp_array* values, const char* site, char* err,
-               size_t errlen) {
+               int nres, const int* result_axes, vp_array* values, int mode, const char* site,
+               char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout& v = arr(dst).layout();
     IndexSpec spec;
@@ -682,6 +687,11 @@ int vp_scatter(vp_runtime* rt, vp_array* dst, int nidx, vp_array* const* idx, co
     if (!index_spec(v, nidx, idx, idx_axes, nres, result_axes, spec, shape, err, errlen)) {
         return VP_INVALID;
     }
+    if (mode < VP_INDEX_RAISE || mode > VP_INDEX_CLIP) {
+        set_error(err, errlen, "indexing: unknown index mode");
+        return VP_INVALID;
+    }
+    spec.mode = static_cast<IndexMode>(mode);
     const Layout& vl = arr(values).layout();
     Shape b;
     if (vl.dtype != v.dtype || !broadcast_shapes(shape, vl.shape, b) || b != shape) {

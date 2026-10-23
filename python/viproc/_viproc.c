@@ -3874,7 +3874,9 @@ static int read_index_args(PyObject* idx_o, PyObject* axes_o, PyObject* res_o, v
 static PyObject* m_gather(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *a, *idx_o, *axes_o, *res_o, *strides_o;
-    if (!PyArg_ParseTuple(args, "O!OOOO", &ArrayType, &a, &idx_o, &axes_o, &res_o, &strides_o) ||
+    int mode = VP_INDEX_RAISE;
+    if (!PyArg_ParseTuple(args, "O!OOOO|i", &ArrayType, &a, &idx_o, &axes_o, &res_o, &strides_o,
+                          &mode) ||
         check_runtime() < 0) {
         return NULL;
     }
@@ -3895,7 +3897,7 @@ static PyObject* m_gather(PyObject* self, PyObject* args) {
     char err[ERRLEN] = "";
     const int status =
         vp_gather(g_rt, array_of(a), nidx, idx, axes, nres, res,
-                  strides_o == Py_None ? NULL : strides, &r, issue_site(), err, sizeof err);
+                  strides_o == Py_None ? NULL : strides, mode, &r, issue_site(), err, sizeof err);
     if (raise_status(status, err) < 0) {
         return NULL;
     }
@@ -3905,8 +3907,9 @@ static PyObject* m_gather(PyObject* self, PyObject* args) {
 static PyObject* m_scatter(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *a, *idx_o, *axes_o, *res_o, *values;
-    if (!PyArg_ParseTuple(args, "O!OOOO!", &ArrayType, &a, &idx_o, &axes_o, &res_o, &ArrayType,
-                          &values) ||
+    int mode = VP_INDEX_RAISE;
+    if (!PyArg_ParseTuple(args, "O!OOOO!|i", &ArrayType, &a, &idx_o, &axes_o, &res_o, &ArrayType,
+                          &values, &mode) ||
         check_runtime() < 0) {
         return NULL;
     }
@@ -3917,7 +3920,7 @@ static PyObject* m_scatter(PyObject* self, PyObject* args) {
     }
     char err[ERRLEN] = "";
     const int status = vp_scatter(g_rt, array_of(a), nidx, idx, axes, nres, res, array_of(values),
-                                  issue_site(), err, sizeof err);
+                                  mode, issue_site(), err, sizeof err);
     if (raise_status(status, err) < 0) {
         return NULL;
     }
@@ -4250,7 +4253,7 @@ static PyMethodDef methods[] = {
     {"broadcast_to", m_broadcast_to, METH_VARARGS,
      "broadcast_to(a, shape): read-only broadcast view, None if not broadcastable"},
     {"gather", m_gather, METH_VARARGS,
-     "gather(a, idx, idx_axes, result_axes, result_strides): a[idx...] (vp_gather)"},
+     "gather(a, idx, idx_axes, result_axes, result_strides[, mode]): a[idx...] (vp_gather)"},
     {"scatter", m_scatter, METH_VARARGS,
      "scatter(a, idx, idx_axes, result_axes, values): a[idx...] = values (vp_scatter)"},
     {"where", (PyCFunction)(void (*)(void))m_where, METH_FASTCALL | METH_KEYWORDS,

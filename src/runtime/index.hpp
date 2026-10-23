@@ -16,10 +16,17 @@ namespace viproc {
 // indexing result comes from either a non-indexed axis of the view
 // (result_axes[k] >= 0, the view's axis) or a dimension of `bshape`
 // (result_axes[k] = -1 - dimension).
+// What an index outside [-n, n) of an axis of extent n does (NumPy's take /
+// put modes): fail the task with an IndexError (Raise; -n..-1 count from the
+// end), wrap around (Wrap: i mod n), or go to the nearest end (Clip: < 0 -> 0,
+// >= n -> n - 1; also -n..-1 -> 0).
+enum class IndexMode { Raise, Wrap, Clip };
+
 struct IndexSpec {
     std::vector<int> index_axes; // view axis of each index array
     Shape bshape;
     std::vector<int> result_axes;
+    IndexMode mode = IndexMode::Raise;
 };
 
 // Gather. Operands: inputs = {src view, index arrays...}, outputs = {result}.

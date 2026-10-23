@@ -75,6 +75,23 @@ std::string for_each_indexed(const IndexSpec& spec, const Operand& view,
     const std::int64_t vs_inner = nr != 0 ? vstride[nr - 1] : 0;
     const std::int64_t os_inner = nr != 0 ? other_strides[nr - 1] : 0;
     const bool one_int64 = nidx == 1 && index[0].layout().dtype == DType::Int64;
+    // An index outside [0, n) as NumPy's mode resolves it; -1 if it is out of
+    // bounds (also for an empty axis, where no index is valid).
+    const IndexMode mode = spec.mode;
+    auto resolve = [mode](std::int64_t i, std::int64_t n) -> std::int64_t {
+        if (n == 0) {
+            return -1;
+        }
+        switch (mode) {
+        case IndexMode::Raise:
+            return i >= -n && i < 0 ? i + n : -1;
+        case IndexMode::Wrap:
+            i %= n;
+            return i < 0 ? i + n : i;
+        default:
+            return i < 0 ? 0 : n - 1;
+        }
+    };
     auto bad = [&](std::size_t j, std::int64_t i) {
         return "IndexError: index " + std::to_string(i) + " is out of bounds for axis " +
                std::to_string(spec.index_axes[j]) + " with size " + std::to_string(extent[j]);
@@ -90,22 +107,29 @@ std::string for_each_indexed(const IndexSpec& spec, const Operand& view,
             for (std::int64_t t = 0; t < n_inner; ++t) {
                 std::int64_t i;
                 std::memcpy(&i, p + t * inner_is[0], sizeof i);
-                if (i < -n || i >= n) {
-                    return bad(0, i);
+                if (i < 0 || i >= n) {
+                    const std::int64_t r = resolve(i, n);
+                    if (r < 0) {
+                        return bad(0, i);
+                    }
+                    i = r;
                 }
-                fn(vp + t * vs_inner + (i < 0 ? i + n : i) * step, other + t * os_inner);
+                fn(vp + t * vs_inner + i * step, other + t * os_inner);
             }
         } else {
             for (std::int64_t t = 0; t < n_inner; ++t) {
                 char* e = vp + t * vs_inner;
                 for (std::size_t j = 0; j < nidx; ++j) {
-                    const std::int64_t i =
-                        read_index(ip[j] + t * inner_is[j], index[j].layout().dtype);
+                    std::int64_t i = read_index(ip[j] + t * inner_is[j], index[j].layout().dtype);
                     const std::int64_t n = extent[j];
-                    if (i < -n || i >= n) {
-                        return bad(j, i);
+                    if (i < 0 || i >= n) {
+                        const std::int64_t r = resolve(i, n);
+                        if (r < 0) {
+                            return bad(j, i);
+                        }
+                        i = r;
                     }
-                    e += (i < 0 ? i + n : i) * vstep[j];
+                    e += i * vstep[j];
                 }
                 fn(e, other + t * os_inner);
             }
@@ -136,20 +160,24 @@ std::string for_each_indexed(const IndexSpec& spec, const Operand& view,
     }
 }
 
-// Element copy of a fixed size (the compiler turns it into one move).
-template <std::size_t N> void copy_element(char* dst, const char* src) { std::memcpy(dst, src, N); }
+// Element copy of a fixed size (the compiler turns it into one move). A type
+// of its own per size, not a function pointer: the copy is inlined into the
+// element loop instead of being an indirect call per element.
+template <std::size_t N> struct CopyElement {
+    void operator()(char* dst, const char* src) const { std::memcpy(dst, src, N); }
+};
 
 // Runs `body(copy)` with the element copy for `item` bytes.
 template <class Body> std::string with_copy(std::size_t item, Body&& body) {
     switch (item) {
     case 1:
-        return body(copy_element<1>);
+        return body(CopyElement<1>{});
     case 4:
-        return body(copy_element<4>);
+        return body(CopyElement<4>{});
     case 8:
-        return body(copy_element<8>);
+        return body(CopyElement<8>{});
     default:
-        return body(copy_element<16>);
+        return body(CopyElement<16>{});
     }
 }
 

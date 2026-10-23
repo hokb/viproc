@@ -248,16 +248,20 @@ int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array
  * (result_axes[k] = -1 - d); NumPy's placement rules are the caller's.
  * Out-of-bounds indices fail the task: the next sync point raises
  * AsyncIndexError (an IndexError). */
+/* `mode` decides what an index outside [-n, n) does, as NumPy's take/put
+ * modes: VP_INDEX_RAISE (the task fails), VP_INDEX_WRAP (i mod n),
+ * VP_INDEX_CLIP (to 0 or n - 1; clip maps negative indices to 0 too). */
+enum { VP_INDEX_RAISE = 0, VP_INDEX_WRAP = 1, VP_INDEX_CLIP = 2 };
 /* r = src[idx...]: a new array with `result_strides` (NumPy's layout for the
  * indexing result; NULL for C order). */
 int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, const int* idx_axes,
-              int nres, const int* result_axes, const int64_t* result_strides, vp_array** result,
-              const char* site, char* err, size_t errlen);
+              int nres, const int* result_axes, const int64_t* result_strides, int mode,
+              vp_array** result, const char* site, char* err, size_t errlen);
 /* dst[idx...] = values (dst's dtype, broadcastable to the indexing result's
  * shape); the last of repeated indices wins, as in NumPy. */
 int vp_scatter(vp_runtime* rt, vp_array* dst, int nidx, vp_array* const* idx, const int* idx_axes,
-               int nres, const int* result_axes, vp_array* values, const char* site, char* err,
-               size_t errlen);
+               int nres, const int* result_axes, vp_array* values, int mode, const char* site,
+               char* err, size_t errlen);
 /* dst[mask] = value: `value` 0-d with dst's dtype, `mask` bool broadcastable
  * to dst. */
 int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* value, const char* site,

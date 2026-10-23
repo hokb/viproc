@@ -276,8 +276,9 @@ def _average(a, axis=None, weights=None, returned=False, *, keepdims=_NV):
         wc = wgt if wgt.dtype == result_dtype else wgt.astype(result_dtype)
         avg = np.multiply(ac, wc).sum(axis, **keepdims_kw) / scl
     if returned:
-        if np.shape(scl) != np.shape(avg):
-            scl = np.broadcast_to(scl, np.shape(avg)).copy()
+        shape = getattr(avg, "shape", ())  # np.shape of a viproc array would export it
+        if getattr(scl, "shape", ()) != shape:
+            scl = np.broadcast_to(scl, shape).copy()
         return avg, scl
     return avg
 
