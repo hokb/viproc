@@ -34,6 +34,16 @@ class Task;
 // the common one or two (no heap allocation per task), else on the heap.
 using TaskList = InlineVector<std::shared_ptr<Task>, 2>;
 
+// A task's registration with one of its producers: an entry in the producer's
+// lock-free consumer list (Task::add_consumer). The node lives in the consumer
+// task (inline, one per producer it waits on) and holds a reference to it
+// while it is in the list; the producer takes that reference over when it
+// completes.
+struct ConsumerNode {
+    ConsumerNode* next = nullptr;
+    std::shared_ptr<Task> task;
+};
+
 // The layout of one array or view (docs/design/array-data-model.md, A1, A2): its
 // size descriptor (SD: dtype, shape, byte strides, offset) and the task of the
 // op that configures it while the SD is incomplete. One per array and per
@@ -293,11 +303,14 @@ class Task {
     Operands& operands_for_issue() { return operands_; }
     void set_ninputs(std::size_t ninputs) { ninputs_ = ninputs; }
     void advance(TaskState next);
-    // Announces one more pending producer before registering on it.
-    void add_pending_input() { pending_.fetch_add(1, std::memory_order_relaxed); }
-    // Registers `consumer` for this task's completion. Returns false if this
-    // task has already completed; the caller then accounts for it itself.
-    bool add_consumer(const std::shared_ptr<Task>& consumer);
+    // Announces `n` pending producers before registering on them, and makes
+    // room for their consumer nodes (inline up to kInlineNodes).
+    void add_pending_inputs(std::size_t n);
+    // Registers `consumer` for this task's completion, with the consumer's
+    // node `i` (one per producer, i < the n of add_pending_inputs). Returns
+    // false if this task has already completed; the caller then accounts for
+    // it itself. Lock-free; the main thread only.
+    bool add_consumer(const std::shared_ptr<Task>& consumer, std::size_t i);
     // Drops the issue guard (see pending_). Returns true if the task is
     // runnable now, i.e. all producers it waits on have completed.
     bool release_issue_guard() { return input_done(nullptr); }
@@ -305,7 +318,7 @@ class Task {
     bool producer_already_done(const Task& producer) { return input_done(&producer); }
     // Marks an input as failed (its producer completed with an error before
     // this task was issued). The task then skips its kernel and fails too.
-    void add_upstream_error(const ErrorRef& error);
+    void add_upstream_error(const ErrorRef& error) { set_upstream_error(error); }
     // Copy-on-write inside this task: before its kernel runs, `to` (one of
     // its deferred output buffers) gets the old data of `from`, whose read
     // the caller counted. Decided as late as possible, right before the
@@ -336,6 +349,11 @@ class Task {
     // point that sees the failed task finds its record too.
     TaskList execute(ErrorTable* errors = nullptr);
 
+    ~Task();
+
+    // Consumer nodes inline in the task; more producers take a heap array.
+    static constexpr std::size_t kInlineNodes = 3;
+
   private:
     // Gives every output without memory its block: a dying input's (same
     // layout, in_place_ok kernels) or one from the element pool.
@@ -346,6 +364,16 @@ class Task {
     // Called once per producer when it completes (and once for the issue
     // guard with nullptr). Returns true when the last one arrives.
     bool input_done(const Task* producer);
+    // The first upstream error wins (any thread, before its pending_
+    // decrement; execute() reads it after the last one).
+    void set_upstream_error(const ErrorRef& error) {
+        if (!upstream_claimed_.exchange(true, std::memory_order_relaxed)) {
+            upstream_error_ = error;
+        }
+    }
+    ConsumerNode& node(std::size_t i) {
+        return i < kInlineNodes ? nodes_[i] : more_nodes_[i - kInlineNodes];
+    }
 
     std::atomic<TaskState> state_{TaskState::Created};
     // Number of producers still to complete, plus one guard held by the main
@@ -362,13 +390,21 @@ class Task {
     };
     std::vector<Copy> copies_; // copy-on-write, empty for most tasks
 
-    // Guards consumers_, upstream_error_, waiters_ and the switch to Completed.
-    mutable std::mutex mutex_;
-    // Someone waits (or is about to) in wait_completed(): only then does
-    // completion notify. std::atomic::notify_all is not free even without
-    // waiters (libstdc++ bumps a process-wide counter for 1-byte atomics).
-    mutable bool waiters_ = false;
-    TaskList consumers_;
+    // The consumers registered for this task's completion: a lock-free stack
+    // of ConsumerNodes (the main thread pushes with a CAS), closed for good
+    // when the task completes (exchange with kClosed: a later push fails, so
+    // no consumer is lost or notified twice). Bit kWaiter: someone waits (or
+    // is about to) in wait_completed(); only then does completion notify.
+    // std::atomic::notify_all is not free even without waiters (libstdc++
+    // bumps a process-wide counter for 1-byte atomics). Waiter and completer
+    // meet in this one atomic, so no lock and no seq_cst are needed.
+    static constexpr std::uintptr_t kWaiter = 1;
+    static constexpr std::uintptr_t kClosed = 2; // no node has this address
+    static bool closed(std::uintptr_t h) { return (h & ~kWaiter) == kClosed; }
+    mutable std::atomic<std::uintptr_t> consumers_{0};
+    ConsumerNode nodes_[kInlineNodes];
+    std::unique_ptr<ConsumerNode[]> more_nodes_;
+    std::atomic<bool> upstream_claimed_{false};
     ErrorRef upstream_error_;
 
     ErrorRef error_;

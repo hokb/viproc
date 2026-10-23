@@ -159,6 +159,12 @@ reported with that issue site and the NumPy function it runs
   Registration is atomic with respect to the producer's state: if the
   producer already passed the stage, the registering thread learns that
   immediately and handles it itself; no event is lost or delivered twice.
+  Implemented without a lock (`Task::add_consumer`): a task's consumers
+  are a lock-free stack of nodes that live in the consumer tasks (one per
+  producer, inline up to 3), pushed by the main thread with a CAS and
+  closed by the completing thread with one exchange (`kClosed`: a later
+  push fails, and the main thread accounts for the producer itself); a
+  bit in the same word marks a waiter in `wait_completed`.
 - **Sync points** (reading data, `print`, `float(x)`, handing memory back to
   plain NumPy) wait for `completed` of the array's producer. Querying only
   metadata (`x.shape`, `x.dtype`) waits for `size_completed` only. Because
@@ -1155,15 +1161,18 @@ Rules:
   memory). The bridge front end (~900) is cheaper than NumPy's own dispatch
   and dtype resolution (~2,500); what remains on top is the task protocol
   itself (task object, operand capture, async_reads, slot accounting,
-  completion under the task mutex) and the result's release.
+  completion) and the result's release.
   Task path (`x = x * 0.5`, pending `x` of 1e4, #47): main thread ~5,100
   instructions per op (was ~7,750: the scalar's conversion ~2,700, heap
   vectors for producers/consumers), ~0.74 µs issue (was 1.21); worker
-  ~1,100 besides the kernel (was ~1,750).
+  ~1,100 besides the kernel (was ~1,750). The lock-free consumer list
+  (#49) took the task mutex out: main thread ~50 instructions less per
+  op, worker ~180 less per task.
 - `std::atomic::notify_all` is not free without waiters: libstdc++ bumps a
   process-wide counter (a shared cache line) for atomics that are not
   4-byte futex words. Task completion and `run()` therefore notify only
-  when a waiter registered (`Task::waiters_`, `active_waiters_`).
+  when a waiter registered (`Task::kWaiter` in the consumer list's word,
+  `active_waiters_`).
 - **Element-wise loops are called exactly as NumPy calls them.** Their
   results depend on the strides of the call: NumPy's SIMD paths (complex
   multiply, float32 exp/sin/arctan2, ...) round differently from their
