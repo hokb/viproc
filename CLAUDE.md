@@ -250,16 +250,21 @@ change is judged by; read it before design decisions. In short: G1, the
 central claim, is to find the parallel potential within and throughout
 large sections of regular, un-annotated NumPy programs automatically and
 feed parallel hardware with it (strong scaling, array ILP only); G2, results identical
-to NumPy; G3, **never slower than NumPy** (hard: never below 0.95x for any
-expression; soft: at most 3% slower where there is no sufficient
-parallel potential).
+to NumPy; G3, **as fast as possible within G2**: no avoidable cost (no pass
+over the data, no fallback for a supported op, fewest main-thread
+instructions; below 0.95x on large data is a defect); "never slower than
+NumPy" (never below 0.95x for any expression, at most 3% slower where there
+is no sufficient parallel potential) is the target, not a guarantee.
+**G2 has priority over G3:** both cannot always hold together, because the
+per-op layer comes on top of NumPy's own loops and small ops cannot hide it.
 
 **Bit-identical results are mandatory (currently).** Every change must keep
 results bit-identical to plain NumPy of the installed version (values,
 dtypes, shapes, strides, warnings, errors), as the drop-in rule demands
 (see "Conventions"). Never trade bit-identity for speed: no own kernels, no
 reordered sums, no fusion or splitting of an op that changes rounding. The
-small per-op overhead on small data that this costs is accepted. A
+small per-op overhead on small data that this costs is accepted; work it
+down, never at G2's expense. A
 configurable mode that allows deviating but correct results (further
 (auto-)parallelization, optimizations, auto-offloading, partial
 re-implementation of NumPy internals) is planned (goals.md, G2), not
@@ -308,7 +313,7 @@ execution.
 
 ```
 docs/design/           Design documents (decisions with rationale)
-  goals.md             goals, non-goals, never-slower rule (G1-G3), roadmap
+  goals.md             goals, non-goals, G2 (bit-identical) before G3 (speed), roadmap
   error-handling.md    run-time errors on any thread, asynchronous reporting
   memory-management.md ownership, release, pools, NumPy interop, COW
   pipelining.md        array stages, partial completion, pending sizes (roadmap)
@@ -1299,7 +1304,8 @@ Rules:
   optimizations until there is a benchmark that shows the need.
 - Measure success as strong scaling: benchmark whole array programs
   (fixed problem size) against plain NumPy at 1, 2, 4, … worker threads,
-  and check the never-slower rule (`docs/design/goals.md`, G3).
+  and check the speed rules (`docs/design/goals.md`, G3: no avoidable
+  cost; NumPy's speed as the target where there is nothing to overlap).
 - **Benchmark suite** (`python/benchmarks/suite.py`): the yardstick for
   changes that affect performance; run it before and after. Score =
   100 x geomean over categories of geomean(efficiency), efficiency =
@@ -1408,8 +1414,8 @@ code, comments, docs and commit messages in English.
       ideal 20 and is not comparable. `suite.py --workers 1,max,threads`
       measures 12 and 20 workers in one run.
 - [ ] Remaining per-op overhead on small data (`docs/design/goals.md`,
-      G3: never below 0.95x of NumPy, at most 3% slower without
-      sufficient parallel potential): `np.abs(x)` and other ufunc calls
+      G3 target, within G2: never below 0.95x of NumPy, at most 3% slower
+      without sufficient parallel potential): `np.abs(x)` and other ufunc calls
       on real NumPy pay NumPy's override dispatch (~2,000 instructions;
       module mode skips it), the direct path itself ~800 over NumPy's
       ufunc call (P4: operand vector, buffer refcounts), masked

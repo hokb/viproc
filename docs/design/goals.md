@@ -60,24 +60,41 @@ e.g. another summation order or rounding) to be computed faster, by
 further (auto-)parallelization (splitting single ops), optimizations
 (fusion), automatic offloading and partially re-implementing NumPy's
 internals. Until that mode exists, G2 holds without exception, and the
-bit-identical mode stays available afterwards.
+bit-identical mode stays available afterwards. G2 has priority over G3:
+"never slower than NumPy" is the target of the bit-identical mode, not
+its guarantee (G3).
 
-## G3 — Never slower than NumPy
+## G3 — As fast as possible within G2
 
-**viproc may never be slower than NumPy (below 0.95x of NumPy's speed) for
-any expression.** This is a hard rule: it holds for every expression,
-program, data size, shape and dtype, not only on average. A measurement
-below 0.95x is a defect, not an accepted cost of the asynchronous model.
+**G2 comes first.** Bit-identical results and "never slower than NumPy"
+cannot always hold together: when NumPy's own loops do every computation,
+viproc's layer (issue, task, arrays, dispatch) comes on top of NumPy's own
+work, and an operation on small data without parallel potential has
+nothing to hide that cost behind. viproc therefore does not guarantee
+"never slower" in the bit-identical mode (today's only mode). Where the
+two conflict, G2 wins; trading exactness for speed is left to the planned
+configurable mode (G2), which may deviate from NumPy's results.
 
-**Soft rule, no sufficient parallel potential: no slow-down beyond 3%.**
-Where a measurement has no sufficient parallel potential (for example a simple expression on
-small data), no speed-up is expected, but viproc must not slow it down
-significantly either: the design target is at most 3% slower than NumPy.
-This is a soft design rule (a target that designs are judged by, within
-measurement noise); the 0.95x limit above is the hard bound.
+Within G2, viproc must be as fast as it can be:
+
+- **Rule, no avoidable cost:** viproc adds nothing that G2 does not need.
+  No pass over the data (scan, check, copy) to catch a rare condition, no
+  eager fallback for a supported op, the fewest main-thread instructions
+  per op. Data-sized costs are a defect: on data large enough that the
+  per-op layer does not count, a measurement below 0.95x of NumPy's speed
+  is a defect, not an accepted cost of the asynchronous model.
+- **Target, not a guarantee: never below 0.95x of NumPy for any
+  expression**, every program, data size, shape and dtype; where a
+  measurement has no sufficient parallel potential (for example a simple
+  expression on small data), at most 3% slower than NumPy. Designs are
+  judged by this target (within measurement noise), and the per-op
+  overhead is worked down towards it, but never at the expense of G2.
+  Small data misses it today (`docs/benchmarks.md`, shape map).
+- **Speed-up where there is parallel potential** (G1): medium and large
+  data with independent array instructions run faster than NumPy.
 
 Example: `x = a[x + 1]` on a scalar `x` has nothing to overlap and is not
-expected to be faster than NumPy; it must run at NumPy's speed. The same
+expected to be faster than NumPy; the target is NumPy's speed. The same
 expression in a loop may or may not run faster than NumPy, depending on
 whether consecutive iterations can overlap (instruction pipelining, see
 "Roadmap").
@@ -85,7 +102,9 @@ whether consecutive iterations can overlap (instruction pipelining, see
 Judging a change against G3: compare viproc with NumPy on the same machine,
 same build and options (`docs/benchmarks.md`, "How to measure"); single
 configurations vary by ±25–30% between runs on noisy machines, so repeat
-before calling a result a violation or a fix.
+before calling a result a violation or a fix. A slow-down that comes from
+the per-op layer on small data misses the target; one that a change could
+avoid without giving up G2 is a defect.
 
 ## Non-goals
 
@@ -97,7 +116,8 @@ before calling a result a violation or a fix.
 - **Global program analysis:** no dependency graph (DAG) of the program, no
   ahead-of-time (AOT) analysis. Every decision is local.
 - **Changing what NumPy computes** to gain speed: no other summation order,
-  no other BLAS threading, no approximations (G2).
+  no other BLAS threading, no approximations (G2; only the planned,
+  opt-in configurable mode may deviate, see G2).
 - **Dedicated array types or scopes in user code** (temporary/return types,
   scope APIs as on .NET): they would rule out running unchanged NumPy
   programs (`docs/design/memory-management.md`, D1).

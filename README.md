@@ -75,10 +75,14 @@ The execution model follows the
   (auto-)parallelization (splitting single operations), optimizations such as operator
   fusion, automatic offloading to other devices and re-implementing parts of NumPy's
   internals. The bit-identical mode stays available.
-- **Never slower than NumPy.** Array operations on medium-sized and large data viproc commonly runs
-  efficiently in parallel. Small data and algorithms without much parallel potential must
-  not get slower: viproc must not make any expression slower than NumPy (hard limit 0.95x;
-  where there is nothing to overlap, at most 3% slower by design – not quite there yet).
+- **Faster where there is parallel potential; NumPy's speed as the target elsewhere.**
+  Array operations on medium-sized and large data viproc commonly runs efficiently in
+  parallel. For small data and algorithms without much parallel potential, the target is
+  NumPy's speed (at most 3% slower, never below 0.95x), but bit-identical results come
+  first: the small per-op overhead described above cannot always be hidden, so "never
+  slower than NumPy" is a target, not a guarantee, in the bit-identical mode (not quite
+  there yet on small data). The planned configurable mode is where speed may win over
+  bit-identity.
 - **Designed for heterogeneous hardware and further JIT optimizations.** viproc runs on
   multi-core CPUs today, but the approach is designed to include heterogeneous compute
   resources into execution fully automatically, by adding cost-based device scheduling to
@@ -100,9 +104,9 @@ element-wise work, iterative algorithms over arrays (k-means, simulations, image
 pipelines), on medium and large data. The more complex a program gets the more parallel potential it brings. viproc shines on real-world algorithms not on too simple toy examples. 
 
 Programs that spend their time in algorithms or loops over **scalar** data, one element
-at a time, offer little array-level parallelism and gain little from viproc today (they must
-not get slower either). For them the manual options remain: vectorizing the loop into array
-operations, or parallelizing it explicitly (`multiprocessing`, `concurrent.futures`, Numba's
+at a time, offer little array-level parallelism and gain little from viproc today (the
+target is NumPy's speed for them; the per-op overhead can make them slightly slower). For
+them the manual options remain: vectorizing the loop into array operations, or parallelizing it explicitly (`multiprocessing`, `concurrent.futures`, Numba's
 `prange`, ...). Overlapping consecutive loop iterations automatically (instruction
 pipelining) is on the roadmap.
 

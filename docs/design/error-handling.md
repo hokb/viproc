@@ -252,7 +252,7 @@ Linalg's `LinAlgError` (set through the invalid flag in NumPy's
 
 The first fix in #17 scanned the exponents before every integer power call.
 It was correct and passed the tests, but it added a pass over the data to
-a kernel: 3–10% on large data, against G3 ("never slower than NumPy"). The
+a kernel: 3–10% on large data, against G3 (an avoidable cost on large data). The
 second fix ran the op synchronously in NumPy: exact, but it gave up
 parallelism for every `int ** int`-array to handle a case that almost never
 happens. How it happened:
