@@ -69,20 +69,17 @@ The execution model follows the
   The price is a small overhead on small computations: the viproc layer (task, arrays,
   dispatch) comes on top of NumPy's own work, while the kernels themselves cannot get
   faster than NumPy's.
-- **Planned: faster, correct, not bit-identical (opt-in).** viproc is planned to become
-  configurable: a mode that allows results deviating from NumPy's in the last bits (still
-  correct, e.g. a different summation order) in exchange for speed, by further
-  (auto-)parallelization (splitting single operations), optimizations such as operator
-  fusion, automatic offloading to other devices and re-implementing parts of NumPy's
-  internals. The bit-identical mode stays available.
+- **Planned: optimization levels.** Bit-identity is today's level, O1. Higher levels are
+  to compute correct but not bit-identical results faster (see
+  [Optimization levels](#optimization-levels-planned)).
 - **Faster where there is parallel potential; NumPy's speed as the target elsewhere.**
   Array operations on medium-sized and large data viproc commonly runs efficiently in
   parallel. For small data and algorithms without much parallel potential, the target is
   NumPy's speed (at most 3% slower, never below 0.95x), but bit-identical results come
   first: the small per-op overhead described above cannot always be hidden, so "never
   slower than NumPy" is a target, not a guarantee, in the bit-identical mode (not quite
-  there yet on small data). The planned configurable mode is where speed may win over
-  bit-identity.
+  there yet on small data). The planned optimization levels above O1 are where speed may
+  win over bit-identity.
 - **Designed for heterogeneous hardware and further JIT optimizations.** viproc runs on
   multi-core CPUs today, but the approach is designed to include heterogeneous compute
   resources into execution fully automatically, by adding cost-based device scheduling to
@@ -95,6 +92,26 @@ The goal is strong scaling: a fixed program with a fixed problem size gets faste
 cores. Goals, non-goals and rules are in [docs/design/goals.md](docs/design/goals.md),
 measurements in [docs/benchmarks.md](docs/benchmarks.md), architecture and build details in
 [CLAUDE.md](CLAUDE.md).
+
+## Optimization levels (planned)
+
+Bit-identical results are a consequence of today's implementation, not a fixed limit of
+viproc. A future, multi-stage optimization setting decides how far viproc may go beyond
+NumPy's own execution; each level adds to the one below:
+
+| Level | What viproc does | Results |
+|-------|------------------|---------|
+| **O1** (current) | array ILP only: independent array instructions run in parallel; NumPy itself executes every function | bit-identical to NumPy |
+| **O2** | + stage pipelining (an instruction starts on partial results of its inputs), BLAS threading removed (viproc's workers parallelize instead of BLAS) | correct, may deviate (BLAS results depend on its thread count) |
+| **O3** | + micro kernels: viproc's own kernels, fused and split operations, partly re-implemented NumPy internals | correct, may deviate in rounding |
+| **O4** | + automatic device offloading (GPUs and other accelerators, chosen per instruction) | correct, may deviate |
+
+"Correct" means what NumPy's semantics allow: the same dtypes, shapes, errors and
+warnings, values within the floating-point error of a valid evaluation order. O1 stays
+available as the reference and for programs that need NumPy's exact bits. The higher
+levels are also where the per-op overhead on small data can disappear, because viproc no
+longer has to call NumPy's code exactly as NumPy does. Details:
+[docs/design/goals.md](docs/design/goals.md), "Optimization levels".
 
 ## Where it helps, and where it does not (yet)
 
