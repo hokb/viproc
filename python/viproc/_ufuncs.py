@@ -13,6 +13,8 @@ A handler returns _NOPE for arguments it does not cover: NumPy then runs
 the call in the eager fallback, with its own errors.
 """
 
+import math
+import operator
 import warnings
 
 import numpy as np
@@ -62,37 +64,12 @@ _CALL_KEYWORDS = frozenset(("out", "dtype", "signature", "casting", "where"))
 _PY_SCALARS = (bool, int, float, complex)
 
 
-def call(ufunc, inputs, kwargs):
-    """ufunc(*inputs, **kwargs) for what the C fast path leaves out: several
-    outputs (divmod, modf, frexp), dtype=, signature=, casting=, where= (a
-    bool mask: NumPy's masked loop, vp_ufunc_issue_masked) and an out=
-    array of another dtype (NumPy casts into it in its iterator's buffers;
-    so does viproc's kernel). The dtypes are NumPy's (ufunc.resolve_dtypes,
-    which also raises NumPy's casting errors: then NumPy runs the call);
-    inputs of another dtype are cast as NumPy casts them (vp_ufunc_issue,
-    vp_ufunc_multi). Returns _NOPE where NumPy has to run it."""
+def _typed_inputs(ufunc, inputs, out, kwargs):
+    """NumPy's loop dtypes for ufunc(*inputs, out=out, **kwargs)
+    (ufunc.resolve_dtypes with dtype=, signature=, casting=) and the inputs
+    as viproc arrays (weak Python scalars converted to their loop dtype, as
+    NumPy converts them): (dtypes, dtype codes, inputs), or _NOPE."""
     nin, nout = ufunc.nin, ufunc.nout
-    if (ufunc.signature is not None or len(inputs) != nin or not kwargs.keys() <= _CALL_KEYWORDS
-            or nin > 3):
-        return _NOPE
-    where = kwargs.get("where", True)
-    if where is not True:
-        # _wheremask_converter: a bool array (a safe cast); several outputs: not yet
-        if nout != 1:
-            return _NOPE
-        if not isinstance(where, ndarray):
-            where = np.asarray(where)
-            if where.dtype != np.bool_:
-                return _NOPE
-            where = _nd.asarray(where)
-        if where.dtype != np.bool_:
-            return _NOPE
-    out = kwargs.get("out")
-    if out is not None:
-        out = out if isinstance(out, tuple) else (out,)
-        # several outputs into given arrays: not yet (they may alias)
-        if nout != 1 or len(out) != 1 or type(out[0]) is not ndarray or out[0]._readonly:
-            return _NOPE
     spec = []
     for x in inputs:
         if isinstance(x, (ndarray, np.ndarray, np.generic)):
@@ -130,19 +107,62 @@ def call(ufunc, inputs, kwargs):
             if not isinstance(x, ndarray):
                 return _NOPE
         ins.append(x)
+    return dtypes, codes, ins
+
+
+def _complex_warnings(ins, dtypes, out_casts):
+    """NumPy warns once per cast of complex to real values it sets up (each
+    call); viproc's iterator templates are made once: warn here (the caller
+    silences the cast's own warning). Returns the number of warnings."""
+    discards = sum(a.kind == "c" and b.kind in "iuf" for a, b in
+                   [(x.dtype, d) for x, d in zip(ins, dtypes)] + out_casts)
+    for _ in range(discards):
+        warnings.warn("Casting complex values to real discards the imaginary part",
+                      np.exceptions.ComplexWarning, stacklevel=4)
+    return discards
+
+
+def call(ufunc, inputs, kwargs):
+    """ufunc(*inputs, **kwargs) for what the C fast path leaves out: several
+    outputs (divmod, modf, frexp), dtype=, signature=, casting=, where= (a
+    bool mask: NumPy's masked loop, vp_ufunc_issue_masked) and an out=
+    array of another dtype (NumPy casts into it in its iterator's buffers;
+    so does viproc's kernel). The dtypes are NumPy's (ufunc.resolve_dtypes,
+    which also raises NumPy's casting errors: then NumPy runs the call);
+    inputs of another dtype are cast as NumPy casts them (vp_ufunc_issue,
+    vp_ufunc_multi). Returns _NOPE where NumPy has to run it."""
+    nin, nout = ufunc.nin, ufunc.nout
+    if (ufunc.signature is not None or len(inputs) != nin or not kwargs.keys() <= _CALL_KEYWORDS
+            or nin > 3):
+        return _NOPE
+    where = kwargs.get("where", True)
+    if where is not True:
+        # _wheremask_converter: a bool array (a safe cast); several outputs: not yet
+        if nout != 1:
+            return _NOPE
+        if not isinstance(where, ndarray):
+            where = np.asarray(where)
+            if where.dtype != np.bool_:
+                return _NOPE
+            where = _nd.asarray(where)
+        if where.dtype != np.bool_:
+            return _NOPE
+    out = kwargs.get("out")
+    if out is not None:
+        out = out if isinstance(out, tuple) else (out,)
+        # several outputs into given arrays: not yet (they may alias)
+        if nout != 1 or len(out) != 1 or type(out[0]) is not ndarray or out[0]._readonly:
+            return _NOPE
+    r = _typed_inputs(ufunc, inputs, out, kwargs)
+    if r is _NOPE:
+        return _NOPE
+    dtypes, codes, ins = r
     if out is None and all(x.ndim == 0 for x in ins) and (where is True or where.ndim == 0):
         return _NOPE  # NumPy's scalars
     if where is not True and "out" not in kwargs:
         warnings.warn("'where' used without 'out', expect uninitialized memory in output. "
                       "If this is intentional, use out=None.", UserWarning, stacklevel=3)
-    # NumPy warns once per cast of complex to real values it sets up (each
-    # call); viproc's iterator templates are made once: warn here, quiet there
-    discards = sum(a.kind == "c" and b.kind in "iuf" for a, b in
-                   [(x.dtype, d) for x, d in zip(ins, dtypes)]
-                   + ([(dtypes[-1], out[0].dtype)] if out is not None else []))
-    for _ in range(discards):
-        warnings.warn("Casting complex values to real discards the imaginary part",
-                      np.exceptions.ComplexWarning, stacklevel=3)
+    discards = _complex_warnings(ins, dtypes, [(dtypes[-1], out[0].dtype)] if out else [])
     with warnings.catch_warnings():
         if discards:
             warnings.simplefilter("ignore", np.exceptions.ComplexWarning)
@@ -152,6 +172,180 @@ def call(ufunc, inputs, kwargs):
         else:
             r = _viproc.ufunc_multi(ufunc, tuple(ins), codes)
     return _NOPE if r is None else r
+
+
+# ufunc -> its parsed core signature: (labels, fixed sizes (-1 if free),
+# flexible flags, per operand the label index of each core axis)
+_signatures = {}
+
+
+def _core_signature(ufunc):
+    sig = _signatures.get(ufunc)
+    if sig is None:
+        labels, fixed, flexible, ops = [], [], [], []
+        ins, outs = ufunc.signature.replace(" ", "").split("->")
+        for part in (ins, outs):
+            for group in part[1:-1].split("),("):
+                axes = []
+                for name in filter(None, group.split(",")):
+                    flex = name.endswith("?")
+                    name = name.rstrip("?")
+                    if name not in labels:
+                        labels.append(name)
+                        fixed.append(int(name) if name.isdigit() else -1)
+                        flexible.append(flex)
+                    axes.append(labels.index(name))
+                ops.append(axes)
+        sig = _signatures[ufunc] = (labels, fixed, flexible, ops)
+    return sig
+
+
+# (ufunc, (dtype, shape) per input) -> the arguments of _viproc.gufunc for a
+# call without keywords on viproc arrays (all of them depend only on the key)
+_gufunc_plans = {}
+
+_GUFUNC_KEYWORDS = frozenset(("out", "dtype", "signature", "casting", "axes", "axis"))
+
+
+def _remaps(ufunc, ops, ncore, axes, axis, bcast):
+    """Per operand the axis order with its core axes last (NumPy's
+    REMAP_AXIS from _parse_axes_arg / _parse_axis_arg), or None to keep it.
+    `ops` are the operands (None: an output to allocate). Raises where
+    NumPy raises (the caller then leaves the call to NumPy)."""
+    nin, nop = ufunc.nin, len(ops)
+    if axis is not None:
+        if len(_core_signature(ufunc)[0]) != 1:
+            raise TypeError
+        axis = operator.index(axis)
+        axes = [axis if n == 1 else () for n in ncore]
+    if not isinstance(axes, list) or (len(axes) != nop and (
+            len(axes) != nin or any(ncore[nin:]))):
+        raise ValueError
+    remaps = [None] * nop
+    for i, entry in enumerate(axes):
+        nd = ops[i].ndim if ops[i] is not None else bcast + ncore[i]
+        if not isinstance(entry, tuple):
+            if ncore[i] != 1:
+                raise TypeError
+            entry = (entry,)
+        if len(entry) != ncore[i]:
+            raise ValueError
+        core = [normalize_axis_index(operator.index(a), nd) for a in entry]
+        if len(set(core)) != len(core):
+            raise ValueError
+        order = [a for a in range(nd) if a not in core] + core
+        if order != list(range(nd)):
+            remaps[i] = order
+    return remaps
+
+
+def gufunc(ufunc, inputs, kwargs):
+    """A generalized ufunc call (ufunc.signature set: matmul with casts or
+    out=, vecdot, matvec, vecmat, ...) on NumPy's gufunc loop (vp_gufunc):
+    NumPy's dtypes (ufunc.resolve_dtypes), inputs of another dtype cast as
+    NumPy's iterator copies them, missing flexible dimensions (matmul's 1-d
+    operands), axes=/axis= as views moving the core axes last, out= of the
+    loop's dtype. Returns _NOPE where NumPy has to run it (keepdims=, out=
+    of another dtype or overlapping an input, NumPy's errors)."""
+    if not kwargs:
+        key = (ufunc,) + tuple((x.dtype, x.shape) for x in inputs if type(x) is ndarray)
+        plan = _gufunc_plans.get(key) if len(key) == len(inputs) + 1 else None
+        if plan is not None:  # the same call as before: all decisions taken
+            codes, core_n, core_axes, sizes, work, discards = plan
+            for _ in range(discards):
+                warnings.warn("Casting complex values to real discards the imaginary part",
+                              np.exceptions.ComplexWarning, stacklevel=3)
+            with warnings.catch_warnings():
+                if discards:
+                    warnings.simplefilter("ignore", np.exceptions.ComplexWarning)
+                r = _viproc.gufunc(ufunc, tuple(inputs), None, codes, core_n, core_axes, sizes, 0,
+                                   None, work)
+            if r is None:
+                return _NOPE
+            res = [_nd._scalar_result(x) if x.ndim == 0 else x for x in r]
+            return res[0] if len(res) == 1 else tuple(res)
+    else:
+        key = None
+    nin, nout = ufunc.nin, ufunc.nout
+    if len(inputs) != nin or not kwargs.keys() <= _GUFUNC_KEYWORDS or nin + nout > 8:
+        return _NOPE
+    if "axes" in kwargs and "axis" in kwargs:
+        return _NOPE
+    out = kwargs.get("out")
+    if out is not None:
+        out = out if isinstance(out, tuple) else (out,)
+        if all(o is None for o in out):
+            out = None
+        elif len(out) != nout or any(type(o) is not ndarray or o._readonly for o in out):
+            return _NOPE
+    labels, fixed, flexible, core = _core_signature(ufunc)
+    r = _typed_inputs(ufunc, inputs, out, kwargs)
+    if r is _NOPE:
+        return _NOPE
+    dtypes, codes, ins = r
+    ops = ins + (list(out) if out is not None else [None] * nout)
+    # _validate_num_dims: operands with too few axes drop flexible ones
+    ncore = [len(c) for c in core]
+    missing = set()
+    for i, x in enumerate(ops):
+        if x is None or x.ndim >= ncore[i]:
+            continue
+        for label in core[i]:
+            if flexible[label] and label not in missing:
+                missing.add(label)
+                ncore = [n - c.count(label) for n, c in zip(ncore, core)]
+                if x.ndim == ncore[i]:
+                    break
+        if x.ndim < ncore[i]:
+            return _NOPE  # NumPy's ValueError
+    bcast = max(x.ndim - n for x, n in zip(ops, ncore) if x is not None)
+    if "axes" in kwargs or "axis" in kwargs:
+        if missing:
+            return _NOPE
+        try:
+            remaps = _remaps(ufunc, ops, ncore, kwargs.get("axes"), kwargs.get("axis"), bcast)
+        except (TypeError, ValueError, np.exceptions.AxisError):
+            return _NOPE
+        ops = [x if m is None or x is None else x.transpose(m) for x, m in zip(ops, remaps)]
+    else:
+        remaps = [None] * len(ops)
+    sizes = [1 if label in missing else f for label, f in enumerate(fixed)]
+    core_axes = tuple(-1 - label if label in missing else label for c in core for label in c)
+    # rough cost for the dispatch policy: the loop's index space per batch
+    # element (vecdot: n multiply-adds; matmul: n*k*m, which BLAS runs about
+    # 16x faster per element, as vp_matmul counts it)
+    batch = 1
+    for x, n in zip(ops, ncore):
+        if x is not None:
+            batch = max(batch, math.prod(x.shape[:x.ndim - n]))
+    dims = {}
+    for x, c in zip(ops, core):
+        if x is not None:
+            present = [label for label in c if label not in missing]
+            dims.update(zip(present, x.shape[x.ndim - len(present):]))
+    work = batch * math.prod(dims.values())
+    work = max(work // 16 if ufunc is np.matmul else work, 1)
+    core_n = tuple(len(c) for c in core)
+    discards = _complex_warnings(ins, dtypes, [])
+    with warnings.catch_warnings():
+        if discards:
+            warnings.simplefilter("ignore", np.exceptions.ComplexWarning)
+        r = _viproc.gufunc(ufunc, tuple(ops[:nin]), None if out is None else tuple(ops[nin:]),
+                           codes, core_n, core_axes, tuple(sizes), 0, None, work)
+    if r is None:
+        return _NOPE
+    if key is not None and len(key) == nin + 1:
+        if len(_gufunc_plans) >= 256:
+            _gufunc_plans.clear()
+        _gufunc_plans[key] = (codes, core_n, core_axes, tuple(sizes), work, discards)
+    if out is not None:
+        return out[0] if nout == 1 else out
+    res = []
+    for x, m in zip(r, remaps[nin:]):
+        if m is not None:
+            x = x.transpose(np.argsort(m).tolist())
+        res.append(_nd._scalar_result(x) if x.ndim == 0 else x)
+    return res[0] if nout == 1 else tuple(res)
 
 
 def _accumulate(ufunc, a, axis=0, dtype=None, out=None):

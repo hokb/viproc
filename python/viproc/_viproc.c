@@ -3350,6 +3350,117 @@ static PyObject* m_ufunc_multi(PyObject* self, PyObject* args) {
     return t;
 }
 
+/* Small int tuple into `out` (at most `max` entries); -1 if not one. */
+static int int_tuple(PyObject* t, int* out, Py_ssize_t max) {
+    if (!PyTuple_Check(t) || PyTuple_GET_SIZE(t) > max) {
+        return -1;
+    }
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(t); ++i) {
+        const long v = PyLong_AsLong(PyTuple_GET_ITEM(t, i));
+        if (v == -1 && PyErr_Occurred()) {
+            PyErr_Clear();
+            return -1;
+        }
+        out[i] = (int)v;
+    }
+    return (int)PyTuple_GET_SIZE(t);
+}
+
+static PyObject* m_gufunc(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *ufunc, *ins, *outs, *codes, *core_n_t, *core_axes_t, *sizes_t, *invalid;
+    int c_order;
+    long long work;
+    if (!PyArg_ParseTuple(args, "OO!OO!O!O!O!iOL", &ufunc, &PyTuple_Type, &ins, &outs,
+                          &PyTuple_Type, &codes, &PyTuple_Type, &core_n_t, &PyTuple_Type,
+                          &core_axes_t, &PyTuple_Type, &sizes_t, &c_order, &invalid, &work) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    enum { MAXOP = 8, MAXCORE = 32 };
+    const Py_ssize_t nin = PyTuple_GET_SIZE(ins);
+    const Py_ssize_t nop = PyTuple_GET_SIZE(codes);
+    const Py_ssize_t nout = nop - nin;
+    if (nin < 1 || nout < 1 || nop > MAXOP ||
+        (outs != Py_None && (!PyTuple_Check(outs) || PyTuple_GET_SIZE(outs) != nout)) ||
+        (invalid != Py_None && !PyUnicode_Check(invalid))) {
+        Py_RETURN_NONE;
+    }
+    vp_array* in[MAXOP];
+    vp_array* out[MAXOP];
+    vp_dtype dts[MAXOP];
+    int core_n[MAXOP], core_axes[MAXCORE], codes_i[MAXOP];
+    int64_t sizes[MAXCORE];
+    int labels[MAXCORE];
+    if (int_tuple(codes, codes_i, MAXOP) != nop || int_tuple(core_n_t, core_n, MAXOP) != nop ||
+        int_tuple(core_axes_t, core_axes, MAXCORE) < 0) {
+        Py_RETURN_NONE;
+    }
+    const int nlabels = int_tuple(sizes_t, labels, MAXCORE);
+    if (nlabels < 0) {
+        Py_RETURN_NONE;
+    }
+    for (int i = 0; i < nlabels; ++i) {
+        sizes[i] = labels[i];
+    }
+    for (Py_ssize_t i = 0; i < nop; ++i) {
+        if (codes_i[i] < 0 || codes_i[i] > 6) {
+            Py_RETURN_NONE;
+        }
+        dts[i] = (vp_dtype)codes_i[i];
+    }
+    for (Py_ssize_t i = 0; i < nin; ++i) {
+        PyObject* x = PyTuple_GET_ITEM(ins, i);
+        if (!is_array(x)) {
+            Py_RETURN_NONE;
+        }
+        in[i] = array_of(x);
+    }
+    for (Py_ssize_t j = 0; outs != Py_None && j < nout; ++j) {
+        PyObject* x = PyTuple_GET_ITEM(outs, j);
+        if (!is_array(x) || ((ArrayObject*)x)->readonly) {
+            Py_RETURN_NONE;
+        }
+        out[j] = array_of(x);
+    }
+    const char* inv = invalid != Py_None ? PyUnicode_AsUTF8(invalid) : NULL;
+    if (invalid != Py_None && inv == NULL) {
+        return NULL;
+    }
+    vp_array* res[MAXOP] = {NULL};
+    char err[ERRLEN] = "";
+    const int status = vp_gufunc(g_rt, ufunc, (int)nin, in, (int)nout, outs != Py_None ? out : NULL,
+                                 dts, core_n, core_axes, nlabels, sizes, c_order, inv,
+                                 (int64_t)work, res, issue_site(), err, sizeof err);
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    if (outs != Py_None) {
+        return Py_NewRef(outs);
+    }
+    PyObject* t = PyTuple_New(nout);
+    for (Py_ssize_t j = 0; j < nout; ++j) {
+        PyObject* w = NULL;
+        if (t != NULL) {
+            w = wrap_array(res[j]); /* releases res[j] on failure */
+        } else {
+            vp_array_release(res[j]);
+        }
+        if (w == NULL) {
+            for (Py_ssize_t k = j + 1; k < nout; ++k) {
+                vp_array_release(res[k]);
+            }
+            Py_XDECREF(t);
+            return NULL;
+        }
+        PyTuple_SET_ITEM(t, j, w);
+    }
+    return t;
+}
+
 static PyObject* m_reduceat(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *ufunc, *a, *indices, *strides;
@@ -4587,6 +4698,10 @@ static PyMethodDef methods[] = {
      "for exactly these dtypes (inputs cast, out= of any dtype, a bool where= mask), or None"},
     {"ufunc_multi", m_ufunc_multi, METH_VARARGS,
      "ufunc_multi(ufunc, inputs, dtype codes): async ufunc with several outputs, or None"},
+    {"gufunc", m_gufunc, METH_VARARGS,
+     "gufunc(ufunc, inputs, outs|None, dtype codes, core_n, core_axes, label sizes, c_order, "
+     "invalid_error|None, work): async generalized ufunc (vp_gufunc): the outputs (a tuple) "
+     "or None"},
     {"reduceat", m_reduceat, METH_VARARGS,
      "reduceat(ufunc, a, axis, indices (int64 bytes), strides|None): async ufunc.reduceat "
      "without casts, or None"},

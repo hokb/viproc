@@ -49,6 +49,11 @@ struct Layout {
     // (F-order inputs give an F-order result). Reductions over the result
     // then visit elements in NumPy's order (bit-identical sums).
     static Layout keep_order(DType dtype, Shape shape, std::span<const Layout> inputs);
+    // The axis order behind keep_order(): the axes of `shape`, innermost
+    // first, as npyiter_find_best_axis_ordering sorts them for `operands`
+    // (broadcast to `shape`).
+    static std::vector<std::size_t> iteration_order(const Shape& shape,
+                                                    std::span<const Layout> operands);
 
     std::int64_t size() const;
     // True if the elements lie C-contiguously (dimensions of extent 1 may
