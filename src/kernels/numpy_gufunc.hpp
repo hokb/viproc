@@ -44,9 +44,20 @@ struct GufuncCore {
 // their core axes). `invalid_error` non-empty: the loop reports failure
 // through the floating-point invalid flag (numpy.linalg's loops, which NumPy's
 // wrappers turn into LinAlgError with errstate(invalid='call')); the op
-// then fails with that message ("LinAlgError: Singular matrix"). Any
-// thread, without the GIL.
+// then fails with that message ("LinAlgError: Singular matrix").
+// `options` (bits, as vp_gufunc's flags):
+//  - kGufuncCheckFinite: the op fails with "LinAlgError: Array must not
+//    contain infs or NaNs" if input 0 has a non-finite element
+//    (numpy.linalg's _assert_finite, which NumPy runs before eig and
+//    eigvals; one pass over the input, as NumPy's isfinite(a).all()).
+//  - kGufuncSerial: the loop calls of all such ops run one at a time
+//    (a process-wide mutex): LAPACK on matrices OpenBLAS threads itself.
+//    Several threaded OpenBLAS calls at once oversubscribe its thread pool
+//    (measured: 8 concurrent 200x200 inv took 1x-4.5x NumPy's time,
+//    bimodal); one at a time they take NumPy's.
+// Any thread, without the GIL.
+enum : int { kGufuncCheckFinite = 2, kGufuncSerial = 4 };
 std::shared_ptr<Kernel> make_gufunc_kernel(const UfuncLoop* loop, GufuncCore core,
-                                           std::string invalid_error);
+                                           std::string invalid_error, int options = 0);
 
 } // namespace viproc::numpy

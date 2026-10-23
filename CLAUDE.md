@@ -382,6 +382,8 @@ python/viproc/         Python package
                        ufunc.accumulate (cumsum, cumprod, nancum*), outer,
                        where=, ufunc.at, ufunc.reduceat, gufunc calls
                        (vp_gufunc: casts, out=, axes=/axis=, 1-d matmul)
+  _linalg.py           numpy.linalg wrappers ported onto vp_gufunc (det, inv,
+                       solve, cholesky, eig*, svd; AsyncLinAlgError)
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -725,11 +727,29 @@ Rules:
 - **`argmin`/`argmax`** come from NumPy too: the per-dtype functions in
   `PyDataType_GetArrFuncs(descr)->argmax` / `->argmin`
   (`int f(void *data, npy_intp n, npy_intp *index, void *arr)`).
-- **Linalg:** the Python wrappers (`np.linalg.inv`, …) do argument checks
-  and raise `LinAlgError` via an `errstate(invalid='call')` callback when
-  the gufunc sets the invalid flag. We replicate those checks in the
-  bridge and map the stored FP flags to `LinAlgError` at sync. Linalg
-  loops call BLAS/LAPACK, which may be multithreaded itself.
+- **Linalg** (`_linalg.py`, `LINALG`): `det`, `slogdet`, `inv`, `solve`,
+  `cholesky`, `eig`, `eigh`, `eigvals`, `eigvalsh`, `svd` (not
+  `hermitian=True`), `svdvals`. NumPy's wrappers are ported: the same
+  argument checks (`LinAlgError` at the call), `_commonType` (computation
+  in double/cdouble, the input cast first, results cast back), the same
+  gufunc and signature, run through `vp_gufunc` (labels only outputs have,
+  svd's `p`, passed in). NumPy's wrappers raise `LinAlgError` through an
+  `errstate(invalid='call')` callback when the loop sets the FP invalid
+  flag; viproc's kernel checks the flag after each loop call and fails
+  the op with the wrapper's message: `AsyncLinAlgError` (a `LinAlgError`)
+  at the next call into viproc and at the result's sync points.
+  `_assert_finite` (eig, eigvals) runs in the kernel before the loop
+  (`VP_GUFUNC_CHECK_FINITE`), no sync. `qr` (its `qr_r_raw` writes its
+  input), `lstsq` (data-dependent residual shape), `pinv`, `matrix_rank`,
+  `cond`, `matrix_power` and `svd(hermitian=True)` still fall back. Linalg
+  loops call LAPACK, which OpenBLAS threads itself for larger matrices:
+  matrices of >= 64 x 64 elements run one loop call at a time
+  (`VP_GUFUNC_SERIAL`, a process-wide mutex; `_linalg.SERIAL_FROM`).
+  Several threaded OpenBLAS calls at once oversubscribe its threads: 8
+  concurrent 300 x 300 `inv` took 20 ms to 1.1 s (NumPy ~22 ms), serialized
+  17–47 ms. Small ready inputs (at most `sync_below` elements) run NumPy's
+  own function on read-only exports, results adopted (`_small_ready`, as
+  `_join.py`). Fuzzed in `python/tests/test_linalg.py`.
 - **BLAS threads decide BLAS results.** OpenBLAS (NumPy's wheels, 0.3.34)
   splits large products differently with 1, 2 or 4 threads, and the values
   differ (`a @ b` of 513 x 513 float64: three different results for
@@ -741,7 +761,10 @@ Rules:
   products that OpenBLAS already threads (side >= ~300) gains little
   (BLAS already uses the cores); serializing them with a lock did not
   help either. Small products (side < ~200, single-threaded inside BLAS)
-  overlap well.
+  overlap well. **Open:** concurrent threaded OpenBLAS calls have a heavy
+  tail (8 independent 128 x 128 `a @ a`: median 2x NumPy's time, p90 25x;
+  with `OPENBLAS_NUM_THREADS=1` 2.7x faster than NumPy): the matmul
+  kernel may need linalg's `VP_GUFUNC_SERIAL`.
 - **`matmul`** (`src/kernels/numpy_matmul.*`, `vp_matmul`): NumPy's matmul
   gufunc loop `(m?,n),(n,p?)->(m?,p?)`, called as
   `PyUFunc_GeneralizedFunctionInternal` calls it: no buffering, one call
@@ -907,8 +930,8 @@ Rules:
 - **Fallback (sync + eager NumPy on viproc memory, `_Host`):** everything
   else (`nonzero`, `flatnonzero`, `argwhere`, `count_nonzero` sync on their
   argument and run in NumPy on a read-only export, without the general
-  fallback's wait for readers): other reductions (`out=`, `where=`), gufuncs
-  (linalg, fft), `np.dot` of n-d
+  fallback's wait for readers): other reductions (`out=`, `where=`), fft,
+  `qr`/`lstsq`/`pinv` and other linalg functions not in `LINALG`, `np.dot` of n-d
   operands, empty advanced-index results, 0-d boolean indices,
   `ufunc.at`, other NumPy functions. NumPy's semantics exactly (design doc
   D7, "Eager fallbacks"): each viproc argument becomes a writable NumPy
@@ -1268,7 +1291,7 @@ Rules:
 - Python objects whose memory a task still uses are released only on the
   main thread with the GIL: a worker dropping the last reference parks
   the object in a graveyard drained at the next C ABI call.
-- Not implemented yet: the linalg and fft gufuncs, FP-flag reporting to
+- Not implemented yet: the fft gufuncs, FP-flag reporting to
   Python (NumPy warnings / `np.errstate`).
 
 ## Conventions
@@ -1406,8 +1429,8 @@ code, comments, docs and commit messages in English.
       queued task itself was decided against, see "Dispatch decision").
 - [x] `matmul`/`dot` asynchronously (NumPy's matmul loop; `matmul_batch`
       has no fallbacks left).
-- [ ] The linalg and fft gufuncs (the generic gufunc path exists:
-      `vp_gufunc`).
+- [ ] The fft gufuncs and the remaining linalg functions (`qr`, `lstsq`,
+      `pinv`, ...; the generic gufunc path exists: `vp_gufunc`).
 - [ ] Scaling beyond 4 cores: on a 20-core i7-12700K (8 P + 4 E cores,
       HT) the suite scores 22 with medium/large at 11 (`chains_wide`
       medium 6.2x of ideal 20x, large 1.2–3.9x): find out whether memory

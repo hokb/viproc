@@ -29,6 +29,7 @@ from ._ndarray import fresh as _fresh
 from ._ndarray import (
     AsyncError,
     AsyncIndexError,
+    AsyncLinAlgError,
     AsyncValueError,
     array,
     asarray,

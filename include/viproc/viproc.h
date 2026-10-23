@@ -381,20 +381,28 @@ int vp_ufunc_at(vp_runtime* rt, const vp_loop* loop, vp_array* a, vp_array* indi
  *  - Inputs of another dtype are cast into copies first, laid out as
  *    NumPy's iterator lays them out.
  *  - outs == NULL or outs[0] == NULL: new outputs in NumPy's layout (the
- *    iterator's order, or C order if c_order), into results[0..nout).
+ *    iterator's order, or C order with VP_GUFUNC_C_ORDER in `flags`), into
+ *    results[0..nout).
  *    Otherwise all outputs are given (in/out semantics, exactly the loop's
  *    dtypes and the batch shape) and results[] are set to NULL.
  *  - `invalid_error` (or NULL): the loop reports failure through the
  *    floating-point invalid flag (numpy.linalg); the op then fails with this
  *    message ("LinAlgError: Singular matrix").
+ *  - VP_GUFUNC_CHECK_FINITE in `flags`: the op fails with "LinAlgError: Array
+ *    must not contain infs or NaNs" if input 0 has a non-finite element,
+ *    before the loop runs (numpy.linalg's _assert_finite, eig/eigvals).
+ *  - VP_GUFUNC_SERIAL in `flags`: the loop calls of all ops with this flag
+ *    run one at a time (LAPACK on matrices OpenBLAS threads itself: several
+ *    threaded calls at once oversubscribe its threads).
  *  - `work` sizes the op for the dispatch policy (element-wise op units).
  * Returns VP_UNSUPPORTED (reason in `err`) where NumPy raises or copies an
  * operand for another reason (misaligned, out= overlapping an input, out=
  * of another dtype or shape, shapes that do not match); the caller then
  * falls back to NumPy. */
+enum { VP_GUFUNC_C_ORDER = 1, VP_GUFUNC_CHECK_FINITE = 2, VP_GUFUNC_SERIAL = 4 };
 int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, int nout,
               vp_array* const* outs, const vp_dtype* dtypes, const int* core_n,
-              const int* core_axes, int nlabels, int64_t* sizes, int c_order,
+              const int* core_axes, int nlabels, int64_t* sizes, int flags,
               const char* invalid_error, int64_t work, vp_array** results, const char* site,
               char* err, size_t errlen);
 
