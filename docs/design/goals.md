@@ -54,30 +54,46 @@ a viproc-specific error or a different result is a defect.
 
 The price of G2 is a small overhead on small computations: NumPy's own
 loops and operators do the work, and viproc's layer (tasks, arrays,
-dispatch) comes on top. **Planned:** viproc becomes configurable, with an
-opt-in mode that allows results deviating from NumPy's (still correct,
-e.g. another summation order or rounding) to be computed faster, by
-further (auto-)parallelization (splitting single ops), optimizations
-(fusion), automatic offloading and partially re-implementing NumPy's
-internals. Until that mode exists, G2 holds without exception, and the
-bit-identical mode stays available afterwards.
+dispatch) comes on top. **Planned:** bit-identity becomes a property of
+the optimization level ("Optimization levels" below): it holds at O1,
+today's only level; higher levels compute correct results that may
+deviate from NumPy's, faster. Until they exist, G2 holds without
+exception, and O1 stays available afterwards. G2 has priority over G3:
+"never slower than NumPy" is the target of the bit-identical mode, not
+its guarantee (G3).
 
-## G3 — Never slower than NumPy
+## G3 — As fast as possible within G2
 
-**viproc may never be slower than NumPy (below 0.95x of NumPy's speed) for
-any expression.** This is a hard rule: it holds for every expression,
-program, data size, shape and dtype, not only on average. A measurement
-below 0.95x is a defect, not an accepted cost of the asynchronous model.
+**G2 comes first.** Bit-identical results and "never slower than NumPy"
+cannot always hold together: when NumPy's own loops do every computation,
+viproc's layer (issue, task, arrays, dispatch) comes on top of NumPy's own
+work, and an operation on small data without parallel potential has
+nothing to hide that cost behind. viproc therefore does not guarantee
+"never slower" in the bit-identical mode (today's only mode). Where the
+two conflict, G2 wins; trading exactness for speed is left to the planned
+optimization levels above O1 ("Optimization levels"), which may deviate
+from NumPy's results.
 
-**Soft rule, no sufficient parallel potential: no slow-down beyond 3%.**
-Where a measurement has no sufficient parallel potential (for example a simple expression on
-small data), no speed-up is expected, but viproc must not slow it down
-significantly either: the design target is at most 3% slower than NumPy.
-This is a soft design rule (a target that designs are judged by, within
-measurement noise); the 0.95x limit above is the hard bound.
+Within G2, viproc must be as fast as it can be:
+
+- **Rule, no avoidable cost:** viproc adds nothing that G2 does not need.
+  No pass over the data (scan, check, copy) to catch a rare condition, no
+  eager fallback for a supported op, the fewest main-thread instructions
+  per op. Data-sized costs are a defect: on data large enough that the
+  per-op layer does not count, a measurement below 0.95x of NumPy's speed
+  is a defect, not an accepted cost of the asynchronous model.
+- **Target, not a guarantee: never below 0.95x of NumPy for any
+  expression**, every program, data size, shape and dtype; where a
+  measurement has no sufficient parallel potential (for example a simple
+  expression on small data), at most 3% slower than NumPy. Designs are
+  judged by this target (within measurement noise), and the per-op
+  overhead is worked down towards it, but never at the expense of G2.
+  Small data misses it today (`docs/benchmarks.md`, shape map).
+- **Speed-up where there is parallel potential** (G1): medium and large
+  data with independent array instructions run faster than NumPy.
 
 Example: `x = a[x + 1]` on a scalar `x` has nothing to overlap and is not
-expected to be faster than NumPy; it must run at NumPy's speed. The same
+expected to be faster than NumPy; the target is NumPy's speed. The same
 expression in a loop may or may not run faster than NumPy, depending on
 whether consecutive iterations can overlap (instruction pipelining, see
 "Roadmap").
@@ -85,7 +101,31 @@ whether consecutive iterations can overlap (instruction pipelining, see
 Judging a change against G3: compare viproc with NumPy on the same machine,
 same build and options (`docs/benchmarks.md`, "How to measure"); single
 configurations vary by ±25–30% between runs on noisy machines, so repeat
-before calling a result a violation or a fix.
+before calling a result a violation or a fix. A slow-down that comes from
+the per-op layer on small data misses the target; one that a change could
+avoid without giving up G2 is a defect.
+
+## Optimization levels (planned)
+
+viproc is to become configurable through one multi-stage optimization
+setting. Each level adds optimizations to the one below; bit-identity is
+a property of a level, not a fixed promise of viproc.
+
+| Level | Adds | Results |
+|-------|------|---------|
+| **O1** (current implementation) | array ILP only: independent array instructions overlap; NumPy itself executes every function (its loops, operators and BLAS, called exactly as NumPy calls them) | bit-identical to NumPy (G2) |
+| **O2** | stage pipelining (`pipelining.md`: tasks advance through size, device, allocation and completion on their inputs' stage events; partial results start their consumers); BLAS threading removed (viproc's workers parallelize, each BLAS call runs on one thread) | correct; may deviate from NumPy's (OpenBLAS splits products by its thread count, and the values depend on that split) |
+| **O3** | micro kernels: viproc's own kernels where NumPy's calling pattern costs (fusion of element-wise chains, splitting single ops, other summation orders, re-implemented NumPy internals) | correct; may deviate in rounding |
+| **O4** | automatic device offloading: cost-based device selection per array instruction (GPUs and other accelerators) | correct; may deviate (device kernels and their rounding) |
+
+"Correct" means a result NumPy's semantics allow: the same dtypes,
+shapes, errors and warnings, values within the floating-point error of a
+valid evaluation order. O1 stays available at every stage, as the
+reference and for programs that need NumPy's exact bits.
+G3 changes with the level: at O1 "never slower than NumPy" is a target
+(G3); at higher levels viproc may compute differently, so the per-op
+overhead on small data can be removed (own micro kernels, fused ops) and
+the target can become a firm rule.
 
 ## Non-goals
 
@@ -97,7 +137,8 @@ before calling a result a violation or a fix.
 - **Global program analysis:** no dependency graph (DAG) of the program, no
   ahead-of-time (AOT) analysis. Every decision is local.
 - **Changing what NumPy computes** to gain speed: no other summation order,
-  no other BLAS threading, no approximations (G2).
+  no other BLAS threading, no approximations (G2; only the planned
+  optimization levels above O1 may deviate, see "Optimization levels").
 - **Dedicated array types or scopes in user code** (temporary/return types,
   scope APIs as on .NET): they would rule out running unchanged NumPy
   programs (`docs/design/memory-management.md`, D1).
@@ -105,10 +146,11 @@ before calling a result a violation or a fix.
 
 ## Not goals yet
 
-- **Any optimization besides array ILP:** own SIMD code, kernel fusion,
-  JIT code generation, GPU offloading. SIMD comes from NumPy's loops. Do not
-  add these, but do not make design decisions that rule them out (keep
-  device and memory handling behind an interface).
+- **Any optimization besides array ILP (levels O2-O4):** stage pipelining,
+  own SIMD code, kernel fusion, JIT code generation, GPU offloading. SIMD
+  comes from NumPy's loops. Do not add these yet, but do not make design
+  decisions that rule them out (keep device and memory handling behind an
+  interface).
 - **Phase 1 is CPUs only:** autonomous, asynchronous execution of array
   instructions on multicore CPUs, with NumPy's kernels taken from the
   installed NumPy at runtime. Out of scope for phase 1: .NET/ILNumerics
