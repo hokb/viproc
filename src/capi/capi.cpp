@@ -463,6 +463,33 @@ bool cast_small_inputs(vp_runtime* rt, const vp_loop& loop, std::span<ArrayPtr> 
 
 extern "C" {
 
+int vp_ndarray_shape(PyObject* nd, int* ndim, int64_t* shape) {
+    return numpy::ndarray_shape(nd, ndim, shape) ? 1 : 0;
+}
+
+PyObject* vp_ufunc_host(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
+                        PyObject* const* ndarrays, int out_ndim, const int64_t* out_shape) {
+    (void)rt;
+    const int nin = loop->loop->nin();
+    const Array* ins[3];
+    if (nin > 3) {
+        return nullptr;
+    }
+    for (int i = 0; i < nin; ++i) {
+        if (ndarrays != nullptr && ndarrays[i] != nullptr) {
+            ins[i] = nullptr;
+            continue;
+        }
+        Array& a = arr(inputs[i]);
+        if (!a.ready() || a.group()->last_error()) {
+            return nullptr;
+        }
+        ins[i] = &a;
+    }
+    return numpy::run_trivial_into_ndarray(*loop->loop, loop->dtypes.data(), ins, ndarrays, nin,
+                                           out_ndim, out_shape);
+}
+
 int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs, int out_ndim,
                    const int64_t* out_shape, vp_array* out, vp_array** result, const char* site,
                    char* err, size_t errlen) {

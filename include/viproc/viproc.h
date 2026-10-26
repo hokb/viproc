@@ -249,6 +249,14 @@ int vp_ufunc_loop(vp_runtime* rt, PyObject* ufunc, int nin, const vp_dtype* dtyp
  * than the loop's are cast as NumPy casts them (short ones into copies
  * first, others in the iterator's buffers); an `out` of another dtype gets
  * the results cast into it, as NumPy's iterator does. */
+/* PROTOTYPE: computes a ufunc on ready inputs right away into a new
+ * numpy.ndarray (no task, no viproc array), if it is NumPy's trivial loop
+ * call (see run_trivial_into_ndarray). NULL without a Python error: not
+ * applicable, use vp_ufunc_issue(). Main thread, with the GIL. */
+PyObject* vp_ufunc_host(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
+                        PyObject* const* ndarrays, int out_ndim, const int64_t* out_shape);
+/* PROTOTYPE: shape of a numpy.ndarray; 0 if `nd` is none. */
+int vp_ndarray_shape(PyObject* nd, int* ndim, int64_t* shape);
 int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs, int out_ndim,
                    const int64_t* out_shape, vp_array* out, vp_array** result, const char* site,
                    char* err, size_t errlen);

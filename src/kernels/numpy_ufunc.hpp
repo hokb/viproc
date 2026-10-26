@@ -274,6 +274,21 @@ PyObject* export_ndarray(const Array& a, bool writable);
 // still referenced after the call, pin_borrowed() turns it into a read-only
 // export. Main thread, with the GIL.
 PyObject* borrow_ndarray(const Array& a);
+
+// PROTOTYPE (small results as numpy.ndarray): runs `loop` on ready inputs
+// right here, as NumPy's trivial loop runs it (one call, contiguous inputs of
+// the output's shape or 0-d inputs with stride 0, no casts), into a fresh
+// C-ordered ndarray. Returns that ndarray, or nullptr without a Python error
+// if the call is not such a trivial one (or set a floating-point flag: NumPy
+// has to warn), nullptr with a Python error on failure. Main thread, GIL.
+// `nds[i]`, if not null, is a numpy.ndarray input used in place of ins[i]
+// (read during this call only).
+PyObject* run_trivial_into_ndarray(const UfuncLoop& loop, const DType* dtypes,
+                                   const Array* const* ins, PyObject* const* nds, int nin,
+                                   int ndim, const std::int64_t* shape);
+// PROTOTYPE: ndim and shape of a numpy.ndarray (false if it is none or has
+// more than VP's dimensions).
+bool ndarray_shape(PyObject* nd, int* ndim, std::int64_t* shape);
 bool pin_borrowed(const Array& a, PyObject* view);
 
 } // namespace viproc::numpy

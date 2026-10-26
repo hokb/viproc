@@ -14,6 +14,7 @@
 #include "kernels/numpy_iter.hpp"
 
 #include <algorithm>
+#include <cfenv>
 #include <cstring>
 #include <mutex>
 
@@ -1345,6 +1346,83 @@ PyObject* export_ndarray(const Array& a, bool writable) {
 // reductions, e.g. argmax), for the reductions the bridge calls: they read
 // it only. Read-only once pinned.
 PyObject* borrow_ndarray(const Array& a) { return ndarray_over(a, true); }
+
+bool ndarray_shape(PyObject* nd, int* ndim, std::int64_t* shape) {
+    if (!PyArray_Check(nd)) {
+        return false;
+    }
+    PyArrayObject* a = reinterpret_cast<PyArrayObject*>(nd);
+    *ndim = PyArray_NDIM(a);
+    for (int i = 0; i < *ndim; ++i) {
+        shape[i] = PyArray_DIM(a, i);
+    }
+    return true;
+}
+
+PyObject* run_trivial_into_ndarray(const UfuncLoop& loop, const DType* dtypes,
+                                   const Array* const* ins, PyObject* const* nds, int nin,
+                                   int ndim, const std::int64_t* shape) {
+    if (loop.raises_through_pyapi() || nin > 3) {
+        return nullptr;
+    }
+    npy_intp n = 1;
+    npy_intp dims[NPY_MAXDIMS];
+    for (int i = 0; i < ndim; ++i) {
+        dims[i] = static_cast<npy_intp>(shape[i]);
+        n *= dims[i];
+    }
+    char* data[4];
+    npy_intp strides[4];
+    for (int i = 0; i < nin; ++i) {
+        if (nds != nullptr && nds[i] != nullptr) {
+            PyArrayObject* x = reinterpret_cast<PyArrayObject*>(nds[i]);
+            const int xd = PyArray_NDIM(x);
+            if (!same_dtype(PyArray_DESCR(x)->type_num, dtypes[i]) || !PyArray_ISALIGNED(x) ||
+                !PyArray_ISNOTSWAPPED(x)) {
+                return nullptr;
+            }
+            if (xd == 0) {
+                strides[i] = 0;
+            } else if (xd == ndim && PyArray_IS_C_CONTIGUOUS(x) &&
+                       std::equal(PyArray_DIMS(x), PyArray_DIMS(x) + xd, shape)) {
+                strides[i] = static_cast<npy_intp>(itemsize(dtypes[i]));
+            } else {
+                return nullptr;
+            }
+            data[i] = static_cast<char*>(PyArray_DATA(x));
+            continue;
+        }
+        const Array& a = *ins[i];
+        const Layout& l = a.layout();
+        if (l.dtype != dtypes[i]) {
+            return nullptr; // a cast: NumPy's iterator
+        }
+        if (l.shape.empty()) {
+            strides[i] = 0;
+        } else if (static_cast<int>(l.shape.size()) == ndim &&
+                   std::equal(l.shape.begin(), l.shape.end(), shape) && l.c_contiguous()) {
+            strides[i] = static_cast<npy_intp>(itemsize(l.dtype));
+        } else {
+            return nullptr;
+        }
+        data[i] = reinterpret_cast<char*>(a.buffer()->data() + l.offset);
+    }
+    PyObject* out = PyArray_SimpleNew(ndim, dims, type_num(dtypes[nin]));
+    if (out == nullptr) {
+        return nullptr;
+    }
+    data[nin] = static_cast<char*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(out)));
+    strides[nin] = static_cast<npy_intp>(itemsize(dtypes[nin]));
+    std::feclearexcept(FE_ALL_EXCEPT);
+    const npy_intp count[1] = {n};
+    const int st = n > 0 ? loop.call(data, count, strides) : 0;
+    if (st != 0 || std::fetestexcept(FE_DIVBYZERO | FE_OVERFLOW | FE_INVALID | FE_UNDERFLOW)) {
+        Py_DECREF(out);
+        PyErr_Clear();
+        return nullptr; // NumPy runs it again: its errors and warnings
+    }
+    return out;
+}
 
 bool pin_borrowed(const Array& a, PyObject* view) {
     PyArray_CLEARFLAGS(reinterpret_cast<PyArrayObject*>(view), NPY_ARRAY_WRITEABLE);

@@ -50,6 +50,7 @@ static PyObject* AsyncError = NULL;
 static PyObject* AsyncIndexError = NULL;  /* AsyncError and IndexError */
 static PyObject* AsyncValueError = NULL;  /* AsyncError and ValueError */
 static PyObject* AsyncLinAlgError = NULL; /* AsyncError and numpy.linalg.LinAlgError */
+static int g_host_small = 0;  /* PROTOTYPE: VIPROC_HOST_SMALL=1 */
 static long long g_small = 2048; /* the runtime's sync_below: ops this small run directly */
 
 /* Registered by _ndarray.py via _viproc.setup(). */
@@ -1673,6 +1674,8 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
     /* Inputs as runtime arrays; scalars (cached) and NumPy arrays are
      * converted. */
     vp_array* ins[MAXIN];
+    PyObject* nds[MAXIN] = {NULL};
+    int any_nd = 0;
     vp_array* evicted[MAXIN];
     PyObject* keep[MAXIN];
     int nevicted = 0, nkeep = 0, status = 0;
@@ -1682,6 +1685,19 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
         PyObject* x = inputs[i];
         if (is_array(x)) {
             ins[i] = ((ArrayObject*)x)->a;
+        } else if (g_host_small && out == NULL &&
+                   PyObject_TypeCheck(x, (PyTypeObject*)g_np_ndarray)) {
+            /* PROTOTYPE: imported only if the host path does not take it. */
+            nds[i] = x;
+            ins[i] = NULL;
+            any_nd = 1;
+            int xd;
+            int64_t xs[MAXDIMS];
+            if (!vp_ndarray_shape(x, &xd, xs) || xd > MAXDIMS ||
+                broadcast_into(shape, &ndim, xd, xs) < 0) {
+                status = 1;
+            }
+            continue;
         } else if (PyObject_TypeCheck(x, (PyTypeObject*)g_np_ndarray)) {
             PyObject* w = PyObject_CallOneArg(g_asarray, x); /* copy into the runtime */
             if (w == NULL) {
@@ -1711,6 +1727,37 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             status = 1; /* casting/broadcasting into out=, or read-only: NumPy decides */
         }
     }
+    int handled = 0;
+    if (status == 0 && out == NULL && g_host_small && ndim > 0) {
+        /* PROTOTYPE: a small op on ready data is computed right here into a
+         * numpy.ndarray, which is returned as is (no task, no viproc array). */
+        long long elements = 1;
+        for (int i = 0; i < ndim; ++i) {
+            elements *= shape[i];
+        }
+        if (elements < g_small) {
+            PyObject* r = vp_ufunc_host(g_rt, loop, ins, any_nd ? nds : NULL, ndim, shape);
+            if (r != NULL) {
+                *result = r;
+                handled = 1;
+                goto done;
+            }
+            if (PyErr_Occurred()) {
+                status = -1;
+            }
+        }
+    }
+    for (Py_ssize_t i = 0; i < n && status == 0 && any_nd; ++i) {
+        if (nds[i] != NULL) { /* PROTOTYPE: the host path did not take it */
+            PyObject* w = PyObject_CallOneArg(g_asarray, nds[i]);
+            if (w == NULL) {
+                status = -1;
+                break;
+            }
+            keep[nkeep++] = w;
+            ins[i] = ((ArrayObject*)w)->a;
+        }
+    }
     if (status == 0 && elide && out == NULL) {
         /* Operators only (as NumPy): write into a temporary operand. */
         out = elision_candidate(inputs, ins, n, codes[n], ndim, shape);
@@ -1718,7 +1765,6 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             ++g_elided;
         }
     }
-    int handled = 0;
     if (status == 0) {
         char err[ERRLEN] = "";
         vp_array* res = NULL;
@@ -1736,6 +1782,7 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             handled = -1;
         }
     }
+done:
     for (int i = 0; i < nevicted; ++i) {
         vp_array_release(evicted[i]); /* an issued task keeps its data alive */
     }
@@ -2396,6 +2443,10 @@ static PyObject* m_init(PyObject* self, PyObject* args) {
     g_main_thread = PyThread_get_thread_ident();
     vp_set_error_notify(g_rt, error_recorded, NULL);
     g_small = sync_below >= 0 ? sync_below : 2048;
+    {
+        const char* h = getenv("VIPROC_HOST_SMALL");
+        g_host_small = h != NULL && h[0] == '1';
+    }
     if (sync_below >= 0 || !adaptive) {
         vp_set_offload_policy(g_rt, sync_below >= 0 ? sync_below : 2048, adaptive);
     }
