@@ -233,12 +233,28 @@ def _eigh(a, UPLO="L"):
 
 
 def _svd(a, full_matrices=True, compute_uv=True, hermitian=False):
-    if hermitian:
-        return _NOPE  # eigh, then argsort (step 7)
     a = _arrays(a)
     if a is None:
         return _NOPE
     a, = a
+    if hermitian:  # NumPy's code: eigh, the values sorted by magnitude
+        if compute_uv:
+            r = _eigh(a)
+            if r is _NOPE:
+                return _NOPE
+            s, u = r
+            sgn = np.copysign(1.0, s)
+            s = abs(s)
+            sidx = np.argsort(s)[..., ::-1]
+            sgn = np.take_along_axis(sgn, sidx, axis=-1)
+            s = np.take_along_axis(s, sidx, axis=-1)
+            u = np.take_along_axis(u, sidx[..., None, :], axis=-1)
+            vt = np.swapaxes(u * sgn[..., None, :], -1, -2).conjugate()
+            return SVDResult(u, s, vt)
+        s = _eigvalsh(a)
+        if s is _NOPE:
+            return _NOPE
+        return np.sort(abs(s))[..., ::-1]
     _assert_stacked_2d(a)
     t, result_t = _common_type(a)
     m, n = a.shape[-2:]
@@ -278,9 +294,21 @@ def _small_ready(func, handler):
     return h
 
 
+def _svd_entry(svd_small):
+    """svd: hermitian=True always as NumPy's composition (its results are
+    views, a reversed one too, which NumPy's result adopted would lose)."""
+    def h(a, full_matrices=True, compute_uv=True, hermitian=False):
+        if hermitian:
+            return _svd(a, full_matrices, compute_uv, True)
+        return svd_small(a, full_matrices, compute_uv, hermitian)
+
+    return h
+
+
 LINALG = {f: _small_ready(f, h) for f, h in {
     np.linalg.det: _det, np.linalg.slogdet: _slogdet, np.linalg.inv: _inv,
     np.linalg.solve: _solve, np.linalg.cholesky: _cholesky, np.linalg.eigvals: _eigvals,
     np.linalg.eig: _eig, np.linalg.eigvalsh: _eigvalsh, np.linalg.eigh: _eigh,
     np.linalg.svd: _svd, np.linalg.svdvals: _svdvals,
 }.items()}
+LINALG[np.linalg.svd] = _svd_entry(LINALG[np.linalg.svd])

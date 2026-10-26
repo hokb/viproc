@@ -5,16 +5,20 @@
 #include "kernels/numpy_gufunc.hpp"
 #include "kernels/numpy_matmul.hpp"
 #include "kernels/numpy_reduce.hpp"
+#include "kernels/numpy_sort.hpp"
 #include "kernels/numpy_ufunc.hpp"
 #include "runtime/assign.hpp"
 #include "runtime/element_pool.hpp"
 #include "runtime/index.hpp"
 #include "runtime/runtime.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -122,6 +126,8 @@ struct vp_runtime {
     std::shared_ptr<Graveyard> graveyard = std::make_shared<Graveyard>();
     // One matmul kernel per resolved loop.
     std::unordered_map<const numpy::UfuncLoop*, std::shared_ptr<Kernel>> matmul_kernels;
+    // One sort kernel per (dtype, kind, arg, axis).
+    std::map<std::tuple<DType, int, bool, int>, std::shared_ptr<Kernel>> sort_kernels;
     // One gufunc kernel per (loop, core axes, invalid_error, options).
     std::map<std::tuple<const numpy::UfuncLoop*, std::vector<std::vector<int>>, std::string, int>,
              std::shared_ptr<Kernel>>
@@ -1256,6 +1262,75 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
     for (std::size_t j = 0; j < no; ++j) {
         results[j] = hand_out(std::move(res[j]));
     }
+    return VP_OK;
+}
+
+int vp_sort(vp_runtime* rt, vp_array* in, int axis, int kind, int arg, int in_place, int order_n,
+            const int* out_order, vp_array** result, const char* site, char* err, size_t errlen) {
+    rt->graveyard->drain();
+    *result = nullptr;
+    const Layout& l = arr(in).layout();
+    const auto nd = static_cast<int>(l.shape.size());
+    if (axis < 0 || axis >= nd || (in_place != 0 && arg != 0) ||
+        (in_place == 0 && arg == 0 && order_n != nd && order_n != 0)) {
+        set_error(err, errlen, "sort: unsupported arguments");
+        return VP_UNSUPPORTED;
+    }
+    std::shared_ptr<Kernel>& k = rt->sort_kernels[{l.dtype, kind, arg != 0, axis}];
+    if (!k) {
+        std::string e;
+        k = numpy::make_sort_kernel(l.dtype, kind, arg != 0, axis, e);
+        if (!k) {
+            set_error(err, errlen, e);
+            return VP_UNSUPPORTED;
+        }
+    }
+    if (in_place != 0) {
+        const ArrayPtr io[] = {ref(in)};
+        rt->rt->issue(k, {}, io, {}, site, {});
+        return VP_OK;
+    }
+    Layout out;
+    if (arg != 0) {
+        out = Layout::contiguous(DType::Int64, l.shape); // NumPy's intp result, C order
+    } else {
+        out.dtype = l.dtype;
+        out.shape = l.shape;
+        out.strides = Strides(l.shape.size(), 0);
+        std::vector<int> k_order;
+        if (order_n == 0) { // empty_like(a), order K (PyArray_NewLikeArray)
+            k_order.resize(l.shape.size());
+            for (int i = 0; i < nd; ++i) {
+                k_order[static_cast<std::size_t>(i)] = l.c_contiguous() ? i : nd - 1 - i;
+            }
+            if (!l.c_contiguous() && !l.f_contiguous()) {
+                std::iota(k_order.begin(), k_order.end(), 0); // PyArray_CreateSortedStridePerm
+                std::ranges::stable_sort(k_order, [&l](int x, int y) {
+                    return std::abs(l.strides[static_cast<std::size_t>(x)]) >
+                           std::abs(l.strides[static_cast<std::size_t>(y)]);
+                });
+            }
+            order_n = nd;
+            out_order = k_order.data();
+        }
+        std::int64_t step = static_cast<std::int64_t>(itemsize(l.dtype));
+        std::vector<bool> seen(l.shape.size(), false);
+        for (int i = order_n - 1; i >= 0; --i) {
+            const int a = out_order[i];
+            if (a < 0 || a >= nd || seen[static_cast<std::size_t>(a)]) {
+                set_error(err, errlen, "sort: out_order is no permutation");
+                return VP_UNSUPPORTED;
+            }
+            seen[static_cast<std::size_t>(a)] = true;
+            out.strides[static_cast<std::size_t>(a)] = step;
+            step *= l.shape[static_cast<std::size_t>(a)];
+        }
+    }
+    const ArrayPtr ins[] = {ref(in)};
+    ArrayPtr res;
+    rt->rt->issue(k, ins, {}, std::span(&out, 1), site, std::span(&res, 1),
+                  static_cast<std::int64_t>(l.size()) * 4);
+    *result = hand_out(std::move(res));
     return VP_OK;
 }
 

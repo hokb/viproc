@@ -296,6 +296,18 @@ int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* valu
 int vp_select(vp_runtime* rt, vp_array* cond, vp_array* x, vp_array* y, vp_array** result,
               const char* site, char* err, size_t errlen);
 
+/* Issues a sort (`arg` 0) or argsort (`arg` != 0) of `in` along `axis` with
+ * NumPy's per-dtype sort functions (src/kernels/numpy_sort.hpp); `kind` is
+ * NumPy's sort table index (0 the default, 2 stable; NumPy maps heapsort to
+ * 0). A sort writes a new array, dense with its axes in `out_order`
+ * (order_n == ndim entries, outermost first; order_n == 0: the layout of
+ * np.sort's copy, empty_like(in) in order K), or,
+ * with `in_place`, sorts `in` itself (`a.sort()`, *result NULL); an argsort
+ * gives a new C-ordered int64 array. Returns VP_UNSUPPORTED for other
+ * arguments. */
+int vp_sort(vp_runtime* rt, vp_array* in, int axis, int kind, int arg, int in_place, int order_n,
+            const int* out_order, vp_array** result, const char* site, char* err, size_t errlen);
+
 /* Issues argmax (`argmax` != 0) or argmin of `in` along its last axis with
  * NumPy's per-dtype functions, one call per row, as PyArray_ArgMax calls
  * them. `in` must be C-contiguous with at least one dimension (the bridge

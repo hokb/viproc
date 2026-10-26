@@ -228,6 +228,13 @@ def test_composed_methods_take_async_path(det, call, ops):
     same(assert_async(call, v, ops=ops), call(x))
 
 
+@pytest.mark.parametrize("call", [lambda a: a.argsort(), lambda a: (a.sort(), a)[1]],
+                         ids=["argsort", "sort"])
+def test_sort_methods_take_async_path(det, call):
+    x, v = big()
+    same(assert_async(call, v), call(x.copy()))
+
+
 def test_trace_takes_async_path(det):
     x = rng.random((3000, 3000))
     v = pending(viproc.asarray(x))
@@ -237,10 +244,8 @@ def test_trace_takes_async_path(det):
 # Methods whose function form still falls back: each step of #25 that makes
 # the function asynchronous turns its entry green (strict xfail).
 FALLING_BACK = [
-    ("argsort", lambda a: a.argsort(), 1),
     ("argpartition", lambda a: a.argpartition(5), 1),
     ("searchsorted", lambda a: a.searchsorted(0.9), 1),
-    ("sort", lambda a: a.sort(), 1),
     ("partition", lambda a: a.partition(5), 1),
 ]
 
