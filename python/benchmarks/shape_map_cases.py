@@ -59,11 +59,22 @@ class Case:
     make: object  # make(rng, shape, width) -> list of NumPy arrays
     run: object  # run(data, reps) -> result (array or list of arrays)
     scalar_ok: bool = True  # also meaningful on 0-d data
+    complexity: str = ""  # key of CLASSES, set from COMPLEXITY below
 
 
 CASES = []
-GROUPS = ["dependent", "independent", "mixed", "reductions", "sync", "expressions",
-          "loops", "control"]
+GROUPS = ["single", "dependent", "independent", "mixed", "reductions", "sync", "expressions",
+          "loops", "control", "algorithms"]
+
+# Complexity classes (shape_map.py --classes: one image each), orthogonal to
+# the groups. An op counts as binary when it combines two arrays; a Python or
+# NumPy scalar operand (`x * 0.5`, `x ** 3`) is a constant of a unary step.
+CLASSES = {
+    "single": "single ops: one op per step (x = op(x))",
+    "unary": "chains without binary ops: every op reads one array",
+    "binary": "chains with binary ops: ops combine two or more arrays",
+    "algorithms": "whole algorithms (k-means, power iteration, ...)",
+}
 
 
 def case(name, group, description, width, mem, scalar_ok=True):
@@ -89,6 +100,60 @@ def inputs(n, dtype=np.float64):
 def sync(x):
     """A sync point as a NumPy program has it: read a value into Python."""
     return float(np.max(x))
+
+
+# --- single ops (P = 1) -------------------------------------------------------------
+# One op per step, each reading the previous step's result: what one op costs
+# in a stream of ops (dep1_abs below is the cheapest of them).
+
+
+@case("op_cos", "single", "x = cos(x): 1 expensive unary op per step", 1, 6)
+def _():
+    def run(d, reps):
+        x = d[0]
+        for _ in range(reps):
+            x = np.cos(x)
+        return x
+
+    return inputs(1), run
+
+
+@case("op_sub", "single", "x = y - x: 1 binary op per step", 1, 8)
+def _():
+    def run(d, reps):
+        x, y = d
+        for _ in range(reps):
+            x = y - x
+        return x
+
+    return inputs(2), run
+
+
+@case("op_div", "single", "x = y / x: 1 binary op per step", 1, 8)
+def _():
+    def run(d, reps):
+        x, y = d
+        for _ in range(reps):
+            x = y / x
+        return x
+
+    return inputs(2), run
+
+
+@case("op_matmul", "single", "x = x @ q, q orthogonal (cols, cols): 1 matmul per step", 1, 8,
+      scalar_ok=False)
+def _():
+    def make(rng, shape, width):
+        q, _ = np.linalg.qr(rng.standard_normal((shape[1], shape[1])))
+        return [uniform(rng, shape), q]
+
+    def run(d, reps):
+        x, q = d
+        for _ in range(reps):
+            x = x @ q
+        return x
+
+    return make, run
 
 
 # --- dependent chains (P = 1) ---------------------------------------------------
@@ -576,3 +641,149 @@ def _():
         return x
 
     return inputs(1), run
+
+
+# --- whole algorithms -------------------------------------------------------------------
+
+
+@case("kmeans_points", "algorithms",
+      "k-means of ILNumerics' Part 3: rows = dimensions, cols = points, k = cols / 10 "
+      "(2..50); per point distances and argmin, per cluster nonzero (sync) and mean",
+      "cols", 8, scalar_ok=False)
+def _():
+    # The NumPy program of github.com/hokb/decentralized-array-execution-
+    # artifacts2026 (Appendix, Part 3 KMeans), as suite_cases.kmeans_points,
+    # with a fixed iteration count (reps) instead of the convergence test.
+    def make(rng, shape, width):
+        return [rng.uniform(0, 10, size=shape)]
+
+    def run(d, reps):
+        X = d[0]
+        n = np.size(X, 1)
+        k = min(50, max(2, n // 10))
+        centers = X[:, np.linspace(0, n - 2, k, dtype=np.int64)].copy()
+        classes = np.zeros_like(X, shape=(1, n))
+        for _ in range(reps):
+            for i in range(n):
+                dist = np.sqrt(np.sum(np.square(X[:, i, np.newaxis] - centers), axis=0))
+                classes[0, i] = dist.argmin()
+            for i in range(k):
+                found = np.nonzero(classes == i)[1]
+                in_class = X[:, found]
+                if in_class.size > 0:
+                    centers[:, i] = in_class.mean(axis=1)
+        return [classes, centers]
+
+    return make, run
+
+
+@case("kmeans_vec", "algorithms",
+      "k-means, k = 8, of the 2-d points (x, y) (each of the shape): distances, labels by "
+      "minimum and where, centroids from masked sums (sync per cluster)", 8, 30)
+def _():
+    k = 8
+
+    def make(rng, shape, width):
+        return [uniform(rng, shape, lo=0, hi=10), uniform(rng, shape, lo=0, hi=10)]
+
+    def run(pts, reps):
+        x, y = pts
+        cx = [float(v) for v in np.linspace(1, 9, k)]
+        cy = [float(v) for v in np.linspace(9, 1, k)]
+        labels = None
+        for _ in range(reps):
+            dist = [(x - cx[j]) ** 2 + (y - cy[j]) ** 2 for j in range(k)]
+            best = dist[0]
+            labels = np.zeros(x.shape, dtype=np.int64)
+            for j in range(1, k):
+                closer = dist[j] < best
+                best = np.minimum(best, dist[j])
+                labels = np.where(closer, j, labels)
+            for j in range(k):
+                m = labels == j
+                cnt = int(m.sum())
+                if cnt:
+                    cx[j] = float((x * m).sum()) / cnt
+                    cy[j] = float((y * m).sum()) / cnt
+        return [labels, np.array(cx), np.array(cy)]
+
+    return make, run
+
+
+@case("power_iter", "algorithms",
+      "power iteration on A^T A: v = A.T @ (A @ v); v = v / norm(v)", 1, 4, scalar_ok=False)
+def _():
+    def make(rng, shape, width):
+        return [uniform(rng, shape), uniform(rng, (shape[1],))]
+
+    def run(d, reps):
+        a, v = d
+        for _ in range(reps):
+            v = a.T @ (a @ v)
+            v = v / np.linalg.norm(v)
+        return v
+
+    return make, run
+
+
+@case("logreg", "algorithms",
+      "logistic regression, gradient descent: rows = samples, cols = features; "
+      "p = 1 / (1 + exp(-X @ w)); w -= 0.1 * X.T @ (p - y) / rows", 1, 4, scalar_ok=False)
+def _():
+    def make(rng, shape, width):
+        x = uniform(rng, shape, lo=-1.0, hi=1.0)
+        y = (rng.uniform(size=shape[0]) < 0.5).astype(np.float64)
+        return [x, y, uniform(rng, (shape[1],), lo=-0.1, hi=0.1)]
+
+    def run(d, reps):
+        x, y, w = d
+        n = x.shape[0]
+        for _ in range(reps):
+            p = 1.0 / (1.0 + np.exp(-(x @ w)))
+            w = w - 0.1 * (x.T @ (p - y)) / n
+        return w
+
+    return make, run
+
+
+@case("mandelbrot", "algorithms",
+      "Mandelbrot iteration on a complex tile: z = where(|z| <= 2, z * z + c, z); "
+      "count += |z| <= 2", 1, 20)
+def _():
+    def make(rng, shape, width):
+        rows, cols = shape if shape else (1, 1)
+        re = np.linspace(-2.0, 0.5, cols)
+        im = np.linspace(-1.25, 1.25, rows)
+        c = (re + 1j * im[:, None]).reshape(shape)
+        return [c]
+
+    def run(d, reps):
+        c = d[0]
+        z = c * 0.0
+        count = c.real * 0.0
+        for _ in range(reps):
+            inside = np.abs(z) <= 2.0
+            z = np.where(inside, z * z + c, z)
+            count += inside
+        return [z, count]
+
+    return make, run
+
+
+COMPLEXITY = {
+    "single": ["op_cos", "op_sub", "op_div", "op_matmul", "dep1_abs"],
+    "unary": ["dep2_abs_pow", "dep3_cos_pow_neg", "ind2", "ind3", "ind_cores_3ops",
+              "ind8_cheap", "ind_cores_f32", "dep3_sync", "ind3_sync", "loop_cols",
+              "loop_cols_dep", "loop_blocks_out", "cond_data"],
+    "binary": ["expr2", "expr8", "inplace", "broadcast", "stencil", "center_cols",
+               "normalize_rows", "sum_cores", "converge", "expr_poly", "expr_gauss",
+               "expr_option", "expr_where", "expr_mask", "expr_softmax", "loop_rows",
+               "loop_scan", "loop_accum", "cond_index", "cond_newton"],
+    "algorithms": ["kmeans_points", "kmeans_vec", "power_iter", "logreg", "mandelbrot"],
+}
+for _cls, _names in COMPLEXITY.items():
+    for _c in CASES:
+        if _c.name in _names:
+            _c.complexity = _cls
+assert all(c.complexity for c in CASES), [c.name for c in CASES if not c.complexity]
+assert sum(map(len, COMPLEXITY.values())) == len(CASES)

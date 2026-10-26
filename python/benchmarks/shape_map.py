@@ -22,8 +22,11 @@ Usage:
     python3 python/benchmarks/shape_map.py --plot DIR/shape_map.json [--out DIR] [--groups G,..]
 
 Writes DIR/shape_map.json, DIR/shape_map.md and, with matplotlib installed,
-DIR/shape_map.png (median and spread) and DIR/shape_map_groups.png (median
-per case group).
+DIR/shape_map.png (median and spread), DIR/shape_map_groups.png (median
+per case group) and one DIR/shape_map_<class>.png per complexity class
+(shape_map_cases.CLASSES: single ops, chains without and with binary ops,
+whole algorithms): the class median with its spread and every case of the
+class on its own.
 """
 
 import argparse
@@ -100,7 +103,8 @@ def measure(case, shape, cores, workers, target, repeat, seed, module=False):
     t_vp, _ = best_of(run, repeats_for(warm, repeat))
     del vdata, expected
     viproc.shutdown()
-    return {"case": case.name, "group": case.group, "width": width, "reps": reps,
+    return {"case": case.name, "group": case.group, "complexity": case.complexity,
+            "width": width, "reps": reps,
             "numpy_s": t_np, "viproc_s": t_vp, "speedup": t_np / t_vp,
             "identical": bool(same), "fallbacks": fallbacks}
 
@@ -117,6 +121,19 @@ def run_groups(run):
     """The case groups a run measured, in the order of shape_map_cases.GROUPS."""
     have = {r["group"] for r in run["results"]}
     return [g for g in shape_map_cases.GROUPS if g in have]
+
+
+def complexity(r):
+    """The complexity class of a result (looked up for runs that predate it)."""
+    if r.get("complexity"):
+        return r["complexity"]
+    return next((c.complexity for c in shape_map_cases.CASES if c.name == r["case"]), "")
+
+
+def run_classes(run):
+    """The complexity classes a run measured, in the order of CLASSES."""
+    have = {complexity(r) for r in run["results"]}
+    return [k for k in shape_map_cases.CLASSES if k in have]
 
 
 def select_groups(run, groups):
@@ -143,9 +160,14 @@ def summarize(results):
             gs = [r["speedup"] for r in rs if r["group"] == g]
             if gs:
                 groups[g] = quartiles(gs)[1]
+        classes = {}
+        for k in shape_map_cases.CLASSES:
+            ks = [r["speedup"] for r in rs if complexity(r) == k]
+            if ks:
+                classes[k] = quartiles(ks) + (len(ks),)
         out.append({"shape": rs[0]["shape"], "elements": rs[0]["elements"],
                     "cases": len(rs), "median": med, "q25": q25, "q75": q75,
-                    "spread": q75 / q25, "groups": groups,
+                    "spread": q75 / q25, "groups": groups, "classes": classes,
                     "identical": sum(r["identical"] for r in rs),
                     "fallbacks": sum(r["fallbacks"] for r in rs)})
     return out
@@ -261,11 +283,31 @@ def write_markdown(run, path):
                 cells.append("–" if v is None else f"{v:.2f}")
             lines.append(f"| **{r:,}** | " + " | ".join(cells) + " |")
         lines.append("")
-    lines += ["## Cases", "", "| case | group | P | program |", "|---|---|---:|---|"]
+    lines += ["## Median per complexity class", "",
+              "In brackets the interquartile range over the cases of the class.", ""]
+    for k in run_classes(run):
+        n = len({r["case"] for r in run["results"] if complexity(r) == k})
+        lines += [f"### {shape_map_cases.CLASSES[k]} ({n} cases)", "",
+                  "| rows \\ cols | " + " | ".join(f"{c:,}" for c in cols) + " |",
+                  "|---:|" + "---:|" * len(cols)]
+        for r in rows:
+            cells = []
+            for c in cols:
+                v = pts.get((r, c), {}).get("classes", {}).get(k)
+                cells.append("–" if v is None else f"**{v[1]:.2f}** ({v[0]:.2f}–{v[2]:.2f})")
+            lines.append(f"| **{r:,}** | " + " | ".join(cells) + " |")
+        v = pts.get((), {}).get("classes", {}).get(k)
+        if v:
+            lines += ["", f"0-d scalars: median **{v[1]:.2f}x** ({v[0]:.2f}–{v[2]:.2f}, "
+                          f"{v[3]} cases)."]
+        lines.append("")
+    measured = {r["case"] for r in run["results"]}
+    lines += ["## Cases", "", "| case | group | class | P | program |", "|---|---|---|---:|---|"]
     for c in shape_map_cases.CASES:
-        if c.group not in run_groups(run):
+        if c.name not in measured:
             continue
-        lines.append(f"| {c.name} | {c.group} | {c.width} | {c.description} |")
+        lines.append(f"| {c.name} | {c.group} | {c.complexity} | {c.width} | "
+                     f"{c.description} |")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -426,6 +468,77 @@ def plot(run, out_dir):
     fig.savefig(path, dpi=110)
     plt.close(fig)
     files.append(path)
+    return files + plot_classes(run, out_dir, cmap, norm, ticks)
+
+
+def plot_classes(run, out_dir, cmap, norm, ticks):
+    """One image per complexity class: the median over the class's cases with
+    its interquartile range (left) and every case of the class (right)."""
+    import matplotlib.pyplot as plt
+
+    m = run["machine"]
+    xe, ye = _edges(m["cols"]), _edges(m["rows"])
+    lb = labels(run)
+    sub_, base = lb["subject"], lb["baseline"]
+    by_case = {}
+    for r in run["results"]:
+        by_case.setdefault(r["case"], {})[tuple(r["shape"])] = r["speedup"]
+    order = [c.name for c in shape_map_cases.CASES]
+    files = []
+    for k in run_classes(run):
+        cases = [n for n in order if n in by_case
+                 and complexity(next(r for r in run["results"] if r["case"] == n)) == k]
+        ncols = 4 if len(cases) <= 16 else 5
+        nrows = max(2, -(-len(cases) // ncols))
+        fig = plt.figure(figsize=(8.5 + 2.6 * ncols, max(8.0, 2.75 * nrows + 1.2)),
+                         facecolor="white", layout="constrained")
+        left, right = fig.subfigures(1, 2, width_ratios=[8.5, 2.6 * ncols])
+        ax = left.subplots()
+        med = _grid(run, lambda p: p.get("classes", {}).get(k, (math.nan,) * 3)[1])
+        q25 = _grid(run, lambda p: p.get("classes", {}).get(k, (math.nan,) * 3)[0])
+        q75 = _grid(run, lambda p: p.get("classes", {}).get(k, (math.nan,) * 3)[2])
+        mesh = ax.pcolormesh(xe, ye, np.log10(med), cmap=cmap, norm=norm)
+        _axes(ax, run, f"{shape_map_cases.CLASSES[k]}\nmedian speedup over {len(cases)} "
+                       f"cases ({base} time / {sub_} time), IQR below")
+        _annotate(ax, run, np.log10(med),
+                  lambda i, j: f"{med[i, j]:.2f}x\n{q25[i, j]:.1f}–{q75[i, j]:.1f}", cmap,
+                  norm, fontsize=7)
+        cb = left.colorbar(mesh, ax=ax, ticks=[math.log10(t) for t in ticks], shrink=0.8)
+        cb.ax.set_yticklabels([f"{t:g}x" for t in ticks], fontsize=8)
+        cb.outline.set_visible(False)
+        cb.set_label(f"{sub_} faster than {base}  ↑   ·   ↓  slower", color=MUTED, fontsize=8)
+        scalar = next((p for p in run["points"] if not p["shape"]), None)
+        foot = f"{sub_} vs. {base}: {lb['header']}"
+        sv = scalar and scalar.get("classes", {}).get(k)
+        if sv:
+            foot += f"\n0-d scalars: median {sv[1]:.2f}x (IQR {sv[0]:.2f}–{sv[2]:.2f})"
+        ax.set_xlabel("columns\n\n" + foot, color=INK, fontsize=8, loc="left")
+
+        axs = right.subplots(nrows, ncols).ravel()
+        for a, name in zip(axs, cases):
+            z = _grid(run, lambda p, name=name: by_case[name].get(tuple(p["shape"]), math.nan))
+            a.pcolormesh(xe, ye, np.log10(z), cmap=cmap, norm=norm)
+            _axes(a, run, "")
+            a.set_xlabel("")
+            a.set_ylabel("")
+            a.set_xticks([m["cols"][0], m["cols"][-1]])
+            a.set_xticklabels([f"{m['cols'][0]:,}", f"{m['cols'][-1]:,}"], rotation=0,
+                              ha="center", fontsize=6)
+            a.set_yticks([m["rows"][0], m["rows"][-1]])
+            a.set_yticklabels([f"{m['rows'][0]:,}", f"{m['rows'][-1]:,}"], fontsize=6)
+            s0 = by_case[name].get(())
+            a.set_title(name + (f"  (0-d {s0:.2f}x)" if s0 else ""), fontsize=8, color=INK,
+                        loc="left")
+            _annotate(a, run, np.log10(z), lambda i, j, z=z: f"{z[i, j]:.1f}", cmap, norm,
+                      fontsize=5)
+        for a in axs[len(cases):]:
+            a.axis("off")
+        right.suptitle("per case: speedup (rows ↓, columns →)", fontsize=9, color=MUTED,
+                       x=0.02, ha="left")
+        path = os.path.join(out_dir, f"{lb['prefix']}_{k}.png")
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+        files.append(path)
     return files
 
 
