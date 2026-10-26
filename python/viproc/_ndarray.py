@@ -103,6 +103,27 @@ def asarray(obj, dtype=None, order=None, *, copy=None, like=None, **kwargs):
     return array(obj, dtype, copy=True, order=order or "K")
 
 
+def user_asarray(obj, dtype=None, order=None, *, copy=None, like=None, **kwargs):
+    """viproc.asarray as the user calls it: in the prototype mode
+    (VIPROC_HOST_SMALL=1) small NumPy data stays NumPy's (numpy.asarray);
+    internal callers use asarray(), which always gives a viproc array."""
+    if _HOST_SMALL and _enabled[0] and like is None and not kwargs and \
+            not isinstance(obj, ndarray):
+        r = np.asarray(obj, dtype, order, copy=copy)
+        if r.size < _small_ops[0]:
+            return r
+    return asarray(obj, dtype, order, copy=copy, like=like, **kwargs)
+
+
+def user_array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0, like=None):
+    """viproc.array as the user calls it (see user_asarray)."""
+    if _HOST_SMALL and _enabled[0] and like is None and not isinstance(obj, ndarray):
+        r = np.array(obj, dtype, copy=copy, order=order, subok=subok, ndmin=ndmin)
+        if r.size < _small_ops[0]:
+            return r
+    return array(obj, dtype, copy=copy, order=order, subok=subok, ndmin=ndmin, like=like)
+
+
 def fresh(r, args=(), kwargs=None):
     """Result `r` of a NumPy function as viproc array: fresh memory is adopted
     without a copy, a view of other memory is copied first. Returned as is:
@@ -116,7 +137,7 @@ def fresh(r, args=(), kwargs=None):
         return r
     if not r.flags.owndata:
         r = r.copy(order="K")  # keeps NumPy's layout (a transposed result)
-    return _adopt(r)
+    return _give(r)
 
 
 def _to_numpy(x):
@@ -137,6 +158,19 @@ def _tree(x, fn):
     if isinstance(x, dict):
         return {k: _tree(v, fn) for k, v in x.items()}
     return fn(x)
+
+
+# PROTOTYPE (VIPROC_HOST_SMALL=1): small results reach the user as NumPy's
+# own arrays (no viproc array); viproc arrays only above the threshold.
+_HOST_SMALL = os.environ.get("VIPROC_HOST_SMALL") == "1"
+
+
+def _give(arr):
+    """A result for the user: small ones as NumPy arrays in the prototype
+    mode, else adopted (_adopt)."""
+    if _HOST_SMALL and arr.size < _small_ops[0]:
+        return arr
+    return _adopt(arr)
 
 
 def _adopt(arr):
@@ -202,7 +236,7 @@ class _Host:
             if np.may_share_memory(r, e):
                 code = _CODES.get(r.dtype)
                 if code is None or not r.flags.aligned or not r.dtype.isnative:
-                    return _adopt(r.copy())  # a view viproc cannot express
+                    return _give(r.copy())  # a view viproc cannot express
                 offset = r.__array_interface__["data"][0] - e.__array_interface__["data"][0]
                 w = _viproc.view(v, r.shape, r.strides, offset, code)
                 if r.flags.num & _WARN_ON_WRITE:  # writable, warns on the first write
@@ -214,8 +248,8 @@ class _Host:
             if r is p or np.may_share_memory(r, p):
                 return r  # aliases a NumPy argument: unchanged, as NumPy returns it
         if r.flags.owndata and r.base is None:
-            return _adopt(r)  # fresh memory nobody else holds
-        return _adopt(r.copy())
+            return _give(r)  # fresh memory nobody else holds
+        return _give(r.copy())
 
 
 # NPY_ARRAY_WARN_ON_WRITE in flags.num (broadcast_arrays' results).
@@ -831,9 +865,9 @@ def _readonly_call(fn):
         fallback_calls += 1
         r = fn(a.numpy(), *args, **kwargs)
         if isinstance(r, tuple):
-            return tuple(_adopt(x) if isinstance(x, np.ndarray) and x.flags.owndata else x
+            return tuple(_give(x) if isinstance(x, np.ndarray) and x.flags.owndata else x
                          for x in r)
-        return _adopt(r) if isinstance(r, np.ndarray) and r.flags.owndata else r
+        return _give(r) if isinstance(r, np.ndarray) and r.flags.owndata else r
 
     return handler
 
@@ -1537,7 +1571,7 @@ class _FlatIter:
 
     def __getitem__(self, key):
         r = self.base.numpy().flat[_numpy_key(key)]
-        return _adopt(r) if isinstance(r, np.ndarray) else r  # NumPy copies
+        return _give(r) if isinstance(r, np.ndarray) else r  # NumPy copies
 
     def __setitem__(self, key, value):
         def assign(a, k, v):
@@ -1709,7 +1743,7 @@ def _getitem(self, key):
         if self.size <= _small_ops[0] and _viproc.ready(self) and _ready_key(key):
             # Small and ready: nothing to overlap, NumPy indexes right away
             # (advanced indexing always copies: the result is fresh).
-            return _adopt(np.asarray(self.numpy()[_numpy_key(key)]))
+            return _give(np.asarray(self.numpy()[_numpy_key(key)]))
         try:
             r = _gather(self, key)
         except AsyncError:

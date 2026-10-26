@@ -1626,6 +1626,69 @@ static int fast_matmul(PyObject* ufunc, PyObject* a, PyObject* b, PyObject** res
     return 1;
 }
 
+/* A viproc array holding a copy of NumPy array `x` (viproc.asarray, which
+ * gives small data back as NumPy's array in the prototype mode). */
+static PyObject* import_copy(PyObject* x) {
+    if (!g_host_small) {
+        return PyObject_CallOneArg(g_asarray, x);
+    }
+    PyObject* c = PyObject_CallMethod(x, "copy", "s", "K");
+    if (c == NULL) {
+        return NULL;
+    }
+    vp_array* a = NULL;
+    char err[ERRLEN] = "";
+    const int st = vp_array_from_ndarray(g_rt, c, &a, err, sizeof err);
+    Py_DECREF(c);
+    if (raise_status(st, err) < 0) {
+        return NULL;
+    }
+    return wrap_array(a);
+}
+
+/* PROTOTYPE (VIPROC_HOST_SMALL=1): NumPy computes a small call on ready
+ * data itself, on borrowed views of the viproc inputs (broadcasting, casts,
+ * strided layouts, warnings: all NumPy's); its ndarray result is returned
+ * as is. NULL without a Python error if an input is not ready. */
+static PyObject* host_numpy_call(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n,
+                                 vp_array* const* ins) {
+    PyObject* args[MAXIN];
+    PyObject* views[MAXIN] = {NULL};
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        if (is_array(inputs[i])) {
+            vp_array* a = ((ArrayObject*)inputs[i])->a;
+            if (!vp_array_ready(a)) {
+                for (Py_ssize_t j = 0; j < i; ++j) {
+                    Py_XDECREF(views[j]);
+                }
+                return NULL;
+            }
+            views[i] = vp_array_borrow(a);
+            if (views[i] == NULL) {
+                for (Py_ssize_t j = 0; j < i; ++j) {
+                    Py_XDECREF(views[j]);
+                }
+                return NULL;
+            }
+            args[i] = views[i];
+        } else {
+            args[i] = inputs[i];
+        }
+    }
+    (void)ins;
+    PyObject* r = PyObject_Vectorcall(ufunc, args, (size_t)n, NULL);
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        if (views[i] != NULL) {
+            if (Py_REFCNT(views[i]) > 1 && r != NULL &&
+                vp_array_pin(((ArrayObject*)inputs[i])->a, views[i]) != VP_OK) {
+                Py_CLEAR(r);
+            }
+            Py_DECREF(views[i]);
+        }
+    }
+    return r;
+}
+
 /* Issues ufunc(*inputs, out=out) asynchronously. Returns 1 and sets *result
  * (new reference), 0 if the fast path does not handle the call, -1 on a
  * Python error. `out` is NULL or a viproc array. */
@@ -1699,7 +1762,7 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             }
             continue;
         } else if (PyObject_TypeCheck(x, (PyTypeObject*)g_np_ndarray)) {
-            PyObject* w = PyObject_CallOneArg(g_asarray, x); /* copy into the runtime */
+            PyObject* w = import_copy(x); /* copy into the runtime */
             if (w == NULL) {
                 status = -1;
                 break;
@@ -1737,6 +1800,9 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
         }
         if (elements < g_small) {
             PyObject* r = vp_ufunc_host(g_rt, loop, ins, any_nd ? nds : NULL, ndim, shape);
+            if (r == NULL && !PyErr_Occurred()) {
+                r = host_numpy_call(ufunc, inputs, n, ins);
+            }
             if (r != NULL) {
                 *result = r;
                 handled = 1;
@@ -1749,7 +1815,7 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
     }
     for (Py_ssize_t i = 0; i < n && status == 0 && any_nd; ++i) {
         if (nds[i] != NULL) { /* PROTOTYPE: the host path did not take it */
-            PyObject* w = PyObject_CallOneArg(g_asarray, nds[i]);
+            PyObject* w = import_copy(nds[i]);
             if (w == NULL) {
                 status = -1;
                 break;
@@ -3803,7 +3869,7 @@ static PyObject* red_return(PyObject* self, PyObject* view, PyObject* r) {
         return NULL;
     }
     Py_DECREF(view);
-    if (r != NULL && Py_TYPE(r) == (PyTypeObject*)g_np_ndarray) {
+    if (r != NULL && Py_TYPE(r) == (PyTypeObject*)g_np_ndarray && !g_host_small) {
         vp_array* x = NULL;
         char err[ERRLEN] = "";
         if (vp_array_from_ndarray(g_rt, r, &x, err, sizeof err) == VP_OK) {
@@ -3930,7 +3996,8 @@ static PyObject* red_method(const char* name, int* cache, PyObject* self, PyObje
     PyObject* const* kwn = nkw > 0 ? &PyTuple_GET_ITEM(kwnames, 0) : NULL;
     const int parsed =
         sp->kind != RK_OTHER && red_parse(sp->kind, args, nargs, kwn, args + nargs, nkw, v);
-    if (parsed && red_array_result(v)) {
+    if (parsed && red_array_result(v) &&
+        !(g_host_small && nargs + nkw <= RA_N + 4 && red_delegates(self, args, nargs + nkw))) {
         PyObject* result = NULL;
         const int h = red_async(sp, self, v, &result);
         if (h != 0) {
@@ -4333,7 +4400,8 @@ static PyObject* Array_array_function(PyObject* self, PyObject* const* args, Py_
     PyObject* const* pos = &PyTuple_GET_ITEM(fargs, 1);
     PyObject* v[RA_N];
     const int parsed = sp->kind != RK_OTHER && red_parse(sp->kind, pos, npos - 1, kwn, kwv, nkw, v);
-    if (parsed && red_array_result(v)) {
+    if (parsed && red_array_result(v) && !(g_host_small && sp->impl != NULL && red_delegates(target, pos, npos - 1) &&
+                                     red_delegates(target, kwv, nkw))) {
         PyObject* result = NULL;
         const int h = red_async(sp, target, v, &result);
         if (h != 0) {

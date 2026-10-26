@@ -31,8 +31,6 @@ from ._ndarray import (
     AsyncIndexError,
     AsyncLinAlgError,
     AsyncValueError,
-    array,
-    asarray,
     init,
     ndarray,
     offload_stats,
@@ -43,6 +41,9 @@ from ._ndarray import (
     wait_all,
     workers,
 )
+
+from ._ndarray import user_array as array  # noqa: E402
+from ._ndarray import user_asarray as asarray  # noqa: E402
 
 __version__ = _viproc.version
 
