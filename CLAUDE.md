@@ -729,9 +729,10 @@ Rules:
   (ufunc, input layout, axes, keepdims, `dtype=`, initial or not, buffer
   size) as a template over a dummy address (`ReduceTemplate`; the result
   NumPy allocates there gives viproc's result layout). Per op the main
-  thread only looks the template up and takes a finished copy from its
-  pool (`NpyIter_Copy` on a miss): no element memory, no address. The
-  task fills the initial values, points the copy at its buffers
+  thread only looks the template up (and makes one more copy while the
+  template has fewer than the kernel threads + 1, `IterTemplate::reserve`):
+  no element memory, no address. The task takes a copy from the template's
+  pool when it runs, fills the initial values, points the copy at its buffers
   (`NpyIter_ResetBasePointers(iter, base, &errmsg)`, no GIL) and runs
   NumPy's `reduce_loop`. 0-d inputs are iterated as 1-element 1-d ones:
   NumPy casts a 0-d input into a copy when it builds the iterator, which a
@@ -1279,10 +1280,15 @@ Rules:
   everything else (strided, reversed, broadcast, mixed orders, casts) runs
   on NumPy's iterator, set up as `execute_ufunc_loop` sets it up
   (`LoopCache::iter_elementwise`: a template per (loop, layouts, buffer
-  size) over a dummy address; per op a finished iterator of that template
-  from its pool, else an `NpyIter_Copy`; `NpyIter_ResetBasePointers` on
-  the worker; a fresh copy per op allocated its buffers on the worker and
-  released them later on the main thread, which kept that memory cold). Casts happen in the
+  size) over a dummy address; the kernel takes a copy from the template's
+  pool when it runs and gives it back after, so at most one copy per
+  thread that runs kernels exists, its buffers stay warm, and the main
+  thread only tops the pool up, `IterTemplate::reserve`;
+  `NpyIter_ResetBasePointers` on the worker). Before, each op took a copy
+  at issue: with up to 1,000 ops in flight the pool of 16 ran dry, and
+  nearly every op ran on a new copy whose buffers faulted in on the worker
+  (`bool * float64` of 1e4 elements, chained: 30-40 µs per op, NumPy 6-10;
+  now 5 µs). Casts happen in the
   iterator's buffers, or, for 0-d and short 1-d inputs, as a separate cast
   task first (NumPy's `check_for_trivial_loop` copies those).
 - **Measurements live in `docs/benchmarks.md`** (suite scores per change,

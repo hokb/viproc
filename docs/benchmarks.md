@@ -653,12 +653,20 @@ lose up to 0.57x on small data (the direct path, P4). Large data scales
 less with ndarray inputs (inputs copied per op). Below 0.8x in every
 mode: `expr_where` from 3,000 to 100,000 elements (0.22-0.39x), from two
 defects found here: (1) ufunc ops with a cast on NumPy's iterator (bool
-or float32 with float64) run 5-15x slower than NumPy when they run
+or float32 with float64) ran 5-15x slower than NumPy when they ran
 asynchronously (`c * x`, 1e4 elements, chained: ~30-60 µs vs. NumPy
-8 µs; direct path 6 µs): the iterator pool keeps 16 iterators per
+8 µs; direct path 6 µs): the iterator pool kept 16 iterators per
 template, the look-ahead has up to 1,000 ops in flight, so nearly every op
-gets a fresh copy whose buffers fault in on the worker (~15 page faults
-and ~25 µs system time per op); (2) the select kernel of `np.where` is
+got a fresh copy whose buffers faulted in on the worker (~15 page faults
+and ~25 µs system time per op). Fixed: kernels take a copy when they run
+and give it back after, the main thread keeps at most kernel threads + 1
+copies per template (4-vCPU VM, chained ops of 1e4 elements, µs per op,
+before / after / NumPy: `bool * float64` 31.7-38.5 / 5.1-5.9 / 5.7-10.0,
+`float32 * float64` 39.7-41.8 / 7.4 / 9.1-12.3, `int32 * float64`
+31.5-36.2 / 3.7-4.9 / 5.6-9.9, `x + x.sum(axis=1, keepdims=True)` of int32
+100 x 200 45 / 16-19 / 19; strided ops without a cast unchanged; main
+thread ~2,400 instructions less per op, no `NpyIter_Copy`; worker
+instructions unchanged); (2) the select kernel of `np.where` is
 slower than NumPy's `where` (1e4 elements, chained: 41-49 µs vs. 34 µs).
 Also below 0.8x: `loop_cols`, `loop_accum` (arrays mode, small data) and
 `ind_cores_f32` (arrays and module mode; not analysed yet).

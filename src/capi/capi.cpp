@@ -180,6 +180,7 @@ vp_runtime* vp_runtime_create(size_t workers, size_t max_active_tasks, char* err
     auto* r = new vp_runtime();
     r->rt = std::make_unique<Runtime>(options);
     r->loops = std::make_unique<numpy::LoopCache>();
+    numpy::set_kernel_threads(r->rt->worker_count() + 1);
     return r;
 }
 

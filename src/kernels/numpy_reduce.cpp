@@ -431,10 +431,8 @@ namespace {
 // GIL.
 class IterReduceKernel : public Kernel {
   public:
-    IterReduceKernel(std::shared_ptr<ReduceTemplate> t, NpyIter* iter)
-        : t_(std::move(t)), iter_(iter) {}
+    explicit IterReduceKernel(std::shared_ptr<ReduceTemplate> t) : t_(std::move(t)) {}
 
-    ~IterReduceKernel() override { t_->iters->give_back(iter_, clean_); }
     const char* name() const override { return t_->loop->name(); }
     const char* fp_name() const override {
         return t_->loop->reports_fp_errors() ? "reduce" : nullptr;
@@ -452,25 +450,25 @@ class IterReduceKernel : public Kernel {
             copy_first(in, out);
         }
         char* base[2] = {out, in};
+        PooledIter it;
+        std::string error;
+        if (!t_->iters->acquire(it, error)) {
+            return {1, std::move(error), 0};
+        }
         char* errmsg = nullptr;
-        clean_ = false;
+        KernelResult r;
         // Points the iterator at the buffers (no GIL: errmsg variant); with
         // buffering it also copies the first block.
-        if (NpyIter_ResetBasePointers(iter_, base, &errmsg) != NPY_SUCCEED) {
-            return {1, errmsg != nullptr ? errmsg : "NpyIter_ResetBasePointers failed", 0};
+        if (NpyIter_ResetBasePointers(it.iter, base, &errmsg) != NPY_SUCCEED) {
+            r = {1, errmsg != nullptr ? errmsg : "NpyIter_ResetBasePointers failed", 0};
+        } else if (!reduce_loop(it)) {
+            r = {1, "NumPy reduction loop failed", 0};
         }
-        if (!reduce_loop()) {
-            return {1, "NumPy reduction loop failed", 0};
-        }
-        clean_ = true;
-        return {};
+        t_->iters->give_back(it, r.status == 0);
+        return r;
     }
 
     // Set up by LoopCache::iter_reduction().
-    NpyIter_IterNextFunc* iternext_ = nullptr;
-    char** dataptr_ = nullptr;
-    npy_intp* strideptr_ = nullptr;
-    npy_intp* countptr_ = nullptr;
     std::array<std::byte, kMaxItemsize> initial_{};
 
   private:
@@ -500,7 +498,10 @@ class IterReduceKernel : public Kernel {
     }
 
     // NumPy's reduce_loop (ufunc_object.c), unmasked.
-    bool reduce_loop() {
+    bool reduce_loop(const PooledIter& it) {
+        char** const dataptr_ = it.dataptr;
+        npy_intp* const strideptr_ = it.strideptr;
+        npy_intp* const countptr_ = it.countptr;
         const UfuncLoop* loop = t_->loop.get();
         npy_intp skip = t_->has_initial ? 0 : t_->result_size;
         char* data[3];
@@ -509,7 +510,7 @@ class IterReduceKernel : public Kernel {
             for (;;) {
                 npy_intp count = *countptr_;
                 char* in = dataptr_[1];
-                if (NpyIter_IsFirstVisit(iter_, 0)) {
+                if (NpyIter_IsFirstVisit(it.iter, 0)) {
                     if (strideptr_[0] == 0) {
                         --count;
                         --skip;
@@ -530,7 +531,7 @@ class IterReduceKernel : public Kernel {
                         return false;
                     }
                 }
-                if (!iternext_(iter_)) {
+                if (!it.iternext(it.iter)) {
                     return true;
                 }
                 if (skip == 0) {
@@ -548,13 +549,11 @@ class IterReduceKernel : public Kernel {
             if (loop->call(data, countptr_, strides) < 0) {
                 return false;
             }
-        } while (iternext_(iter_));
+        } while (it.iternext(it.iter));
         return true;
     }
 
     std::shared_ptr<ReduceTemplate> t_;
-    NpyIter* iter_;
-    bool clean_ = true; // a fresh copy has nothing in its buffers
 };
 
 // Builds the template of a reduction (see LoopCache::iter_reduction()).
@@ -613,7 +612,7 @@ std::shared_ptr<ReduceTemplate> build_reduce_template(PyObject* ufunc, const Lay
     }
     auto t = std::make_shared<ReduceTemplate>();
     t->defer = defer;
-    t->iters = std::make_shared<IterTemplate>();
+    t->iters = new_iter_template();
     t->iters->templ = iter;
     t->iters->defer = std::move(defer);
     auto fail = [&](const char* why) {
@@ -752,20 +751,11 @@ std::shared_ptr<Kernel> LoopCache::iter_reduction(PyObject* ufunc, const Layout&
             t->last_initial = initial;
         }
     }
-    NpyIter* iter = t->iters->get();
-    if (iter == nullptr) {
+    if (!t->iters->reserve()) {
         error = fetch_python_error();
         return nullptr;
     }
-    auto kernel = std::make_shared<IterReduceKernel>(t, iter);
-    kernel->iternext_ = NpyIter_GetIterNext(iter, nullptr);
-    if (kernel->iternext_ == nullptr) {
-        error = fetch_python_error();
-        return nullptr; // the kernel releases the iterator
-    }
-    kernel->dataptr_ = NpyIter_GetDataPtrArray(iter);
-    kernel->strideptr_ = NpyIter_GetInnerStrideArray(iter);
-    kernel->countptr_ = NpyIter_GetInnerLoopSizePtr(iter);
+    auto kernel = std::make_shared<IterReduceKernel>(t);
     kernel->initial_ = t->initial_bytes;
     result = t->result;
     return kernel;

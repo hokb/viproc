@@ -108,6 +108,11 @@ using DeferRelease = std::function<void(std::function<void()>)>;
 // An element-wise iterator template and its pool of reusable copies
 // (numpy_ufunc.cpp).
 struct IterTemplate;
+
+// The number of threads that may run kernels at the same time (workers and
+// the main thread): bounds the iterator copies kept per template
+// (numpy_iter.hpp). 0: the hardware threads plus one. Main thread.
+void set_kernel_threads(std::size_t threads);
 // A reduction iterator template (numpy_reduce.cpp).
 struct ReduceTemplate;
 
