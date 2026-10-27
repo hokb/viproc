@@ -1484,6 +1484,9 @@ static int input_kind(PyObject* x) {
     if (PyComplex_CheckExact(x)) {
         return K_PYCOMPLEX;
     }
+    if (Py_TYPE(x) == (PyTypeObject*)g_np_ndarray) {
+        return vp_ndarray_kind(x);
+    }
     if (PyObject_TypeCheck(x, (PyTypeObject*)g_np_generic) ||
         PyObject_TypeCheck(x, (PyTypeObject*)g_np_ndarray)) {
         PyObject* dt = PyObject_GetAttrString(x, "dtype");
@@ -1755,7 +1758,7 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             ins[i] = NULL;
             any_nd = 1;
             int xd;
-            int64_t xs[MAXDIMS];
+            int64_t xs[64]; /* NPY_MAXDIMS */
             if (!vp_ndarray_shape(x, &xd, xs) || xd > MAXDIMS ||
                 broadcast_into(shape, &ndim, xd, xs) < 0) {
                 status = 1;
@@ -1856,6 +1859,174 @@ done:
         Py_DECREF(keep[i]);
     }
     return status < 0 ? -1 : handled;
+}
+
+/* --- PROTOTYPE: operator hook on numpy.ndarray (VIPROC_NDARRAY_HOOK=1) -----
+ * NumPy has no hook for its operators, so the prototype replaces the slot
+ * pointers of numpy.ndarray's number protocol and rich comparison (static
+ * tables in NumPy, writable) by a switch: an operator executed by *user
+ * code* (not NumPy, viproc, the standard library or installed packages)
+ * with an n-d ndarray operand goes to fast_ufunc: small ready data runs
+ * there right away into a NumPy array (viproc's short path), large results
+ * become viproc tasks, viproc operands skip NumPy's override dispatch.
+ * Everything else, and every call fast_ufunc declines, runs NumPy's
+ * original slot. */
+
+enum { HK_ADD, HK_SUB, HK_MUL, HK_TDIV, HK_FDIV, HK_MOD, HK_AND, HK_OR, HK_XOR, HK_N };
+static binaryfunc g_hook_orig[HK_N];
+static PyObject* g_hook_ufunc[HK_N];
+static richcmpfunc g_hook_orig_cmp = NULL;
+static PyObject* g_hook_cmp_ufunc[6]; /* Py_LT ... Py_GE */
+static PyObject* g_lib_dirs = NULL;   /* path prefixes that are not user code */
+static Table g_user_code;             /* (code, 1) -> v: 1 = user code */
+static unsigned long long g_hooked = 0;
+static int g_hook_on = 1; /* viproc.enable(False) / disabled(): NumPy's slots */
+
+/* 1 if the running Python frame is user code, cached per code object. */
+static int caller_is_user(void) {
+    PyFrameObject* f = PyEval_GetFrame(); /* borrowed */
+    if (f == NULL) {
+        return 0;
+    }
+    PyCodeObject* code = PyFrame_GetCode(f); /* new ref */
+    const Entry* hit = t_find(&g_user_code, code, 1);
+    int user;
+    if (hit != NULL) {
+        user = (int)hit->v;
+    } else {
+        user = 0;
+        PyObject* fn = PyObject_GetAttrString((PyObject*)code, "co_filename");
+        if (fn != NULL && g_lib_dirs != NULL) {
+            PyObject* name = PyUnicode_InternFromString("startswith");
+            PyObject* r = PyObject_CallMethodOneArg(fn, name, g_lib_dirs);
+            Py_DECREF(name);
+            user = r == Py_False;
+            Py_XDECREF(r);
+        }
+        Py_XDECREF(fn);
+        PyErr_Clear();
+        if (t_put(&g_user_code, code, 1, user, NULL, (PyObject*)code) < 0) {
+            PyErr_Clear();
+        }
+    }
+    Py_DECREF(code);
+    return user;
+}
+
+static int nd_operand(PyObject* x) {
+    if (!PyObject_TypeCheck(x, (PyTypeObject*)g_np_ndarray)) {
+        return 0;
+    }
+    int nd;
+    int64_t shp[64]; /* NPY_MAXDIMS */
+    return vp_ndarray_shape(x, &nd, shp) && nd > 0 && nd <= MAXDIMS; /* n-d, no exception */
+}
+
+/* 1 with *r, 0: NumPy's slot, -1: error. */
+static int hook_try(PyObject* ufunc, PyObject* a, PyObject* b, PyObject** r) {
+    if (!g_hook_on || g_rt == NULL || PyThread_get_thread_ident() != g_main_thread) {
+        return 0;
+    }
+    if (!(nd_operand(a) || nd_operand(b))) {
+        return 0;
+    }
+    if (!caller_is_user()) {
+        return 0;
+    }
+    PyObject* ins[2] = {a, b};
+    const int h = fast_ufunc(ufunc, ins, 2, NULL, 0, r);
+    g_hooked += h > 0;
+    return h;
+}
+
+#define HOOK_BINARY(NAME, IDX)                                                                     \
+    static PyObject* NAME(PyObject* a, PyObject* b) {                                              \
+        PyObject* r = NULL;                                                                        \
+        const int h = hook_try(g_hook_ufunc[IDX], a, b, &r);                                       \
+        if (h != 0) {                                                                              \
+            return h > 0 ? r : NULL;                                                               \
+        }                                                                                          \
+        return g_hook_orig[IDX](a, b);                                                             \
+    }
+HOOK_BINARY(hook_add, HK_ADD)
+HOOK_BINARY(hook_sub, HK_SUB)
+HOOK_BINARY(hook_mul, HK_MUL)
+HOOK_BINARY(hook_tdiv, HK_TDIV)
+HOOK_BINARY(hook_fdiv, HK_FDIV)
+HOOK_BINARY(hook_mod, HK_MOD)
+HOOK_BINARY(hook_and, HK_AND)
+HOOK_BINARY(hook_or, HK_OR)
+HOOK_BINARY(hook_xor, HK_XOR)
+
+static PyObject* hook_cmp(PyObject* a, PyObject* b, int op) {
+    PyObject* r = NULL;
+    const int h = hook_try(g_hook_cmp_ufunc[op], a, b, &r);
+    if (h != 0) {
+        return h > 0 ? r : NULL;
+    }
+    return g_hook_orig_cmp(a, b, op);
+}
+
+/* install_ndarray_hook(library_dirs): replaces the slots once. */
+static PyObject* m_install_ndarray_hook(PyObject* mod, PyObject* dirs) {
+    (void)mod;
+    if (g_hook_orig_cmp != NULL) {
+        Py_RETURN_NONE;
+    }
+    if (g_np_ndarray == NULL || !PyTuple_Check(dirs)) {
+        PyErr_SetString(PyExc_RuntimeError, "install_ndarray_hook: setup() first, dirs a tuple");
+        return NULL;
+    }
+    PyObject* np = PyImport_ImportModule("numpy");
+    if (np == NULL) {
+        return NULL;
+    }
+    static const char* const names[HK_N] = {"add", "subtract", "multiply", "true_divide",
+                                            "floor_divide", "remainder", "bitwise_and",
+                                            "bitwise_or", "bitwise_xor"};
+    static const char* const cmps[6] = {"less", "less_equal", "equal",
+                                        "not_equal", "greater", "greater_equal"};
+    for (int i = 0; i < HK_N; ++i) {
+        if ((g_hook_ufunc[i] = PyObject_GetAttrString(np, names[i])) == NULL) {
+            Py_DECREF(np);
+            return NULL;
+        }
+    }
+    for (int i = 0; i < 6; ++i) {
+        if ((g_hook_cmp_ufunc[i] = PyObject_GetAttrString(np, cmps[i])) == NULL) {
+            Py_DECREF(np);
+            return NULL;
+        }
+    }
+    Py_DECREF(np);
+    Py_XSETREF(g_lib_dirs, Py_NewRef(dirs));
+    PyTypeObject* t = (PyTypeObject*)g_np_ndarray;
+    PyNumberMethods* nb = t->tp_as_number;
+    binaryfunc* slots[HK_N] = {&nb->nb_add, &nb->nb_subtract, &nb->nb_multiply,
+                               &nb->nb_true_divide, &nb->nb_floor_divide, &nb->nb_remainder,
+                               &nb->nb_and, &nb->nb_or, &nb->nb_xor};
+    const binaryfunc hooks[HK_N] = {hook_add, hook_sub,  hook_mul, hook_tdiv, hook_fdiv,
+                                    hook_mod, hook_and, hook_or,  hook_xor};
+    for (int i = 0; i < HK_N; ++i) {
+        g_hook_orig[i] = *slots[i];
+        *slots[i] = hooks[i];
+    }
+    g_hook_orig_cmp = t->tp_richcompare;
+    t->tp_richcompare = hook_cmp;
+    PyType_Modified(t);
+    Py_RETURN_NONE;
+}
+
+static PyObject* m_set_ndarray_hook(PyObject* mod, PyObject* on) {
+    (void)mod;
+    g_hook_on = PyObject_IsTrue(on);
+    Py_RETURN_NONE;
+}
+
+static PyObject* m_hooked_count(PyObject* mod, PyObject* unused) {
+    (void)mod;
+    (void)unused;
+    return PyLong_FromUnsignedLongLong(g_hooked);
 }
 
 /* _Array.__array_ufunc__(self, ufunc, method, *inputs, **kwargs) */
@@ -4956,6 +5127,10 @@ static PyObject* m_where(PyObject* self, PyObject* const* args, Py_ssize_t nargs
 
 static PyMethodDef methods[] = {
     {"_issue_site", m_issue_site, METH_NOARGS, "The issue site an op issued here would get."},
+    {"install_ndarray_hook", m_install_ndarray_hook, METH_O,
+     "PROTOTYPE: route numpy.ndarray operators of user code through viproc."},
+    {"hooked_count", m_hooked_count, METH_NOARGS, "PROTOTYPE: operators the hook handled."},
+    {"set_ndarray_hook", m_set_ndarray_hook, METH_O, "PROTOTYPE: hook on/off (viproc.enable)."},
     {"setup", m_setup, METH_VARARGS,
      "setup(cls, dtypes, fallback, asarray, internal_dirs, ops, ndarray, generic)"},
     {"init", m_init, METH_VARARGS,

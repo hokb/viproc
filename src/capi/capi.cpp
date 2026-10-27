@@ -463,6 +463,8 @@ bool cast_small_inputs(vp_runtime* rt, const vp_loop& loop, std::span<ArrayPtr> 
 
 extern "C" {
 
+int vp_ndarray_kind(PyObject* nd) { return numpy::ndarray_dtype_code(nd); }
+
 int vp_ndarray_shape(PyObject* nd, int* ndim, int64_t* shape) {
     return numpy::ndarray_shape(nd, ndim, shape) ? 1 : 0;
 }

@@ -1807,6 +1807,22 @@ _viproc.setup(
     _setitem,
 )
 
+if os.environ.get("VIPROC_NDARRAY_HOOK") == "1":
+    # PROTOTYPE: numpy.ndarray operators of user code go through viproc.
+    import site as _site
+    import sysconfig as _sysconfig
+
+    _dirs = {_PKG_DIR, _NUMPY_DIR}
+    _dirs.update(v for k, v in _sysconfig.get_paths().items()
+                 if k in ("stdlib", "platstdlib", "purelib", "platlib"))
+    try:
+        _dirs.update(_site.getsitepackages())
+    except AttributeError:
+        pass
+    _dirs.update(p for p in sys.path if os.path.basename(p) in ("site-packages", "dist-packages"))
+    _ensure_runtime()  # the hook needs the runtime from the first operator on
+    _viproc.install_ndarray_hook(tuple(os.path.join(d, "") for d in _dirs if d) + ("<frozen",))
+
 
 def wait_all():
     """Sync point: wait until all issued ops have completed."""

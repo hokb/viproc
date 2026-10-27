@@ -135,6 +135,7 @@ def enable(on=True):
     viproc, numpy.*) return NumPy's own arrays: the same code runs as plain
     NumPy. Existing viproc arrays stay viproc arrays."""
     _ndarray._enabled[0] = bool(on)
+    _viproc.set_ndarray_hook(bool(on))
 
 
 def enabled():
@@ -147,11 +148,11 @@ def disabled():
     """with viproc.disabled(): ... runs the block as plain NumPy (see
     enable()), e.g. to time the same code with and without viproc."""
     previous = _ndarray._enabled[0]
-    _ndarray._enabled[0] = False
+    enable(False)
     try:
         yield
     finally:
-        _ndarray._enabled[0] = previous
+        enable(previous)
 
 
 # Element-wise ufuncs and np.where without NumPy's dispatch when called

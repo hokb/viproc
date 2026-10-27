@@ -257,6 +257,8 @@ PyObject* vp_ufunc_host(vp_runtime* rt, const vp_loop* loop, vp_array* const* in
                         PyObject* const* ndarrays, int out_ndim, const int64_t* out_shape);
 /* PROTOTYPE: shape of a numpy.ndarray; 0 if `nd` is none. */
 int vp_ndarray_shape(PyObject* nd, int* ndim, int64_t* shape);
+/* PROTOTYPE: vp_dtype of a numpy.ndarray, -1 if viproc has none for it. */
+int vp_ndarray_kind(PyObject* nd);
 int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs, int out_ndim,
                    const int64_t* out_shape, vp_array* out, vp_array** result, const char* site,
                    char* err, size_t errlen);

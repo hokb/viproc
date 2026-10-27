@@ -404,11 +404,12 @@ def run_suite(args):
         width = cores if case.width == "cores" else case.width
         bases, lay, base_shape = numpy_inputs(case, size, layout, dtype, cores, ram, seed=i)
         data = apply_layout(bases, lay, base_shape, lambda a: a)
-        reps = calibrate_reps(case, data, target)
-        t0 = time.perf_counter()
-        expected = materialize(case.run(data, reps))
-        warm = time.perf_counter() - t0
-        t_np, _ = best_of(lambda: case.run(data, reps), repeats_for(warm, repeat))
+        with viproc.disabled():  # plain NumPy (also with the operator hook prototype)
+            reps = calibrate_reps(case, data, target)
+            t0 = time.perf_counter()
+            expected = materialize(case.run(data, reps))
+            warm = time.perf_counter() - t0
+            t_np, _ = best_of(lambda: case.run(data, reps), repeats_for(warm, repeat))
         r = {"case": case.name, "category": case.category, "description": case.description,
              "size": size, "layout": layout, "dtype": dtype or default_dtype(bases),
              "width": width, "reps": reps,

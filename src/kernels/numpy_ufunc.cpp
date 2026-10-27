@@ -1347,6 +1347,18 @@ PyObject* export_ndarray(const Array& a, bool writable) {
 // it only. Read-only once pinned.
 PyObject* borrow_ndarray(const Array& a) { return ndarray_over(a, true); }
 
+int ndarray_dtype_code(PyObject* nd) {
+    if (!PyArray_Check(nd)) {
+        return -1;
+    }
+    PyArray_Descr* d = PyArray_DESCR(reinterpret_cast<PyArrayObject*>(nd));
+    DType t;
+    if (!PyArray_ISNBO(d->byteorder) || !dtype_of(d->type_num, t)) {
+        return -1;
+    }
+    return static_cast<int>(t);
+}
+
 bool ndarray_shape(PyObject* nd, int* ndim, std::int64_t* shape) {
     if (!PyArray_Check(nd)) {
         return false;
