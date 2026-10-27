@@ -19,7 +19,7 @@ Status labels as in `memory-management.md` (Decided, Implemented, Proposed).
 | E5 | Where: the exact issue site and the NumPy function, not the full call stack | Implemented |
 | E6 | Loops that raise through the Python API are watched on the thread that runs them | Implemented |
 | E7 | Accepted differences from NumPy | Decided |
-| E8 | Floating-point errors (`np.errstate`) through the same channel | Proposed |
+| E8 | Floating-point errors (`np.errstate`) through the same channel | Implemented |
 
 ## E1 — Two kinds of errors
 
@@ -240,17 +240,51 @@ call returned long ago. Deliberately, and only for run-time errors (E1):
 - **Exit status:** an error reported only at interpreter exit is printed,
   but the process exits with status 0.
 
-## E8 — Floating-point errors (proposed)
+## E8 — Floating-point errors
 
-NumPy reports divide-by-zero, overflow, underflow and invalid as warnings,
-or raises `FloatingPointError` under `np.errstate(...='raise')`. Integer
-division by zero is a warning too. Workers already record the FP flags per
-task (`Task::fp_flags`); the plan: capture the `errstate` mode at issue (it
-is thread-local in NumPy and belongs to the issuing code), and at reporting
-time either warn (NumPy's `RuntimeWarning` text) or raise
-`FloatingPointError`, through the channel of E3, with the issue site of E5.
-Linalg's `LinAlgError` (set through the invalid flag in NumPy's
-`errstate(invalid='call')` callback) uses the same path.
+NumPy reports divide-by-zero, overflow, underflow and invalid after each
+ufunc call (`_check_ufunc_fperr`) under the `np.errstate` in effect: a
+`RuntimeWarning` ("divide by zero encountered in divide"),
+`FloatingPointError` under `'raise'`, or the errstate's `call`, `log` or
+`print`. viproc does the same for its ops:
+
+- **The mode is the issuing code's.** NumPy keeps errstate in a context
+  variable (`numpy.ufunc.extobj`, a new capsule per `errstate` block). Every
+  call into viproc compares it with the capsule seen last (one
+  `PyContextVar_Get`, `fp_sync` in `_viproc.c`); on a change its modes go to
+  the runtime (`vp_set_fp_mode`: three bits per category, NumPy's
+  `UFUNC_ERR_*` values, plus an index for the call/log object), which hands
+  them to every op issued from then on (`Task::set_fp_mode`). An op issued
+  inside `with np.errstate(all="ignore")` stays silent even if it completes
+  after the block.
+- **The flags are the kernel's.** The thread that runs the kernel clears the
+  FP status before it and reads it after (`Task::execute`, the direct path
+  in `Runtime::issue_direct`), as before. `report_fp_errors` then follows
+  NumPy's order (divide, over, under, invalid): categories whose mode is
+  warn, call, print or log are queued for the main thread (`FpEvent` in the
+  `ErrorTable`, the same pending flag and notifier as errors, E3); the first
+  one whose mode is raise fails the op with "FloatingPointError: <kind>
+  encountered in <name>", raised as `AsyncFloatingPointError` (a
+  `FloatingPointError`), like every run-time error.
+- **The name is NumPy's** (`Kernel::fp_name()`): the ufunc's name for
+  element-wise loops, `ufunc.at`, matmul and other gufuncs, "reduce",
+  "accumulate", "reduceat", "cast" for `astype`; none for copies, indexing,
+  sort and loops NumPy marks `no_floatingpoint_errors`. Linalg kernels
+  consume the invalid flag themselves (`LinAlgError`, as NumPy's
+  `errstate(invalid='call')`), the other categories are reported.
+- **Reported in the main thread** before any pending error
+  (`raise_pending_error` → `_report_fp` in `_ndarray.py`): warnings with
+  `warnings.warn_explicit` at the issue site (file and line of E5), with the
+  issuing module's `__warningregistry__`, so the default filter warns once
+  per line as NumPy does and filters (`error`, `ignore`, `catch_warnings`)
+  apply; `call(kind, status)` and `log.write("Warning: ...\n")` with NumPy's
+  arguments; `print` to stderr; NumPy's `NameError` if no call object is set.
+
+Accepted differences (E7): the warning comes a little after the call (at the
+next call into viproc, the interpreter's next check, a sync point or
+`wait_all()`), and NumPy functions written in Python (`np.sum`, `mean`)
+warn from NumPy's own file and line, viproc from the user's line that
+called them. Tests: `python/tests/test_fp_errors.py`.
 
 ## Lesson: why #17 first proposed a solution against G3
 

@@ -95,6 +95,7 @@ class GufuncKernel : public Kernel {
         }
     }
     const char* name() const override { return loop_->name(); }
+    const char* fp_name() const override { return loop_->fp_name(); }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const std::size_t nin = static_cast<std::size_t>(loop_->nin());

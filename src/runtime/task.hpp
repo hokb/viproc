@@ -177,6 +177,32 @@ class Kernel {
     // The NumPy function the op runs ("numpy.power", "numpy.add.reduce"),
     // reported with its errors. A string with static storage.
     virtual const char* name() const { return "array op"; }
+    // The name NumPy's floating-point error reports give the op ("divide",
+    // "reduce", "cast", "matmul": "overflow encountered in reduce"), or null
+    // if NumPy does not check the FP flags for it (copies, indexing, sort,
+    // loops flagged no_floatingpoint_errors). Error handling, E8.
+    virtual const char* fp_name() const { return nullptr; }
+};
+
+// NumPy's floating-point error modes (np.errstate), captured at issue: three
+// bits per category, NumPy's UFUNC_ERR_* values (0 ignore, 1 warn, 2 raise,
+// 3 call, 4 print, 5 log), categories in NumPy's order of reporting:
+// divide (bits 0-2), over (3-5), under (6-8), invalid (9-11). `ctx` names
+// the bridge's call/log object for this mode (0 if none).
+struct FpMode {
+    std::uint16_t mode = 0;
+    std::uint16_t ctx = 0;
+};
+inline constexpr int kFpRaise = 2;
+
+// FP errors of an op to report in the main thread (modes other than raise).
+struct FpEvent {
+    int report = 0; // NumPy's FPE bits (1 divide, 2 over, 4 under, 8 invalid) to report
+    int status = 0; // all FPE bits the op raised (passed to an errstate call)
+    FpMode mode;
+    const char* name = nullptr; // Kernel::fp_name()
+    std::string issue_site;
+    std::uint64_t id = 0;
 };
 
 // The error of a failed op (docs/design/error-handling.md).
@@ -243,6 +269,10 @@ class ErrorTable : public std::enable_shared_from_this<ErrorTable> {
     TaskError raise_at_sync_point(const ErrorRef& r);
     // Records held (tests).
     std::size_t size() const;
+    // Any thread: an op's FP errors to report (warn, call, print, log).
+    void record_fp(FpEvent e);
+    // Main thread: the FP events not reported yet, in issue order.
+    std::vector<FpEvent> take_fp();
     // Called (from the recording thread, without locks) when the table goes
     // from nothing to report to something to report. The bridge uses it to
     // raise the error in its main thread right away. Set before ops are issued.
@@ -272,9 +302,20 @@ class ErrorTable : public std::enable_shared_from_this<ErrorTable> {
     void* notify_arg_ = nullptr;
     mutable std::mutex mutex_;
     std::vector<Record> records_; // few: one per failed op still referenced
+    std::vector<FpEvent> fp_events_; // bounded: kMaxFpEvents
+    static constexpr std::size_t kMaxFpEvents = 1024;
     std::size_t orphans_ = 0;
     std::size_t dropped_ = 0;
 };
+
+// After a kernel ran with FP flags `fe_flags` (FE_*): NumPy's reporting of
+// FP errors under `mode` (_check_ufunc_fperr): the categories set, in
+// NumPy's order, are recorded for the main thread (warn, call, print, log)
+// until one whose mode is raise: that one fails the op (the returned
+// record, "FloatingPointError: divide by zero encountered in divide").
+// Any thread. Empty if the op does not fail.
+ErrorRef report_fp_errors(ErrorTable& errors, const Kernel& kernel, int fe_flags, FpMode mode,
+                          const char* issue_site, std::uint64_t id);
 
 class Task {
   public:
@@ -296,6 +337,8 @@ class Task {
     // Valid once completed (acquire through state()).
     const ErrorRef& error() const { return error_; }
     int fp_flags() const { return fp_flags_; }
+    // NumPy's errstate at issue (set by the runtime when it launches the task).
+    void set_fp_mode(FpMode m) { fp_mode_ = m; }
 
     // --- Main thread, while issuing -------------------------------------
     // The operands, filled in place by the issuing code: the inputs followed
@@ -409,6 +452,7 @@ class Task {
 
     ErrorRef error_;
     int fp_flags_ = 0;
+    FpMode fp_mode_;
 
     // Main thread only (see set_blame).
     SiteStats* blame_ = nullptr;

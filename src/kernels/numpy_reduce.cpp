@@ -119,6 +119,7 @@ class ReduceKernel : public Kernel {
     ReduceKernel(const UfuncLoop* loop, ReducePlan plan, std::vector<std::byte> identity)
         : loop_(loop), plan_(std::move(plan)), identity_(std::move(identity)) {}
     const char* name() const override { return loop_->name(); }
+    const char* fp_name() const override { return loop_->reports_fp_errors() ? "reduce" : nullptr; }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Layout& out_layout = outputs[0].layout();
@@ -304,6 +305,11 @@ class AccumulateKernel : public Kernel {
     const UfuncLoop* loop_;
     int axis_;
     std::string name_ = method_name(loop_->name(), "accumulate");
+
+  public:
+    const char* fp_name() const override {
+        return loop_->reports_fp_errors() ? "accumulate" : nullptr;
+    }
 };
 
 class ReduceatKernel : public Kernel {
@@ -311,6 +317,9 @@ class ReduceatKernel : public Kernel {
     ReduceatKernel(const UfuncLoop* loop, int axis, std::vector<std::int64_t> indices)
         : loop_(loop), axis_(axis), indices_(std::move(indices)) {}
     const char* name() const override { return name_.c_str(); }
+    const char* fp_name() const override {
+        return loop_->reports_fp_errors() ? "reduceat" : nullptr;
+    }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Layout& il = inputs[0].layout();
@@ -427,6 +436,9 @@ class IterReduceKernel : public Kernel {
 
     ~IterReduceKernel() override { t_->iters->give_back(iter_, clean_); }
     const char* name() const override { return t_->loop->name(); }
+    const char* fp_name() const override {
+        return t_->loop->reports_fp_errors() ? "reduce" : nullptr;
+    }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         char* const in = reinterpret_cast<char*>(inputs[0].first());

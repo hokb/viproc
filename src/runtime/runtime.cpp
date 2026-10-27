@@ -199,6 +199,7 @@ void Runtime::launch(const std::shared_ptr<Task>& task, const TaskList& producer
                      std::int64_t elements) {
     ++seq_;
     task->set_id(seq_);
+    task->set_fp_mode(fp_mode_);
     // While pending, the task's work is attributed to the decision that
     // started the work it waits for.
     for (const std::shared_ptr<Task>& p : producers) {
@@ -463,9 +464,16 @@ bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<cons
     } catch (...) {
         r = KernelResult{1, "unknown exception in kernel", 0};
     }
+    ErrorRef e;
     if (r.status != 0) {
-        const ErrorRef e =
-            errors_->record(TaskError{std::move(r.message), issue_site, kernel->name(), seq_});
+        e = errors_->record(TaskError{std::move(r.message), issue_site, kernel->name(), seq_});
+    } else if (fp_mode_.mode != 0) {
+        const int fe = r.fp_flags | std::fetestexcept(FE_ALL_EXCEPT);
+        if (fe != 0) {
+            e = report_fp_errors(*errors_, *kernel, fe, fp_mode_, issue_site, seq_);
+        }
+    }
+    if (e) {
         for (const ArrayPtr& a : inouts) {
             a->group_->last_error_ = e;
         }
