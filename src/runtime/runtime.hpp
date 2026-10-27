@@ -131,6 +131,13 @@ struct RuntimeOptions {
     // (UfuncLoop::call_watched). Null: nothing to do.
     void (*block_enter)() = nullptr;
     void (*block_leave)() = nullptr;
+    // When a worker's completion makes several tasks runnable, those with
+    // fewer elements than this stay with that worker (its local
+    // queue) and run there next (Task::work: the largest operand): handing one to another worker
+    // costs a wake-up and moves its inputs to another core, more than it computes. Larger ones go
+    // to the shared queue. A spinning (idle) worker takes local tasks over from busy ones. 0: all
+    // go to the shared queue.
+    std::int64_t local_below = 65536;
 };
 
 class Runtime {
@@ -217,7 +224,6 @@ class Runtime {
     void set_fp_mode(FpMode m) { fp_mode_ = m; }
 
   private:
-    void worker_loop();
     // Executes `task` on the current thread and returns its runnable consumers.
     TaskList run(const std::shared_ptr<Task>& task);
     void enqueue(std::shared_ptr<Task> task);
@@ -261,6 +267,18 @@ class Runtime {
     std::atomic<int> sleeping_{0};
     bool stopping_ = false;
     std::shared_ptr<Task> try_pop();
+    // Per worker: unblocked small tasks (RuntimeOptions::local_below). The
+    // owner pushes and pops at the back (most recent: its inputs are hot),
+    // a spinning worker steals from the front. `local_` counts all of them.
+    struct LocalQueue {
+        std::mutex mutex;
+        std::deque<std::shared_ptr<Task>> tasks;
+    };
+    std::vector<std::unique_ptr<LocalQueue>> locals_;
+    std::atomic<std::size_t> local_{0};
+    std::shared_ptr<Task> pop_local(std::size_t worker);
+    std::shared_ptr<Task> steal(std::size_t thief);
+    void worker_loop(std::size_t id);
     std::vector<std::thread> workers_;
 };
 
