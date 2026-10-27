@@ -630,6 +630,39 @@ assignments into ndarrays). Configurations below 0.95x of NumPy: 12
 they are small-data cases, under the hook medium ones (`boolean_mask`
 0.32-0.43x, `dtype_promote` 0.67x, `kmeans`, `scatter`, stencils).
 
+**Shape map, same machine and build, three modes** (`shape_map.py --mode
+arrays|module|hook`, 12 workers, 34 cases, 1,688 measurements per mode,
+all bit-identical, no fallbacks; `docs/benchmarks/windows/modes/`, one
+directory per mode, side by side in `shape_map_modes.png` from
+`shape_map.py --compare`):
+
+![Shape map per mode, Windows](benchmarks/windows/modes/shape_map_modes.png)
+
+| mode | median: points < 0.95x | worst group: points < 0.95x | measurements < 0.95x / < 0.8x | 1000 x 1000 |
+|---|---:|---:|---:|---:|
+| arrays | 25 / 49 | 48 / 49 | 844 / 392 | 2.28x |
+| module | 0 / 49 | 35 / 49 | 353 / 67 | 1.81x |
+| hook | 0 / 49 | 4 / 49 | 95 / 52 | 1.40x |
+
+The shape map's programs hold their state in local names, not in
+ndarrays they assign into, so here the hook comes closest to the goal on
+small data (worst group 0.93-1.01x; small results stay NumPy's, and the
+hook's operator path is even faster than NumPy's own: `(a*b+c)*2.0-a` on
+10 elements 1.27 µs vs. 1.59 µs, Linux), while viproc arrays as inputs
+lose up to 0.57x on small data (the direct path, P4). Large data scales
+less with ndarray inputs (inputs copied per op). Below 0.8x in every
+mode: `expr_where` from 3,000 to 100,000 elements (0.22-0.39x), from two
+defects found here: (1) ufunc ops with a cast on NumPy's iterator (bool
+or float32 with float64) run 5-15x slower than NumPy when they run
+asynchronously (`c * x`, 1e4 elements, chained: ~30-60 µs vs. NumPy
+8 µs; direct path 6 µs): the iterator pool keeps 16 iterators per
+template, the look-ahead has up to 1,000 ops in flight, so nearly every op
+gets a fresh copy whose buffers fault in on the worker (~15 page faults
+and ~25 µs system time per op); (2) the select kernel of `np.where` is
+slower than NumPy's `where` (1e4 elements, chained: 41-49 µs vs. 34 µs).
+Also below 0.8x: `loop_cols`, `loop_accum` (arrays mode, small data) and
+`ind_cores_f32` (arrays and module mode; not analysed yet).
+
 **i7-12700K, 20 logical cores (8 P-cores with HT + 4 E-cores), 31 GiB,
 NumPy 2.5.4, Docker Linux image, 97 cases (state of `2d4c915`):** score
 22, 1.40x with 20 workers, 0.76x with 1 worker, 97/97 bit-identical.

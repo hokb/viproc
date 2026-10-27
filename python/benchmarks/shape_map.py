@@ -441,6 +441,63 @@ def plot(run, out_dir):
     return files
 
 
+MODE_TITLES = {"arrays": "viproc arrays as inputs", "module": "python -m viproc, ndarray inputs",
+               "hook": "enable_hook(), ndarray inputs"}
+
+
+def run_mode(run):
+    m = run["machine"]
+    return m.get("mode") or ("module" if m.get("module") else "arrays")
+
+
+def plot_compare(runs, out_dir):
+    """Runs of the same grid side by side (e.g. one per --mode): the median
+    over all cases, and below it the worst case group per point (the
+    smallest group median), with the points below 0.95x counted."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+    except ImportError:
+        print("matplotlib not installed: no images (pip install matplotlib)")
+        return []
+    m0 = runs[0]["machine"]
+    xe, ye = _edges(m0["cols"]), _edges(m0["rows"])
+    cmap = LinearSegmentedColormap.from_list("speedup", [SLOW, MID, FAST])
+    cmap.set_bad("#ffffff")
+    top = max(math.log10(2 * m0["workers"]), 0.5)
+    norm = TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=top)
+    rows = [("median over cases", lambda p: p["median"]),
+            ("worst case group (smallest group median)", lambda p: min(p["groups"].values()))]
+    fig, axs = plt.subplots(2, len(runs), figsize=(6.6 * len(runs) + 1, 13), facecolor="white",
+                            layout="constrained", squeeze=False)
+    for i, (what, value) in enumerate(rows):
+        for j, run in enumerate(runs):
+            ax, mode = axs[i, j], run_mode(run)
+            z = _grid(run, value)
+            mesh = ax.pcolormesh(xe, ye, np.log10(z), cmap=cmap, norm=norm)
+            below = int(np.sum(z < 0.95))
+            _axes(ax, run, f"{mode}: {MODE_TITLES.get(mode, mode)}\n{what} "
+                           f"({below} of {np.count_nonzero(~np.isnan(z))} points below 0.95x)")
+            _annotate(ax, run, np.log10(z), lambda a, b, z=z: f"{z[a, b]:.2f}", cmap, norm,
+                      fontsize=8)
+    ticks = [t for t in (0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32) if -1 <= math.log10(t) <= top]
+    cb = fig.colorbar(mesh, ax=axs, ticks=[math.log10(t) for t in ticks], shrink=0.6)
+    cb.ax.set_yticklabels([f"{t:g}x" for t in ticks])
+    cb.outline.set_visible(False)
+    cb.set_label("viproc faster than NumPy  ↑   ·   ↓  slower", color=MUTED)
+    builds = sorted({r["machine"].get("build", "?") for r in runs})
+    fig.suptitle(f"viproc vs. NumPy by mode: {m0.get('cpu', '')}, {m0['workers']} workers, "
+                 f"NumPy {m0.get('numpy', '')}, Python {m0.get('python', '')}, build "
+                 + ", ".join(builds), color=INK, x=0.01, ha="left")
+    path = os.path.join(out_dir, "shape_map_modes.png")
+    fig.savefig(path, dpi=100)
+    plt.close(fig)
+    return [path]
+
+
 def main():
     warnings.simplefilter("ignore", RuntimeWarning)
     np.seterr(all="ignore")
@@ -463,11 +520,17 @@ def main():
     p.add_argument("--module", action="store_const", dest="mode", const="module",
                    help="same as --mode module")
     p.add_argument("--plot", metavar="SHAPE_MAP_JSON", help="only redraw the reports of a run")
+    p.add_argument("--compare", nargs="+", metavar="SHAPE_MAP_JSON",
+                   help="only draw runs side by side (one per --mode), shape_map_modes.png")
     p.add_argument("--reference", action="store_true",
                    help="allow --out to replace results committed to git (reference runs)")
     args = p.parse_args()
     check_out_dir(args.out, args.reference)
     os.makedirs(args.out, exist_ok=True)
+    if args.compare:
+        runs = [json.load(open(f, encoding="utf-8")) for f in args.compare]
+        print("written: " + ", ".join(plot_compare(runs, args.out)))
+        return
     if args.plot:
         run = json.load(open(args.plot, encoding="utf-8"))
         if args.groups:
