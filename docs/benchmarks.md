@@ -637,6 +637,29 @@ iteration again) without restoring `sum_cores`. Suite (quick, 42
 configurations of the affected categories, 3 alternating runs each):
 geomean 1.02, within noise.
 
+### Break-even of the task path (`sync_below`)
+
+Same 4-vCPU VM, `python/benchmarks/break_even.py` (adaptive policy, best of
+7, bit-identical). Speedup vs. NumPy per element count when ready ops at
+or above `sync_below` become tasks (sb=200) and when they all take the
+direct path (sb=1e6); NumPy's time per op in brackets:
+
+| elements | `chains_sin` (4 chains of sin/cos) | `chains_add` (4 chains of `x * 0.5 + 1.0`) | `read_now` (`float((a * b).sum())`) |
+|---:|---|---|---|
+| 500 | 1.82 / 0.91 (1.8 µs) | 0.29 / 0.93 (0.8 µs) | 0.62 / 1.28 (1.0 µs) |
+| 1,000 | 2.32 / 0.93 (3.1 µs) | 0.36 / 1.02 (1.0 µs) | 0.59 / 0.82 (0.8 µs) |
+| 2,000 | 2.36 / 1.01 (5.7 µs) | 0.42 / 1.14 (1.2 µs) | 0.73 / 1.03 (1.3 µs) |
+| 4,000 | 4.32 / 1.32 (14 µs) | 0.40 / 1.15 (1.7 µs) | 0.88 / 1.26 (2.1 µs) |
+| 8,000 | 3.66 / 1.04 (22 µs) | 1.69 / 1.09 (2.5 µs) | 1.21 / 1.39 (3.6 µs) |
+
+The break-even is a time, not an element count: the task path pays off
+from about 2 µs of NumPy work per op, ~700 elements for `sin`, ~6,000 for
+`add`. Below it, cheap ops on the task path cost ~3 µs per op (2.5-3.5x
+slower than NumPy) and a result read right away up to 6x (deterministic
+policy, 200-500 elements). A lower element threshold (200 or 500) would
+win for expensive ops and lose more for cheap ones; a threshold per loop
+cost (estimated NumPy time per op) fits both.
+
 ## Other machines
 
 **i7-12700K, Windows 11, 12 physical cores (20 hardware threads), native
