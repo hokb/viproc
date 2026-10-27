@@ -140,6 +140,28 @@ Per operator call, on the main thread, before anything is computed:
   path): a library that computes on viproc arrays it got from the user
   still gets viproc results, through the protocols.
 
+## Testing
+
+- `python/tests/test_ndarray_hook.py`: the hook on user code, each check in
+  a child process (operators bit for bit against NumPy, result types,
+  library code, borrowing, in-place takeover; also on CPython 3.12).
+- The whole pytest suite also runs with the hook installed
+  (`VIPROC_NDARRAY_HOOK=1`; CI and ctest's `python_hook`). `conftest.py`
+  then treats the test files as library code, so their NumPy references
+  stay NumPy's, and keeps small results of viproc arrays (otherwise the
+  small-data tests would compare NumPy with NumPy). Running the suite in
+  this mode found a deadlock: a task needing the GIL while the main thread
+  waited inside an issue (fixed, `RuntimeOptions::block_enter`).
+- `python/benchmarks/suite.py --mode hook|module` runs the suite's plain
+  NumPy programs on numpy.ndarray inputs under the hook (`hook`: operators
+  only; `module`: as `python -m viproc`, the cases' `np` is viproc), bit
+  for bit against NumPy; `test_benchmark_suite.py` runs a few of them.
+  Quick run, 4 cores (91 configurations, all identical): score 79 with
+  viproc arrays as inputs, 68 in module mode, 61 in hook mode. Indexing
+  and reductions score lowest with ndarray inputs: `x[idx]` and methods
+  such as `x.sum()` on an ndarray stay NumPy's (only operators are
+  hooked), until the first viproc result takes over.
+
 ## Opt-in or default
 
 Open (step 5): decided after suite runs on several machines. Until then

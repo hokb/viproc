@@ -36,3 +36,21 @@ def test_suite_runs_and_writes_reports(tmp_path):
         capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "comparison" in (merged / "report.md").read_text(encoding="utf-8")
+
+
+def test_suite_hook_and_module_modes_are_bit_identical(tmp_path):
+    """The suite's plain NumPy programs on numpy.ndarrays under the operator
+    hook (--mode hook) and as `python -m viproc` runs them (--mode module)."""
+    for mode in ("hook", "module"):
+        out = tmp_path / mode
+        proc = subprocess.run(
+            [sys.executable, SUITE, "--quick", "--repeat", "1", "--workers", "2",
+             "--mode", mode, "--filter",
+             r"chain_serial/(tiny|medium)|chains_wide/medium|gather/small|scalar_newton",
+             "--out", str(out)],
+            capture_output=True, text=True, timeout=600)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        run = json.loads((out / "results.json").read_text())
+        assert run["machine"]["mode"] == mode
+        assert run["summary"]["configs"] >= 4
+        assert run["summary"]["identical"] == run["summary"]["configs"], proc.stdout

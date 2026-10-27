@@ -329,14 +329,30 @@ def score(results, cores):
     }
 
 
-def measure_viproc(case, bases, lay, base_shape, reps, repeat, expected, workers):
+def measure_viproc(case, bases, lay, base_shape, reps, repeat, expected, workers, mode="arrays"):
     """Best time of `case` on viproc with `workers` threads, whether its result
     equals NumPy's, and the eager fallbacks of one run. Every viproc array
-    is gone when this returns (before the next init)."""
+    is gone when this returns (before the next init).
+
+    mode "arrays": the inputs are viproc arrays (viproc.asarray). "hook": the
+    inputs stay numpy.ndarrays, the numpy.ndarray operator hook routes the
+    case's operators (viproc.enable_hook(); NumPy functions stay NumPy's).
+    "module": as `python -m viproc`: ndarray inputs, the hook, and the case's
+    `np` is viproc."""
     import viproc
 
     viproc.init(workers=workers)
     unsupported = []
+    if mode != "arrays":
+        viproc.enable_hook()
+        if mode == "module":
+            suite_cases.np = viproc
+        try:
+            return measure_viproc_on(case, apply_layout(bases, lay, base_shape, lambda a: a),
+                                     reps, repeat, expected, unsupported)
+        finally:
+            suite_cases.np = np
+            viproc.enable_hook(False)
 
     def convert(a):
         # A dtype viproc does not support (int16, float16) stays a NumPy
@@ -349,6 +365,11 @@ def measure_viproc(case, bases, lay, base_shape, reps, repeat, expected, workers
 
     vdata = apply_layout(bases, lay, base_shape, convert)
     viproc.wait_all()
+    return measure_viproc_on(case, vdata, reps, repeat, expected, unsupported)
+
+
+def measure_viproc_on(case, vdata, reps, repeat, expected, unsupported):
+    import viproc
 
     def run():
         out = case.run(vdata, reps)
@@ -380,6 +401,7 @@ def run_suite(args):
     repeat = args.repeat or (3 if args.quick else 5)
     info = machine_info(cores, ram)
     info.update({"workers": workers, "default_workers": default, "repeat": repeat, "target_s": target,
+                 "mode": args.mode,
                  "large_elements": size_elements("large", cores, ram)})
 
     configs = []
@@ -395,7 +417,7 @@ def run_suite(args):
                 continue
             configs.append((case, size, layout, dtype))
 
-    print(f"viproc benchmark suite: {len(configs)} configurations, {cores} cores, "
+    print(f"viproc benchmark suite ({args.mode}): {len(configs)} configurations, {cores} cores, "
           f"{ram / 2**30:.1f} GiB RAM, workers {workers}, large = "
           f"{info['large_elements']:,} elements, build {info['build']}", flush=True)
 
@@ -417,7 +439,7 @@ def run_suite(args):
              "numpy_s": t_np, "viproc_s": {}, "fallbacks": None, "identical": True}
         for w in workers:
             t, same, fallbacks, unsupported = measure_viproc(
-                case, bases, lay, base_shape, reps, repeat, expected, w)
+                case, bases, lay, base_shape, reps, repeat, expected, w, args.mode)
             r["viproc_s"][str(w)] = t
             r["identical"] = r["identical"] and same
             if w == wmax:
@@ -456,6 +478,10 @@ def main():
                         "default (one per physical core), 'threads' = hardware threads "
                         "(default 1,max)")
     p.add_argument("--cores", type=int, help="override the detected physical core count")
+    p.add_argument("--mode", choices=("arrays", "hook", "module"), default="arrays",
+                   help="arrays: inputs are viproc arrays (default); hook: inputs stay "
+                        "numpy.ndarrays, viproc.enable_hook() routes their operators; module: "
+                        "as `python -m viproc` (hook, and the cases' np is viproc)")
     p.add_argument("--repeat", type=int, help="timed runs per measurement (best of)")
     p.add_argument("--merge", nargs="+", metavar="RESULTS_JSON",
                    help="combine results of several machines/platforms into one report")

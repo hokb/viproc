@@ -1904,6 +1904,17 @@ _viproc.set_fp_reporting(np._core._multiarray_umath._extobj_contextvar,
 _hook = [False]  # enable_hook(): the operator hook is wanted (and installed)
 
 
+_hook_dirs = []  # path prefixes of library code: NumPy's operators under the hook
+
+
+def hook_exclude(path):
+    """Code under `path` keeps NumPy's operators under the hook, as installed
+    libraries do (the test suite's own NumPy reference code in hook mode)."""
+    if _hook[0]:
+        _hook_dirs.append(os.path.join(os.path.abspath(path), ""))
+        _viproc.hook_library_dirs(tuple(_hook_dirs))
+
+
 def _inplace_opcodes():
     """Opcodes the hook needs to redirect `x += y` on ndarrays (inplace_rebinds
     in _viproc.c), None where it cannot (CPython 3.14 borrows loads)."""
@@ -1940,8 +1951,8 @@ def enable_hook(on=True):
         _ensure_runtime()  # the hook needs the runtime from the first operator on
         _HOST_SMALL = True  # small results of ndarrays stay NumPy's
         _viproc.set_host_small(True)
-        _viproc.install_ndarray_hook(tuple(os.path.join(d, "") for d in dirs if d) + ("<frozen",),
-                                     _inplace_opcodes())
+        _hook_dirs[:] = [os.path.join(d, "") for d in dirs if d] + ["<frozen"]
+        _viproc.install_ndarray_hook(tuple(_hook_dirs), _inplace_opcodes())
     _hook[0] = bool(on)
     _viproc.set_ndarray_hook(bool(on) and _enabled[0])
 

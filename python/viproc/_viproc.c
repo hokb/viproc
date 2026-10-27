@@ -2799,6 +2799,19 @@ static PyObject* m_install_ndarray_hook(PyObject* mod, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+/* hook_library_dirs(dirs): code under these path prefixes keeps NumPy's
+ * operators (replaces the list install_ndarray_hook got). */
+static PyObject* m_hook_library_dirs(PyObject* mod, PyObject* dirs) {
+    (void)mod;
+    if (!PyTuple_Check(dirs)) {
+        PyErr_SetString(PyExc_TypeError, "hook_library_dirs: a tuple of path prefixes");
+        return NULL;
+    }
+    Py_XSETREF(g_lib_dirs, Py_NewRef(dirs));
+    t_clear(&g_user_code);
+    Py_RETURN_NONE;
+}
+
 static PyObject* m_set_ndarray_hook(PyObject* mod, PyObject* on) {
     (void)mod;
     g_hook_on = PyObject_IsTrue(on);
@@ -5702,6 +5715,8 @@ static PyMethodDef methods[] = {
     {"rebound_count", m_rebound_count, METH_NOARGS,
      "In-place operators on ndarrays the hook ran on their memory (x += y)."},
     {"set_ndarray_hook", m_set_ndarray_hook, METH_O, "Hook on/off (viproc.enable_hook, enable)."},
+    {"hook_library_dirs", m_hook_library_dirs, METH_O,
+     "Path prefixes whose code keeps NumPy's operators under the hook."},
     {"set_host_small", m_set_host_small, METH_O, "Small results as numpy.ndarray on/off."},
     {"set_fp_reporting", m_set_fp_reporting, METH_VARARGS,
      "set_fp_reporting(extobj_contextvar, get_extobj_dict, mode_of, reporter)"},

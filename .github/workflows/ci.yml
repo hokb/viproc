@@ -24,6 +24,10 @@ jobs:
         run: python -m pip install -v ".[test]"
       - name: pytest
         run: python -m pytest -q python/tests
+      - name: pytest with the numpy.ndarray hook installed
+        run: python -m pytest -q python/tests
+        env:
+          VIPROC_NDARRAY_HOOK: "1"
 
   # dev.cmd's script, started as from Visual Studio's default (x86) developer
   # prompt: it must still build for the 64-bit interpreter.

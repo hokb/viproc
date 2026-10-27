@@ -412,7 +412,8 @@ python/tests/          pytest tests of the bridge (bit-identical to NumPy)
 python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py,
                        strided_identity.py (strided view vs. dense copy in NumPy)
                        (per-op issue times: main-thread stalls, pool misses)
-  suite.py             benchmark suite: runner, machine detection, score
+  suite.py             benchmark suite: runner, machine detection, score;
+                       --mode hook|module: ndarray inputs under the ndarray hook
   suite_cases.py       its cases (plain NumPy programs, width P, variants)
   suite_report.py      its Markdown / HTML reports, multi-run comparison
   shape_map.py         speedup vs. NumPy over rows x cols (2-d, log grid):
@@ -472,8 +473,9 @@ docker/benchmark.sh [--quick]     # (re)build images, suite on Linux + Windows (
                                   # reports copied to ./reports (old ones deleted first)
 ```
 
-`ctest` also runs the pytest suite. Tests need `pytest`
-(`pip install pytest`).
+`ctest` also runs the pytest suite, twice: as is and with the
+numpy.ndarray hook installed (`python_hook`, `VIPROC_NDARRAY_HOOK=1`,
+`python/tests/conftest.py`). Tests need `pytest` (`pip install pytest`).
 
 Windows / Visual Studio: Debug builds work with a regular (release)
 Python installation; the extension module is written to

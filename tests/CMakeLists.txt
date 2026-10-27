@@ -28,6 +28,11 @@ if(VIPROC_NO_PYTEST)
 else()
     add_test(NAME python COMMAND ${Python3_EXECUTABLE} -m pytest -q ${CMAKE_SOURCE_DIR}/python/tests)
     set_tests_properties(python PROPERTIES ENVIRONMENT "PYTHONPATH=${VIPROC_PYTHON_DIR}")
+    # the same suite with the numpy.ndarray operator hook installed (conftest.py)
+    add_test(NAME python_hook COMMAND ${Python3_EXECUTABLE} -m pytest -q
+             ${CMAKE_SOURCE_DIR}/python/tests)
+    set_tests_properties(python_hook PROPERTIES ENVIRONMENT
+                         "PYTHONPATH=${VIPROC_PYTHON_DIR};VIPROC_NDARRAY_HOOK=1")
 endif()
 
 # Test executables that embed Python start it as the interpreter CMake found
