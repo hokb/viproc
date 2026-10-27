@@ -614,7 +614,13 @@ float64` 39.7-41.8 / 7.4 / 9.1-12.3, `int32 * float64` 31.5-36.2 / 3.7-4.9 /
 19; strided ops without a cast unchanged; main thread ~2,400 instructions
 less per op, no `NpyIter_Copy`; worker instructions unchanged); (2) the
 select kernel of `np.where` was slower than NumPy's `where` (1e4 elements,
-chained: 41-49 µs vs. 34 µs; see below).
+chained: 41-49 µs vs. 34 µs): a branch per element. Fixed: dense rows are
+selected branch-free (mask and blend per element word), 5.4 µs (NumPy
+40 µs, whose contiguous loop branches too). `expr_where` (4-vCPU VM, quick)
+after both fixes: 1e4 elements 0.42x -> 1.3-1.5x, 1e5 1.75-2.5x, 1e6 3.8x.
+What remains at 1e4 is the fan-out of tiny tasks to other workers: per
+iteration (5 ops) 13 µs with 1 worker, 35 µs with 4 (wake-ups, ~0.9 context
+switches per op; NumPy 53 µs).
 
 **i7-12700K, 20 logical cores (8 P-cores with HT + 4 E-cores), 31 GiB,
 NumPy 2.5.4, Docker Linux image, 97 cases (state of `2d4c915`):** score
