@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <thread>
 
 namespace viproc::numpy {
 
@@ -698,11 +699,9 @@ namespace {
 // NumPy's element-wise ufunc loop over its iterator (execute_ufunc_loop).
 class IterElementwiseKernel : public Kernel {
   public:
-    IterElementwiseKernel(const UfuncLoop* loop, NpyIter* iter, std::shared_ptr<IterTemplate> pool,
-                          bool masked)
-        : loop_(loop), iter_(iter), pool_(std::move(pool)), masked_(masked) {}
+    IterElementwiseKernel(const UfuncLoop* loop, std::shared_ptr<IterTemplate> pool, bool masked)
+        : loop_(loop), pool_(std::move(pool)), masked_(masked) {}
 
-    ~IterElementwiseKernel() override { pool_->give_back(iter_, clean_); }
     const char* name() const override { return loop_->name(); }
     const char* fp_name() const override { return loop_->fp_name(); }
 
@@ -723,31 +722,42 @@ class IterElementwiseKernel : public Kernel {
         if (masked_) {
             base[nop] = reinterpret_cast<char*>(inputs[nin].first()); // the where= mask
         }
+        PooledIter it;
+        std::string error;
+        if (!pool_->acquire(it, error)) {
+            return {1, std::move(error), 0};
+        }
+        KernelResult r = iterate(it, base, nop);
+        pool_->give_back(it, r.status == 0);
+        return r;
+    }
+
+    KernelResult iterate(const PooledIter& it, char** base, std::size_t nop) const {
         char* errmsg = nullptr;
-        clean_ = false;
         // Points the iterator at the buffers (no GIL: errmsg variant); with
         // buffering it also copies the first block.
-        if (NpyIter_ResetBasePointers(iter_, base, &errmsg) != NPY_SUCCEED) {
+        if (NpyIter_ResetBasePointers(it.iter, base, &errmsg) != NPY_SUCCEED) {
             return {1, errmsg != nullptr ? errmsg : "NpyIter_ResetBasePointers failed", 0};
         }
         do {
-            const int r = masked_ ? masked_call(nop) : loop_->call(dataptr_, countptr_, strideptr_);
+            const int r =
+                masked_ ? masked_call(it, nop) : loop_->call(it.dataptr, it.countptr, it.strideptr);
             if (r != 0) {
                 return {1, take_loop_error(), 0};
             }
-        } while (iternext_(iter_));
-        clean_ = true;
+        } while (it.iternext(it.iter));
         return {};
     }
 
     // NumPy's generic_masked_strided_loop (array_method.c): the loop is
     // called once per run of True mask values, the False ones are skipped.
-    int masked_call(std::size_t nop) const {
+    int masked_call(const PooledIter& it, std::size_t nop) const {
+        const npy_intp* strides = it.strideptr;
         char* ptrs[kMaxOps];
-        std::copy(dataptr_, dataptr_ + nop, ptrs);
-        const char* mask = dataptr_[nop];
-        const npy_intp ms = strideptr_[nop];
-        npy_intp n = *countptr_;
+        std::copy(it.dataptr, it.dataptr + nop, ptrs);
+        const char* mask = it.dataptr[nop];
+        const npy_intp ms = strides[nop];
+        npy_intp n = *it.countptr;
         while (n > 0) {
             npy_intp skip = 0;
             while (skip < n && *mask == 0) {
@@ -761,14 +771,14 @@ class IterElementwiseKernel : public Kernel {
                 ++run;
             }
             for (std::size_t i = 0; i < nop; ++i) {
-                ptrs[i] += skip * strideptr_[i];
+                ptrs[i] += skip * strides[i];
             }
             if (run > 0) {
-                if (loop_->call(ptrs, &run, strideptr_) != 0) {
+                if (loop_->call(ptrs, &run, strides) != 0) {
                     return -1;
                 }
                 for (std::size_t i = 0; i < nop; ++i) {
-                    ptrs[i] += run * strideptr_[i];
+                    ptrs[i] += run * strides[i];
                 }
                 n -= run;
             }
@@ -776,18 +786,13 @@ class IterElementwiseKernel : public Kernel {
         return 0;
     }
 
-    NpyIter_IterNextFunc* iternext_ = nullptr;
-    char** dataptr_ = nullptr;
-    npy_intp* strideptr_ = nullptr;
-    npy_intp* countptr_ = nullptr;
-
   private:
     const UfuncLoop* loop_;
-    NpyIter* iter_;
     std::shared_ptr<IterTemplate> pool_;
-    bool clean_ = true; // a fresh copy has nothing in its buffers
     bool masked_;
 };
+
+std::size_t g_kernel_threads = 0;
 
 npy_intp numpy_buffersize() {
     npy_intp buffersize = 0;
@@ -957,6 +962,16 @@ Layout at_least_1d(Layout l) {
 
 } // namespace
 
+void set_kernel_threads(std::size_t threads) { g_kernel_threads = threads; }
+
+std::shared_ptr<IterTemplate> new_iter_template() {
+    auto t = std::make_shared<IterTemplate>();
+    const std::size_t threads =
+        g_kernel_threads != 0 ? g_kernel_threads : std::thread::hardware_concurrency() + 1;
+    t->target = threads + 1;
+    return t;
+}
+
 std::shared_ptr<Kernel> make_cast_kernel(const Layout& in, const Layout& out, long buffersize,
                                          DeferRelease defer, std::string& error) {
     char* const dummy = template_address();
@@ -1123,7 +1138,7 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
                                         NPY_UNSAFE_CASTING, op_flags, descrs, -1, nullptr, nullptr,
                                         bufsize);
         }
-        pool = std::make_shared<IterTemplate>();
+        pool = new_iter_template();
         if (templ != nullptr && mask != nullptr) {
             // masked: new iterators from the same arguments (IterTemplate)
             std::vector<PyArrayObject*> ops(op, op + nit);
@@ -1161,21 +1176,11 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
         pool->defer = std::move(defer);
         iter_templates_.emplace(std::move(key), pool);
     }
-    NpyIter* iter = pool->get();
-    if (iter == nullptr) {
+    if (!pool->reserve()) {
         error = fetch_python_error();
         return nullptr;
     }
-    auto kernel = std::make_shared<IterElementwiseKernel>(loop, iter, pool, mask != nullptr);
-    kernel->iternext_ = NpyIter_GetIterNext(iter, nullptr);
-    if (kernel->iternext_ == nullptr) {
-        error = fetch_python_error();
-        return nullptr; // the kernel releases the iterator
-    }
-    kernel->dataptr_ = NpyIter_GetDataPtrArray(iter);
-    kernel->strideptr_ = NpyIter_GetInnerStrideArray(iter);
-    kernel->countptr_ = NpyIter_GetInnerLoopSizePtr(iter);
-    return kernel;
+    return std::make_shared<IterElementwiseKernel>(loop, pool, mask != nullptr);
 }
 
 PyObject* scalar_object(DType dtype, const void* data) {

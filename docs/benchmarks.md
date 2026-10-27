@@ -597,6 +597,25 @@ over the run), the pool test's loop misses only on its first iteration.
 
 ## Other machines
 
+**Iterator copies taken when the kernel runs.** The shape map found
+`expr_where` below 0.8x of NumPy from 3,000 to 100,000 elements (0.22-0.39x),
+from two defects: (1) ufunc ops with a cast on NumPy's iterator (bool or
+float32 with float64) ran 5-15x slower than NumPy when they ran
+asynchronously (`c * x`, 1e4 elements, chained: ~30-60 µs vs. NumPy 8 µs;
+direct path 6 µs): the iterator pool kept 16 iterators per template, the
+look-ahead has up to 1,000 ops in flight, so nearly every op got a fresh
+copy whose buffers faulted in on the worker (~15 page faults and ~25 µs
+system time per op). Fixed: kernels take a copy when they run and give it
+back after, the main thread keeps at most kernel threads + 1 copies per
+template (4-vCPU VM, chained ops of 1e4 elements, µs per op, before / after
+/ NumPy: `bool * float64` 31.7-38.5 / 5.1-5.9 / 5.7-10.0, `float32 *
+float64` 39.7-41.8 / 7.4 / 9.1-12.3, `int32 * float64` 31.5-36.2 / 3.7-4.9 /
+5.6-9.9, `x + x.sum(axis=1, keepdims=True)` of int32 100 x 200 45 / 16-19 /
+19; strided ops without a cast unchanged; main thread ~2,400 instructions
+less per op, no `NpyIter_Copy`; worker instructions unchanged); (2) the
+select kernel of `np.where` was slower than NumPy's `where` (1e4 elements,
+chained: 41-49 µs vs. 34 µs; see below).
+
 **i7-12700K, 20 logical cores (8 P-cores with HT + 4 E-cores), 31 GiB,
 NumPy 2.5.4, Docker Linux image, 97 cases (state of `2d4c915`):** score
 22, 1.40x with 20 workers, 0.76x with 1 worker, 97/97 bit-identical.

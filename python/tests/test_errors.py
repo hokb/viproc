@@ -174,3 +174,30 @@ def test_restarting_the_runtime_raises_an_error_nobody_reported():
         if not viproc._viproc.initialized():
             viproc.init()
     assert np.array_equal(np.asarray(viproc.asarray(base) + 1), base + 1)
+
+
+def test_failed_iterator_ops_leave_working_iterators_behind():
+    # Ops on NumPy's iterator (a strided operand) share a few iterator
+    # copies; a failed op drops its copy (its buffers may hold data to write
+    # back), so later ops run on new ones, made on the worker if needed.
+    base, exp = _operands(100_000)
+    x, bad = viproc.asarray(base), exp[::-1]
+    failed = []
+    for _ in range(120):
+        try:
+            failed.append(np.power(x, bad))
+        except viproc.AsyncValueError:
+            pass
+    try:
+        viproc.wait_all()
+    except viproc.AsyncValueError:
+        pass
+    assert len(failed) > 0
+    ok = np.abs(exp)[::-1]
+    for _ in range(3):
+        rs = [np.power(x, ok) + i for i in range(40)]
+        for i, r in enumerate(rs):
+            assert np.array_equal(np.asarray(r), base ** ok + i)
+    for r in failed[:3]:
+        with pytest.raises(ValueError, match=NEG):
+            np.asarray(r)
