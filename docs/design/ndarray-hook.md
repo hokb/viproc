@@ -222,11 +222,16 @@ is a sync, and every read of the state is a copy (or NumPy, if strided).
 on the main thread per rod and step (each 225-354 µs into fresh memory) and
 one sync at `u[1:-1] = e`; the main thread spends ~1.4 ms per rod-step,
 more than NumPy's whole step (~0.9 ms): 1.35x vs. 8.7x with viproc arrays.
-In a `python -m viproc` program whose arrays come from viproc itself
-(`np.random...`, `np.zeros`, `np.loadtxt`) the state is viproc and none
-of this happens; it happens where the state comes from outside as
-ndarrays (a library, a file reader, the suite's ndarray inputs) and
-in the hook mode, where creation functions stay NumPy's.
+This only happens where the arrays that hold the program's state are
+real `numpy.ndarray`s, which is the case in two situations: (1) the state
+comes in from outside as ndarrays (a library such as pandas or h5py, a
+function argument, the suite's inputs in module mode; then `np.zeros_like(X)`
+of such an X is an ndarray too), and (2) hook mode (`enable_hook()`), which
+only routes operators: `np.zeros`, `np.random...`, `np.loadtxt` still return
+ndarrays, so even a program that creates its own arrays keeps its state in
+ndarrays. A `python -m viproc` program that creates its own data gets viproc
+arrays from those functions: its state is viproc, assignments are tasks,
+and none of the syncs and copies above occur (as in arrays mode).
 
 ## Opt-in or default
 
