@@ -281,6 +281,8 @@ int vp_ndarray_ndim(PyObject* nd, int* dense);
 int vp_ndarray_immutable(PyObject* nd);
 /* Bytes of a numpy.ndarray that owns its memory, else 0. */
 int64_t vp_ndarray_owned_nbytes(PyObject* nd);
+/* 1 if NumPy lets write a numpy.ndarray (WRITEABLE, no WRITEBACKIFCOPY). */
+int vp_ndarray_writeable(PyObject* nd);
 /* 1 if the memory extents of two numpy.ndarrays overlap. */
 int vp_ndarrays_overlap(PyObject* a, PyObject* b);
 int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs, int out_ndim,

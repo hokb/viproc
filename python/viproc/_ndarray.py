@@ -1904,6 +1904,21 @@ _viproc.set_fp_reporting(np._core._multiarray_umath._extobj_contextvar,
 _hook = [False]  # enable_hook(): the operator hook is wanted (and installed)
 
 
+def _inplace_opcodes():
+    """Opcodes the hook needs to redirect `x += y` on ndarrays (inplace_rebinds
+    in _viproc.c), None where it cannot (CPython 3.14 borrows loads)."""
+    if sys.version_info >= (3, 14):
+        return None
+    import dis
+
+    op = dis.opmap
+    caches = dis._inline_cache_entries
+    binary = op["BINARY_OP"]
+    ncache = caches["BINARY_OP"] if isinstance(caches, dict) else caches[binary]
+    return (binary, ncache, op["STORE_FAST"], op["STORE_DEREF"], op["STORE_NAME"],
+            op["STORE_GLOBAL"], op.get("STORE_FAST_LOAD_FAST", -1))
+
+
 def enable_hook(on=True):
     """Routes operators on numpy.ndarray in the user's own code through
     viproc (see viproc.enable_hook). Installs the hook on first use."""
@@ -1925,7 +1940,8 @@ def enable_hook(on=True):
         _ensure_runtime()  # the hook needs the runtime from the first operator on
         _HOST_SMALL = True  # small results of ndarrays stay NumPy's
         _viproc.set_host_small(True)
-        _viproc.install_ndarray_hook(tuple(os.path.join(d, "") for d in dirs if d) + ("<frozen",))
+        _viproc.install_ndarray_hook(tuple(os.path.join(d, "") for d in dirs if d) + ("<frozen",),
+                                     _inplace_opcodes())
     _hook[0] = bool(on)
     _viproc.set_ndarray_hook(bool(on) and _enabled[0])
 

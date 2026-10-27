@@ -1414,6 +1414,14 @@ std::int64_t ndarray_owned_nbytes(PyObject* nd) {
     return PyArray_CHKFLAGS(a, NPY_ARRAY_OWNDATA) ? PyArray_NBYTES(a) : 0;
 }
 
+bool ndarray_writeable(PyObject* nd) {
+    if (!PyArray_Check(nd)) {
+        return false;
+    }
+    PyArrayObject* a = reinterpret_cast<PyArrayObject*>(nd);
+    return PyArray_ISWRITEABLE(a) && !PyArray_CHKFLAGS(a, NPY_ARRAY_WRITEBACKIFCOPY);
+}
+
 bool ndarrays_overlap(PyObject* a, PyObject* b) {
     auto extent = [](PyArrayObject* x, char** lo, char** hi) {
         *lo = *hi = PyArray_BYTES(x);

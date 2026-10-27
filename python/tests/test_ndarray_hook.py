@@ -95,8 +95,12 @@ def test_large_results_are_viproc_arrays_small_ones_numpys(tmp_path):
     with viproc.disabled():
         assert type(a + 1) is np.ndarray
     b = a.copy()
-    b += viproc.asarray(a)  # in place on an ndarray: NumPy's, the ndarray keeps it
-    assert type(b) is np.ndarray and b[0, 0] == 2
+    c = b
+    b += viproc.asarray(a)  # in place on an ndarray another name sees: NumPy's
+    assert type(b) is np.ndarray and b is c and b[0, 0] == 2
+    b = a.copy()
+    b += viproc.asarray(a)  # only the name sees it: viproc takes b's memory over
+    assert isinstance(b, viproc.ndarray) and b[0, 0] == 2
     print("ok")
     """, tmp_path)
     assert out.strip() == "ok"
@@ -233,6 +237,133 @@ def test_ndarray_operands_are_borrowed_only_where_nobody_can_write_them(tmp_path
     r = y * 3
     y[...] = 0
     assert np.array_equal(np.asarray(r), expected)
+    print("ok")
+    """, tmp_path)
+    assert out.strip() == "ok"
+
+
+@pytest.mark.skipif(sys.version_info >= (3, 14), reason="redirection needs strong loads")
+def test_in_place_operators_take_over_ndarrays_only_where_a_plain_name_is_rebound(tmp_path):
+    out = run_child("""
+    import numpy as np
+    import viproc
+    rebound = viproc._viproc.rebound_count
+    N = 100000
+    base = np.random.default_rng(0).random(N)
+
+    def taken(f):
+        before = rebound()
+        r = f()
+        return rebound() - before, r
+
+    def local():
+        x = base.copy()
+        x += 1.5
+        x *= base
+        x **= 2
+        return x
+    n, r = taken(local)
+    assert n == 1 and isinstance(r, viproc.ndarray)
+    assert np.asarray(r).tobytes() == (((base + 1.5) * base) ** 2).tobytes()
+
+    def fortran():
+        x = np.asfortranarray(base.reshape(400, 250))
+        x -= 1
+        return x
+    n, r = taken(fortran)
+    assert n == 1 and r.strides == (8, 3200)  # NumPy's layout kept
+
+    def closure():
+        x = base.copy()
+        def g():
+            nonlocal x
+            x /= 3
+        g()
+        return x
+    assert taken(closure)[0] == 1
+
+    G = base.copy()
+    def glob():
+        global G
+        G //= 0.25
+        return G
+    assert taken(glob)[0] == 1
+    M = base.copy()
+    before = rebound()
+    M %= 0.3
+    assert rebound() - before == 1 and isinstance(M, viproc.ndarray)
+
+    # NumPy's in-place write stays visible where something else sees x
+    def other_name():
+        x = base.copy()
+        y = x
+        x += 1
+        return y
+    def view_of_x():
+        x = base.copy()
+        v = x[::2]
+        x += 1
+        return v
+    def x_is_a_view():
+        big = base.copy()
+        x = big[: N // 2]
+        x += 1
+        return big
+    def tuple_item():
+        x = base.copy()
+        t = (x,)
+        try:
+            t[0] += 1  # NumPy writes x, then the store raises
+        except TypeError:
+            pass
+        return x
+    class O:
+        pass
+    def attribute():
+        o = O()
+        o.x = base.copy()
+        o.x += 1
+        return o.x
+    for f in (other_name, view_of_x, x_is_a_view, tuple_item, attribute):
+        n, r = taken(f)
+        assert n == 0 and type(r) is np.ndarray and r[0] == base[0] + 1, f
+    def small():
+        x = base[:10].copy()
+        x += 1
+        return x
+    def strided_operand():
+        x = base.copy()
+        x += np.stack([base, base], axis=1)[:, 1]
+        return x
+    def readonly():
+        x = base.copy()
+        x.setflags(write=False)
+        try:
+            x += 1
+        except ValueError as e:
+            return e
+    for f in (small, strided_operand, readonly):
+        assert taken(f)[0] == 0, f
+
+    def cast_error():  # NumPy's error, x unchanged
+        x = np.ones(N, np.int64)
+        try:
+            x += 1.5
+        except Exception as e:
+            return type(e).__name__, str(e), type(x) is np.ndarray and x[0] == 1
+    with viproc.disabled():
+        expected = cast_error()
+    assert cast_error() == expected
+
+    def loop(a):
+        x = a.copy()
+        for _ in range(20):
+            x += 1
+            x *= 0.5
+        return x
+    with viproc.disabled():
+        expected = loop(base)
+    assert np.asarray(loop(base)).tobytes() == expected.tobytes()
     print("ok")
     """, tmp_path)
     assert out.strip() == "ok"

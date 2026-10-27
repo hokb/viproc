@@ -305,6 +305,9 @@ int ndarray_ndim_dense(PyObject* nd, bool* dense);
 bool ndarray_immutable(PyObject* nd);
 // Bytes of a numpy.ndarray that owns its memory (OWNDATA), else 0.
 std::int64_t ndarray_owned_nbytes(PyObject* nd);
+// True if `nd` is a numpy.ndarray NumPy lets write (WRITEABLE, no
+// WRITEBACKIFCOPY).
+bool ndarray_writeable(PyObject* nd);
 // True if the memory extents of two numpy.ndarrays overlap.
 bool ndarrays_overlap(PyObject* a, PyObject* b);
 // PROTOTYPE: viproc's dtype code of a numpy.ndarray, -1 if none (or not native).

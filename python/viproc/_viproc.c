@@ -2557,11 +2557,178 @@ static PyObject* hook_matmul(PyObject* a, PyObject* b) {
     return g_hook_orig_matmul(a, b);
 }
 
+/* In-place operators on a plain ndarray (`x += y`): NumPy writes x's
+ * memory, synchronously. Where nobody can see the difference, viproc takes
+ * x's memory over instead (a viproc array over it, no copy) and runs the
+ * in-place op on that asynchronously; the statement rebinds the name to it.
+ * Nobody can see it when the instruction after the operator stores into a
+ * plain name, which cannot fail (STORE_FAST, STORE_DEREF, STORE_NAME into
+ * an exact dict, STORE_GLOBAL; `t[0] += y` and `o.x += y` stay NumPy's: their
+ * store can fail after NumPy wrote x), the name holds x, and only the name
+ * and the interpreter's stack reference x (no other name, view or buffer).
+ * x must own its memory (a view's base sees it) and be writable; its layout
+ * is kept, so the loop calls are NumPy's. CPython 3.12/3.13 only: their
+ * loads always push a strong reference, so the count is exactly 2; 3.14
+ * borrows loads of fast locals, and a count of 2 could then be another
+ * name (install_ndarray_hook gets no opcodes there). */
+enum {
+    HI_ADD,
+    HI_SUB,
+    HI_MUL,
+    HI_TDIV,
+    HI_FDIV,
+    HI_MOD,
+    HI_AND,
+    HI_OR,
+    HI_XOR,
+    HI_LSHIFT,
+    HI_RSHIFT,
+    HI_N
+};
+static binaryfunc g_hook_orig_ip[HI_N];
+static ternaryfunc g_hook_orig_ipow;
+static const binaryfunc g_ip_viproc[HI_N] = {nb_iadd,      nb_isub,    nb_imul,   nb_itruediv,
+                                             nb_ifloordiv, nb_irem,    nb_iand,   nb_ior,
+                                             nb_ixor,      nb_ilshift, nb_irshift};
+/* opcodes: BINARY_OP, its inline cache entries, STORE_FAST, STORE_DEREF,
+ * STORE_NAME, STORE_GLOBAL, STORE_FAST_LOAD_FAST (-1: none); BINARY_OP < 0:
+ * no redirection */
+static int g_ip_op[7] = {-1, 0, -1, -1, -1, -1, -1};
+static unsigned long long g_rebound = 0; /* in-place operators redirected */
+
+/* 1 if the statement running `x op= ...` rebinds a plain name holding x
+ * right after the operator, and nothing else references x. */
+static int inplace_rebinds(PyObject* x) {
+    if (g_ip_op[0] < 0 || Py_REFCNT(x) != 2) { /* the name and the stack */
+        return 0;
+    }
+    PyFrameObject* f = PyEval_GetFrame(); /* borrowed */
+    if (f == NULL) {
+        return 0;
+    }
+    PyCodeObject* co = PyFrame_GetCode(f);
+    PyObject* bytes = PyCode_GetCode(co); /* cached by CPython after the first call */
+    int ok = 0;
+    const int lasti = PyFrame_GetLasti(f);
+    const Py_ssize_t next = lasti + 2 * (1 + (Py_ssize_t)g_ip_op[1]);
+    if (bytes != NULL && lasti >= 0 && next + 1 < PyBytes_GET_SIZE(bytes)) {
+        const unsigned char* b = (const unsigned char*)PyBytes_AS_STRING(bytes);
+        const int op = b[next];
+        const int arg = b[next + 1];
+        PyObject* holder = NULL; /* new ref: what the target name holds */
+        if (b[lasti] != g_ip_op[0]) {
+            /* not BINARY_OP: some other path called the slot */
+        } else if (op == g_ip_op[2] || op == g_ip_op[3] || op == g_ip_op[6]) {
+            /* STORE_FAST, STORE_DEREF: arg indexes the frame's variables */
+            PyObject* name = PyObject_CallMethod((PyObject*)co, "_varname_from_oparg", "i",
+                                                 op == g_ip_op[6] ? arg >> 4 : arg);
+            holder = name != NULL ? PyFrame_GetVar(f, name) : NULL;
+            Py_XDECREF(name);
+        } else if (op == g_ip_op[4] || op == g_ip_op[5]) { /* STORE_NAME, STORE_GLOBAL */
+            PyObject* names = PyObject_GetAttrString((PyObject*)co, "co_names");
+            PyObject* ns = op == g_ip_op[4] ? PyFrame_GetLocals(f) : PyFrame_GetGlobals(f);
+            if (names != NULL && ns != NULL && PyTuple_Check(names) &&
+                arg < PyTuple_GET_SIZE(names) && PyDict_CheckExact(ns)) {
+                holder = PyDict_GetItemWithError(ns, PyTuple_GET_ITEM(names, arg));
+                Py_XINCREF(holder);
+            }
+            Py_XDECREF(names);
+            Py_XDECREF(ns);
+        }
+        ok = holder == x;
+        Py_XDECREF(holder);
+    }
+    Py_XDECREF(bytes);
+    Py_DECREF(co);
+    PyErr_Clear();
+    return ok;
+}
+
+/* The ndarray `a` of `a op= b` as a viproc array over its memory, if the
+ * statement only rebinds a name to the result (inplace_rebinds) and the
+ * hook would take `a op b`; NULL (no Python error) for NumPy's slot. */
+static PyObject* inplace_takeover(PyObject* a, PyObject* b) {
+    /* cheap rejections first: small arrays (fewer bytes than sync_below
+     * elements have fewer elements too), other references */
+    if (!g_hook_on || Py_TYPE(a) != (PyTypeObject*)g_np_ndarray || Py_REFCNT(a) != 2 ||
+        g_ip_op[0] < 0 || g_rt == NULL || vp_ndarray_owned_nbytes(a) < (int64_t)g_small ||
+        PyThread_get_thread_ident() != g_main_thread || !vp_ndarray_writeable(a) ||
+        vp_ndarray_kind(a) < 0) {
+        return NULL;
+    }
+    const int cb = hook_class(b);
+    if (cb == OP_OTHER || cb == OP_STRIDED) {
+        return NULL;
+    }
+    int nd;
+    int64_t shape[64]; /* NPY_MAXDIMS */
+    if (!vp_ndarray_shape(a, &nd, shape) || nd > MAXDIMS) {
+        return NULL;
+    }
+    long long n = 1;
+    for (int i = 0; i < nd; ++i) {
+        n *= shape[i];
+    }
+    if (n < g_small || !inplace_rebinds(a) || !caller_is_user()) {
+        return NULL;
+    }
+    vp_array* v = NULL;
+    char err[ERRLEN] = "";
+    if (vp_array_from_ndarray(g_rt, a, &v, err, sizeof err) != VP_OK) {
+        return NULL;
+    }
+    ++g_rebound;
+    return wrap_array(v); /* adopted: x is unreachable once the name is rebound */
+}
+
+#define HOOK_INPLACE(NAME, IDX)                                                                    \
+    static PyObject* NAME(PyObject* a, PyObject* b) {                                              \
+        PyObject* w = inplace_takeover(a, b);                                                      \
+        if (w != NULL) {                                                                           \
+            PyObject* r = g_ip_viproc[IDX](w, b);                                                  \
+            Py_DECREF(w);                                                                          \
+            return r;                                                                              \
+        }                                                                                          \
+        return PyErr_Occurred() ? NULL : g_hook_orig_ip[IDX](a, b);                                \
+    }
+HOOK_INPLACE(hook_iadd, HI_ADD)
+HOOK_INPLACE(hook_isub, HI_SUB)
+HOOK_INPLACE(hook_imul, HI_MUL)
+HOOK_INPLACE(hook_itdiv, HI_TDIV)
+HOOK_INPLACE(hook_ifdiv, HI_FDIV)
+HOOK_INPLACE(hook_imod, HI_MOD)
+HOOK_INPLACE(hook_iand, HI_AND)
+HOOK_INPLACE(hook_ior, HI_OR)
+HOOK_INPLACE(hook_ixor, HI_XOR)
+HOOK_INPLACE(hook_ilshift, HI_LSHIFT)
+HOOK_INPLACE(hook_irshift, HI_RSHIFT)
+
+static PyObject* hook_ipow(PyObject* a, PyObject* b, PyObject* mod) {
+    PyObject* w = mod == Py_None ? inplace_takeover(a, b) : NULL;
+    if (w != NULL) {
+        PyObject* r = nb_ipow(w, b, mod);
+        Py_DECREF(w);
+        return r;
+    }
+    return PyErr_Occurred() ? NULL : g_hook_orig_ipow(a, b, mod);
+}
+
 /* install_ndarray_hook(library_dirs): replaces the slots once. */
-static PyObject* m_install_ndarray_hook(PyObject* mod, PyObject* dirs) {
+static PyObject* m_install_ndarray_hook(PyObject* mod, PyObject* args) {
     (void)mod;
+    PyObject* dirs;
+    PyObject* ops = Py_None;
+    if (!PyArg_ParseTuple(args, "O|O", &dirs, &ops)) {
+        return NULL;
+    }
     if (g_hook_orig_cmp != NULL) {
         Py_RETURN_NONE;
+    }
+    if (ops != Py_None) { /* opcodes of in-place redirection (inplace_rebinds) */
+        if (!PyArg_ParseTuple(ops, "iiiiiii", &g_ip_op[0], &g_ip_op[1], &g_ip_op[2], &g_ip_op[3],
+                              &g_ip_op[4], &g_ip_op[5], &g_ip_op[6])) {
+            return NULL;
+        }
     }
     if (g_np_ndarray == NULL || g_matmul == NULL || !PyTuple_Check(dirs)) {
         PyErr_SetString(PyExc_RuntimeError, "install_ndarray_hook: setup() first, dirs a tuple");
@@ -2606,6 +2773,20 @@ static PyObject* m_install_ndarray_hook(PyObject* mod, PyObject* dirs) {
     }
     g_hook_orig_pow = nb->nb_power;
     nb->nb_power = hook_pow;
+    binaryfunc* ip[HI_N] = {
+        &nb->nb_inplace_add,         &nb->nb_inplace_subtract,     &nb->nb_inplace_multiply,
+        &nb->nb_inplace_true_divide, &nb->nb_inplace_floor_divide, &nb->nb_inplace_remainder,
+        &nb->nb_inplace_and,         &nb->nb_inplace_or,           &nb->nb_inplace_xor,
+        &nb->nb_inplace_lshift,      &nb->nb_inplace_rshift};
+    const binaryfunc ip_hooks[HI_N] = {hook_iadd,  hook_isub,    hook_imul,   hook_itdiv,
+                                       hook_ifdiv, hook_imod,    hook_iand,   hook_ior,
+                                       hook_ixor,  hook_ilshift, hook_irshift};
+    for (int i = 0; i < HI_N; ++i) {
+        g_hook_orig_ip[i] = *ip[i];
+        *ip[i] = ip_hooks[i];
+    }
+    g_hook_orig_ipow = nb->nb_inplace_power;
+    nb->nb_inplace_power = hook_ipow;
     g_hook_orig_matmul = nb->nb_matrix_multiply;
     nb->nb_matrix_multiply = hook_matmul;
     g_hook_orig_cmp = t->tp_richcompare;
@@ -2652,6 +2833,12 @@ static PyObject* m_borrowed_count(PyObject* mod, PyObject* unused) {
     (void)mod;
     (void)unused;
     return PyLong_FromUnsignedLongLong(g_borrowed);
+}
+
+static PyObject* m_rebound_count(PyObject* mod, PyObject* unused) {
+    (void)mod;
+    (void)unused;
+    return PyLong_FromUnsignedLongLong(g_rebound);
 }
 
 static PyNumberMethods Array_as_number = {
@@ -5504,10 +5691,12 @@ static PyObject* m_where(PyObject* self, PyObject* const* args, Py_ssize_t nargs
 
 static PyMethodDef methods[] = {
     {"_issue_site", m_issue_site, METH_NOARGS, "The issue site an op issued here would get."},
-    {"install_ndarray_hook", m_install_ndarray_hook, METH_O,
+    {"install_ndarray_hook", m_install_ndarray_hook, METH_VARARGS,
      "Route numpy.ndarray operators of user code through viproc (viproc.enable_hook)."},
     {"hooked_count", m_hooked_count, METH_NOARGS, "Operators the ndarray hook handled."},
     {"borrowed_count", m_borrowed_count, METH_NOARGS, "ndarray operands read without a copy."},
+    {"rebound_count", m_rebound_count, METH_NOARGS,
+     "In-place operators on ndarrays the hook ran on their memory (x += y)."},
     {"set_ndarray_hook", m_set_ndarray_hook, METH_O, "Hook on/off (viproc.enable_hook, enable)."},
     {"set_host_small", m_set_host_small, METH_O, "Small results as numpy.ndarray on/off."},
     {"set_fp_reporting", m_set_fp_reporting, METH_VARARGS,

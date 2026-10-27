@@ -22,7 +22,31 @@ Per operator call, on the main thread, before anything is computed:
 - **Left to NumPy**: subclasses (`np.matrix`, masked arrays) and any
   operand NumPy would defer to (`__array_ufunc__ = None`, other array
   types); strided ndarray operands (below); in-place operators on
-  ndarrays (below); calls from other threads; small results.
+  ndarrays others can see (next item); calls from other threads; small
+  results.
+- **In-place operators on ndarrays** (`x += y`, `-=`, `*=`, `/=`, `//=`,
+  `%=`, `**=`, `&=`, `|=`, `^=`, `<<=`, `>>=`; not `@=`): NumPy writes
+  `x`. viproc takes `x`'s memory over instead (no copy, `x`'s layout kept)
+  and runs the op on it asynchronously when nobody can tell the
+  difference: the instruction after the operator stores into a plain
+  name (`STORE_FAST`, `STORE_DEREF`, `STORE_GLOBAL`, `STORE_NAME` into an
+  exact dict: stores that cannot fail), that name holds `x`, nothing else
+  references `x` (no other name, view, container or buffer: reference
+  count 2, the name and the interpreter's stack), `x` owns its memory and
+  is writable, `y` is no strided ndarray (O1, below), and the result
+  would be large. The name is then bound to
+  a viproc array with `x`'s values after the op. Everything else stays
+  NumPy's in-place write, visible to every other reference: `y = x; x +=
+  1` (`y` sees it), views of `x` or `x` a view, `o.x += 1`, `d[k] += 1`,
+  and `t[0] += 1` on a tuple (NumPy writes the array, then the store
+  raises). Measured (4 cores, four 2e6-element float64 arrays, 80 in-place
+  ops): NumPy 73 ms, hook 29 ms, bit-identical; a small in-place op pays
+  ~110 instructions for the checks (NumPy's ~5,700). **CPython 3.12 and
+  3.13 only**: their loads always push a strong reference, so the count
+  is exactly 2. CPython 3.14 borrows loads of fast locals; a count of 2
+  could then be the name plus another reference, so there the in-place
+  operators stay NumPy's (open: tell borrowed from strong stack
+  references).
 - **Small results stay `numpy.ndarray`**, computed right away (nothing to
   overlap). Large ones become `viproc.ndarray`, computed asynchronously.
 - **ndarray operands are copied** at issue (the user may write them while
@@ -87,13 +111,6 @@ Per operator call, on the main thread, before anything is computed:
   new machine (step 5); a per-loop proof would let O1 take the copy too.
   viproc views (`v[:, 1]` of a viproc array) are not affected: they run
   asynchronously with their own strides.
-- **In-place operators on ndarrays** (`x += y`, `x` a plain ndarray):
-  NumPy's, synchronous. Planned: when the instruction after the operator
-  stores into a plain name (`STORE_FAST`, `STORE_NAME`, `STORE_GLOBAL`,
-  `STORE_DEREF`, which cannot fail) and nothing but that name references
-  `x`, return a new viproc array instead of writing `x`. Attribute and
-  item targets keep NumPy's in-place write: their store can fail after
-  the write (`t[0] += y` on a tuple writes the array, then raises).
 - **ndarray methods and `np.*` functions** called on plain ndarrays outside
   module mode go to NumPy (only operators are hooked); with
   `import viproc as np` or `python -m viproc` the ufuncs and `np.where`
