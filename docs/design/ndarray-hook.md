@@ -164,5 +164,16 @@ Per operator call, on the main thread, before anything is computed:
 
 ## Opt-in or default
 
-Open (step 5): decided after suite runs on several machines. Until then
-the hook is opt-in.
+Full suite, 4 cores, one build (`docs/benchmarks.md`, 10-27): all 100
+configurations bit-identical in every mode; score 85 with viproc arrays as
+inputs, 62 as `python -m viproc` with ndarray inputs, 57 with
+`enable_hook()` alone. Programs that hold their state in ndarrays and
+assign into them (`u[1:-1] = ...`) run below NumPy's speed under the hook
+(`stencil_1d` medium 0.56x, `kmeans_points` large 0.60x): every op copies
+the ndarray slices it reads, and every assignment into the ndarray syncs.
+That breaks G3's "never below 0.95x", so the hook stays **opt-in**.
+Open: decide per issue site whether the hook takes an op (as the dispatch
+policy decides inline vs. async per site): a site whose results are
+assigned into ndarrays or synced right away, or whose ndarray operands
+must be copied, would stay NumPy's; and run the suite on more machines
+(`--mode hook|module`).

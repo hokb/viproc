@@ -236,6 +236,22 @@ compare directly.
 | 10-23 | `0ac2184` | scalar operands cached, task lists inline (#47) (2.10) | 100 | 81 | 2.03x | 1.16x | 99 | 66 | 93 | 78 | 64 | 90 | 96 | 82 | 93 | 68 | 81 |
 | 10-23 | `8e0fbd6` | same-VM baseline for the lock-free consumer list: `main` (2.10) | 100 | 83 | 2.11x | 1.20x | 104 | 71 | 86 | 77 | 70 | 94 | 97 | 94 | 95 | 69 | 89 |
 | 10-23 | this PR | lock-free consumer list, no mutex in the task (2.10) | 100 | 83 | 2.13x | 1.21x | 108 | 73 | 101 | 79 | 64 | 80 | 65 | 100 | 102 | 67 | 93 |
+| 10-27 | `26d29fd` | ndarray hook branch, viproc arrays as inputs (`--mode arrays`) (2.10) | 100 | 85 | 2.17x | 1.21x | 104 | 79 | 90 | 81 | 69 | 92 | 107 | 92 | 93 | 71 | 94 |
+| 10-27 | `26d29fd` | same build, `--mode module` (`python -m viproc`, ndarray inputs) (2.10) | 100 | 62 | 1.50x | 1.12x | 78 | 35 | 57 | 55 | 55 | 116 | 87 | 120 | 108 | 46 | 42 |
+| 10-27 | `26d29fd` | same build, `--mode hook` (`enable_hook()`, ndarray inputs, NumPy's functions) (2.10) | 100 | 57 | 1.40x | 1.13x | 62 | 33 | 44 | 59 | 56 | 117 | 73 | 119 | 107 | 42 | 40 |
+
+ndarray hook, same VM, one build (`26d29fd`, `#bbea57ec`), three modes:
+every configuration bit-identical in all three. With numpy.ndarray inputs
+the score drops from 85 to 62 (module) and 57 (hook); tiny and small data
+gain (they stay NumPy's, without viproc's per-op cost), medium and large
+lose. The cause is the input, not the hook's own cost: an ndarray the
+program holds is copied at every op that reads it (the program may write
+it later), and a program that keeps its state in ndarrays and writes it
+with `u[1:-1] = ...` (`stencil_1d` medium 6.62x → 0.56x, `stencil_2d`,
+`kmeans_points` large 6.56x → 0.60x) syncs at every assignment and copies
+its slices on top: slower than NumPy. With `python -m viproc` the
+creation functions give viproc arrays, so the module-mode numbers are the
+case of data that comes from a library as ndarrays.
 
 View changes, same VM (`3111820` → `5db8972`): score 64.0 → 63.7,
 unchanged within noise; the programs dominated by slicing gained:
