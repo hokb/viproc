@@ -465,6 +465,10 @@ extern "C" {
 
 int vp_ndarray_kind(PyObject* nd) { return numpy::ndarray_dtype_code(nd); }
 
+int vp_ndarray_immutable(PyObject* nd) { return numpy::ndarray_immutable(nd) ? 1 : 0; }
+
+int64_t vp_ndarray_owned_nbytes(PyObject* nd) { return numpy::ndarray_owned_nbytes(nd); }
+
 int vp_ndarrays_overlap(PyObject* a, PyObject* b) { return numpy::ndarrays_overlap(a, b) ? 1 : 0; }
 
 int vp_ndarray_ndim(PyObject* nd, int* dense) {

@@ -199,3 +199,40 @@ def test_import_alone_does_not_hook(tmp_path):
     print("ok")
     """, tmp_path, enable=False)
     assert out.strip() == "ok"
+
+
+def test_ndarray_operands_are_borrowed_only_where_nobody_can_write_them(tmp_path):
+    out = run_child("""
+    import numpy as np
+    import viproc
+    count = viproc._viproc.borrowed_count
+    x = np.random.default_rng(0).random((600, 600))
+    expected = x * 3
+
+    def borrowed(f):
+        before = count()
+        r = f()
+        np.asarray(r)
+        return count() - before
+
+    assert borrowed(lambda: x.copy() * 3) == 1  # a temporary that owns its memory
+    e = np.asarray(viproc.asarray(x))  # a viproc export: copy-on-write keeps it
+    assert borrowed(lambda: e * 3) == 1
+    b = np.frombuffer(x.tobytes()).reshape(600, 600)  # read-only over bytes
+    assert borrowed(lambda: b[:, ::2] * 3) == 1  # strided: borrowed with its layout
+    assert np.array_equal(np.asarray(b[:, ::2] * 3), expected[:, ::2])
+    assert borrowed(lambda: x * 3) == 0  # the user may write x later
+    ro = x.copy()
+    ro.setflags(write=False)  # owns its memory: setflags(write=True) may come back
+    assert borrowed(lambda: ro * 3) == 0
+    view = x[:]
+    view.setflags(write=False)  # a read-only view of writable memory
+    assert borrowed(lambda: view * 3) == 0
+    # a copied operand keeps the values of the issue
+    y = x.copy()
+    r = y * 3
+    y[...] = 0
+    assert np.array_equal(np.asarray(r), expected)
+    print("ok")
+    """, tmp_path)
+    assert out.strip() == "ok"

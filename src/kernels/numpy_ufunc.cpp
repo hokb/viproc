@@ -1368,6 +1368,44 @@ int ndarray_ndim_dense(PyObject* nd, bool* dense) {
     return PyArray_NDIM(a);
 }
 
+bool ndarray_immutable(PyObject* nd) {
+    PyObject* x = nd;
+    while (PyArray_Check(x)) {
+        PyArrayObject* a = reinterpret_cast<PyArrayObject*>(x);
+        if (PyArray_ISWRITEABLE(a)) {
+            return false;
+        }
+        x = PyArray_BASE(a);
+        if (x == nullptr) {
+            return false; // owns its memory: setflags(write=True) may come back
+        }
+    }
+    if (PyBytes_CheckExact(x)) {
+        return true;
+    }
+    if (PyCapsule_CheckExact(x)) { // a viproc export: copy-on-write keeps it unchanged
+        return PyCapsule_IsValid(x, "viproc.export") != 0;
+    }
+    if (std::strcmp(Py_TYPE(x)->tp_name, "mmap.mmap") == 0) { // read-only if no writable view
+        Py_buffer view;
+        if (PyObject_GetBuffer(x, &view, PyBUF_WRITABLE) == 0) {
+            PyBuffer_Release(&view);
+            return false;
+        }
+        PyErr_Clear();
+        return true;
+    }
+    return false;
+}
+
+std::int64_t ndarray_owned_nbytes(PyObject* nd) {
+    if (!PyArray_Check(nd)) {
+        return 0;
+    }
+    PyArrayObject* a = reinterpret_cast<PyArrayObject*>(nd);
+    return PyArray_CHKFLAGS(a, NPY_ARRAY_OWNDATA) ? PyArray_NBYTES(a) : 0;
+}
+
 bool ndarrays_overlap(PyObject* a, PyObject* b) {
     auto extent = [](PyArrayObject* x, char** lo, char** hi) {
         *lo = *hi = PyArray_BYTES(x);

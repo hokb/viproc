@@ -292,6 +292,12 @@ bool ndarray_shape(PyObject* nd, int* ndim, std::int64_t* shape);
 // ndim of a numpy.ndarray (-1 if none); *dense: C- or F-contiguous and
 // aligned, i.e. a copy in order K has the same strides.
 int ndarray_ndim_dense(PyObject* nd, bool* dense);
+// True if nobody can write the memory of numpy.ndarray `nd` any more: it
+// and every array it views are read-only, and the memory belongs to an
+// immutable object (bytes, a read-only mmap, a viproc export).
+bool ndarray_immutable(PyObject* nd);
+// Bytes of a numpy.ndarray that owns its memory (OWNDATA), else 0.
+std::int64_t ndarray_owned_nbytes(PyObject* nd);
 // True if the memory extents of two numpy.ndarrays overlap.
 bool ndarrays_overlap(PyObject* a, PyObject* b);
 // PROTOTYPE: viproc's dtype code of a numpy.ndarray, -1 if none (or not native).

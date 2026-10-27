@@ -262,6 +262,11 @@ int vp_ndarray_kind(PyObject* nd);
 /* ndim of a numpy.ndarray, -1 if `nd` is none; *dense = 1 if it is C- or
  * F-contiguous and aligned (a copy in order K has the same strides). */
 int vp_ndarray_ndim(PyObject* nd, int* dense);
+/* 1 if nobody can write the memory of a numpy.ndarray any more (read-only
+ * arrays over bytes, a read-only mmap or a viproc export). */
+int vp_ndarray_immutable(PyObject* nd);
+/* Bytes of a numpy.ndarray that owns its memory, else 0. */
+int64_t vp_ndarray_owned_nbytes(PyObject* nd);
 /* 1 if the memory extents of two numpy.ndarrays overlap. */
 int vp_ndarrays_overlap(PyObject* a, PyObject* b);
 int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs, int out_ndim,

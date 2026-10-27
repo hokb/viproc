@@ -1650,6 +1650,36 @@ static PyObject* import_copy(PyObject* x) {
     return wrap_array(a);
 }
 
+static unsigned long long g_borrowed = 0; /* ndarray operands read without a copy */
+
+/* A viproc array for ndarray operand `x` of an op being issued: over x's own
+ * memory where nobody can write it before the task has read it, else over a
+ * copy (import_copy; viproc cannot see a later write to an ndarray, and the
+ * op must read the values of now). Borrowed: immutable memory (read-only
+ * views of bytes, a read-only mmap, a viproc export) and, for operators,
+ * a temporary that owns its memory (only the interpreter's stack holds it;
+ * the wrapper keeps it alive). Borrowing keeps x's layout too. */
+static PyObject* import_operand(PyObject* x, int is_operator) {
+    int borrow = Py_TYPE(x) == (PyTypeObject*)g_np_ndarray && vp_ndarray_immutable(x);
+    if (!borrow && is_operator && Py_TYPE(x) == (PyTypeObject*)g_np_ndarray) {
+        const int64_t nbytes = vp_ndarray_owned_nbytes(x);
+        borrow = nbytes > 0 && is_temporary(x, (size_t)nbytes);
+    }
+    if (borrow) {
+        vp_array* a = NULL;
+        char err[ERRLEN] = "";
+        if (vp_array_from_ndarray(g_rt, x, &a, err, sizeof err) == VP_OK) {
+            PyObject* w = wrap_array(a);
+            if (w != NULL) {
+                ((ArrayObject*)w)->readonly = 1; /* never written: not ours */
+                ++g_borrowed;
+            }
+            return w;
+        }
+    }
+    return import_copy(x);
+}
+
 /* PROTOTYPE (VIPROC_HOST_SMALL=1): NumPy computes a small call on ready
  * data itself, on borrowed views of the viproc inputs (broadcasting, casts,
  * strided layouts, warnings: all NumPy's); its ndarray result is returned
@@ -1766,7 +1796,7 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             }
             continue;
         } else if (PyObject_TypeCheck(x, (PyTypeObject*)g_np_ndarray)) {
-            PyObject* w = import_copy(x); /* copy into the runtime */
+            PyObject* w = import_operand(x, elide); /* borrowed or copied */
             if (w == NULL) {
                 status = -1;
                 break;
@@ -1819,7 +1849,7 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
     }
     for (Py_ssize_t i = 0; i < n && status == 0 && any_nd; ++i) {
         if (nds[i] != NULL) { /* PROTOTYPE: the host path did not take it */
-            PyObject* w = import_copy(nds[i]);
+            PyObject* w = import_operand(nds[i], elide);
             if (w == NULL) {
                 status = -1;
                 break;
@@ -2274,7 +2304,8 @@ static int hook_class(PyObject* x) {
     if (Py_TYPE(x) == (PyTypeObject*)g_np_ndarray) {
         int dense;
         const int nd = vp_ndarray_ndim(x, &dense);
-        return nd == 0 ? OP_ND0 : dense ? OP_ND : OP_STRIDED;
+        /* immutable memory is borrowed with its layout (import_operand) */
+        return nd == 0 ? OP_ND0 : dense || vp_ndarray_immutable(x) ? OP_ND : OP_STRIDED;
     }
     if (is_array(x)) {
         return OP_VIPROC;
@@ -2314,7 +2345,7 @@ static int hook_takes(PyObject* const* ins, int n) {
 
 /* 1 with *r, 0: NumPy's slot, -1: error. */
 static int hook_try(PyObject* ufunc, PyObject* const* ins, int n, PyObject** r) {
-    const int h = fast_ufunc(ufunc, ins, n, NULL, 0, r);
+    const int h = fast_ufunc(ufunc, ins, n, NULL, 1, r); /* an operator: may elide/borrow */
     g_hooked += h > 0;
     return h;
 }
@@ -2437,8 +2468,8 @@ static PyObject* hook_matmul(PyObject* a, PyObject* b) {
                !vp_ndarrays_overlap(a, b) && caller_is_user();
     }
     if (take) {
-        PyObject* x = ca == OP_VIPROC ? Py_NewRef(a) : import_copy(a);
-        PyObject* y = x == NULL ? NULL : cb == OP_VIPROC ? Py_NewRef(b) : import_copy(b);
+        PyObject* x = ca == OP_VIPROC ? Py_NewRef(a) : import_operand(a, 1);
+        PyObject* y = x == NULL ? NULL : cb == OP_VIPROC ? Py_NewRef(b) : import_operand(b, 1);
         int h = -1;
         PyObject* r = NULL;
         if (x != NULL && y != NULL) {
@@ -2529,6 +2560,12 @@ static PyObject* m_hooked_count(PyObject* mod, PyObject* unused) {
     (void)mod;
     (void)unused;
     return PyLong_FromUnsignedLongLong(g_hooked);
+}
+
+static PyObject* m_borrowed_count(PyObject* mod, PyObject* unused) {
+    (void)mod;
+    (void)unused;
+    return PyLong_FromUnsignedLongLong(g_borrowed);
 }
 
 static PyNumberMethods Array_as_number = {
@@ -5383,6 +5420,7 @@ static PyMethodDef methods[] = {
     {"install_ndarray_hook", m_install_ndarray_hook, METH_O,
      "Route numpy.ndarray operators of user code through viproc (viproc.enable_hook)."},
     {"hooked_count", m_hooked_count, METH_NOARGS, "Operators the ndarray hook handled."},
+    {"borrowed_count", m_borrowed_count, METH_NOARGS, "ndarray operands read without a copy."},
     {"set_ndarray_hook", m_set_ndarray_hook, METH_O, "Hook on/off (viproc.enable_hook, enable)."},
     {"set_host_small", m_set_host_small, METH_O, "Small results as numpy.ndarray on/off."},
     {"setup", m_setup, METH_VARARGS,
