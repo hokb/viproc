@@ -324,7 +324,14 @@ def test_in_place_operators_take_over_ndarrays_only_where_a_plain_name_is_reboun
         o.x = base.copy()
         o.x += 1
         return o.x
-    for f in (other_name, view_of_x, x_is_a_view, tuple_item, attribute):
+    import weakref
+    def weak_reference():
+        x = base.copy()
+        w = weakref.ref(x)
+        x += 1
+        assert w() is x
+        return x
+    for f in (other_name, view_of_x, x_is_a_view, tuple_item, attribute, weak_reference):
         n, r = taken(f)
         assert n == 0 and type(r) is np.ndarray and r[0] == base[0] + 1, f
     def small():

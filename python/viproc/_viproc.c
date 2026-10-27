@@ -2566,7 +2566,8 @@ static PyObject* hook_matmul(PyObject* a, PyObject* b) {
  * an exact dict, STORE_GLOBAL; `t[0] += y` and `o.x += y` stay NumPy's: their
  * store can fail after NumPy wrote x), the name holds x, and only the name
  * and the interpreter's stack reference x (no other name, view or buffer).
- * x must own its memory (a view's base sees it) and be writable; its layout
+ * x must own its memory (a view's base sees it), have no weak reference and
+ * be writable; its layout
  * is kept, so the loop calls are NumPy's. CPython 3.12/3.13 only: their
  * loads always push a strong reference, so the count is exactly 2; 3.14
  * borrows loads of fast locals, and a count of 2 could then be another
@@ -2669,7 +2670,10 @@ static PyObject* inplace_takeover(PyObject* a, PyObject* b) {
     for (int i = 0; i < nd; ++i) {
         n *= shape[i];
     }
-    if (n < g_small || !inplace_rebinds(a) || !caller_is_user()) {
+    /* a weak reference would see the old object, while viproc writes it */
+    const Py_ssize_t wl = Py_TYPE(a)->tp_weaklistoffset;
+    if (n < g_small || (wl > 0 && *(PyObject**)((char*)a + wl) != NULL) || !inplace_rebinds(a) ||
+        !caller_is_user()) {
         return NULL;
     }
     vp_array* v = NULL;

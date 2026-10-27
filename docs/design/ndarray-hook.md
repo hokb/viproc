@@ -32,7 +32,7 @@ Per operator call, on the main thread, before anything is computed:
   name (`STORE_FAST`, `STORE_DEREF`, `STORE_GLOBAL`, `STORE_NAME` into an
   exact dict: stores that cannot fail), that name holds `x`, nothing else
   references `x` (no other name, view, container or buffer: reference
-  count 2, the name and the interpreter's stack), `x` owns its memory and
+  count 2, the name and the interpreter's stack; no weak reference), `x` owns its memory and
   is writable, `y` is no strided ndarray (O1, below), and the result
   would be large. The name is then bound to
   a viproc array with `x`'s values after the op. Everything else stays
