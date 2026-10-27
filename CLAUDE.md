@@ -244,10 +244,10 @@ ownership, release or reuse of memory.
   inputs give an F-order result), and copy-on-write keeps the array's
   layout. Importing a non-contiguous NumPy array (`asarray`) copies it
   densely, in its axis order.
-- Memory is handed to plain NumPy for *writing* only inside an eager
-  fallback, after the buffer was made exclusive (no pending writer, no
-  task reader, no live export); exports to the user are read-only and
-  count as readers (`CountableArray::host_views`, design doc D7).
+- Memory is handed to plain NumPy only after its writer and task readers
+  are done; exports are writable aliases, and while one lives
+  (`CountableArray::host_views`) ops on that memory run synchronously
+  (design doc D7).
 
 ### Goals and non-goals
 
@@ -1000,8 +1000,8 @@ Rules:
   operands, empty advanced-index results, 0-d boolean indices,
   `ufunc.at`, other NumPy functions. NumPy's semantics exactly (design doc
   D7, "Eager fallbacks"): each viproc argument becomes a writable NumPy
-  view after `vp_array_prepare_write` (wait for producer and task readers,
-  copy-on-write if read-only exports are alive), so `out=`, mutating
+  view after `vp_array_prepare_write` (wait for producer and task
+  readers; live exports alias it), so `out=`, mutating
   functions (`np.put`, `np.place`, …) and overlap work in place. Results
   are mapped back: an argument returned as is → that viproc array; a view
   of an argument (by memory overlap) → a viproc view of its alias group
@@ -1193,15 +1193,17 @@ Rules:
 - **Sync points:** `np.asarray(x)`, `x.numpy()`, printing, `float(x)`,
   `bool(x)`, scalar indexing, iteration, `x.wait()`, `viproc.wait_all()`.
 - **Conversions (design doc D7):** exports (`np.asarray(x)`, `x.numpy()`,
-  `__array__`) are copy-free **read-only** NumPy views; each counts as a
-  reader of the buffer (`host_views`) while it lives, so later in-place
-  writes to `x` copy-on-write and the export keeps its values (copy
-  semantics without a copy). Imports copy user-held NumPy arrays
-  (`asarray(nd)`, `v + nd`: the user may write `nd` later); fresh memory
-  (creation functions, fallback results that own their data and are no
-  argument) is adopted without a copy. Never give user code a writable
-  view of viproc memory: NumPy calls on an ndarray bypass viproc and race
-  with the workers (fallback exports are made read-only after the call).
+  `__array__`) are copy-free NumPy views of the same memory, writable
+  (read-only only for read-only arrays): aliases, as `np.asarray` of an
+  ndarray. Making one waits for the producer and the task readers; while
+  it lives (`host_views`) every op reading or writing that memory runs
+  synchronously, in place, no copy-on-write (`Runtime::issue`), so NumPy
+  code on the export never races with a worker. Imports copy user-held
+  NumPy arrays (`asarray(nd)`, `v + nd`: the user may write `nd` later)
+  unless nobody can write them (read-only over bytes or a read-only mmap)
+  or, for operators, they are temporaries; fresh memory (creation
+  functions, fallback results that own their data and are no argument) is
+  adopted without a copy.
 - **Hot path in C** (`_viproc._Array`): everything that runs once per op —
   `__array_ufunc__` for element-wise calls, `a[key]` for ready integer and
   basic keys, all Python operators (number

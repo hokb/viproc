@@ -246,13 +246,13 @@ void test_inout_chain_stays_in_place() {
 
 void test_prepare_host_write() {
     Runtime rt(opts(2));
-    // Live NumPy views (host_views): the storage moves to a copy first.
+    // Live NumPy views (host_views) are aliases, as NumPy's views: written in place.
     ArrayPtr a = make_ready(rt, 8, 3.0);
-    std::shared_ptr<CountableArray> exported = a->buffer(); // held, as a read-only export does
+    std::shared_ptr<CountableArray> exported = a->buffer(); // held, as an export does
     ++exported->host_views;
     rt.prepare_host_write(*a);
-    check(a->buffer() != exported && value(rt, a, 7) == 3.0,
-          "prepare_host_write: copy-on-write while NumPy views are alive");
+    check(a->buffer() == exported && value(rt, a, 7) == 3.0,
+          "prepare_host_write: writes in place while NumPy views are alive");
     --exported->host_views;
     // Issued readers: waits until they are done, keeps the buffer.
     ArrayPtr b = make_ready(rt, 8, 1.0);

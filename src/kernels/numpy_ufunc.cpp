@@ -1283,9 +1283,10 @@ bool scalar_bytes(PyObject* value, DType dtype, std::vector<std::byte>& out) {
 
 namespace {
 
-// Base object of exported NumPy views: keeps the buffer alive and, for a
-// read-only export, holds one host_views count on it until the last NumPy view
-// is gone. Created and released with the GIL (main thread).
+// Base object of exported NumPy views: keeps the buffer alive and holds one
+// host_views count on it until the last NumPy view is gone (D7: ops touching
+// the buffer then run as NumPy runs them). Created and released with the GIL
+// (main thread).
 constexpr const char* kExportCapsule = "viproc.export";
 
 struct ExportHold {
@@ -1323,7 +1324,8 @@ PyObject* ndarray_over(const Array& a, bool writable) {
 // buffer alive and, read-only, counts as a reader. Returns false (view
 // untouched, Python error set) on failure.
 bool attach_export(const Array& a, PyObject* view, bool writable) {
-    auto hold = std::make_unique<ExportHold>(ExportHold{a.buffer(), !writable});
+    (void)writable;
+    auto hold = std::make_unique<ExportHold>(ExportHold{a.buffer(), true});
     PyObject* capsule = PyCapsule_New(hold.get(), kExportCapsule, release_export);
     if (capsule == nullptr) {
         return false;

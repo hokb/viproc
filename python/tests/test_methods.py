@@ -103,8 +103,7 @@ def test_in_place_methods(layout):
     x, v = pair()
     if layout == "t":
         x, v = x.T, v.T
-    before = x.copy()
-    snapshot = np.asarray(v)  # an export alive: the writes copy-on-write
+    alias = np.asarray(v)  # an export alive: it sees every write, as in NumPy
     x.sort(axis=0)
     assert v.sort(axis=0) is None
     same(v, x)
@@ -123,7 +122,7 @@ def test_in_place_methods(layout):
     x.setfield(3.0, np.float64)
     v.setfield(3.0, np.float64)
     same(v, x)
-    same(snapshot, before)
+    same(alias, x)
 
 
 def test_fill_casts_as_numpy_and_rejects_sequences():

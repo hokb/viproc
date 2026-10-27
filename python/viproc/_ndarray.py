@@ -151,8 +151,8 @@ class _Host:
     (design doc D7, "Eager fallbacks").
 
     Each viproc argument becomes a *writable* NumPy view of its buffer, made
-    exclusive first (export(a, True): waits for pending writers and readers,
-    copies-on-write if read-only exports of it are alive). NumPy code then
+    exclusive first (export(a, True): waits for pending writers and readers;
+    live exports are aliases and see the writes, as NumPy's views). NumPy code then
     reads and writes viproc memory as it would an ndarray's: in-place
     functions, ``out=`` and overlap handling are NumPy's own. Results are
     mapped back: an argument returned as is -> that viproc array; a view of
@@ -186,7 +186,6 @@ class _Host:
                 x._warn_on_write = False
                 if isinstance(x.base, ndarray):
                     x.base._warn_on_write = False
-            e.flags.writeable = False  # in case NumPy code kept a reference
         return r
 
     def _map(self, r):
@@ -1178,12 +1177,12 @@ class ndarray(_viproc._Array):
 
     # --- sync points ----------------------------------------------------------
     def numpy(self):
-        """Sync point: the data as a read-only NumPy array, without a copy.
-
-        The NumPy array keeps the values it shows: later writes to this
-        viproc array go to a new buffer (copy-on-write). Use ``np.array(x)``
-        or ``x.numpy().copy()`` for a writable copy."""
-        return _viproc.export(self)
+        """Sync point: the data as a NumPy array over the same memory, without
+        a copy, as ``np.asarray`` of a NumPy array gives the array itself:
+        writes through either show in the other (read-only only for
+        read-only arrays). While it lives, ops on this array's memory run
+        synchronously (memory-management.md, D7)."""
+        return _viproc.export(self, True)
 
     def __array__(self, dtype=None, copy=None):
         arr = self.numpy()
