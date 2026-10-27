@@ -1335,7 +1335,11 @@ Rules:
   consumers they unblock to the pool, so the main thread keeps issuing.
   Workers run one unblocked consumer as their continuation.
 - Worker pool: at most one idle worker spins (50 µs, `pause`) before
-  sleeping; `enqueue()` wakes a sleeper only if nobody spins. This avoids a
+  sleeping; `enqueue()` wakes a sleeper only if nobody spins. While tasks
+  stream in (an `enqueue()` had to wake a sleeper), a spinner that finds
+  work hands the spinning to a sleeper, so the wake-up is a worker's cost,
+  not the issuing main thread's (4 chains of cheap ops: 3.6 -> 1.2 µs per
+  op); a spin that finds nothing ends the stream. This avoids a
   wake-up syscall per small task without taking cores from busy threads.
 - Sync points spin too: the main thread spins up to 50 µs (`kSyncSpin`,
   `pause`) for the producer's completion (`Runtime::wait`, `wait_all`)

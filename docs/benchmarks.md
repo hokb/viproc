@@ -644,6 +644,32 @@ policy, 200-500 elements). A lower element threshold (200 or 500) would
 win for expensive ops and lose more for cheap ones; a threshold per loop
 cost (estimated NumPy time per op) fits both.
 
+### Spinner hand-off while tasks stream in
+
+Same 4-vCPU VM, bit-identical. Where workers finish cheap ops faster than
+the main thread issues them (4 chains of `x * 0.5 + 1.0`, 4,000 elements,
+3-4 workers), every op is ready when issued: the one spinner takes it, and
+the next `enqueue()` finds no spinner and wakes a sleeper. That futex call
+on the main thread made an op cost 3.5-3.8 µs (main-thread CPU time, 1.0
+with 1 worker; NumPy 1.8). Now, once an `enqueue()` had to wake a sleeper
+(a stream), a spinner that finds work hands the spinning to a sleeper, so
+the wake-up is paid by a worker; a spin that finds nothing ends the
+stream. Without that condition, every pickup woke a worker on the critical
+path of sync-heavy loops (`converge`, `cond_newton`: -12%).
+
+| `break_even.py`, sb=200 | 500 | 1,000 | 2,000 | 4,000 | 8,000 |
+|---|---:|---:|---:|---:|---:|
+| `chains_add` before | 0.29 | 0.35 | 0.38 | 0.44 | 1.05 |
+| `chains_add` after | 0.50 | 0.70 | 0.84 | 1.29 | 2.31 |
+| `read_now` before | 0.17 | 0.27 | 0.57 | 0.70 | 0.60 |
+| `read_now` after | 0.47 | 0.53 | 0.70 | 0.90 | 1.02 |
+
+The break-even of cheap ops moves from ~7,000 to ~3,000 elements. Quick
+shape map, 2 runs each: geomean over all points above 2,048 elements
+1.003; independent medium (<= 65,536) 1.14, others 0.95-1.03 (noise level
+of single cases between two runs of the same build: +-10-20%); the five
+sync-heavy cases in 3 alternating targeted runs 0.95-1.02.
+
 ## Other machines
 
 **Iterator copies taken when the kernel runs.** The shape map found
