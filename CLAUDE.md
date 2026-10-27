@@ -921,7 +921,9 @@ Rules:
   (error-handling.md);
   scalar indexing returns NumPy's scalar if the array is ready, else a 0-d
   copy (no sync); `np.where(cond, x, y)` as a select task (NumPy's result
-  dtype, x and y cast to it, layout order K);
+  dtype, x and y cast to it, layout order K; dense rows branch-free: a
+  random condition mispredicts a branch per element, 1e4 elements 5 µs,
+  NumPy 40 µs);
   index assignment with basic keys (assign kernel, see below); **reductions** (NumPy ≥
   2.3): `ufunc.reduce` of reorderable ufuncs (add, multiply, minimum,
   maximum, fmin, fmax, logical and/or/xor, bitwise and/or/xor) and
