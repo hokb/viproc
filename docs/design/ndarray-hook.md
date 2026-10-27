@@ -162,6 +162,72 @@ Per operator call, on the main thread, before anything is computed:
   such as `x.sum()` on an ndarray stay NumPy's (only operators are
   hooked), until the first viproc result takes over.
 
+## Where ndarray state stops scaling: k-means, step by step
+
+`python/benchmarks/boundary_trace.py` runs the suite's `kmeans_points`
+(ILNumerics' k-means program) three ways and splits the per-point
+statement `classes[0, i] = np.sqrt(np.sum(np.square(X[:, i, np.newaxis] -
+centers), axis=0)).argmin()` into its ops. 4-vCPU VM, X 1000 x 1000,
+k = 50, all results bit-identical:
+
+| X is | whole program | tasks | syncs |
+|---|---:|---:|---:|
+| a viproc array (arrays) | 4.25x | 6,197 | 1 |
+| an ndarray, `python -m viproc` (module) | 0.39x | 3,998 | 998 |
+| an ndarray, `enable_hook()` (hook) | 1.18x | 0 | 0 |
+
+Main thread per point, µs (syncs) and the kind of each result:
+
+| op | arrays | module | hook |
+|---|---|---|---|
+| `col = X[:, i, np.newaxis]` | 1.2, viproc view | 4.8, strided ndarray | 1.4, strided ndarray |
+| `dif = col - centers` (50,000 el.) | 3.3, task | 71.6, NumPy | 60.0, NumPy |
+| `sq = np.square(dif)` | 1.4, task | 60.1, copy of `dif` + task | 21.5, NumPy |
+| `s = np.sum(sq, axis=0)` | 3.0, task | 15.4, task | 42.2, NumPy |
+| `dist = np.sqrt(s)` | 2.0, task | 3.0, task | 1.9, NumPy |
+| `m = dist.argmin()` | 2.6, task | 9.7, task | 2.4, NumPy |
+| `classes[0, i] = m` | 2.7, task | 152.0 (1 sync) | 2.2, NumPy |
+
+What happens with an ndarray X, in the order of the ops:
+
+1. **A column of an ndarray is a strided view**, so `col - centers` stays
+   NumPy's (O1: a dense copy could change results, "Not taken" above):
+   the op with the most work of the chain runs on the main thread,
+   synchronously. Its result `dif` is a fresh ndarray of 50,000 elements.
+2. **ndarray operands of functions are copied** on the main thread
+   (`np.square(dif)`: the copy costs as much as NumPy's whole op; only
+   temporaries of *operators* are read in place). From here on the results
+   are viproc arrays: `square`, `sum`, `sqrt`, `argmin` are tasks.
+3. **Writing a pending result into an ndarray waits for it.** `classes`
+   is an ndarray (`np.zeros_like(X)` of an ndarray X), and an ndarray has
+   no pending state: `classes[0, i] = m` makes NumPy read `m`
+   (`__array__`), a sync on the chain just issued. One sync per point: the
+   main thread never gets ahead, nothing overlaps, and the ops of 1. and 2.
+   add their copies on top: 0.39x.
+4. Under the hook only operators are taken, and the one operator here has
+   a strided operand: everything is NumPy's, 1.18x by noise.
+
+With a viproc X every result is a viproc array, `classes` too (zeros_like
+of a viproc array), the assignment is a task, and the main thread runs all
+1,000 points ahead (~16 µs each) while the workers compute: 4.25x on 4
+cores (24x on the 12-core i7-12700K, large).
+
+So it is not the size switch itself that costs the scaling: small results
+stay ndarrays only where their inputs are ready, and a pending input keeps
+them viproc. It is **program state held in ndarrays**: written per
+element or slice in a loop (`classes[0, i] = ...`, `u[1:-1] = ...` of
+`stencil_1d`, `x[idx] = ...` of `scatter`), every write of a viproc result
+is a sync, and every read of the state is a copy (or NumPy, if strided).
+`stencil_1d` (4 rods of 1e5 elements, hook): 4 copies of ndarray slices
+on the main thread per rod and step (each 225-354 µs into fresh memory) and
+one sync at `u[1:-1] = e`; the main thread spends ~1.4 ms per rod-step,
+more than NumPy's whole step (~0.9 ms): 1.35x vs. 8.7x with viproc arrays.
+In a `python -m viproc` program whose arrays come from viproc itself
+(`np.random...`, `np.zeros`, `np.loadtxt`) the state is viproc and none
+of this happens; it happens where the state comes from outside as
+ndarrays (a library, a file reader, the suite's ndarray inputs) and
+in the hook mode, where creation functions stay NumPy's.
+
 ## Opt-in or default
 
 Full suite, 4 cores, one build (`docs/benchmarks.md`, 10-27): all 100
