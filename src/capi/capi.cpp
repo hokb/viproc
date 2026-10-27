@@ -143,6 +143,27 @@ vp_array* hand_out(ArrayPtr a) { return reinterpret_cast<vp_array*>(a.release())
 
 extern "C" {
 
+namespace {
+
+// RuntimeOptions::block_enter / block_leave: the GIL is released while the
+// main thread blocks inside an issue (a task may need it).
+thread_local PyThreadState* t_blocked = nullptr;
+
+void release_gil() {
+    if (PyGILState_Check()) {
+        t_blocked = PyEval_SaveThread();
+    }
+}
+
+void reacquire_gil() {
+    if (t_blocked != nullptr) {
+        PyEval_RestoreThread(t_blocked);
+        t_blocked = nullptr;
+    }
+}
+
+} // namespace
+
 vp_runtime* vp_runtime_create(size_t workers, size_t max_active_tasks, char* err, size_t errlen) {
     if (!numpy::init()) {
         PyErr_Clear();
@@ -151,6 +172,8 @@ vp_runtime* vp_runtime_create(size_t workers, size_t max_active_tasks, char* err
     }
     RuntimeOptions options;
     options.workers = workers;
+    options.block_enter = release_gil;
+    options.block_leave = reacquire_gil;
     if (max_active_tasks != 0) {
         options.max_active_tasks = max_active_tasks;
     }

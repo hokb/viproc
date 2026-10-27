@@ -163,6 +163,27 @@ ArrayPtr Runtime::view(const ArrayPtr& base, Layout&& layout) {
     return ArrayPtr(&a);
 }
 
+namespace {
+
+// RuntimeOptions::block_enter / block_leave around a blocking wait.
+struct Blocking {
+    explicit Blocking(const RuntimeOptions& o) : leave(o.block_leave) {
+        if (o.block_enter != nullptr) {
+            o.block_enter();
+        }
+    }
+    ~Blocking() {
+        if (leave != nullptr) {
+            leave();
+        }
+    }
+    Blocking(const Blocking&) = delete;
+    Blocking& operator=(const Blocking&) = delete;
+    void (*leave)();
+};
+
+} // namespace
+
 void Runtime::wait_active_below(std::size_t limit) {
     if (active_.load(std::memory_order_acquire) < limit) {
         return;
@@ -173,6 +194,7 @@ void Runtime::wait_active_below(std::size_t limit) {
     // Completions notify only once active_ is below `limit` (wake_below_):
     // waking the main thread on every completion would cost a futex wake
     // and a context switch per task.
+    const Blocking blocking(options_);
     wake_below_.store(limit, std::memory_order_seq_cst);
     active_waiters_.fetch_add(1, std::memory_order_seq_cst);
     for (std::size_t n = active_.load(std::memory_order_seq_cst); n >= limit;
@@ -283,6 +305,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         host = host || a->group_->current_->host_views > 0;
     }
     if (host) {
+        const Blocking blocking(options_);
         for (const ArrayPtr& a : inouts) {
             wait(*a);
             a->group_->current_->wait_task_readers();
@@ -437,6 +460,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     task->advance(TaskState::SizeCompleted);
     launch(task, producers, elements);
     if (host) {
+        const Blocking blocking(options_);
         wait(!new_outputs.empty() ? *results[0] : *inouts[0]); // errors: at the sync points
     }
 }

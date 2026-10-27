@@ -125,6 +125,12 @@ struct RuntimeOptions {
     // Overrides the policy if set: true -> worker, false -> run immediately on
     // the main thread.
     ShouldOffload should_offload;
+    // Called on the main thread right before and after each blocking wait
+    // inside issue() (back-pressure, live exports): the Python bridge
+    // releases the GIL there, since a running task may need it
+    // (UfuncLoop::call_watched). Null: nothing to do.
+    void (*block_enter)() = nullptr;
+    void (*block_leave)() = nullptr;
 };
 
 class Runtime {

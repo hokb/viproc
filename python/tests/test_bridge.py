@@ -624,3 +624,27 @@ def test_every_c_integer_type_of_a_supported_width_imports(code):
     assert isinstance(v, viproc.ndarray) and v.dtype == a.dtype
     assert np.array_equal(np.asarray(v * 3 + a), a * 3 + a)
     assert np.asarray(v ** 2).dtype == (a ** 2).dtype
+
+
+def test_waits_inside_an_issue_release_the_gil():
+    """An op on memory a live export aliases runs before the issue returns,
+    and back-pressure waits for running tasks; a task may need the GIL
+    (NumPy's integer power reports a negative exponent through it), so the
+    main thread waits without holding it."""
+    base = np.arange(1, 50_001, dtype=np.int64)
+    exponent = viproc.asarray(np.full(50_000, -1, np.int64))
+    x = viproc.asarray(base)
+    e = np.asarray(x)  # live export: the next op on x runs synchronously
+    with pytest.raises(ValueError, match="negative integer powers"):
+        np.asarray(x ** exponent)
+    del e
+    try:
+        viproc.init(max_active_tasks=4, sync_below=0, adaptive=False)
+        x = viproc.asarray(base)
+        exponent = viproc.asarray(np.full(50_000, -1, np.int64))
+        with pytest.raises(ValueError, match="negative integer powers"):
+            r = x ** exponent  # needs the GIL to fail
+            rs = [x + i for i in range(16)]  # the main thread waits for slots meanwhile
+            viproc.wait_all()
+    finally:
+        viproc.init()
