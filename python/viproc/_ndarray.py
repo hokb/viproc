@@ -15,7 +15,7 @@ import operator
 import os
 import warnings
 
-import numpy as np
+import numpy as np  # imports the real NumPy, not viproc
 from numpy.lib.array_utils import normalize_axis_index, normalize_axis_tuple
 
 from . import _viproc
