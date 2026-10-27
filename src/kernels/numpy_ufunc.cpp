@@ -1284,9 +1284,10 @@ bool scalar_bytes(PyObject* value, DType dtype, std::vector<std::byte>& out) {
 
 namespace {
 
-// Base object of exported NumPy views: keeps the buffer alive and, for a
-// read-only export, holds one host_views count on it until the last NumPy view
-// is gone. Created and released with the GIL (main thread).
+// Base object of exported NumPy views: keeps the buffer alive and holds one
+// host_views count on it until the last NumPy view is gone (D7: ops touching
+// the buffer then run as NumPy runs them). Created and released with the GIL
+// (main thread).
 constexpr const char* kExportCapsule = "viproc.export";
 
 struct ExportHold {
@@ -1324,7 +1325,8 @@ PyObject* ndarray_over(const Array& a, bool writable) {
 // buffer alive and, read-only, counts as a reader. Returns false (view
 // untouched, Python error set) on failure.
 bool attach_export(const Array& a, PyObject* view, bool writable) {
-    auto hold = std::make_unique<ExportHold>(ExportHold{a.buffer(), !writable});
+    (void)writable;
+    auto hold = std::make_unique<ExportHold>(ExportHold{a.buffer(), true});
     PyObject* capsule = PyCapsule_New(hold.get(), kExportCapsule, release_export);
     if (capsule == nullptr) {
         return false;
@@ -1391,9 +1393,6 @@ bool ndarray_immutable(PyObject* nd) {
     }
     if (PyBytes_CheckExact(x)) {
         return true;
-    }
-    if (PyCapsule_CheckExact(x)) { // a viproc export: copy-on-write keeps it unchanged
-        return PyCapsule_IsValid(x, "viproc.export") != 0;
     }
     if (std::strcmp(Py_TYPE(x)->tp_name, "mmap.mmap") == 0) { // read-only if no writable view
         Py_buffer view;

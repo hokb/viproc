@@ -277,7 +277,7 @@ int vp_ndarray_kind(PyObject* nd);
  * F-contiguous and aligned (a copy in order K has the same strides). */
 int vp_ndarray_ndim(PyObject* nd, int* dense);
 /* 1 if nobody can write the memory of a numpy.ndarray any more (read-only
- * arrays over bytes, a read-only mmap or a viproc export). */
+ * arrays over bytes or a read-only mmap). */
 int vp_ndarray_immutable(PyObject* nd);
 /* Bytes of a numpy.ndarray that owns its memory, else 0. */
 int64_t vp_ndarray_owned_nbytes(PyObject* nd);

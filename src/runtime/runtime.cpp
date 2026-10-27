@@ -270,6 +270,24 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
                      output_buffers)) {
         return;
     }
+    // A live NumPy export (D7) aliases memory this op reads or writes: NumPy
+    // code may read or write it at any moment, as the same memory, so the op
+    // runs now, as NumPy runs it: its in/outs exclusive first (their writer
+    // done, no task reading them; no copy-on-write, the export must see the
+    // write), and the op completed before issue() returns.
+    bool host = false;
+    for (const ArrayPtr& a : inputs) {
+        host = host || a->group_->current_->host_views > 0;
+    }
+    for (const ArrayPtr& a : inouts) {
+        host = host || a->group_->current_->host_views > 0;
+    }
+    if (host) {
+        for (const ArrayPtr& a : inouts) {
+            wait(*a);
+            a->group_->current_->wait_task_readers();
+        }
+    }
     // The task first (back-pressure: wait for a slot before creating it), so
     // the operands are built in place.
     acquire_slot();
@@ -310,7 +328,12 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         if (std::find(switched.begin(), switched.end(), &g) != switched.end()) {
             continue; // same group written twice by this op: switched already
         }
-        const bool pending_readers = g.current_->has_readers();
+        // Host memory (a live export): the readers were waited for above, the
+        // export itself must see the write.
+        const bool host_group = g.current_->host_views > 0;
+        const bool pending_readers =
+            host_group ? g.current_->async_reads.load(std::memory_order_acquire) > 0
+                       : g.current_->has_readers();
         // An input reading the same group through a different view would see
         // partly updated data if the op wrote in place; NumPy semantics are
         // "all inputs read before any output is written".
@@ -321,6 +344,19 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         }
         if (!pending_readers && !overlapping_input) {
             continue; // write in place
+        }
+        if (host_group) {
+            // NumPy writes the aliased memory in place and gives overlapping
+            // inputs a copy of their data first: so does this op (the group
+            // is ready, see above; the copy is the old data at issue).
+            auto copy = make_pooled<CountableArray>(g.current_->nbytes());
+            std::memcpy(copy->data(), g.current_->data(), g.current_->nbytes());
+            for (std::size_t j = 0; j < inputs.size(); ++j) {
+                if (inputs[j]->group_ == a.group_) {
+                    in_ops[j].buffer = copy;
+                }
+            }
+            continue;
         }
         switched.push_back(&g);
         const bool only_view = a.group_.use_count() == 1;
@@ -400,6 +436,9 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     // D11): from a dying input or from the pool, while it is hot in cache.
     task->advance(TaskState::SizeCompleted);
     launch(task, producers, elements);
+    if (host) {
+        wait(!new_outputs.empty() ? *results[0] : *inouts[0]); // errors: at the sync points
+    }
 }
 
 bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
@@ -527,13 +566,10 @@ ErrorRef Runtime::wait(Array& a) {
 }
 
 ErrorRef Runtime::prepare_host_write(Array& a) {
+    // No copy-on-write for live exports: they alias the memory NumPy writes,
+    // as NumPy's own views would (D7).
     ErrorRef e = wait(a);
-    AliasGroup& g = *a.group_;
-    if (g.current_->host_views > 0) {
-        issue_group_copy(g);
-        e = wait(a);
-    }
-    g.current_->wait_task_readers();
+    a.group_->current_->wait_task_readers();
     return e;
 }
 

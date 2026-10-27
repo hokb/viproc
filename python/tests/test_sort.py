@@ -60,12 +60,12 @@ def test_sort_in_place(dtype, path):
 
 
 def test_sort_in_place_export(path):
-    """An export taken before a.sort() keeps its values (copy-on-write)."""
+    """An export taken before a.sort() sees the sort, as NumPy's view."""
     x = ties((60, 50), np.float64)
     v = viproc.asarray(x)
     e = np.asarray(v)
     v.sort()
-    same(e, x)
+    same(e, np.sort(x))
     same(v, np.sort(x))
 
 

@@ -216,8 +216,8 @@ def test_ndarray_operands_are_borrowed_only_where_nobody_can_write_them(tmp_path
         return count() - before
 
     assert borrowed(lambda: x.copy() * 3) == 1  # a temporary that owns its memory
-    e = np.asarray(viproc.asarray(x))  # a viproc export: copy-on-write keeps it
-    assert borrowed(lambda: e * 3) == 1
+    e = np.asarray(viproc.asarray(x))  # a viproc export: a writable alias, as in NumPy
+    assert borrowed(lambda: e * 3) == 0
     b = np.frombuffer(x.tobytes()).reshape(600, 600)  # read-only over bytes
     assert borrowed(lambda: b[:, ::2] * 3) == 1  # strided: borrowed with its layout
     assert np.array_equal(np.asarray(b[:, ::2] * 3), expected[:, ::2])

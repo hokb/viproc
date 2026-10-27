@@ -1726,7 +1726,8 @@ static unsigned long long g_borrowed = 0; /* ndarray operands read without a cop
  * memory where nobody can write it before the task has read it, else over a
  * copy (import_copy; viproc cannot see a later write to an ndarray, and the
  * op must read the values of now). Borrowed: immutable memory (read-only
- * views of bytes, a read-only mmap, a viproc export) and, for operators,
+ * views of bytes, a read-only mmap; not a viproc export, which is a writable
+ * alias) and, for operators,
  * a temporary that owns its memory (only the interpreter's stack holds it;
  * the wrapper keeps it alive). Borrowing keeps x's layout too. */
 static PyObject* import_operand(PyObject* x, int is_operator) {

@@ -456,33 +456,39 @@ def test_temporary_elision_and_views():
     assert same(x, xn) and same(t, xn * 2.0) and same(keep[0], (xn * 2.0)[::2])
 
 
-def test_export_is_copy_free_and_read_only():
+def test_export_is_copy_free_and_aliases_like_numpy():
+    """np.asarray of a NumPy array is the array itself: viproc's export is a
+    writable NumPy view of the same memory (D7)."""
     x = viproc.asarray(rng.standard_normal(1000))
     a, b = np.asarray(x), x.numpy()
     assert np.shares_memory(a, b)  # both views of the viproc buffer
-    assert not a.flags.writeable
-    with pytest.raises(ValueError):
-        a[0] = 1.0  # NumPy must not write behind viproc's back
+    assert a.flags.writeable
+    a[0] = 1.0  # writes through the export show in x, as in NumPy
+    assert x[0] == 1.0 and b[0] == 1.0
     c = np.array(x)  # explicit copy: writable, independent
     assert c.flags.writeable and not np.shares_memory(c, a)
     assert np.shares_memory(np.asarray(x, copy=False), a)
     assert np.asarray(x, dtype=np.float32).dtype == np.float32
 
 
-def test_export_keeps_copy_semantics():
-    x = viproc.asarray(np.arange(100_000, dtype=np.float64))
-    before = np.asarray(x)  # held across in-place writes
-    snapshot = before.copy()
-    x += 1.0  # pending reader (the export): x switches buffers
-    x[:10] = -5.0
-    assert same(before, snapshot)  # the export keeps what it showed
-    expected = np.arange(100_000, dtype=np.float64) + 1.0
-    expected[:10] = -5.0
-    assert same(x, expected)
-    del before
-    y = np.asarray(x)
-    x *= 2.0  # no export alive any more ... except y: copy-on-write again
-    assert same(y, expected) and same(x, expected * 2.0)
+def test_export_aliases_across_in_place_writes():
+    for module in (np, viproc):
+        x = module.asarray(np.arange(100_000, dtype=np.float64))
+        before = np.asarray(x)  # held across in-place writes
+        x += 1.0  # runs now: the export sees it, as NumPy's view would
+        x[:10] = -5.0
+        before[10] = 7.0  # and x sees writes through the export
+        expected = np.arange(100_000, dtype=np.float64) + 1.0
+        expected[:10] = -5.0
+        expected[10] = 7.0
+        assert same(before, expected) and same(x, expected)
+        y = x * 2.0  # reads x as it is now
+        before[11] = 0.0  # after y was computed
+        assert same(y, expected * 2.0)
+        del before
+        x *= 2.0  # no export alive: asynchronous again
+        expected[11] = 0.0
+        assert same(x, expected * 2.0)
 
 
 def test_export_view_of_view_and_strides():
@@ -616,10 +622,10 @@ def test_mutating_functions_work_in_place_like_numpy(f):
 
 def test_fallback_writes_respect_exports_and_pending_readers():
     x = viproc.asarray(np.arange(100_000, dtype=np.float64))
-    keep = np.asarray(x)  # read-only export alive
+    keep = np.asarray(x)  # export alive: an alias, as in NumPy
     pending = np.sin(x)  # an issued reader (may still run)
-    np.put(x, [0], [-1.0])  # NumPy writes x: copy-on-write away from `keep`
-    assert keep[0] == 0.0 and same(pending, np.sin(np.arange(100_000.0)))
+    np.put(x, [0], [-1.0])  # NumPy writes x after the reader read it
+    assert keep[0] == -1.0 and same(pending, np.sin(np.arange(100_000.0)))
     assert np.asarray(x)[0] == -1.0
 
 
