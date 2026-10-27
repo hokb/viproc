@@ -1538,6 +1538,24 @@ class ndarray(_viproc._Array):
     def dumps(self):
         return self.numpy().dumps()
 
+    # Pickled as numpy.ndarray (a sync point): unpickling needs no viproc.
+    # Protocol 5 would pickle the read-only export as a read-only buffer
+    # and unpickle a read-only array; NumPy's arrays unpickle writable, so
+    # every protocol takes the in-band form of protocols 2-4.
+    def __reduce_ex__(self, protocol):
+        return self.numpy().__reduce_ex__(min(protocol, 4))
+
+    def __reduce__(self):
+        return self.numpy().__reduce__()
+
+    # copy.copy / copy.deepcopy as ndarray's: a copy in order K (no sync;
+    # viproc's dtypes hold no objects to deep-copy).
+    def __copy__(self):
+        return self.copy(order="K")
+
+    def __deepcopy__(self, memo, /):
+        return self.copy(order="K")
+
     def dump(self, file):
         self.numpy().dump(file)
 
@@ -1681,7 +1699,7 @@ _OPS = {
         "add", "subtract", "multiply", "true_divide", "floor_divide", "remainder", "divmod",
         "power", "left_shift", "right_shift", "bitwise_and", "bitwise_or", "bitwise_xor",
         "matmul", "negative", "positive", "absolute", "invert", "less", "less_equal",
-        "equal", "not_equal", "greater", "greater_equal",
+        "equal", "not_equal", "greater", "greater_equal", "square", "reciprocal", "sqrt",
     )
 }
 def _setitem(self, key, value):
@@ -1807,21 +1825,37 @@ _viproc.setup(
     _setitem,
 )
 
-if os.environ.get("VIPROC_NDARRAY_HOOK") == "1":
-    # PROTOTYPE: numpy.ndarray operators of user code go through viproc.
-    import site as _site
-    import sysconfig as _sysconfig
+_hook = [False]  # enable_hook(): the operator hook is wanted (and installed)
 
-    _dirs = {_PKG_DIR, _NUMPY_DIR}
-    _dirs.update(v for k, v in _sysconfig.get_paths().items()
-                 if k in ("stdlib", "platstdlib", "purelib", "platlib"))
-    try:
-        _dirs.update(_site.getsitepackages())
-    except AttributeError:
-        pass
-    _dirs.update(p for p in sys.path if os.path.basename(p) in ("site-packages", "dist-packages"))
-    _ensure_runtime()  # the hook needs the runtime from the first operator on
-    _viproc.install_ndarray_hook(tuple(os.path.join(d, "") for d in _dirs if d) + ("<frozen",))
+
+def enable_hook(on=True):
+    """Routes operators on numpy.ndarray in the user's own code through
+    viproc (see viproc.enable_hook). Installs the hook on first use."""
+    global _HOST_SMALL
+    if on and not _hook[0]:
+        import site as _site
+        import sysconfig as _sysconfig
+
+        dirs = {_PKG_DIR, _NUMPY_DIR}
+        dirs.update(v for k, v in _sysconfig.get_paths().items()
+                    if k in ("stdlib", "platstdlib", "purelib", "platlib"))
+        try:
+            dirs.update(_site.getsitepackages())
+            dirs.add(_site.getusersitepackages())
+        except AttributeError:
+            pass
+        dirs.update(p for p in sys.path
+                    if os.path.basename(p) in ("site-packages", "dist-packages"))
+        _ensure_runtime()  # the hook needs the runtime from the first operator on
+        _HOST_SMALL = True  # small results of ndarrays stay NumPy's
+        _viproc.set_host_small(True)
+        _viproc.install_ndarray_hook(tuple(os.path.join(d, "") for d in dirs if d) + ("<frozen",))
+    _hook[0] = bool(on)
+    _viproc.set_ndarray_hook(bool(on) and _enabled[0])
+
+
+if os.environ.get("VIPROC_NDARRAY_HOOK") == "1":
+    enable_hook()
 
 
 def wait_all():

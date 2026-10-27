@@ -1359,6 +1359,34 @@ int ndarray_dtype_code(PyObject* nd) {
     return static_cast<int>(t);
 }
 
+int ndarray_ndim_dense(PyObject* nd, bool* dense) {
+    if (!PyArray_Check(nd)) {
+        return -1;
+    }
+    PyArrayObject* a = reinterpret_cast<PyArrayObject*>(nd);
+    *dense = (PyArray_IS_C_CONTIGUOUS(a) || PyArray_IS_F_CONTIGUOUS(a)) && PyArray_ISALIGNED(a);
+    return PyArray_NDIM(a);
+}
+
+bool ndarrays_overlap(PyObject* a, PyObject* b) {
+    auto extent = [](PyArrayObject* x, char** lo, char** hi) {
+        *lo = *hi = PyArray_BYTES(x);
+        for (int i = 0; i < PyArray_NDIM(x); ++i) {
+            if (PyArray_DIM(x, i) == 0) {
+                *hi = *lo; // empty
+                return;
+            }
+            const npy_intp step = PyArray_STRIDE(x, i) * (PyArray_DIM(x, i) - 1);
+            (step < 0 ? *lo : *hi) += step;
+        }
+        *hi += PyArray_ITEMSIZE(x);
+    };
+    char *alo, *ahi, *blo, *bhi;
+    extent(reinterpret_cast<PyArrayObject*>(a), &alo, &ahi);
+    extent(reinterpret_cast<PyArrayObject*>(b), &blo, &bhi);
+    return alo < ahi && blo < bhi && alo < bhi && blo < ahi;
+}
+
 bool ndarray_shape(PyObject* nd, int* ndim, std::int64_t* shape) {
     if (!PyArray_Check(nd)) {
         return false;

@@ -465,6 +465,15 @@ extern "C" {
 
 int vp_ndarray_kind(PyObject* nd) { return numpy::ndarray_dtype_code(nd); }
 
+int vp_ndarrays_overlap(PyObject* a, PyObject* b) { return numpy::ndarrays_overlap(a, b) ? 1 : 0; }
+
+int vp_ndarray_ndim(PyObject* nd, int* dense) {
+    bool d = false;
+    const int n = numpy::ndarray_ndim_dense(nd, &d);
+    *dense = d ? 1 : 0;
+    return n;
+}
+
 int vp_ndarray_shape(PyObject* nd, int* ndim, int64_t* shape) {
     return numpy::ndarray_shape(nd, ndim, shape) ? 1 : 0;
 }

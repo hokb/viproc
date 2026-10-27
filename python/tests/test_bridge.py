@@ -211,6 +211,35 @@ def test_divmod_matmul_and_pow_with_mod_fall_back():
         pow(viproc.asarray(np.arange(3)), 2, 5)
 
 
+def bits(x):
+    x = np.asarray(x)
+    return x.dtype, x.shape, np.atleast_1d(x).view(np.uint8).tobytes()
+
+
+@pytest.mark.parametrize(
+    "dtype", [np.bool_, np.int32, np.int64, np.float32, np.float64, np.complex64, np.complex128]
+)
+@pytest.mark.parametrize("n", [5, 5000])  # direct path and task
+def test_power_takes_numpys_fast_scalar_power(dtype, n):
+    """`a ** 2` is square(a), `a ** -1` reciprocal(a), `a ** 0.5` sqrt(a) for
+    inexact a, as NumPy's array_power: other dtypes (bool ** 2 is int8) and
+    other values (complex signs and infinities) than power."""
+    with np.errstate(all="ignore"):
+        a = np.resize(np.array([-0.0, -np.inf, 3.0, 1e30, 0.0, np.nan, -2.5]), n).astype(dtype)
+    exps = [2, 0.5, 3, 2.0, np.float64(2.0), True]
+    if np.issubdtype(dtype, np.inexact):
+        exps.append(-1)
+    for e in exps:
+        with np.errstate(all="ignore"):
+            expected = a ** e
+            assert bits(viproc.asarray(a) ** e) == bits(expected), e
+            va, x = viproc.asarray(a), a.copy()
+            if np.can_cast(expected.dtype, a.dtype, "same_kind"):
+                va **= e
+                x **= e
+                assert bits(va) == bits(x), e
+
+
 def test_inplace_operators_all_kinds():
     a = np.arange(1, 13, dtype=np.int64)
     va = viproc.asarray(a)

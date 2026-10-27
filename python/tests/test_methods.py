@@ -573,3 +573,28 @@ def test_setflags_writeable_view_of_read_only_base():
             return str(e)
 
     assert run(viproc) == run(np)
+
+
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_pickle_gives_numpy_arrays(protocol):
+    """viproc arrays pickle as numpy.ndarray: the receiver needs no viproc."""
+    x = np.asfortranarray(rng.standard_normal((50, 100)))
+    v = viproc.asarray(x)
+    for got, want in ((v, x), (v[::2], x[::2]), (v.T, x.T)):
+        r = pickle.loads(pickle.dumps(got, protocol=protocol))
+        e = pickle.loads(pickle.dumps(want, protocol=protocol))
+        assert type(r) is np.ndarray
+        assert r.dtype == e.dtype and r.strides == e.strides and r.flags.writeable
+        assert np.array_equal(r, e)
+
+
+def test_copy_module_copies_like_ndarray():
+    import copy
+
+    x = np.asfortranarray(rng.standard_normal((50, 100)))
+    v = viproc.asarray(x)
+    for f in (copy.copy, copy.deepcopy):
+        c = f(v)
+        assert isinstance(c, viproc.ndarray) and c is not v
+        assert c.strides == f(x).strides
+        same(c, x)

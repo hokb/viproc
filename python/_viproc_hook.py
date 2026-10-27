@@ -67,6 +67,8 @@ def _viproc_counterpart(name):
     """viproc's object for ``numpy`` or ``numpy.<sub>``: the viproc module,
     its own submodule replacement (viproc.random) or NumPy's submodule."""
     viproc = _original_import("viproc")
+    if not viproc.hook_enabled():
+        viproc.enable_hook()  # python -m viproc / VIPROC=1: numpy.ndarray operators too
     obj = viproc
     for part in name.split(".")[1:]:
         obj = getattr(obj, part)

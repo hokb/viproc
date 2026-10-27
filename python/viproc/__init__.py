@@ -135,7 +135,25 @@ def enable(on=True):
     viproc, numpy.*) return NumPy's own arrays: the same code runs as plain
     NumPy. Existing viproc arrays stay viproc arrays."""
     _ndarray._enabled[0] = bool(on)
-    _viproc.set_ndarray_hook(bool(on))
+    _viproc.set_ndarray_hook(bool(on) and _ndarray._hook[0])
+
+
+def enable_hook(on=True):
+    """Route operators on numpy.ndarray (``a + b``, ``-a``, ``a ** 2``,
+    ``a @ b``, comparisons) in the user's own code through viproc, so plain
+    NumPy code gets array ILP without ``import viproc as np``. Code of the
+    standard library, installed packages, NumPy and viproc keeps NumPy's
+    operators. Small results stay numpy.ndarray (computed right away), large
+    ones become viproc arrays (computed asynchronously). ``python -m viproc``
+    and ``VIPROC=1`` turn it on; ``import viproc`` alone does not.
+    enable_hook(False) gives NumPy's operators back. Limitations:
+    docs/design/ndarray-hook.md."""
+    _ndarray.enable_hook(on)
+
+
+def hook_enabled():
+    """True while the numpy.ndarray operator hook is on (enable_hook)."""
+    return _ndarray._hook[0]
 
 
 def enabled():
