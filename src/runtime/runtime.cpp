@@ -630,6 +630,9 @@ void Runtime::enqueue(std::shared_ptr<Task> task) {
     // by its locked re-check of the queue) rules out a lost wake-up.
     if (spinning_.load(std::memory_order_seq_cst) == 0 &&
         sleeping_.load(std::memory_order_seq_cst) > 0) {
+        if (!stream_.load(std::memory_order_relaxed)) {
+            stream_.store(true, std::memory_order_relaxed);
+        }
         queue_cv_.notify_one();
     }
 }
@@ -703,11 +706,23 @@ void Runtime::worker_loop(std::size_t id) {
                     }
                 }
                 spinning_.store(0, std::memory_order_seq_cst);
-                // Work found while others sleep: let the next worker spin.
+                if (!next) {
+                    stream_.store(false, std::memory_order_relaxed);
+                }
+                // Work found while others sleep: let the next worker spin if
+                // more work is queued or tasks stream in, so that the next
+                // enqueue() needs no wake-up (the issuing main thread would
+                // pay a futex call per op where workers outrun it: 4 chains
+                // of cheap ops, 1 -> 3.5 us per op).
                 if (next &&
-                    (queued_.load(std::memory_order_seq_cst) > 0 ||
+                    (stream_.load(std::memory_order_relaxed) ||
+                     queued_.load(std::memory_order_seq_cst) > 0 ||
                      local_.load(std::memory_order_seq_cst) > 0) &&
                     sleeping_.load(std::memory_order_seq_cst) > 0) {
+                    {
+                        std::lock_guard lock(queue_mutex_);
+                        spin_wanted_ = true;
+                    }
                     queue_cv_.notify_one();
                 }
             }
@@ -715,10 +730,15 @@ void Runtime::worker_loop(std::size_t id) {
         if (!next) {
             std::unique_lock lock(queue_mutex_);
             sleeping_.fetch_add(1, std::memory_order_seq_cst);
-            queue_cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+            queue_cv_.wait(lock,
+                           [this] { return stopping_ || spin_wanted_ || !queue_.empty(); });
             sleeping_.fetch_sub(1, std::memory_order_seq_cst);
             if (queue_.empty()) {
-                return; // stopping
+                if (stopping_) {
+                    return;
+                }
+                spin_wanted_ = false; // asked to take over spinning
+                continue;
             }
             next = std::move(queue_.front());
             queue_.pop_front();

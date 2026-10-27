@@ -258,13 +258,21 @@ class Runtime {
     // Pool queue. Idle workers spin for a short while (checking `queued_`
     // without the lock) before they sleep on `queue_cv_`; enqueue() wakes a
     // sleeper only if no worker is spinning, so a stream of small tasks does
-    // not cost a wake-up syscall per task.
+    // not cost a wake-up syscall per task. Once an enqueue() found no spinner
+    // and had to wake a sleeper (`stream_`: tasks arrive faster than one
+    // spinner takes them), a spinner that finds work hands the role to a
+    // sleeper (`spin_wanted_`, set under `queue_mutex_`), so the next
+    // enqueue() again finds a spinner: the wake-up is paid by a worker, not
+    // by the issuing main thread. A spin that finds nothing ends the stream;
+    // without one, a hand-off would only delay the task the spinner found.
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Task>> queue_;
     std::atomic<std::size_t> queued_{0};
     std::atomic<int> spinning_{0};
     std::atomic<int> sleeping_{0};
+    std::atomic<bool> stream_{false};
+    bool spin_wanted_ = false; // guarded by queue_mutex_
     bool stopping_ = false;
     std::shared_ptr<Task> try_pop();
     // Per worker: unblocked small tasks (RuntimeOptions::local_below). The
