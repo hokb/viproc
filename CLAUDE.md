@@ -327,6 +327,8 @@ docs/design/           Design documents (decisions with rationale)
   error-handling.md    run-time errors on any thread, asynchronous reporting
   memory-management.md ownership, release, pools, NumPy interop, COW
   pipelining.md        array stages, partial completion, pending sizes (roadmap)
+  ndarray-hook.md      operator hook on numpy.ndarray: what it takes, limitations,
+                       known issues (strided views, in-place, fork, exports)
   array-data-model.md  array data model: Array, Metadata (SD + task),
                        AliasGroup, CountableArray; lifecycle, checks per op,
                        figure (array-data-model.svg), evaluation
@@ -407,7 +409,8 @@ python/_viproc_hook.py import numpy -> viproc for user code (python -m viproc,
 python/tests/          pytest tests of the bridge (bit-identical to NumPy)
   async_path.py        assert_async(): an op took the asynchronous path
                        (offload_stats counters: tasks, no fallback, no sync)
-python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
+python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py,
+                       strided_identity.py (strided view vs. dense copy in NumPy)
                        (per-op issue times: main-thread stalls, pool misses)
   suite.py             benchmark suite: runner, machine detection, score
   suite_cases.py       its cases (plain NumPy programs, width P, variants)
