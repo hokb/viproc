@@ -5,6 +5,7 @@
 #include "layout.hpp"
 #include "offload.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -334,6 +335,16 @@ class Task {
     const char* issue_site() const { return issue_site_; }
     // The op's issue number (set by the runtime when it launches the task).
     void set_id(std::uint64_t id) { id_ = id; }
+    // The op's size: the most elements of any operand (a reduction's work
+    // is its input, not its result). Decides where an unblocked task runs
+    // (Runtime::worker_loop). Any thread once the task is launched.
+    std::int64_t work() const {
+        std::int64_t n = 0;
+        for (const Operand& op : operands_) {
+            n = std::max(n, op.layout().size());
+        }
+        return n;
+    }
     // Valid once completed (acquire through state()).
     const ErrorRef& error() const { return error_; }
     int fp_flags() const { return fp_flags_; }

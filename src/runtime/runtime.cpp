@@ -64,9 +64,13 @@ Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_
     if (options_.max_active_tasks == 0) {
         options_.max_active_tasks = 1;
     }
+    locals_.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        locals_.push_back(std::make_unique<LocalQueue>());
+    }
     workers_.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
-        workers_.emplace_back([this] { worker_loop(); });
+        workers_.emplace_back([this, i] { worker_loop(i); });
     }
 }
 
@@ -641,30 +645,68 @@ std::shared_ptr<Task> Runtime::try_pop() {
     return t;
 }
 
-void Runtime::worker_loop() {
+std::shared_ptr<Task> Runtime::pop_local(std::size_t worker) {
+    LocalQueue& q = *locals_[worker];
+    std::lock_guard lock(q.mutex);
+    if (q.tasks.empty()) {
+        return nullptr;
+    }
+    std::shared_ptr<Task> t = std::move(q.tasks.back());
+    q.tasks.pop_back();
+    local_.fetch_sub(1, std::memory_order_relaxed);
+    return t;
+}
+
+std::shared_ptr<Task> Runtime::steal(std::size_t thief) {
+    const std::size_t n = locals_.size();
+    for (std::size_t k = 1; k < n; ++k) {
+        LocalQueue& q = *locals_[(thief + k) % n];
+        std::lock_guard lock(q.mutex);
+        if (!q.tasks.empty()) {
+            std::shared_ptr<Task> t = std::move(q.tasks.front());
+            q.tasks.pop_front();
+            local_.fetch_sub(1, std::memory_order_relaxed);
+            return t;
+        }
+    }
+    return nullptr;
+}
+
+void Runtime::worker_loop(std::size_t id) {
     using clock = std::chrono::steady_clock;
     constexpr auto kSpin = std::chrono::microseconds(50);
     std::shared_ptr<Task> next;
     for (;;) {
+        // Own small tasks first (their inputs were just computed here), then
+        // the shared queue. A worker never sleeps with a task of its own
+        // queued, so a local task is never lost.
+        if (!next) {
+            next = pop_local(id);
+        }
         if (!next) {
             next = try_pop();
         }
         if (!next) {
             // At most one worker spins (the others sleep), so spinning never
             // takes a core away from the main thread or a working worker.
+            // The spinner also takes small tasks over from busy workers.
             int expected = 0;
             if (spinning_.compare_exchange_strong(expected, 1, std::memory_order_seq_cst)) {
                 const auto until = clock::now() + kSpin;
                 while (!next && clock::now() < until) {
                     if (queued_.load(std::memory_order_relaxed) > 0) {
                         next = try_pop();
+                    } else if (local_.load(std::memory_order_relaxed) > 0) {
+                        next = steal(id);
                     } else {
                         cpu_relax();
                     }
                 }
                 spinning_.store(0, std::memory_order_seq_cst);
                 // Work found while others sleep: let the next worker spin.
-                if (next && queued_.load(std::memory_order_seq_cst) > 0 &&
+                if (next &&
+                    (queued_.load(std::memory_order_seq_cst) > 0 ||
+                     local_.load(std::memory_order_seq_cst) > 0) &&
                     sleeping_.load(std::memory_order_seq_cst) > 0) {
                     queue_cv_.notify_one();
                 }
@@ -686,10 +728,28 @@ void Runtime::worker_loop() {
         // is unwound before the continuation starts.
         TaskList runnable = run(next);
         next.reset();
-        if (!runnable.empty()) {
-            next = std::move(runnable[0]);
-            for (std::size_t i = 1; i < runnable.size(); ++i) {
-                enqueue(std::move(runnable[i]));
+        if (runnable.size() == 1) {
+            next = std::move(runnable[0]); // the continuation
+        } else if (!runnable.empty()) {
+            // Several consumers became runnable. Small ones stay here (local
+            // queue, run next, most recent first), large ones go to the
+            // shared queue, where another worker is worth waking for them;
+            // with no small one, the first large one is the continuation.
+            bool small = false;
+            for (const std::shared_ptr<Task>& t : runnable) {
+                small = small || t->work() < options_.local_below;
+            }
+            for (std::shared_ptr<Task>& t : runnable) {
+                if (t->work() < options_.local_below) {
+                    LocalQueue& q = *locals_[id];
+                    std::lock_guard lock(q.mutex);
+                    q.tasks.push_back(std::move(t));
+                    local_.fetch_add(1, std::memory_order_relaxed);
+                } else if (!small && !next) {
+                    next = std::move(t);
+                } else {
+                    enqueue(std::move(t));
+                }
             }
         }
     }

@@ -611,6 +611,32 @@ with the previous `y` still referenced) and `strong_scaling.py --workers 4
 Equal within noise; pool misses in the chains roughly halved (138 → 66
 over the run), the pool test's loop misses only on its first iteration.
 
+### Small unblocked tasks stay with the completing worker
+
+Same 4-vCPU VM, quick shape map, 6 runs before (`17c2e38`) / 3 after,
+all bit-identical. When a completion unblocks several tasks, those whose
+largest operand has fewer than 65,536 elements now run on the completing
+worker (a local queue; a spinning idle worker may steal them), larger ones
+go to the shared queue. Geomean speedup after / before over all points
+above 2,048 elements: 1.02. By group and size (<= 65,536 / larger):
+expressions 1.12 / 1.01, control 1.08 / 1.07, mixed 0.92 / 1.04,
+reductions 0.85 / 1.03, others 0.97-1.07. The trade-off in two cases
+(median speedup vs. NumPy, before -> after):
+
+| case | 100 x 100 | 1000 x 10 | 1000 x 100 | 1000 x 1000 |
+|---|---:|---:|---:|---:|
+| `expr_where` (branches join right away) | 1.82 -> 4.05 | 1.26 -> 2.11 | 2.50 -> 2.90 | 3.49 -> 3.22 |
+| `sum_cores` (`sum` is a side branch) | 2.91 -> 1.56 | 2.62 -> 1.69 | 2.95 -> 2.89 | 2.87 -> 2.67 |
+
+Where the unblocked tasks join soon (`np.where(c, a, b)` of three
+branches), another core only adds a wake-up and moves the data; where one
+of them starts an independent side branch (`s += np.sum(x)` next to the
+chain on `x`), an idle core would have run it in parallel. Waking a
+sleeper for local tasks (tried) gave up the `expr_where` gain (35 µs per
+iteration again) without restoring `sum_cores`. Suite (quick, 42
+configurations of the affected categories, 3 alternating runs each):
+geomean 1.02, within noise.
+
 ## Other machines
 
 **i7-12700K, Windows 11, 12 physical cores (20 hardware threads), native

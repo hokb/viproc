@@ -139,9 +139,17 @@ back to its top-level task loop and runs the consumer from there
 callback frame. Nested execution would build deep stacks along dependency
 chains and, on errors, hide where the failing op came from.
 
-If one completion unblocks several consumers, the completing thread runs
-one of them as its continuation; the others go to idle workers / the
-pool's queue.
+If one completion unblocks several consumers, the small ones (largest
+operand below `RuntimeOptions::local_below`, 65,536 elements) stay with
+the completing worker (its local queue, run next; a spinning idle worker
+steals them), the large ones go to the pool's queue (with no small one,
+the first large one is the continuation). Handing a small task to another
+worker cost a wake-up and moved its inputs to another core: `np.where`
+of three branches of 1e4 elements took 35 µs per iteration on 4 workers,
+13 µs on 1; now ~15 µs. Trade-off: a small side branch that would run
+in parallel on an idle core now waits behind its sibling (shape map
+`sum_cores` at 1e4: 2.6-2.9x -> 1.6-1.7x, `expr_where` 1.3-1.8x ->
+2.1-4.1x).
 
 Each task records its **issue site** (Python file, line and function,
 captured by the main thread at issue time). Errors from a task are
