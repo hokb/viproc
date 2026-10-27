@@ -2347,8 +2347,11 @@ static int caller_is_user(void) {
             Py_XDECREF(r);
             /* installed packages anywhere, also in paths added after
              * enable_hook() (as _viproc_hook.is_user_code) */
-            static const char* const pkgs[] = {"/site-packages/", "\\site-packages\\",
-                                               "/dist-packages/", "\\dist-packages\\"};
+            /* either separator on either side: Windows paths built as
+             * sys.path[0] + "/site-packages" mix them */
+            static const char* const pkgs[] = {
+                "/site-packages/", "\\site-packages\\", "/site-packages\\", "\\site-packages/",
+                "/dist-packages/", "\\dist-packages\\", "/dist-packages\\", "\\dist-packages/"};
             for (size_t i = 0; user && i < sizeof pkgs / sizeof pkgs[0]; ++i) {
                 PyObject* sub = PyUnicode_FromString(pkgs[i]);
                 user = sub != NULL && PySequence_Contains(fn, sub) == 0;
