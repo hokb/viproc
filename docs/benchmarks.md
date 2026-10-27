@@ -613,6 +613,23 @@ over the run), the pool test's loop misses only on its first iteration.
 
 ## Other machines
 
+**i7-12700K, Windows 11, 12 physical cores (20 hardware threads), native
+pip build (MSVC), ndarray hook branch (build `#dd5412cc`, 10-27), three
+modes:** all 100 configurations bit-identical in every mode.
+
+| mode | score | speedup (12 workers) | chains | index. | reduct. | algor. | dtypes | scalars | scalar | tiny | small | medium | large |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| arrays | 53 | 2.59x | 79 | 27 | 53 | 49 | 37 | 106 | 104 | 101 | 95 | 39 | 31 |
+| module | 39 | 1.84x | 55 | 17 | 29 | 34 | 30 | 141 | 96 | 151 | 118 | 24 | 17 |
+| hook | 33 | 1.55x | 40 | 15 | 21 | 34 | 25 | 115 | 100 | 138 | 118 | 17 | 15 |
+
+As on the 4-core VM: small and tiny data gain under the hook (they stay
+NumPy's), medium and large lose (ndarray inputs copied per op, syncs at
+assignments into ndarrays). Configurations below 0.95x of NumPy: 12
+(arrays), 9 (module), 9 (hook); on the VM 18, 19, 18. With viproc arrays
+they are small-data cases, under the hook medium ones (`boolean_mask`
+0.32-0.43x, `dtype_promote` 0.67x, `kmeans`, `scatter`, stencils).
+
 **i7-12700K, 20 logical cores (8 P-cores with HT + 4 E-cores), 31 GiB,
 NumPy 2.5.4, Docker Linux image, 97 cases (state of `2d4c915`):** score
 22, 1.40x with 20 workers, 0.76x with 1 worker, 97/97 bit-identical.
