@@ -63,10 +63,14 @@ def fits(case, elements, ram, itemsize=8):
     return elements * itemsize * case.mem <= MEM_BUDGET * ram
 
 
-def measure(case, shape, cores, workers, target, repeat, seed, module=False):
+def measure(case, shape, cores, workers, target, repeat, seed, mode="arrays"):
     """NumPy and viproc time of one case at one shape (best of `repeat`).
-    module: the viproc run calls the cases' `np.*` through the viproc module,
-    as `python -m viproc` / `import viproc as np` do (ufunc proxies, where)."""
+    mode "arrays": the viproc run gets viproc arrays (viproc.asarray).
+    "module": it calls the cases' `np.*` through the viproc module, as
+    `python -m viproc` / `import viproc as np` do (ufunc proxies, where), on
+    numpy.ndarray inputs under the ndarray hook. "hook": numpy.ndarray inputs
+    and NumPy's own functions, the hook routes their operators
+    (viproc.enable_hook())."""
     import viproc
 
     width = cores if case.width == "cores" else case.width
@@ -79,17 +83,21 @@ def measure(case, shape, cores, workers, target, repeat, seed, module=False):
     t_np, _ = best_of(lambda: case.run(data, reps), repeats_for(warm, repeat))
 
     viproc.init(workers=workers)
-    vdata = [viproc.asarray(a) for a in data]
+    vdata = [viproc.asarray(a) for a in data] if mode == "arrays" else data
     viproc.wait_all()
 
     def run():
-        if module:
+        if mode != "arrays":
+            viproc.enable_hook()
+        if mode == "module":
             shape_map_cases.np = viproc
         try:
             out = case.run(vdata, reps)
+            viproc.wait_all()
         finally:
             shape_map_cases.np = np
-        viproc.wait_all()
+            if mode != "arrays":
+                viproc.enable_hook(False)
         return out
 
     f0 = viproc._ndarray.fallback_calls
@@ -165,8 +173,9 @@ def run_map(args):
              and (not args.groups or c.group in args.groups)]
     info = machine_info(cores, ram)
     info.update({"workers": workers, "repeat": repeat, "target_s": target,
-                 "rows": rows, "cols": cols, "cases": len(cases), "module": args.module})
-    print(f"viproc shape map: {len(rows)} x {len(cols)} shapes + 0-d, {len(cases)} cases, "
+                 "rows": rows, "cols": cols, "cases": len(cases), "mode": args.mode,
+                 "module": args.mode == "module"})
+    print(f"viproc shape map ({args.mode}): {len(rows)} x {len(cols)} shapes + 0-d, {len(cases)} cases, "
           f"{cores} cores, {workers} workers, build {info['build']}", flush=True)
 
     results, skipped = [], []
@@ -181,7 +190,7 @@ def run_map(args):
                 skipped.append({"case": case.name, "shape": list(shape)})
                 continue
             r = measure(case, shape, cores, workers, target, repeat, seed=si * 100 + ci,
-                        module=args.module)
+                        mode=args.mode)
             r.update({"shape": list(shape), "shape_key": "x".join(map(str, shape)) or "0-d",
                       "elements": elements})
             point.append(r)
@@ -210,6 +219,9 @@ def labels(run):
     out.update(run.get("labels") or {})
     if out["header"] is None:
         m = run["machine"]
+        mode = m.get("mode") or ("module" if m.get("module") else "arrays")
+        out["title"] += {"arrays": "", "module": " (python -m viproc, ndarray inputs)",
+                         "hook": " (ndarray hook, ndarray inputs)"}[mode]
         out["header"] = (f"{m['cpu']}, {m['cores']} cores, {m['workers']} workers, "
                          f"NumPy {m['numpy']}, build {m['build']}")
     return out
@@ -444,8 +456,12 @@ def main():
     p.add_argument("--groups", type=lambda s: s.split(","),
                    help="comma-separated case groups (default: all); with --plot: report "
                         "only these groups of the run")
-    p.add_argument("--module", action="store_true",
-                   help="viproc runs call np.* through the viproc module (python -m viproc)")
+    p.add_argument("--mode", choices=("arrays", "module", "hook"), default="arrays",
+                   help="arrays: viproc arrays as inputs (default); module: as `python -m "
+                        "viproc` (np.* through the viproc module, numpy.ndarray inputs, the "
+                        "ndarray hook); hook: numpy.ndarray inputs, viproc.enable_hook()")
+    p.add_argument("--module", action="store_const", dest="mode", const="module",
+                   help="same as --mode module")
     p.add_argument("--plot", metavar="SHAPE_MAP_JSON", help="only redraw the reports of a run")
     p.add_argument("--reference", action="store_true",
                    help="allow --out to replace results committed to git (reference runs)")
