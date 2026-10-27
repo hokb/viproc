@@ -1,0 +1,575 @@
+"""ndarray methods on viproc arrays: every method of numpy.ndarray exists,
+gives NumPy's result, and those whose function form runs asynchronously take
+the asynchronous path (hokb/viproc#25, step 1)."""
+
+import io
+import operator
+import pickle
+
+import numpy as np
+import pytest
+
+import viproc
+from async_path import SIZE, assert_async, deterministic, pending
+
+rng = np.random.default_rng(1)
+
+# Attributes of numpy.ndarray viproc does not offer: `ctypes` (a raw pointer to
+# runtime memory would bypass the runtime).
+NOT_OFFERED = {"ctypes"}
+
+
+def same(r, expected):
+    if isinstance(expected, tuple):
+        assert isinstance(r, tuple) and len(r) == len(expected)
+        for a, b in zip(r, expected):
+            same(a, b)
+        return
+    got = np.asarray(r)
+    expected = np.asarray(expected)
+    assert got.dtype == expected.dtype and got.shape == expected.shape
+    assert np.array_equal(got, expected, equal_nan=True)
+
+
+def pair(shape=(6, 7), dtype=np.float64):
+    x = (rng.standard_normal(shape) * 10).astype(dtype)
+    return x, viproc.asarray(x)
+
+
+def test_every_ndarray_attribute_exists():
+    missing = [name for name in dir(np.ndarray)
+               if not name.startswith("_") and name not in NOT_OFFERED
+               and not any(name in k.__dict__ for k in type(viproc.asarray(np.ones(3))).__mro__)]
+    assert missing == []
+
+
+METHODS = [
+    ("conj", lambda a: a.conj()),
+    ("conjugate", lambda a: a.conjugate()),
+    ("round", lambda a: a.round()),
+    ("round2", lambda a: a.round(2)),
+    ("clip", lambda a: a.clip(-3, 4)),
+    ("clip_min", lambda a: a.clip(min=0)),
+    ("cumsum", lambda a: a.cumsum()),
+    ("cumsum_axis", lambda a: a.cumsum(axis=1)),
+    ("cumprod", lambda a: a.cumprod(axis=0)),
+    ("trace", lambda a: a.trace()),
+    ("trace_offset", lambda a: a.trace(1)),
+    ("nonzero", lambda a: (a > 0).nonzero()),
+    ("argsort", lambda a: a.argsort()),
+    ("argsort_axis0_stable", lambda a: a.argsort(axis=0, kind="stable")),
+    ("argpartition", lambda a: a.argpartition(3)),
+    ("searchsorted", lambda a: a[0].copy().reshape(-1)),
+    ("take", lambda a: a.take([0, 5, -1])),
+    ("take_axis", lambda a: a.take([1, 0], axis=1)),
+    ("choose", lambda a: (a > 0).astype(np.int64).choose([a, -a])),
+    ("compress", lambda a: a.compress([True, False, True], axis=0)),
+    ("repeat", lambda a: a.repeat(2, axis=1)),
+    ("byteswap", lambda a: a.byteswap()),
+    ("getfield", lambda a: a.getfield(np.float64)),
+    ("tobytes", lambda a: np.frombuffer(a.tobytes(), a.dtype)),
+    ("tobytes_F", lambda a: np.frombuffer(a.tobytes("F"), a.dtype)),
+    ("data", lambda a: np.frombuffer(bytes(a.data), a.dtype) if a.flags.c_contiguous
+     else np.zeros(0)),
+    ("flat_get", lambda a: a.flat[3]),
+    ("flat_slice", lambda a: a.flat[2:9]),
+    ("flat_iter", lambda a: np.array(list(a.flat))),
+    ("flat_len", lambda a: len(a.flat)),
+    ("dumps", lambda a: pickle.loads(a.dumps())),
+]
+
+
+@pytest.mark.parametrize("call", [c for _, c in METHODS], ids=[n for n, _ in METHODS])
+@pytest.mark.parametrize("layout", ["c", "t", "step"])
+def test_method_gives_numpys_result(call, layout):
+    x, v = pair()
+    if layout == "t":
+        x, v = x.T, v.T
+    elif layout == "step":
+        x, v = x[::2, ::-1], v[::2, ::-1]
+    same(call(v), call(x))
+
+
+def test_searchsorted():
+    x = np.sort(rng.standard_normal(50))
+    q = rng.standard_normal(20)
+    v = viproc.asarray(x)
+    same(v.searchsorted(q), x.searchsorted(q))
+    same(v.searchsorted(viproc.asarray(q), side="right"), x.searchsorted(q, side="right"))
+
+
+@pytest.mark.parametrize("layout", ["c", "t"])
+def test_in_place_methods(layout):
+    x, v = pair()
+    if layout == "t":
+        x, v = x.T, v.T
+    before = x.copy()
+    snapshot = np.asarray(v)  # an export alive: the writes copy-on-write
+    x.sort(axis=0)
+    assert v.sort(axis=0) is None
+    same(v, x)
+    x.partition(2, axis=1)
+    v.partition(2, axis=1)
+    same(v, x)
+    x.put([0, 3], [7.5, -1.0])
+    v.put([0, 3], [7.5, -1.0])
+    same(v, x)
+    x.fill(2.25)
+    v.fill(2.25)
+    same(v, x)
+    x.flat[[1, 4]] = 9.0
+    v.flat[[1, 4]] = 9.0
+    same(v, x)
+    x.setfield(3.0, np.float64)
+    v.setfield(3.0, np.float64)
+    same(v, x)
+    same(snapshot, before)
+
+
+def test_fill_casts_as_numpy_and_rejects_sequences():
+    x, v = pair(dtype=np.int32)
+    x.fill(3.7)
+    v.fill(3.7)
+    same(v, x)
+    with pytest.raises(ValueError):
+        np.ones(3).fill([1, 2, 3])
+    with pytest.raises(ValueError):
+        viproc.asarray(np.ones(3)).fill([1, 2, 3])
+
+
+def test_flags_without_sync():
+    x, v = pair((4, 5))
+    for a, b in [(x, v), (x.T, v.T), (x[::2], v[::2]), (x[:, 1], v[:, 1])]:
+        for name in ("c_contiguous", "f_contiguous", "contiguous", "aligned", "writeable",
+                     "owndata"):
+            assert getattr(b.flags, name) == getattr(a.flags, name), name
+        for key in ("C_CONTIGUOUS", "F", "W", "WRITEABLE", "A", "O", "OWNDATA"):
+            assert b.flags[key] == a.flags[key], key
+        assert repr(b.flags) == repr(a.flags)
+    assert "WRITEABLE : True" in repr(v.flags)
+    v.flags.writeable = False
+    assert not v.flags.writeable and "WRITEABLE : False" in repr(v.flags)
+    with pytest.raises(ValueError):
+        v[0, 0] = 1.0
+    v.setflags(write=True)  # NumPy: an array owning its data may
+    assert v.flags.writeable
+    w = viproc.asarray(np.ones(3))
+    w.setflags(write=False)
+    with pytest.raises(ValueError):
+        w.fill(0.0)
+    assert not np.broadcast_to(viproc.asarray(np.ones(3)), (2, 3)).flags.writeable
+
+
+def test_to_device_and_files(tmp_path):
+    x, v = pair()
+    assert v.device == x.device == "cpu"
+    assert v.to_device("cpu") is v
+    with pytest.raises(ValueError):
+        v.to_device("gpu")
+    f = tmp_path / "a.bin"
+    v.tofile(str(f))
+    same(np.fromfile(str(f)).reshape(x.shape), x)
+    buf = io.BytesIO()
+    v.dump(buf)
+    buf.seek(0)
+    same(pickle.load(buf), x)
+
+
+# --- asynchronous path ------------------------------------------------------------
+
+
+@pytest.fixture
+def det():
+    with deterministic():
+        yield
+
+
+def big(dtype=np.float64):
+    x = (rng.random(SIZE) + 0.5).astype(dtype)
+    return x, pending(viproc.asarray(x))
+
+
+def test_conj_is_an_async_ufunc(det):
+    x = (rng.random(SIZE) + 1j * rng.random(SIZE))
+    v = pending(viproc.asarray(x))
+    same(assert_async(v.conj), x.conj())
+    same(assert_async(v.conjugate), x.conjugate())
+
+
+@pytest.mark.parametrize("dtype", [bool, np.int32, np.float64])
+def test_conj_of_real_data_is_the_array(dtype):
+    """NumPy's conj()/conjugate() return a real array itself (no copy)."""
+    x = np.ones((3, 4), dtype)
+    v = viproc.asarray(x)
+    assert x.conj() is x and v.conj() is v and v.conjugate() is v
+    assert v[:, ::2].conj().shape == (3, 2)
+
+
+def test_fill_is_an_assignment_task(det):
+    x, v = big()
+    assert_async(v.fill, 1.5)
+    x.fill(1.5)
+    same(v, x)
+
+
+def test_metadata_methods_issue_nothing(det):
+    x, v = big()
+    assert assert_async(lambda: v.flags.c_contiguous, ops=0) is True
+    assert assert_async(lambda: v.device, ops=0) == "cpu"
+    assert assert_async(v.to_device, "cpu", ops=0) is v
+
+
+@pytest.mark.parametrize("call, ops", [
+    (lambda a: a.round(), 1), (lambda a: a.round(2), 3), (lambda a: a.clip(0.7, 1.2), 1),
+    (lambda a: a.clip(max=1.0), 1),
+])
+def test_composed_methods_take_async_path(det, call, ops):
+    x, v = big()
+    same(assert_async(call, v, ops=ops), call(x))
+
+
+@pytest.mark.parametrize("call", [lambda a: a.argsort(), lambda a: (a.sort(), a)[1]],
+                         ids=["argsort", "sort"])
+def test_sort_methods_take_async_path(det, call):
+    x, v = big()
+    same(assert_async(call, v), call(x.copy()))
+
+
+def test_trace_takes_async_path(det):
+    x = rng.random((3000, 3000))
+    v = pending(viproc.asarray(x))
+    same(assert_async(v.trace), x.trace())
+
+
+# Methods whose function form still falls back: each step of #25 that makes
+# the function asynchronous turns its entry green (strict xfail).
+FALLING_BACK = [
+    ("argpartition", lambda a: a.argpartition(5), 1),
+    ("searchsorted", lambda a: a.searchsorted(0.9), 1),
+    ("partition", lambda a: a.partition(5), 1),
+]
+
+
+@pytest.mark.xfail(strict=True, reason="the function form falls back (hokb/viproc#25)")
+@pytest.mark.parametrize("call, ops", [(c, o) for _, c, o in FALLING_BACK],
+                         ids=[n for n, _, _ in FALLING_BACK])
+def test_method_takes_async_path(det, call, ops):
+    x, v = big()
+    assert_async(call, v, ops=ops)
+
+
+# ndarray.base: which array a result is a view of (None for an array owning
+# its data), as NumPy: the first array of a chain of views
+BASE_CASES = {
+    "slice": lambda a, c: a[1:],
+    "slice_of_slice": lambda a, c: a[1:][::2],
+    "int": lambda a, c: a[1],
+    "ellipsis": lambda a, c: a[...],
+    "T": lambda a, c: a.T,
+    "TT": lambda a, c: a.T.T,
+    "chain_mixed": lambda a, c: a[1:][:, ::2].T[1].view(np.int64)[None],
+    "chain_of_copy": lambda a, c: a.T.reshape(24)[::2][1:],  # base: the copy
+    "transpose": lambda a, c: np.transpose(a),
+    "swapaxes": lambda a, c: a.swapaxes(0, 1),
+    "moveaxis": lambda a, c: np.moveaxis(a, 0, 1),
+    "reshape_view": lambda a, c: a.reshape(6, 4),
+    "reshape_copy": lambda a, c: a.T.reshape(24),  # NumPy: a view of its copy
+    "ravel_view": lambda a, c: a.ravel(),
+    "ravel_copy": lambda a, c: a.T.ravel(),
+    "flatten": lambda a, c: a.flatten(),
+    "real": lambda a, c: c.real,
+    "imag": lambda a, c: c.imag,
+    "real_of_real": lambda a, c: a.real,  # the array itself
+    "conj_of_real": lambda a, c: a.conj(),
+    "diagonal": lambda a, c: a.diagonal(),
+    "broadcast_to": lambda a, c: np.broadcast_to(a[0], (3, 6)),
+    "expand_dims": lambda a, c: np.expand_dims(a, 0),
+    "squeeze": lambda a, c: a[:1].squeeze(),
+    "flip": lambda a, c: np.flip(a),
+    "rot90": lambda a, c: np.rot90(a),
+    "view_dtype": lambda a, c: a.view(np.int64),
+    "split": lambda a, c: np.split(a, 2)[1],
+    "atleast_3d": lambda a, c: np.atleast_3d(a),
+    "copy": lambda a, c: a.copy(),
+    "ufunc": lambda a, c: a + 1,
+    "reduction": lambda a, c: a.sum(0),
+}
+
+
+def _base_kind(r, a, c):
+    b = r.base
+    if b is None:
+        return None
+    if b is a or b is c:
+        return "a" if b is a else "c"
+    return ("other", b.shape, b.strides)
+
+
+@pytest.mark.parametrize("case", BASE_CASES.values(), ids=BASE_CASES.keys())
+def test_base(case):
+    x, xc = np.ones((4, 6)), np.ones((4, 6), complex)
+    v, vc = viproc.asarray(x), viproc.asarray(xc)
+    r, s = case(x, xc), case(v, vc)
+    assert _base_kind(s, v, vc) == _base_kind(r, x, xc)
+    assert s.flags.owndata == r.flags.owndata
+    assert v.base is None and v.flags.owndata
+
+
+def test_base_keeps_the_array_alive():
+    v = viproc.asarray(np.arange(6.0))
+    w = v[1:]
+    del v
+    assert w.base.shape == (6,)
+    same(w.base, np.arange(6.0))
+
+
+def _f(x):
+    return np.asfortranarray(x)
+
+
+# (name, make(x) from a C-ordered NumPy array, resize(a)); the same code
+# runs on the NumPy array and on the viproc array, so references match.
+RESIZE_CASES = [
+    ("grow", lambda x: x.ravel().copy(), lambda a: a.resize(9)),
+    ("shrink", lambda x: x.ravel().copy(), lambda a: a.resize(4)),
+    ("2d_grow", lambda x: x.copy(), lambda a: a.resize(4, 2)),
+    ("2d_tuple", lambda x: x.copy(), lambda a: a.resize((3, 3))),
+    ("list", lambda x: x.copy(), lambda a: a.resize([2, 5])),
+    ("np_ints", lambda x: x.copy(), lambda a: a.resize(np.int64(2), np.int32(2))),
+    ("f_grow", _f, lambda a: a.resize(3, 3)),
+    ("f_shrink", _f, lambda a: a.resize(2, 2)),
+    ("f_to_1d", _f, lambda a: a.resize(7)),
+    ("to_zero", lambda x: x.copy(), lambda a: a.resize(0)),
+    ("zero_dims", lambda x: x.copy(), lambda a: a.resize((2, 0, 3))),
+    ("f_zero_dims", _f, lambda a: a.resize((0, 5))),
+    ("to_0d", lambda x: x.copy(), lambda a: a.resize(())),
+    ("ones", lambda x: x.copy(), lambda a: a.resize((2, 1, 4))),
+    ("same_size", lambda x: x.copy(), lambda a: a.resize(3, 2)),
+    ("same_size_view", lambda x: x[:], lambda a: a.resize(6)),
+    ("f_same_size", _f, lambda a: a.resize(3, 2)),
+    ("no_args", lambda x: x.copy(), lambda a: a.resize()),
+    ("none", lambda x: x.copy(), lambda a: a.resize(None)),
+    ("refcheck_false", lambda x: x.copy(), lambda a: a.resize(8, refcheck=False)),
+    ("refcheck_0", lambda x: x.copy(), lambda a: a.resize(8, refcheck=0)),
+    ("view", lambda x: x[:], lambda a: a.resize(7)),
+    ("strided", lambda x: x[:, ::2].copy()[:, ::-1], lambda a: a.resize(7)),
+    ("not_contiguous", lambda x: x.T.copy(order="C")[::2], lambda a: a.resize(7)),
+    ("negative", lambda x: x.copy(), lambda a: a.resize(2, -1)),
+    ("float", lambda x: x.copy(), lambda a: a.resize(2.0)),
+    ("str", lambda x: x.copy(), lambda a: a.resize("x")),
+    ("bad_keyword", lambda x: x.copy(), lambda a: a.resize(2, foo=1)),
+    ("bad_refcheck", lambda x: x.copy(), lambda a: a.resize(2, refcheck="x")),
+    ("too_big", lambda x: x.copy(), lambda a: a.resize(2**40, 2**40)),
+]
+
+
+def _resize_outcome(make, op, x):
+    a = make(x)
+    try:
+        r = op(a)
+    except Exception as e:
+        return type(e), str(e)
+    assert r is None
+    return (a.shape, a.strides, a.flags.c_contiguous, a.flags.f_contiguous, a.flags.owndata,
+            np.asarray(a).tolist())
+
+
+@pytest.mark.parametrize("dtype", [bool, np.int32, np.float64, np.complex128])
+@pytest.mark.parametrize("case", RESIZE_CASES, ids=[c[0] for c in RESIZE_CASES])
+def test_resize(case, dtype):
+    _, make, op = case
+    x = (np.arange(6).reshape(2, 3) + 1).astype(dtype)
+    assert _resize_outcome(make, op, viproc.asarray(x)) == _resize_outcome(make, op, x)
+
+
+def test_resize_keeps_identity_and_references():
+    import weakref
+
+    messages = {}
+    for mod in (np, viproc):
+        a = mod.arange(6.0)
+        a.resize(8)
+        assert a.shape == (8,)
+        b = a[:]  # a view references the array: refcheck refuses
+        with pytest.raises(ValueError, match="referenced") as e1:
+            a.resize(3)
+        with pytest.raises(ValueError, match="own its data") as e2:
+            b.resize(3)
+        a.resize(3, refcheck=False)  # NumPy's view b dangles; viproc's keeps the old data
+        if mod is viproc:
+            assert b.tolist() == [0, 1, 2, 3, 4, 5, 0, 0] and a.tolist() == [0, 1, 2]
+        c = mod.arange(4.0)
+        w = weakref.ref(c)
+        with pytest.raises(ValueError, match="referenced") as e3:
+            c.resize(5, refcheck=False)  # weak references refuse even then
+        assert w() is c
+        messages[mod] = [str(e.value) for e in (e1, e2, e3)]
+    assert messages[np] == messages[viproc]
+
+
+def test_resize_is_async(det):
+    x, v = big()
+    v2 = v * 1.0  # owns its data, pending
+    del v
+    # copy, zeros (both large: a small zero fill may run directly)
+    assert_async(lambda: v2.resize(2 * SIZE), ops=2)
+    r = np.concatenate([x, np.zeros(SIZE)])
+    same(v2, r)
+
+
+def test_flags_object_is_a_snapshot():
+    """NumPy's a.flags is a new object per access, holding the flags of that
+    moment; its setter changes the array, not the object."""
+    def run(a):
+        f = a.flags
+        g = a.flags
+        a.setflags(write=False)
+        h = a.flags
+        h.writeable = True
+        return (f is g, f.writeable, f["W"], h.writeable, a.flags.writeable,
+                f.owndata, f.c_contiguous)
+
+    x = np.ones(4)
+    assert run(viproc.asarray(x)) == run(x.copy())
+
+
+SETFLAGS_CASES = [
+    ("owner", lambda m: m.ones(3), lambda a: a),
+    ("view", lambda m: m.ones(3), lambda a: a[1:]),
+    ("view_of_readonly", lambda m: m.ones(3), lambda a: (a.setflags(write=False), a[1:])[1]),
+    ("broadcast", lambda m: m.ones(3), lambda a: m_of(a).broadcast_to(a, (2, 3))),
+    ("diagonal", lambda m: m.ones((3, 3)), lambda a: a.diagonal()),
+]
+
+
+def m_of(a):
+    return viproc if isinstance(a, viproc.ndarray) else np
+
+
+@pytest.mark.parametrize("case", SETFLAGS_CASES, ids=[c[0] for c in SETFLAGS_CASES])
+def test_setflags_writeable_again(case):
+    """NumPy's _IsWriteable: who may be made writeable after read-only."""
+    _, make, view = case
+
+    def run(m):
+        out = []
+        a = view(make(m))
+        out.append(a.flags.writeable)
+        for w in (False, True):
+            try:
+                a.setflags(write=w)
+                out.append(a.flags.writeable)
+            except ValueError as e:
+                out.append(str(e))
+        return out
+
+    assert run(viproc) == run(np)
+
+
+FLAG_ATTRS = ("c_contiguous", "f_contiguous", "contiguous", "fortran", "owndata", "writeable",
+              "aligned", "writebackifcopy", "behaved", "carray", "farray", "fnc", "forc", "num",
+              "_writeable_no_warn")
+FLAG_KEYS = ("C", "F", "W", "B", "O", "A", "X", "CA", "FA", "FNC", "FORC", "CARRAY", "FARRAY",
+             "FORTRAN", "BEHAVED", "OWNDATA", "ALIGNED", "WRITEABLE", "CONTIGUOUS",
+             "C_CONTIGUOUS", "F_CONTIGUOUS", "WRITEBACKIFCOPY", b"C", b"OWNDATA")
+
+FLAG_CASES = [
+    ("c", lambda a: a),
+    ("T", lambda a: a.T),
+    ("rows", lambda a: a[::2]),
+    ("cols", lambda a: a[:, 1]),
+    ("reversed", lambda a: a[::-1]),
+    ("empty", lambda a: a[:0]),
+    ("one_row", lambda a: a[1:2]),
+    ("one_col_T", lambda a: a[:, 1:2].T),
+    ("scalar", lambda a: a[1, 1:2].reshape(())),
+    ("f_copy", lambda a: a.copy(order="F")),
+    ("bool_unaligned", lambda a: (a > 0).ravel()[1:9].view(np.int32)),
+    ("bool_aligned", lambda a: (a > 0).ravel()[4:12].view(np.int32)),
+    ("real", lambda a: (a + 1j).real),
+    ("imag_T", lambda a: (a + 1j).T.imag),
+]
+
+
+def _flags_of(f):
+    return ([getattr(f, n) for n in FLAG_ATTRS], [f[k] for k in FLAG_KEYS], repr(f), str(f))
+
+
+@pytest.mark.parametrize("case", FLAG_CASES, ids=[c[0] for c in FLAG_CASES])
+def test_flags_as_numpy(case):
+    """Every attribute, key and the repr of a.flags as NumPy's (no probe:
+    the bits come from the layout, ALIGNED from offset and strides)."""
+    _, make = case
+    x = np.arange(48.0).reshape(6, 8).copy()  # owns its data, as viproc's copy
+    a, b = make(x), make(viproc.asarray(x))
+    assert isinstance(b, viproc.ndarray)
+    assert _flags_of(b.flags) == _flags_of(a.flags)
+    assert b.flags == a.flags and a.flags == b.flags and not (b.flags != a.flags)
+    assert b.flags is not b.flags  # a new object per access, as NumPy's
+    with pytest.raises(TypeError):
+        hash(b.flags)
+    for k in ("Q", "carray", 1, "WRITEABLE" * 3, "Ä"):
+        def err(f):
+            try:
+                f[k]
+            except Exception as e:
+                return type(e), str(e)
+        assert err(b.flags) == err(a.flags)
+
+
+SETFLAGS_CALLS = [
+    {"align": False}, {"align": True}, {"align": 0, "write": False}, {"uic": False},
+    {"uic": True}, {"write": False, "uic": True}, {"align": False, "uic": True},
+    {"foo": 1}, {"write": False, "align": False, "uic": False},
+]
+
+
+@pytest.mark.parametrize("case", [FLAG_CASES[0], FLAG_CASES[2], FLAG_CASES[10]],
+                         ids=["c", "rows", "bool_unaligned"])
+def test_setflags_as_numpy(case):
+    _, make = case
+    x = np.arange(48.0).reshape(6, 8)
+
+    def run(a):
+        out = []
+        for kw in SETFLAGS_CALLS:
+            try:
+                out.append(a.setflags(**kw))
+            except Exception as e:
+                out.append((type(e), str(e)))
+            out.append(repr(a.flags))
+            out.append(a[:].flags.aligned)  # a new view computes ALIGNED anew
+        try:
+            a.setflags(1, 2, 3, 4)
+        except TypeError as e:
+            out.append(str(e))
+        f = a.flags
+        f["A"] = False
+        f.writeable = False
+        out.append((f.aligned, f.writeable, a.flags.aligned, a.flags.writeable))
+        for bad in ("Q", "C"):
+            try:
+                f[bad] = True
+            except KeyError as e:
+                out.append(str(e))
+        try:
+            del f.writeable
+        except AttributeError as e:
+            out.append(str(e))
+        return out
+
+    assert run(make(viproc.asarray(x))) == run(make(x.copy()))
+
+
+def test_setflags_writeable_view_of_read_only_base():
+    def run(m):
+        a = m.ones(3)
+        v = a[:]
+        a.setflags(write=False)
+        try:
+            v.setflags(write=True)  # v is writeable, its base is not: NumPy refuses
+            return v.flags.writeable
+        except ValueError as e:
+            return str(e)
+
+    assert run(viproc) == run(np)

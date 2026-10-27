@@ -18,11 +18,18 @@ import types as _types
 
 import numpy as _np
 
+# viproc reproduces NumPy's calling patterns, result layouts and wrappers as
+# they are in 2.5; older versions give different results (eig dtypes,
+# layouts, reduction blocks), so they are refused rather than run.
+if _np.lib.NumpyVersion(_np.__version__) < "2.5.0":
+    raise ImportError(f"viproc needs NumPy >= 2.5, found {_np.__version__}")
+
 from . import _ndarray, _viproc
 from ._ndarray import fresh as _fresh
 from ._ndarray import (
     AsyncError,
     AsyncIndexError,
+    AsyncLinAlgError,
     AsyncValueError,
     array,
     asarray,

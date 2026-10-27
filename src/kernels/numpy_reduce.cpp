@@ -229,6 +229,145 @@ std::shared_ptr<Kernel> make_reduce_kernel(const UfuncLoop* loop, ReducePlan pla
 
 namespace {
 
+// Calls fn(in, out) once per lane along `axis`: per position of the other
+// axes of `il` and `ol` (same extents there; any order, lanes are
+// independent), with pointers to the lane's first elements. Stops at the
+// first fn returning false and returns false then.
+template <class F>
+bool for_each_lane(char* in, const Layout& il, char* out, const Layout& ol, std::size_t axis,
+                   F fn) {
+    const std::size_t nd = il.shape.size();
+    SmallVector<std::int64_t, kInlineRank> idx(nd, 0);
+    for (;;) {
+        if (!fn(in, out)) {
+            return false;
+        }
+        std::size_t k = nd;
+        for (;;) {
+            if (k == 0) {
+                return true;
+            }
+            --k;
+            if (k == axis) {
+                continue;
+            }
+            if (++idx[k] < il.shape[k]) {
+                in += il.strides[k];
+                out += ol.strides[k];
+                break;
+            }
+            in -= (il.shape[k] - 1) * il.strides[k];
+            out -= (ol.shape[k] - 1) * ol.strides[k];
+            idx[k] = 0;
+        }
+    }
+}
+
+// "add.reduce" (the reduction loop's name) -> "add.<method>"
+std::string method_name(std::string n, const char* method) {
+    const std::size_t p = n.rfind(".reduce");
+    return p == std::string::npos ? n + "." + method : n.replace(p, 7, std::string(".") + method);
+}
+
+class AccumulateKernel : public Kernel {
+  public:
+    AccumulateKernel(const UfuncLoop* loop, int axis) : loop_(loop), axis_(axis) {}
+    const char* name() const override { return name_.c_str(); }
+
+    KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
+        const Layout& il = inputs[0].layout();
+        const Layout& ol = outputs[0].layout();
+        if (ol.size() == 0) {
+            return {};
+        }
+        const std::size_t isz = itemsize(ol.dtype);
+        const auto ax = static_cast<std::size_t>(axis_);
+        const auto n = static_cast<std::intptr_t>(il.shape[ax]);
+        const auto sin = static_cast<std::intptr_t>(il.strides[ax]);
+        const auto sout = static_cast<std::intptr_t>(ol.strides[ax]);
+        const std::intptr_t strides[3] = {sout, sin, sout};
+        const bool ok = for_each_lane(reinterpret_cast<char*>(inputs[0].first()), il,
+                                      reinterpret_cast<char*>(outputs[0].first()), ol, ax,
+                                      [&](char* in, char* out) {
+                                          std::memmove(out, in, isz);
+                                          if (n <= 1) {
+                                              return true;
+                                          }
+                                          std::intptr_t count = n - 1;
+                                          char* data[3] = {out, in + sin, out + sout};
+                                          return loop_->call(data, &count, strides) == 0;
+                                      });
+        return ok ? KernelResult{} : KernelResult{1, take_loop_error(), 0};
+    }
+
+  private:
+    const UfuncLoop* loop_;
+    int axis_;
+    std::string name_ = method_name(loop_->name(), "accumulate");
+};
+
+class ReduceatKernel : public Kernel {
+  public:
+    ReduceatKernel(const UfuncLoop* loop, int axis, std::vector<std::int64_t> indices)
+        : loop_(loop), axis_(axis), indices_(std::move(indices)) {}
+    const char* name() const override { return name_.c_str(); }
+
+    KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
+        const Layout& il = inputs[0].layout();
+        const Layout& ol = outputs[0].layout();
+        if (ol.size() == 0) {
+            return {};
+        }
+        const std::size_t isz = itemsize(ol.dtype);
+        const auto ax = static_cast<std::size_t>(axis_);
+        const std::int64_t n = il.shape[ax];
+        const auto sin = static_cast<std::intptr_t>(il.strides[ax]);
+        const auto sout = static_cast<std::intptr_t>(ol.strides[ax]);
+        // the accumulator does not advance: the loop reduces (pairwise sums)
+        const std::intptr_t strides[3] = {0, sin, 0};
+        const std::size_t m = indices_.size();
+        const bool ok = for_each_lane(
+            reinterpret_cast<char*>(inputs[0].first()), il,
+            reinterpret_cast<char*>(outputs[0].first()), ol, ax, [&](char* in, char* out) {
+                for (std::size_t i = 0; i < m; ++i) {
+                    const std::int64_t start = indices_[i];
+                    const std::int64_t end = i + 1 == m ? n : indices_[i + 1];
+                    char* o = out + static_cast<std::intptr_t>(i) * sout;
+                    char* first = in + static_cast<std::intptr_t>(start) * sin;
+                    std::memmove(o, first, isz);
+                    if (end - start > 1) {
+                        std::intptr_t count = static_cast<std::intptr_t>(end - start - 1);
+                        char* data[3] = {o, first + sin, o};
+                        if (loop_->call(data, &count, strides) != 0) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            });
+        return ok ? KernelResult{} : KernelResult{1, take_loop_error(), 0};
+    }
+
+  private:
+    const UfuncLoop* loop_;
+    int axis_;
+    std::vector<std::int64_t> indices_;
+    std::string name_ = method_name(loop_->name(), "reduceat");
+};
+
+} // namespace
+
+std::shared_ptr<Kernel> make_accumulate_kernel(const UfuncLoop* loop, int axis) {
+    return std::make_shared<AccumulateKernel>(loop, axis);
+}
+
+std::shared_ptr<Kernel> make_reduceat_kernel(const UfuncLoop* loop, int axis,
+                                             std::vector<std::int64_t> indices) {
+    return std::make_shared<ReduceatKernel>(loop, axis, std::move(indices));
+}
+
+namespace {
+
 // op_axes entry of a reduction axis (NumPy's NPY_ITER_REDUCTION_AXIS, which
 // its public headers do not export; the encoding is part of the nditer API).
 constexpr int reduction_axis(int axis) { return axis + (1 << (NPY_BITSOF_INT - 2)); }

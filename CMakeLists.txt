@@ -24,6 +24,10 @@ if(VIPROC_BUILD_TESTS)
     list(APPEND VIPROC_PYTHON_COMPONENTS Development.Embed)
 endif()
 find_package(Python3 3.12 REQUIRED COMPONENTS ${VIPROC_PYTHON_COMPONENTS})
+# viproc reproduces the calling patterns of the NumPy it runs on; only 2.5+ is tested.
+if(Python3_NumPy_VERSION AND Python3_NumPy_VERSION VERSION_LESS 2.5)
+    message(FATAL_ERROR "viproc needs NumPy >= 2.5, found ${Python3_NumPy_VERSION}")
+endif()
 
 option(VIPROC_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(VIPROC_ELEMENT_POOL "Cache element memory in viproc's pool (OFF for AddressSanitizer runs)" ON)
@@ -66,7 +70,8 @@ endif()
 # Links only Python's headers (Python3::Module): an extension module must not
 # link libpython; test executables that embed Python add Python3::Python.
 add_library(viproc_numpy src/kernels/numpy_ufunc.cpp src/kernels/numpy_reduce.cpp
-                         src/kernels/numpy_matmul.cpp)
+                         src/kernels/numpy_matmul.cpp src/kernels/numpy_gufunc.cpp
+                         src/kernels/numpy_sort.cpp)
 target_link_libraries(viproc_numpy PUBLIC viproc Python3::Module Python3::NumPy PRIVATE viproc_warnings)
 
 # Public C ABI (include/viproc/viproc.h).

@@ -195,6 +195,12 @@ class Runtime {
     const OffloadPolicy& offload_policy() const { return policy_; }
     // Ops that took the direct path (see issue()).
     std::uint64_t direct_count() const { return direct_; }
+    // Tasks issued so far (ops that did not take the direct path, plus the
+    // copy-on-write copies issued for them).
+    std::uint64_t task_count() const { return seq_ - direct_; }
+    // Sync points so far that found their array pending (wait() blocked; main
+    // thread; wait_all() not counted).
+    std::uint64_t sync_count() const { return syncs_; }
     // Main thread, before issuing ops: replaces the dispatch policy.
     void set_offload_options(const OffloadOptions& o) { policy_ = OffloadPolicy(o); }
     std::size_t worker_count() const { return workers_.size(); }
@@ -204,7 +210,7 @@ class Runtime {
   private:
     void worker_loop();
     // Executes `task` on the current thread and returns its runnable consumers.
-    std::vector<std::shared_ptr<Task>> run(const std::shared_ptr<Task>& task);
+    TaskList run(const std::shared_ptr<Task>& task);
     void enqueue(std::shared_ptr<Task> task);
     void trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t elements);
     // The direct path of issue(): see there.
@@ -214,8 +220,8 @@ class Runtime {
                       std::span<const std::shared_ptr<CountableArray>> output_buffers);
     void acquire_slot();
     // Registers `task` on its pending producers and triggers it if none.
-    void launch(const std::shared_ptr<Task>& task,
-                const std::vector<std::shared_ptr<Task>>& producers, std::int64_t elements);
+    void launch(const std::shared_ptr<Task>& task, const TaskList& producers,
+                std::int64_t elements);
     // Copy-on-write with views: switches `g` to a new version holding a copy of
     // the old data (issued as its own task); views keep their layouts.
     void issue_group_copy(AliasGroup& g);
@@ -225,6 +231,7 @@ class Runtime {
     OffloadPolicy policy_;     // main thread only
     std::uint64_t seq_ = 0;    // ops issued so far (main thread only)
     std::uint64_t direct_ = 0; // ... of which ran directly, without a task
+    std::uint64_t syncs_ = 0;  // waits that found the array pending (main thread only)
     std::atomic<std::size_t> active_{0};
     // Threads waiting in wait_active_below(): run() notifies only if > 0.
     std::atomic<int> active_waiters_{0};

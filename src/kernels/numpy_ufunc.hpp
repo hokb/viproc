@@ -134,12 +134,18 @@ class LoopCache {
     // iterator must not reverse axes, as NumPy's would not with an output it
     // allocates itself. Returns nullptr (reason in `error`, Python error
     // cleared) if NumPy cannot. Main thread with the GIL.
-    // `dtypes`: the loop's operand dtypes (inputs, then the output); inputs
+    // `dtypes`: the loop's operand dtypes (inputs, then the outputs); inputs
     // of another dtype are cast in the iterator's buffers, as NumPy does.
+    // `outs`: one layout per output of the ufunc (divmod, modf, frexp: two).
+    // `mask`: the where= mask (bool), or nullptr. With a mask the loop runs
+    // as NumPy runs it masked: iterator flags of execute_ufunc_loop(masked),
+    // one loop call per run of True values (generic_masked_strided_loop);
+    // the kernel's inputs are then {inputs..., mask}.
     std::shared_ptr<Kernel> iter_elementwise(const UfuncLoop* loop, std::span<const DType> dtypes,
-                                             std::span<const Layout> inputs, const Layout& out,
-                                             bool out_given, DeferRelease defer,
-                                             std::string& error);
+                                             std::span<const Layout> inputs,
+                                             std::span<const Layout> outs, bool out_given,
+                                             DeferRelease defer, std::string& error,
+                                             const Layout* mask = nullptr);
 
     // Reduction driven by NumPy's own iterator, for what ReducePlan does not
     // cover (numpy_reduce.hpp): casts, initial=, reduced axes that do not
@@ -183,6 +189,16 @@ class LoopCache {
 // single_call() holds; everything else goes through
 // LoopCache::iter_elementwise().
 std::shared_ptr<Kernel> make_elementwise_kernel(const UfuncLoop* loop);
+
+// ufunc.at(a, idx, b) for a 1-d int32/int64 index along a's first axis, as
+// NumPy's ufunc_at runs it without casts: every index checked first (an
+// IndexError changes nothing), then per index in order and per element of
+// a's other axes (C order) one loop call over one element, args {a, b, a}
+// for a binary ufunc ({a, a} for a unary one), strides 0. Repeated indices
+// accumulate. `loop` has a's dtype for every operand. Operands: inputs =
+// {idx, b (binary only; broadcasts to idx.shape + a.shape[1:]), a}, outputs
+// = {a} (in/out).
+std::shared_ptr<Kernel> make_at_kernel(const UfuncLoop* loop);
 
 // True if NumPy calls the loop of an element-wise ufunc with one output once
 // over all elements with these operand layouts; `strides` (inputs, then the

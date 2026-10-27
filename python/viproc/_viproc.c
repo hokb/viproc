@@ -13,6 +13,8 @@
 
 #include "viproc/viproc.h"
 
+#include <assert.h>
+#include <limits.h>
 #include <string.h>
 
 /* Temporary elision (docs/design/memory-management.md, D5) needs to know
@@ -45,13 +47,15 @@
 static vp_runtime* g_rt = NULL;
 static unsigned long g_main_thread = 0;
 static PyObject* AsyncError = NULL;
-static PyObject* AsyncIndexError = NULL; /* AsyncError and IndexError */
-static PyObject* AsyncValueError = NULL; /* AsyncError and ValueError */
-static long long g_small = 2048;         /* the runtime's sync_below: ops this small run directly */
+static PyObject* AsyncIndexError = NULL;  /* AsyncError and IndexError */
+static PyObject* AsyncValueError = NULL;  /* AsyncError and ValueError */
+static PyObject* AsyncLinAlgError = NULL; /* AsyncError and numpy.linalg.LinAlgError */
+static long long g_small = 2048; /* the runtime's sync_below: ops this small run directly */
 
 /* Registered by _ndarray.py via _viproc.setup(). */
 static PyTypeObject* g_array_cls = NULL; /* viproc.ndarray */
 static PyObject* g_dtypes[7];            /* np.dtype per vp_dtype code */
+static int g_alignment[7];               /* np.dtype(...).alignment per vp_dtype code */
 static PyObject* g_matmul = NULL;        /* np.matmul */
 static PyObject* g_fallback = NULL;      /* fallback(ufunc, method, inputs, kwargs) */
 static PyObject* g_asarray = NULL;       /* asarray(ndarray) -> viproc.ndarray */
@@ -59,6 +63,8 @@ static PyObject* g_internal_dirs = NULL; /* tuple of path prefixes skipped for i
 static PyObject* g_np_ndarray = NULL;    /* numpy.ndarray */
 static PyObject* g_np_generic = NULL;    /* numpy.generic */
 static PyObject* g_where_func = NULL;    /* numpy.where */
+static PyObject* g_sort_func = NULL;     /* numpy.sort */
+static PyObject* g_argsort_func = NULL;  /* numpy.argsort */
 static PyObject* g_where_impl = NULL;    /* numpy.where._implementation */
 static PyObject* g_np_integer = NULL;    /* numpy.integer */
 static PyObject* g_ops = NULL;           /* dict: operator name -> ufunc */
@@ -153,6 +159,58 @@ static void t_clear(Table* t) {
     PyMem_Free(e);
 }
 
+/* Scalar operands as ready 0-d runtime arrays, by (object, dtype code). A
+ * loop's constants (`x * 0.5`) are the same object in every iteration, so the
+ * conversion (a NumPy array built and freed per op: ~2,700 instructions) runs
+ * once. Direct-mapped: a miss replaces its slot, so the cache stays small
+ * whatever the program does. A slot holds a reference to its object (the
+ * address stays unique while cached) and to the array. Only immutable
+ * scalars are cached; the arrays are read by tasks, never written or handed
+ * to user code. */
+#define SCALAR_SLOTS 64
+typedef struct {
+    PyObject* obj; /* NULL: empty */
+    int code;
+    vp_array* a;
+} ScalarSlot;
+static ScalarSlot g_scalars[SCALAR_SLOTS];
+
+static void scalars_clear(void) {
+    for (size_t i = 0; i < SCALAR_SLOTS; ++i) {
+        ScalarSlot* s = &g_scalars[i];
+        if (s->obj != NULL) {
+            vp_array_release(s->a);
+            Py_DECREF(s->obj);
+            *s = (ScalarSlot){NULL, 0, NULL};
+        }
+    }
+}
+
+/* Returns the cached 0-d array of `x` as dtype `code` (borrowed), converting
+ * it on a miss; NULL with an exception set if NumPy's conversion fails. A
+ * miss that replaces a slot hands its array over in *evicted (else NULL): an
+ * earlier operand of the same op may still use it, so the caller releases it
+ * after the op is issued. */
+static vp_array* scalar_operand(PyObject* x, int code, vp_array** evicted) {
+    *evicted = NULL;
+    const unsigned long long h = (unsigned long long)(uintptr_t)x * 0x9E3779B97F4A7C15ull ^
+                                 (unsigned long long)code * 0xC2B2AE3D27D4EB4Full;
+    ScalarSlot* s = &g_scalars[(h ^ (h >> 31)) & (SCALAR_SLOTS - 1)];
+    if (s->obj == x && s->code == code) {
+        return s->a;
+    }
+    vp_array* a = NULL;
+    if (vp_array_from_scalar(g_rt, x, (vp_dtype)code, &a) != VP_OK) {
+        return NULL;
+    }
+    if (s->obj != NULL) {
+        *evicted = s->a;
+        Py_DECREF(s->obj);
+    }
+    *s = (ScalarSlot){Py_NewRef(x), code, a};
+    return a;
+}
+
 static PyObject* s_call = NULL; /* "__call__" */
 static PyObject* s_out = NULL;  /* "out" */
 
@@ -160,16 +218,25 @@ static PyObject* s_out = NULL;  /* "out" */
 
 typedef struct {
     PyObject_HEAD vp_array* a;
-    int readonly; /* NumPy's WRITEABLE == False (e.g. views NumPy made read-only) */
-    int scalar;   /* 0-d result NumPy returns as a scalar (reductions, a[i]) */
+    int readonly;       /* writes take NumPy's path: WRITEABLE == False, or warn_on_write */
+    int warn_on_write;  /* NumPy's WARN_ON_WRITE (broadcast_arrays): WRITEABLE, but NumPy warns
+                           on the first write, so writes run eagerly in NumPy (readonly set) */
+    int unaligned;      /* ALIGNED cleared by setflags(align=False) */
+    int scalar;         /* 0-d result NumPy returns as a scalar (reductions, a[i]) */
+    PyObject* base;     /* ndarray.base: the array a view was made from, else NULL */
+    PyObject* weakrefs; /* weak references to this array, as NumPy's arrays allow */
 } ArrayObject;
 
 static PyTypeObject ArrayType; /* forward */
 
 static void Array_dealloc(ArrayObject* self) {
+    if (self->weakrefs != NULL) {
+        PyObject_ClearWeakRefs((PyObject*)self);
+    }
     if (self->a != NULL) {
         vp_array_release(self->a);
     }
+    Py_XDECREF(self->base);
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
@@ -257,6 +324,30 @@ static int Array_set_readonly(ArrayObject* self, PyObject* v, void* c) {
         return -1;
     }
     self->readonly = t;
+    self->warn_on_write = 0;
+    return 0;
+}
+
+static PyObject* Array_get_warn_on_write(ArrayObject* self, void* c) {
+    (void)c;
+    return PyBool_FromLong(self->warn_on_write);
+}
+
+/* True: WRITEABLE with NumPy's warning on the first write; False: plainly
+ * writeable again (NumPy clears the flag on that write). */
+static int Array_set_warn_on_write(ArrayObject* self, PyObject* v, void* c) {
+    (void)c;
+    const int t = v != NULL ? PyObject_IsTrue(v) : 0;
+    if (t < 0) {
+        return -1;
+    }
+    if (t) {
+        self->readonly = 1;
+        self->warn_on_write = 1;
+    } else if (self->warn_on_write) {
+        self->readonly = 0;
+        self->warn_on_write = 0;
+    }
     return 0;
 }
 
@@ -278,8 +369,410 @@ static PyObject* Array_get_c_contiguous(ArrayObject* self, void* c) {
     return PyBool_FromLong(c_contiguous(self->a));
 }
 
+static PyObject* Array_get_base(ArrayObject* self, void* c) {
+    (void)c;
+    return Py_NewRef(self->base != NULL ? self->base : Py_None);
+}
+
+/* --- ndarray.flags --------------------------------------------------------
+ * NumPy's flags object (flagsobject.c) ported, for a viproc array: the bits
+ * are computed from the layout as NumPy computes them
+ * (_UpdateContiguousFlags, IsAligned), no probe array. Like NumPy's, a new
+ * object per access holding the flags of that moment; its setters call the
+ * array's setflags(). */
+enum {
+    FL_WARN_ON_WRITE = INT_MIN, /* NPY_ARRAY_WARN_ON_WRITE, bit 31 */
+    FL_C = 0x1, /* NumPy's NPY_ARRAY_* values: `num` is NumPy's */
+    FL_F = 0x2,
+    FL_OWNDATA = 0x4,
+    FL_ALIGNED = 0x100,
+    FL_WRITEABLE = 0x400,
+    FL_WRITEBACKIFCOPY = 0x2000,
+};
+
+typedef struct {
+    PyObject_HEAD PyObject* arr;
+    int flags;
+} FlagsObject;
+
+static PyTypeObject FlagsType; /* forward */
+
+/* F-contiguous (extent-1 dimensions may have any stride). */
+static int f_contiguous(const vp_array* a) {
+    const int nd = vp_array_ndim(a);
+    const int64_t* shape = vp_array_shape(a);
+    const int64_t* strides = vp_array_strides(a);
+    static const int64_t itemsizes[] = {1, 4, 8, 4, 8, 8, 16}; /* vp_dtype order */
+    int64_t step = itemsizes[vp_array_dtype(a)];
+    for (int i = 0; i < nd; ++i) {
+        if (shape[i] == 0) {
+            return 1;
+        }
+        if (shape[i] != 1) {
+            if (strides[i] != step) {
+                return 0;
+            }
+            step *= shape[i];
+        }
+    }
+    return 1;
+}
+
+/* NumPy's raw_array_is_aligned: the data address (storage aligned, plus the
+ * offset) and the strides of extents > 1, as multiples of the alignment. */
+static int aligned(const vp_array* a) {
+    const int alignment = g_alignment[vp_array_dtype(a)];
+    if (alignment <= 1) {
+        return 1;
+    }
+    const int nd = vp_array_ndim(a);
+    const int64_t* shape = vp_array_shape(a);
+    const int64_t* strides = vp_array_strides(a);
+    uint64_t check = (uint64_t)vp_array_offset(a);
+    for (int i = 0; i < nd; ++i) {
+        if (shape[i] > 1) {
+            check |= (uint64_t)strides[i];
+        } else if (shape[i] == 0) {
+            return 1;
+        }
+    }
+    return check % (uint64_t)alignment == 0;
+}
+
+static PyObject* Array_get_flags(ArrayObject* self, void* c) {
+    (void)c;
+    FlagsObject* f = PyObject_New(FlagsObject, &FlagsType);
+    if (f == NULL) {
+        return NULL;
+    }
+    f->arr = Py_NewRef((PyObject*)self);
+    f->flags = (c_contiguous(self->a) ? FL_C : 0) | (f_contiguous(self->a) ? FL_F : 0) |
+               (self->base == NULL ? FL_OWNDATA : 0) |
+               (!self->unaligned && aligned(self->a) ? FL_ALIGNED : 0) |
+               (self->readonly && !self->warn_on_write ? 0 : FL_WRITEABLE) |
+               (self->warn_on_write ? FL_WARN_ON_WRITE : 0);
+    return (PyObject*)f;
+}
+
+static void Flags_dealloc(FlagsObject* self) {
+    Py_XDECREF(self->arr);
+    PyObject_Free(self);
+}
+
+#define FLAGS_GET(name, bits)                                                                      \
+    static PyObject* Flags_get_##name(FlagsObject* self, void* c) {                                \
+        (void)c;                                                                                   \
+        return PyBool_FromLong((self->flags & (bits)) == (bits));                                  \
+    }
+FLAGS_GET(contiguous, FL_C)
+FLAGS_GET(fortran, FL_F)
+FLAGS_GET(writebackifcopy, FL_WRITEBACKIFCOPY)
+FLAGS_GET(owndata, FL_OWNDATA)
+FLAGS_GET(aligned, FL_ALIGNED)
+FLAGS_GET(writeable_no_warn, FL_WRITEABLE)
+#undef FLAGS_GET
+
+/* Getters reading WRITEABLE warn while WARN_ON_WRITE is set, as NumPy's. */
+#define FLAGS_GET_WARN(name, bits)                                                                 \
+    static PyObject* Flags_get_##name(FlagsObject* self, void* c) {                                \
+        (void)c;                                                                                   \
+        if ((self->flags & FL_WARN_ON_WRITE) &&                                                    \
+            PyErr_WarnEx(PyExc_FutureWarning,                                                      \
+                         "future versions will not create a writeable array from "                 \
+                         "broadcast_array. Set the writable flag explicitly to avoid this "       \
+                         "warning.",                                                               \
+                         1) < 0) {                                                                 \
+            return NULL;                                                                           \
+        }                                                                                          \
+        return PyBool_FromLong((self->flags & (bits)) == (bits));                                  \
+    }
+FLAGS_GET_WARN(writeable, FL_WRITEABLE)
+FLAGS_GET_WARN(behaved, FL_ALIGNED | FL_WRITEABLE)
+FLAGS_GET_WARN(carray, FL_ALIGNED | FL_WRITEABLE | FL_C)
+#undef FLAGS_GET_WARN
+
+static PyObject* Flags_get_forc(FlagsObject* self, void* c) {
+    (void)c;
+    return PyBool_FromLong((self->flags & (FL_F | FL_C)) != 0);
+}
+
+static PyObject* Flags_get_fnc(FlagsObject* self, void* c) {
+    (void)c;
+    return PyBool_FromLong((self->flags & FL_F) && !(self->flags & FL_C));
+}
+
+static PyObject* Flags_get_farray(FlagsObject* self, void* c) {
+    (void)c; /* NumPy's test, as it is: any of the three bits, not C */
+    return PyBool_FromLong((self->flags & (FL_ALIGNED | FL_WRITEABLE | FL_F)) != 0 &&
+                           !(self->flags & FL_C));
+}
+
+static PyObject* Flags_get_num(FlagsObject* self, void* c) {
+    (void)c;
+    return PyLong_FromLong(self->flags);
+}
+
+/* setflags(write, align, uic) with one of them given, as NumPy's setters. */
+static int flags_set(FlagsObject* self, PyObject* value, int which, const char* name) {
+    if (value == NULL) {
+        PyErr_Format(PyExc_AttributeError, "Cannot delete flags %s attribute", name);
+        return -1;
+    }
+    const int t = PyObject_IsTrue(value);
+    if (t < 0) {
+        return -1;
+    }
+    PyObject* args[3] = {Py_None, Py_None, Py_None};
+    args[which] = t ? Py_True : Py_False;
+    PyObject* r = PyObject_CallMethod(self->arr, "setflags", "OOO", args[0], args[1], args[2]);
+    Py_XDECREF(r);
+    return r != NULL ? 0 : -1;
+}
+
+static int Flags_set_writeable(FlagsObject* self, PyObject* v, void* c) {
+    (void)c;
+    return flags_set(self, v, 0, "writeable");
+}
+
+static int Flags_set_aligned(FlagsObject* self, PyObject* v, void* c) {
+    (void)c;
+    return flags_set(self, v, 1, "aligned");
+}
+
+static int Flags_set_writebackifcopy(FlagsObject* self, PyObject* v, void* c) {
+    (void)c;
+    return flags_set(self, v, 2, "writebackifcopy");
+}
+
+static PyGetSetDef Flags_getset[] = {
+    {"contiguous", (getter)Flags_get_contiguous, NULL, NULL, NULL},
+    {"c_contiguous", (getter)Flags_get_contiguous, NULL, NULL, NULL},
+    {"f_contiguous", (getter)Flags_get_fortran, NULL, NULL, NULL},
+    {"fortran", (getter)Flags_get_fortran, NULL, NULL, NULL},
+    {"writebackifcopy", (getter)Flags_get_writebackifcopy, (setter)Flags_set_writebackifcopy, NULL,
+     NULL},
+    {"owndata", (getter)Flags_get_owndata, NULL, NULL, NULL},
+    {"aligned", (getter)Flags_get_aligned, (setter)Flags_set_aligned, NULL, NULL},
+    {"writeable", (getter)Flags_get_writeable, (setter)Flags_set_writeable, NULL, NULL},
+    {"_writeable_no_warn", (getter)Flags_get_writeable_no_warn, NULL, NULL, NULL},
+    {"fnc", (getter)Flags_get_fnc, NULL, NULL, NULL},
+    {"forc", (getter)Flags_get_forc, NULL, NULL, NULL},
+    {"behaved", (getter)Flags_get_behaved, NULL, NULL, NULL},
+    {"carray", (getter)Flags_get_carray, NULL, NULL, NULL},
+    {"farray", (getter)Flags_get_farray, NULL, NULL, NULL},
+    {"num", (getter)Flags_get_num, NULL, NULL, NULL},
+    {NULL, NULL, NULL, NULL, NULL},
+};
+
+/* The key's bytes as NumPy reads them (an ASCII str or bytes): 1; 0: no
+ * key. A non-ASCII str raises its encoding error where NumPy's getitem
+ * does (`encode_error`), else it is no key either. */
+static int flags_key(PyObject* ind, const char** key, Py_ssize_t* n, int encode_error) {
+    if (PyUnicode_Check(ind)) {
+        if (!PyUnicode_IS_ASCII(ind)) {
+            if (encode_error) {
+                Py_XDECREF(PyUnicode_AsASCIIString(ind)); /* NumPy's error */
+                return -1;
+            }
+            return 0;
+        }
+        *key = (const char*)PyUnicode_DATA(ind); /* ASCII: one byte per character */
+        *n = PyUnicode_GET_LENGTH(ind);
+        return 1;
+    }
+    if (PyBytes_Check(ind)) {
+        *key = PyBytes_AS_STRING(ind);
+        *n = PyBytes_GET_SIZE(ind);
+        return 1;
+    }
+    return 0;
+}
+
+static int key_is(const char* key, Py_ssize_t n, const char* name) {
+    return (size_t)n == strlen(name) && memcmp(key, name, (size_t)n) == 0;
+}
+
+static PyObject* Flags_getitem(FlagsObject* self, PyObject* ind) {
+    static const struct {
+        const char* key;
+        PyObject* (*get)(FlagsObject*, void*);
+    } keys[] = {
+        {"C", Flags_get_contiguous},
+        {"F", Flags_get_fortran},
+        {"W", Flags_get_writeable},
+        {"B", Flags_get_behaved},
+        {"O", Flags_get_owndata},
+        {"A", Flags_get_aligned},
+        {"X", Flags_get_writebackifcopy},
+        {"CA", Flags_get_carray},
+        {"FA", Flags_get_farray},
+        {"FNC", Flags_get_fnc},
+        {"FORC", Flags_get_forc},
+        {"CARRAY", Flags_get_carray},
+        {"FARRAY", Flags_get_farray},
+        {"FORTRAN", Flags_get_fortran},
+        {"BEHAVED", Flags_get_behaved},
+        {"OWNDATA", Flags_get_owndata},
+        {"ALIGNED", Flags_get_aligned},
+        {"WRITEABLE", Flags_get_writeable},
+        {"CONTIGUOUS", Flags_get_contiguous},
+        {"C_CONTIGUOUS", Flags_get_contiguous},
+        {"F_CONTIGUOUS", Flags_get_fortran},
+        {"WRITEBACKIFCOPY", Flags_get_writebackifcopy},
+    };
+    const char* k;
+    Py_ssize_t n;
+    const int r = flags_key(ind, &k, &n, 1);
+    if (r < 0) {
+        return NULL;
+    }
+    for (size_t i = 0; r > 0 && i < sizeof keys / sizeof keys[0]; ++i) {
+        if (key_is(k, n, keys[i].key)) {
+            return keys[i].get(self, NULL);
+        }
+    }
+    PyErr_SetString(PyExc_KeyError, "Unknown flag");
+    return NULL;
+}
+
+static int Flags_setitem(FlagsObject* self, PyObject* ind, PyObject* value) {
+    static const char* const keys[][2] = {
+        {"W", "WRITEABLE"}, {"A", "ALIGNED"}, {"X", "WRITEBACKIFCOPY"}};
+    static const char* const names[] = {"writeable", "aligned", "writebackifcopy"};
+    const char* k;
+    Py_ssize_t n;
+    if (flags_key(ind, &k, &n, 0) > 0) {
+        for (int i = 0; i < 3; ++i) {
+            if (key_is(k, n, keys[i][0]) || key_is(k, n, keys[i][1])) {
+                return flags_set(self, value, i, names[i]);
+            }
+        }
+    }
+    PyErr_SetString(PyExc_KeyError, "Unknown flag");
+    return -1;
+}
+
+static const char* torf(int flags, int bit) { return (flags & bit) ? "True" : "False"; }
+
+static PyObject* Flags_repr(FlagsObject* self) {
+    const int f = self->flags;
+    return PyUnicode_FromFormat(
+        "  %s : %s\n  %s : %s\n  %s : %s\n  %s : %s%s\n  %s : %s\n  %s : %s\n", "C_CONTIGUOUS",
+        torf(f, FL_C), "F_CONTIGUOUS", torf(f, FL_F), "OWNDATA", torf(f, FL_OWNDATA), "WRITEABLE",
+        torf(f, FL_WRITEABLE), (f & FL_WARN_ON_WRITE) ? "  (with WARN_ON_WRITE=True)" : "",
+        "ALIGNED", torf(f, FL_ALIGNED), "WRITEBACKIFCOPY", torf(f, FL_WRITEBACKIFCOPY));
+}
+
+/* == and != as NumPy's: by the flags; also against NumPy's flags objects
+ * (their `num`), whose own comparison returns NotImplemented for ours. */
+static PyObject* Flags_richcompare(PyObject* self, PyObject* other, int op) {
+    if (op != Py_EQ && op != Py_NE) {
+        Py_RETURN_NOTIMPLEMENTED;
+    }
+    long theirs;
+    if (Py_TYPE(other) == &FlagsType) {
+        theirs = ((FlagsObject*)other)->flags;
+    } else {
+        const char* name = Py_TYPE(other)->tp_name;
+        const size_t n = strlen(name);
+        if (n < 9 || strcmp(name + n - 9, ".flagsobj") != 0) {
+            Py_RETURN_NOTIMPLEMENTED;
+        }
+        PyObject* num = PyObject_GetAttrString(other, "num");
+        if (num == NULL) {
+            return NULL;
+        }
+        theirs = PyLong_AsLong(num);
+        Py_DECREF(num);
+        if (theirs == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
+    }
+    const int eq = ((FlagsObject*)self)->flags == theirs;
+    return PyBool_FromLong(op == Py_EQ ? eq : !eq);
+}
+
+static PyMappingMethods Flags_as_mapping = {
+    .mp_subscript = (binaryfunc)Flags_getitem,
+    .mp_ass_subscript = (objobjargproc)Flags_setitem,
+};
+
+static PyTypeObject FlagsType = {
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "viproc._viproc.flagsobj",
+    .tp_basicsize = sizeof(FlagsObject),
+    .tp_dealloc = (destructor)Flags_dealloc,
+    .tp_repr = (reprfunc)Flags_repr,
+    .tp_str = (reprfunc)Flags_repr,
+    .tp_as_mapping = &Flags_as_mapping,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_doc = "ndarray.flags of a viproc array, as NumPy's flags object.",
+    .tp_richcompare = Flags_richcompare,
+    .tp_getset = Flags_getset,
+};
+
+/* a.setflags(write, align, uic): NumPy's array_setflags on the viproc
+ * array's flags (readonly, unaligned), in NumPy's order and with its
+ * messages; an error after a change restores the flags, as NumPy's does. */
+static PyObject* Array_setflags(ArrayObject* self, PyObject* args, PyObject* kwds) {
+    static char* kwlist[] = {"write", "align", "uic", NULL};
+    PyObject *write = Py_None, *align = Py_None, *uic = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|OOO:setflags", kwlist, &write, &align, &uic)) {
+        return NULL;
+    }
+    const int unaligned = self->unaligned;
+    if (align != Py_None) {
+        const int no = PyObject_Not(align);
+        if (no < 0) {
+            return NULL;
+        }
+        if (no) {
+            self->unaligned = 1;
+        } else if (aligned(self->a)) {
+            self->unaligned = 0;
+        } else {
+            PyErr_SetString(PyExc_ValueError,
+                            "cannot set aligned flag of mis-aligned array to True");
+            return NULL;
+        }
+    }
+    if (uic != Py_None) {
+        const int t = PyObject_IsTrue(uic);
+        if (t < 0) {
+            return NULL;
+        }
+        if (t) {
+            self->unaligned = unaligned;
+            PyErr_SetString(PyExc_ValueError, "cannot set WRITEBACKIFCOPY flag to True");
+            return NULL;
+        }
+    }
+    if (write != Py_None) {
+        const int t = PyObject_IsTrue(write);
+        if (t < 0) {
+            return NULL;
+        }
+        /* _IsWriteable: an array owning its data, or a view whose base (the
+         * array owning the data, collapsed) is writeable */
+        const ArrayObject* base = (const ArrayObject*)self->base;
+        if (t && base != NULL && base->readonly && !base->warn_on_write) {
+            self->unaligned = unaligned;
+            PyErr_SetString(PyExc_ValueError, "cannot set WRITEABLE flag to True of this array");
+            return NULL;
+        }
+        self->readonly = !t;
+        self->warn_on_write = 0; /* set either way: NumPy clears WARN_ON_WRITE */
+    }
+    Py_RETURN_NONE;
+}
+
 static PyGetSetDef Array_getset[] = {
+    {"base", (getter)Array_get_base, NULL,
+     "The array a view was made from (the first array of a chain of views, as NumPy's "
+     "PyArray_SetBaseObject collapses it), None for an array that is no view.",
+     NULL},
     {"size", (getter)Array_get_size, NULL, "Number of elements (no sync).", NULL},
+    {"flags", (getter)Array_get_flags, NULL,
+     "NumPy's flags object of the layout (no sync): a new snapshot per access.", NULL},
     {"_c_contiguous", (getter)Array_get_c_contiguous, NULL,
      "C-contiguous, as NumPy's flag (no sync).", NULL},
     {"_scalar", (getter)Array_get_scalar, (setter)Array_set_scalar,
@@ -287,7 +780,13 @@ static PyGetSetDef Array_getset[] = {
      "scalars",
      NULL},
     {"_readonly", (getter)Array_get_readonly, (setter)Array_set_readonly,
-     "True if writes raise, as for a NumPy array with WRITEABLE == False.", NULL},
+     "True if writes take NumPy's path: they raise (WRITEABLE == False) or warn first "
+     "(_warn_on_write). Setting it clears _warn_on_write.",
+     NULL},
+    {"_warn_on_write", (getter)Array_get_warn_on_write, (setter)Array_set_warn_on_write,
+     "NumPy's WARN_ON_WRITE (broadcast_arrays results): writeable, NumPy warns on the first "
+     "write.",
+     NULL},
     {"shape", (getter)Array_get_shape, NULL, "Shape (no sync).", NULL},
     {"strides", (getter)Array_get_strides, NULL, "Byte strides (no sync).", NULL},
     {"ndim", (getter)Array_get_ndim, NULL, "Number of dimensions (no sync).", NULL},
@@ -333,6 +832,8 @@ static void raise_async(const char* err) {
         PyErr_SetString(AsyncIndexError, err + 12);
     } else if (strncmp(err, "ValueError: ", 12) == 0) {
         PyErr_SetString(AsyncValueError, err + 12);
+    } else if (strncmp(err, "LinAlgError: ", 13) == 0) {
+        PyErr_SetString(AsyncLinAlgError, err + 13);
     } else {
         PyErr_SetString(AsyncError, err);
     }
@@ -891,10 +1392,16 @@ static PyObject* elision_candidate(PyObject* const* inputs, vp_array* const* ins
  * reductions and scalar indexing return them, and ufuncs on 0-d arrays do
  * too). Its result is NumPy's: a NumPy scalar. Any n-d operand (even of one
  * element) keeps the array path, so NumPy's output shapes stay as they
- * are. Fills `out` with new references and returns 1, or 0 if an operand is
- * not a ready scalar. */
-static int scalars_of(PyObject* const* inputs, Py_ssize_t n, PyObject** out) {
-    if (g_rt == NULL || n > MAXIN) {
+ * are. Fills `out` (capacity `out_len` entries, at least `n`) with new
+ * references and returns 1, or 0 if an operand is not a ready scalar. Call it
+ * through SCALARS_OF, which passes the length of the `out` array. */
+static int scalars_of(PyObject* const* inputs, Py_ssize_t n, PyObject** out, Py_ssize_t out_len) {
+    if (n > MAXIN) {
+        return 0;
+    }
+    assert(n >= 0 && n <= out_len);
+    (void)out_len;
+    if (g_rt == NULL) {
         return 0;
     }
     for (Py_ssize_t i = 0; i < n; ++i) {
@@ -922,6 +1429,10 @@ static int scalars_of(PyObject* const* inputs, Py_ssize_t n, PyObject** out) {
     }
     return 1;
 }
+
+/* `out` must be an array (not a pointer): its length is checked against n. */
+#define SCALARS_OF(inputs, n, out)                                                                 \
+    scalars_of((inputs), (n), (out), (Py_ssize_t)(sizeof(out) / sizeof((out)[0])))
 
 static void release_all(PyObject** objs, Py_ssize_t n) {
     for (Py_ssize_t i = 0; i < n; ++i) {
@@ -1159,11 +1670,12 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
         codes[i] = (int)((packed >> (8 * i)) & 0xff);
     }
 
-    /* Inputs as runtime arrays; scalars and NumPy arrays are converted. */
+    /* Inputs as runtime arrays; scalars (cached) and NumPy arrays are
+     * converted. */
     vp_array* ins[MAXIN];
-    vp_array* temps[MAXIN];
+    vp_array* evicted[MAXIN];
     PyObject* keep[MAXIN];
-    int ntemps = 0, nkeep = 0, status = 0;
+    int nevicted = 0, nkeep = 0, status = 0;
     int64_t shape[MAXDIMS];
     int ndim = 0;
     for (Py_ssize_t i = 0; i < n && status == 0; ++i) {
@@ -1179,14 +1691,14 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             keep[nkeep++] = w;
             ins[i] = ((ArrayObject*)w)->a;
         } else {
-            vp_array* t = NULL;
-            if (vp_array_from_scalar(g_rt, x, (vp_dtype)codes[i], &t) != VP_OK) {
+            if ((ins[i] = scalar_operand(x, codes[i], &evicted[nevicted])) == NULL) {
                 status = -1; /* e.g. OverflowError, as in NumPy */
                 break;
             }
-            temps[ntemps++] = t;
-            ins[i] = t;
+            nevicted += evicted[nevicted] != NULL;
         }
+        /* Folds input i into the broadcast shape of inputs 0..i-1: after the
+         * loop, shape/ndim is the output shape. */
         if (broadcast_into(shape, &ndim, vp_array_ndim(ins[i]), vp_array_shape(ins[i])) < 0) {
             status = 1; /* not broadcastable: the fallback raises NumPy's error */
         }
@@ -1224,8 +1736,8 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             handled = -1;
         }
     }
-    for (int i = 0; i < ntemps; ++i) {
-        vp_array_release(temps[i]); /* the issued task keeps the data alive */
+    for (int i = 0; i < nevicted; ++i) {
+        vp_array_release(evicted[i]); /* an issued task keeps its data alive */
     }
     for (int i = 0; i < nkeep; ++i) {
         Py_DECREF(keep[i]);
@@ -1257,7 +1769,7 @@ static PyObject* Array_array_ufunc(PyObject* self, PyObject* const* args, Py_ssi
         }
         if (out == NULL) {
             PyObject* sc[MAXIN];
-            const int k = scalars_of(inputs, n, sc);
+            const int k = SCALARS_OF(inputs, n, sc);
             if (k < 0) {
                 return NULL;
             }
@@ -1346,7 +1858,7 @@ static PyObject* binop(const char* name, binaryfunc scalar_op, PyObject* a, PyOb
     }
     PyObject* sc[2];
     PyObject* in2[2] = {a, b};
-    const int k = scalar_op != NULL ? scalars_of(in2, 2, sc) : 0;
+    const int k = scalar_op != NULL ? SCALARS_OF(in2, 2, sc) : 0;
     if (k != 0) {
         PyObject* r = k > 0 ? scalar_op(sc[0], sc[1]) : NULL;
         if (k > 0) {
@@ -1394,11 +1906,11 @@ static PyObject* inplace_op(const char* name, binaryfunc scalar_op, PyObject* a,
 }
 
 static PyObject* unop(const char* name, unaryfunc scalar_op, PyObject* a) {
-    PyObject* sc;
-    const int k = scalars_of(&a, 1, &sc);
+    PyObject* sc[1];
+    const int k = SCALARS_OF(&a, 1, sc);
     if (k != 0) {
-        PyObject* r = k > 0 ? scalar_op(sc) : NULL;
-        Py_XDECREF(k > 0 ? sc : NULL);
+        PyObject* r = k > 0 ? scalar_op(sc[0]) : NULL;
+        Py_XDECREF(k > 0 ? sc[0] : NULL);
         return r;
     }
     PyObject* ufunc = op_ufunc(name);
@@ -1531,8 +2043,14 @@ RED_METHODS(X)
 static PyObject* Array_array_function(PyObject* self, PyObject* const* args, Py_ssize_t nargs);
 static PyObject* Array_reshape(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
                                PyObject* kwnames);
+static PyObject* Array_resize(PyObject* self, PyObject* args, PyObject* kwds);
+static PyObject* Array_setflags(ArrayObject* self, PyObject* args, PyObject* kwds);
 static PyObject* Array_swapaxes(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
                                 PyObject* kwnames);
+static PyObject* Array_sort(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
+                            PyObject* kwnames);
+static PyObject* Array_argsort(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
+                               PyObject* kwnames);
 
 static PyMethodDef Array_methods[] = {
     {"__array_ufunc__", (PyCFunction)(void (*)(void))Array_array_ufunc,
@@ -1549,6 +2067,14 @@ static PyMethodDef Array_methods[] = {
      "As NumPy's ndarray.reshape(): a view in C, copies in _ndarray.py."},
     {"swapaxes", (PyCFunction)(void (*)(void))Array_swapaxes, METH_FASTCALL | METH_KEYWORDS,
      "As NumPy's ndarray.swapaxes()."},
+    {"sort", (PyCFunction)(void (*)(void))Array_sort, METH_FASTCALL | METH_KEYWORDS,
+     "As NumPy's ndarray.sort(): a task in C (vp_sort), else _sort_py."},
+    {"argsort", (PyCFunction)(void (*)(void))Array_argsort, METH_FASTCALL | METH_KEYWORDS,
+     "As NumPy's ndarray.argsort(): a task in C (vp_sort), else np.argsort."},
+    {"setflags", (PyCFunction)(void (*)(void))Array_setflags, METH_VARARGS | METH_KEYWORDS,
+     "As NumPy's ndarray.setflags() (no sync)."},
+    {"resize", (PyCFunction)(void (*)(void))Array_resize, METH_VARARGS | METH_KEYWORDS,
+     "As NumPy's ndarray.resize(): in place, the object keeps its identity."},
     // clang-format on
     {NULL, NULL, 0, NULL},
 };
@@ -1717,6 +2243,9 @@ static int Array_ass_subscript(PyObject* self, PyObject* key, PyObject* value) {
         return -1;
     }
     if (((ArrayObject*)self)->readonly) {
+        if (((ArrayObject*)self)->warn_on_write) {
+            return call_setitem_hook(self, key, value); /* NumPy warns and writes */
+        }
         PyErr_SetString(PyExc_ValueError, "assignment destination is read-only");
         return -1;
     }
@@ -1787,6 +2316,7 @@ static PyTypeObject ArrayType = {
     .tp_as_number = &Array_as_number,
     .tp_as_mapping = &Array_as_mapping,
     .tp_richcompare = Array_richcompare,
+    .tp_weaklistoffset = offsetof(ArrayObject, weakrefs),
     .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
     .tp_doc = "Base class of viproc.ndarray: owns one runtime array.",
     .tp_methods = Array_methods,
@@ -1812,6 +2342,12 @@ static PyObject* m_setup(PyObject* self, PyObject* args) {
     Py_XSETREF(g_array_cls, (PyTypeObject*)Py_NewRef(cls));
     for (int c = 0; c < 7; ++c) {
         Py_XSETREF(g_dtypes[c], Py_NewRef(PyTuple_GET_ITEM(dtypes, c)));
+        PyObject* al = PyObject_GetAttrString(g_dtypes[c], "alignment");
+        g_alignment[c] = al != NULL ? (int)PyLong_AsLong(al) : -1;
+        Py_XDECREF(al);
+        if (g_alignment[c] < 0) {
+            return NULL;
+        }
     }
     Py_XSETREF(g_fallback, Py_NewRef(fallback));
     Py_XSETREF(g_asarray, Py_NewRef(asarray));
@@ -1829,8 +2365,11 @@ static PyObject* m_setup(PyObject* self, PyObject* args) {
     Py_XSETREF(g_where_impl, g_where_func != NULL
                                  ? PyObject_GetAttrString(g_where_func, "_implementation")
                                  : NULL);
+    Py_XSETREF(g_sort_func, np != NULL ? PyObject_GetAttrString(np, "sort") : NULL);
+    Py_XSETREF(g_argsort_func, np != NULL ? PyObject_GetAttrString(np, "argsort") : NULL);
     Py_XDECREF(np);
-    if (g_np_integer == NULL || g_where_func == NULL || g_where_impl == NULL) {
+    if (g_np_integer == NULL || g_where_func == NULL || g_where_impl == NULL ||
+        g_sort_func == NULL || g_argsort_func == NULL) {
         return NULL;
     }
     Py_RETURN_NONE;
@@ -1871,9 +2410,10 @@ static PyObject* m_offload_counts(PyObject* self, PyObject* noargs) {
     }
     uint64_t inl = 0, off = 0;
     vp_offload_counts(g_rt, &inl, &off);
-    return Py_BuildValue("{s:K,s:K,s:K}", "inline", (unsigned long long)inl, "offloaded",
-                         (unsigned long long)off, "direct",
-                         (unsigned long long)vp_direct_count(g_rt));
+    return Py_BuildValue(
+        "{s:K,s:K,s:K,s:K,s:K}", "inline", (unsigned long long)inl, "offloaded",
+        (unsigned long long)off, "direct", (unsigned long long)vp_direct_count(g_rt), "tasks",
+        (unsigned long long)vp_task_count(g_rt), "syncs", (unsigned long long)vp_sync_count(g_rt));
 }
 
 static PyObject* m_pool_stats(PyObject* self, PyObject* noargs) {
@@ -1937,6 +2477,7 @@ static PyObject* m_shutdown(PyObject* self, PyObject* noargs) {
         g_rt = NULL;
         t_clear(&g_sites); /* interned in the runtime being destroyed */
         t_clear(&g_sigs);  /* holds its loop handles */
+        scalars_clear();   /* arrays of the runtime being destroyed */
         vp_runtime_destroy(rt);
         if (failed) {
             raise_async(err);
@@ -2000,6 +2541,20 @@ static PyObject* m_from_ndarray(PyObject* self, PyObject* arr) {
 
 /* --- views: NumPy's metadata rules, computed here ------------------------- */
 
+/* Sets view `v`'s base to `a`, or to a's base if `a` is a view itself (as
+ * NumPy's PyArray_SetBaseObject collapses chains of views); v may be NULL.
+ * Invariant: a base is always an array owning its data (base == NULL). This
+ * function and m_own are the only writers of `base`, and every array starts
+ * with base == NULL: a's base was set here, so it owns its data, and one
+ * step reaches the first array of the chain. */
+static PyObject* set_base(PyObject* v, PyObject* a) {
+    if (v != NULL) {
+        PyObject* b = ((ArrayObject*)a)->base;
+        ((ArrayObject*)v)->base = Py_NewRef(b != NULL ? b : a);
+    }
+    return v;
+}
+
 /* A view of `a` with this layout (offset relative to a's first element),
  * read-only if `a` is; new reference or NULL. */
 static PyObject* make_view(PyObject* a, vp_dtype dtype, int nd, const int64_t* shape,
@@ -2007,8 +2562,9 @@ static PyObject* make_view(PyObject* a, vp_dtype dtype, int nd, const int64_t* s
     PyObject* v = wrap_array(vp_array_view(g_rt, array_of(a), dtype, nd, shape, strides, offset));
     if (v != NULL) {
         ((ArrayObject*)v)->readonly = ((ArrayObject*)a)->readonly || readonly;
+        ((ArrayObject*)v)->warn_on_write = !readonly && ((ArrayObject*)a)->warn_on_write;
     }
-    return v;
+    return set_base(v, a);
 }
 
 /* Basic indexing (ints, slices, None, one Ellipsis) as NumPy's
@@ -2229,8 +2785,60 @@ static PyObject* reshape_view(PyObject* a, int64_t* dims, int nd, int order) {
     PyObject* v = wrap_array(r);
     if (v != NULL) {
         ((ArrayObject*)v)->readonly = ((ArrayObject*)a)->readonly;
+        ((ArrayObject*)v)->warn_on_write = ((ArrayObject*)a)->warn_on_write;
     }
-    return v;
+    return set_base(v, a);
+}
+
+/* own(v): v with its base cleared, for a view of a copy only v references.
+ * NumPy's ravel/flatten copy straight into a new array owning its data
+ * (base None, OWNDATA). viproc has no copy into another shape, so it copies
+ * first (astype, order C) and views the copy (reshape(-1)), which gives the
+ * view base = the temporary copy; own() makes it the owner NumPy returns.
+ * Safe: the view holds its memory through its alias group in the runtime,
+ * not through the copy's Python object, and since nothing else references
+ * that copy, every base still owns its data (set_base's invariant). */
+static PyObject* m_own(PyObject* self, PyObject* v) {
+    (void)self;
+    if (array_of(v) == NULL) {
+        return NULL;
+    }
+    Py_CLEAR(((ArrayObject*)v)->base);
+    return Py_NewRef(v);
+}
+
+/* a.resize(...), NumPy's ndarray.resize (array_resize, PyArray_Resize). Its
+ * refcheck counts the references to the array object as NumPy counts them
+ * in its own C method, so the count is taken here, first. The method
+ * `_resize_py` (_ndarray.py) parses and checks as NumPy does and returns the
+ * runtime array the object holds from then on (other bytes: a new array
+ * with the old data and zeros; the same bytes: a view with the new shape),
+ * or None. The object keeps its identity and base; only its runtime array
+ * changes. Views made before keep the old data (NumPy's would dangle). */
+static PyObject* Array_resize(PyObject* self, PyObject* args, PyObject* kwds) {
+#if PY_VERSION_HEX >= 0x030E00B0
+    const Py_ssize_t refs = PyUnstable_Object_IsUniquelyReferenced(self) ? 1 : Py_REFCNT(self);
+#else
+    const Py_ssize_t refs = Py_REFCNT(self);
+#endif
+    if (check_runtime() < 0) {
+        return NULL;
+    }
+    PyObject* r =
+        PyObject_CallMethod(self, "_resize_py", "OOn", args, kwds != NULL ? kwds : Py_None, refs);
+    if (r == NULL || r == Py_None) {
+        return r;
+    }
+    if (!is_array(r)) {
+        Py_DECREF(r);
+        PyErr_SetString(PyExc_SystemError, "_resize_py must return a viproc array or None");
+        return NULL;
+    }
+    vp_array* old = ((ArrayObject*)self)->a;
+    ((ArrayObject*)self)->a = ((ArrayObject*)r)->a;
+    ((ArrayObject*)r)->a = old; /* released with r */
+    Py_DECREF(r);
+    Py_RETURN_NONE;
 }
 
 static PyObject* m_reshape(PyObject* self, PyObject* args) {
@@ -2403,8 +3011,9 @@ static PyObject* m_view(PyObject* self, PyObject* args) {
         wrap_array(vp_array_view(g_rt, array_of(base), (vp_dtype)code, nd, shape, strides, offset));
     if (v != NULL) {
         ((ArrayObject*)v)->readonly = ((ArrayObject*)base)->readonly; /* as NumPy views */
+        ((ArrayObject*)v)->warn_on_write = ((ArrayObject*)base)->warn_on_write;
     }
-    return v;
+    return set_base(v, base);
 }
 
 static PyObject* m_scalar(PyObject* self, PyObject* a) {
@@ -2516,7 +3125,8 @@ static PyObject* m_export(PyObject* self, PyObject* args) {
         return NULL;
     }
     vp_array* a = array_of(o);
-    writable = writable && !((ArrayObject*)o)->readonly;
+    const int warn = ((ArrayObject*)o)->warn_on_write;
+    writable = writable && (!((ArrayObject*)o)->readonly || warn);
     if (writable) {
         char err[ERRLEN] = "";
         int status;
@@ -2529,7 +3139,15 @@ static PyObject* m_export(PyObject* self, PyObject* args) {
     } else if (wait_array(a) < 0) {
         return NULL;
     }
-    return vp_array_export(a, writable);
+    PyObject* e = vp_array_export(a, writable);
+    if (e != NULL && writable && warn) { /* NumPy warns on the first write */
+        PyObject* flags = PyObject_GetAttrString(e, "flags");
+        if (flags == NULL || PyObject_SetAttrString(flags, "_warn_on_write", Py_True) < 0) {
+            Py_CLEAR(e);
+        }
+        Py_XDECREF(flags);
+    }
+    return e;
 }
 
 static PyObject* m_assign(PyObject* self, PyObject* args) {
@@ -2558,12 +3176,15 @@ static PyObject* m_assign(PyObject* self, PyObject* args) {
  * viproc cannot run it (the caller falls back to NumPy). */
 static PyObject* m_reduce(PyObject* self, PyObject* args) {
     (void)self;
-    PyObject *ufunc, *a, *axes, *dtype, *identity;
+    PyObject *ufunc, *a, *axes, *dtype, *identity, *out = Py_None;
     int keepdims;
-    if (!PyArg_ParseTuple(args, "OO!OpOO", &ufunc, &ArrayType, &a, &axes, &keepdims, &dtype,
-                          &identity) ||
+    if (!PyArg_ParseTuple(args, "OO!OpOO|O", &ufunc, &ArrayType, &a, &axes, &keepdims, &dtype,
+                          &identity, &out) ||
         check_runtime() < 0) {
         return NULL;
+    }
+    if (out != Py_None && (!is_array(out) || ((ArrayObject*)out)->readonly)) {
+        Py_RETURN_NONE;
     }
     vp_array* in = array_of(a);
     const int nd = vp_array_ndim(in);
@@ -2588,8 +3209,379 @@ static PyObject* m_reduce(PyObject* self, PyObject* args) {
     Py_DECREF(fast);
     vp_array* res = NULL;
     char err[ERRLEN] = "";
-    const int status = vp_reduce(g_rt, ufunc, in, flags, keepdims, dtype, identity, &res,
-                                 issue_site(), err, sizeof err);
+    const int status =
+        vp_reduce_out(g_rt, ufunc, in, flags, keepdims, dtype, identity,
+                      out != Py_None ? array_of(out) : NULL, &res, issue_site(), err, sizeof err);
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    return out != Py_None ? Py_NewRef(out) : wrap_array(res);
+}
+
+static PyObject* m_ufunc_typed(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *ufunc, *ins, *codes, *out, *where = Py_None;
+    if (!PyArg_ParseTuple(args, "OO!O!O|O", &ufunc, &PyTuple_Type, &ins, &PyTuple_Type, &codes,
+                          &out, &where) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    if (where != Py_None && !is_array(where)) {
+        Py_RETURN_NONE;
+    }
+    const Py_ssize_t nin = PyTuple_GET_SIZE(ins);
+    if (nin < 1 || nin > MAXIN || PyTuple_GET_SIZE(codes) != nin + 1 ||
+        (out != Py_None && !is_array(out))) {
+        Py_RETURN_NONE;
+    }
+    vp_array* in[MAXIN];
+    vp_dtype dts[MAXIN + 1];
+    int64_t shape[MAXDIMS];
+    int ndim = 0;
+    for (Py_ssize_t i = 0; i <= nin; ++i) {
+        const long c = PyLong_AsLong(PyTuple_GET_ITEM(codes, i));
+        if (c < 0 || c > 6) {
+            if (PyErr_Occurred()) {
+                return NULL;
+            }
+            Py_RETURN_NONE;
+        }
+        dts[i] = (vp_dtype)c;
+    }
+    for (Py_ssize_t i = 0; i < nin; ++i) {
+        PyObject* x = PyTuple_GET_ITEM(ins, i);
+        if (!is_array(x)) {
+            Py_RETURN_NONE;
+        }
+        in[i] = array_of(x);
+        const int nd = vp_array_ndim(in[i]);
+        if (nd > MAXDIMS || broadcast_into(shape, &ndim, nd, vp_array_shape(in[i])) < 0) {
+            Py_RETURN_NONE; /* NumPy raises its error in the fallback */
+        }
+    }
+    vp_array* mask = where != Py_None ? array_of(where) : NULL;
+    if (mask != NULL &&
+        (vp_array_ndim(mask) > MAXDIMS ||
+         broadcast_into(shape, &ndim, vp_array_ndim(mask), vp_array_shape(mask)) < 0)) {
+        Py_RETURN_NONE;
+    }
+    vp_array* o = NULL;
+    if (out != Py_None) {
+        /* the inputs broadcast to out's shape, which must not change */
+        o = array_of(out);
+        const int nd = vp_array_ndim(o);
+        const int64_t* os = vp_array_shape(o);
+        if (((ArrayObject*)out)->readonly || nd > MAXDIMS ||
+            broadcast_into(shape, &ndim, nd, os) < 0 || ndim != nd ||
+            memcmp(shape, os, (size_t)nd * sizeof(int64_t)) != 0) {
+            Py_RETURN_NONE;
+        }
+    }
+    const vp_loop* loop = NULL;
+    char err[ERRLEN] = "";
+    int status = vp_ufunc_loop(g_rt, ufunc, (int)nin, dts, &loop, err, sizeof err);
+    vp_array* res = NULL;
+    if (status == VP_OK) {
+        status = mask != NULL ? vp_ufunc_issue_masked(g_rt, loop, in, mask, ndim, shape, o, &res,
+                                                      issue_site(), err, sizeof err)
+                              : vp_ufunc_issue(g_rt, loop, in, ndim, shape, o, &res, issue_site(),
+                                               err, sizeof err);
+    }
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    return o != NULL ? Py_NewRef(out) : wrap_array(res);
+}
+
+static PyObject* m_ufunc_multi(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *ufunc, *ins, *codes;
+    if (!PyArg_ParseTuple(args, "OO!O!", &ufunc, &PyTuple_Type, &ins, &PyTuple_Type, &codes) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    const Py_ssize_t nin = PyTuple_GET_SIZE(ins);
+    const Py_ssize_t nop = PyTuple_GET_SIZE(codes);
+    if (nin < 1 || nop <= nin || nop > 8) {
+        Py_RETURN_NONE;
+    }
+    vp_array* in[8];
+    vp_dtype dts[8];
+    int64_t shape[MAXDIMS];
+    int ndim = 0;
+    for (Py_ssize_t i = 0; i < nin; ++i) {
+        PyObject* x = PyTuple_GET_ITEM(ins, i);
+        if (!is_array(x)) {
+            Py_RETURN_NONE;
+        }
+        in[i] = array_of(x);
+        const int nd = vp_array_ndim(in[i]);
+        if (nd > MAXDIMS || broadcast_into(shape, &ndim, nd, vp_array_shape(in[i])) < 0) {
+            Py_RETURN_NONE; /* NumPy raises its error in the fallback */
+        }
+    }
+    for (Py_ssize_t i = 0; i < nop; ++i) {
+        const long c = PyLong_AsLong(PyTuple_GET_ITEM(codes, i));
+        if (c < 0 || c > 6) {
+            if (PyErr_Occurred()) {
+                return NULL;
+            }
+            Py_RETURN_NONE;
+        }
+        dts[i] = (vp_dtype)c;
+    }
+    vp_array* res[8] = {NULL};
+    char err[ERRLEN] = "";
+    const int status = vp_ufunc_multi(g_rt, ufunc, (int)nin, in, (int)(nop - nin), dts, ndim, shape,
+                                      res, issue_site(), err, sizeof err);
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    PyObject* t = PyTuple_New(nop - nin);
+    for (Py_ssize_t j = 0; j < nop - nin; ++j) {
+        PyObject* w = NULL;
+        if (t != NULL) {
+            w = wrap_array(res[j]); /* releases res[j] on failure */
+        } else {
+            vp_array_release(res[j]);
+        }
+        if (w == NULL) {
+            for (Py_ssize_t k = j + 1; k < nop - nin; ++k) {
+                vp_array_release(res[k]);
+            }
+            Py_XDECREF(t);
+            return NULL;
+        }
+        PyTuple_SET_ITEM(t, j, w);
+    }
+    return t;
+}
+
+/* Small int tuple into `out` (at most `max` entries); -1 if not one. */
+static int int_tuple(PyObject* t, int* out, Py_ssize_t max) {
+    if (!PyTuple_Check(t) || PyTuple_GET_SIZE(t) > max) {
+        return -1;
+    }
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(t); ++i) {
+        const long v = PyLong_AsLong(PyTuple_GET_ITEM(t, i));
+        if (v == -1 && PyErr_Occurred()) {
+            PyErr_Clear();
+            return -1;
+        }
+        out[i] = (int)v;
+    }
+    return (int)PyTuple_GET_SIZE(t);
+}
+
+static PyObject* m_gufunc(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *ufunc, *ins, *outs, *codes, *core_n_t, *core_axes_t, *sizes_t, *order_t, *invalid;
+    int flags;
+    long long work;
+    if (!PyArg_ParseTuple(args, "OO!OO!O!O!O!iO!OL", &ufunc, &PyTuple_Type, &ins, &outs,
+                          &PyTuple_Type, &codes, &PyTuple_Type, &core_n_t, &PyTuple_Type,
+                          &core_axes_t, &PyTuple_Type, &sizes_t, &flags, &PyTuple_Type, &order_t,
+                          &invalid, &work) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    enum { MAXOP = 8, MAXCORE = 32 };
+    const Py_ssize_t nin = PyTuple_GET_SIZE(ins);
+    const Py_ssize_t nop = PyTuple_GET_SIZE(codes);
+    const Py_ssize_t nout = nop - nin;
+    if (nin < 1 || nout < 1 || nop > MAXOP ||
+        (outs != Py_None && (!PyTuple_Check(outs) || PyTuple_GET_SIZE(outs) != nout)) ||
+        (invalid != Py_None && !PyUnicode_Check(invalid))) {
+        Py_RETURN_NONE;
+    }
+    vp_array* in[MAXOP];
+    vp_array* out[MAXOP];
+    vp_dtype dts[MAXOP];
+    int core_n[MAXOP], core_axes[MAXCORE], codes_i[MAXOP];
+    int64_t sizes[MAXCORE];
+    int labels[MAXCORE];
+    if (int_tuple(codes, codes_i, MAXOP) != nop || int_tuple(core_n_t, core_n, MAXOP) != nop ||
+        int_tuple(core_axes_t, core_axes, MAXCORE) < 0) {
+        Py_RETURN_NONE;
+    }
+    const int nlabels = int_tuple(sizes_t, labels, MAXCORE);
+    int order[64];
+    const int order_n = int_tuple(order_t, order, 64);
+    if (nlabels < 0 || order_n < 0) {
+        Py_RETURN_NONE;
+    }
+    for (int i = 0; i < nlabels; ++i) {
+        sizes[i] = labels[i];
+    }
+    for (Py_ssize_t i = 0; i < nop; ++i) {
+        if (codes_i[i] < 0 || codes_i[i] > 6) {
+            Py_RETURN_NONE;
+        }
+        dts[i] = (vp_dtype)codes_i[i];
+    }
+    for (Py_ssize_t i = 0; i < nin; ++i) {
+        PyObject* x = PyTuple_GET_ITEM(ins, i);
+        if (!is_array(x)) {
+            Py_RETURN_NONE;
+        }
+        in[i] = array_of(x);
+    }
+    for (Py_ssize_t j = 0; outs != Py_None && j < nout; ++j) {
+        PyObject* x = PyTuple_GET_ITEM(outs, j);
+        if (!is_array(x) || ((ArrayObject*)x)->readonly) {
+            Py_RETURN_NONE;
+        }
+        out[j] = array_of(x);
+    }
+    const char* inv = invalid != Py_None ? PyUnicode_AsUTF8(invalid) : NULL;
+    if (invalid != Py_None && inv == NULL) {
+        return NULL;
+    }
+    vp_array* res[MAXOP] = {NULL};
+    char err[ERRLEN] = "";
+    const int status = vp_gufunc(g_rt, ufunc, (int)nin, in, (int)nout, outs != Py_None ? out : NULL,
+                                 dts, core_n, core_axes, nlabels, sizes, flags, order_n, order, inv,
+                                 (int64_t)work, res, issue_site(), err, sizeof err);
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    if (outs != Py_None) {
+        return Py_NewRef(outs);
+    }
+    PyObject* t = PyTuple_New(nout);
+    for (Py_ssize_t j = 0; j < nout; ++j) {
+        PyObject* w = NULL;
+        if (t != NULL) {
+            w = wrap_array(res[j]); /* releases res[j] on failure */
+        } else {
+            vp_array_release(res[j]);
+        }
+        if (w == NULL) {
+            for (Py_ssize_t k = j + 1; k < nout; ++k) {
+                vp_array_release(res[k]);
+            }
+            Py_XDECREF(t);
+            return NULL;
+        }
+        PyTuple_SET_ITEM(t, j, w);
+    }
+    return t;
+}
+
+static PyObject* m_reduceat(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *ufunc, *a, *indices, *strides;
+    int axis;
+    if (!PyArg_ParseTuple(args, "OO!iOO", &ufunc, &ArrayType, &a, &axis, &indices, &strides) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    int64_t st[MAXDIMS];
+    const int nd = vp_array_ndim(array_of(a));
+    if (strides != Py_None) {
+        PyObject* sf = PySequence_Fast(strides, "strides must be a sequence");
+        if (sf == NULL) {
+            return NULL;
+        }
+        if (PySequence_Fast_GET_SIZE(sf) != nd || nd > MAXDIMS) {
+            Py_DECREF(sf);
+            PyErr_SetString(PyExc_ValueError, "reduceat: one stride per dimension expected");
+            return NULL;
+        }
+        for (int i = 0; i < nd; ++i) {
+            st[i] = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(sf, i));
+        }
+        Py_DECREF(sf);
+        if (PyErr_Occurred()) {
+            return NULL;
+        }
+    }
+    /* the indices as int64 values in native byte order (bytes) */
+    Py_buffer view;
+    if (PyObject_GetBuffer(indices, &view, PyBUF_SIMPLE) < 0) {
+        return NULL;
+    }
+    const Py_ssize_t n = view.len / (Py_ssize_t)sizeof(int64_t);
+    int64_t* ind = n > 0 ? PyMem_Malloc((size_t)n * sizeof(int64_t)) : NULL;
+    if (n > 0 && ind == NULL) {
+        PyBuffer_Release(&view);
+        return PyErr_NoMemory();
+    }
+    if (n > 0) {
+        memcpy(ind, view.buf, (size_t)n * sizeof(int64_t));
+    }
+    PyBuffer_Release(&view);
+    vp_array* res = NULL;
+    char err[ERRLEN] = "";
+    const int status = n > INT_MAX ? VP_UNSUPPORTED
+                                   : vp_reduceat(g_rt, ufunc, array_of(a), axis, ind, (int)n,
+                                                 strides != Py_None ? st : NULL, &res, issue_site(),
+                                                 err, sizeof err);
+    PyMem_Free(ind);
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    return wrap_array(res);
+}
+
+static PyObject* m_ufunc_at(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *ufunc, *a, *idx, *values;
+    if (!PyArg_ParseTuple(args, "OO!O!O", &ufunc, &ArrayType, &a, &ArrayType, &idx, &values) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    if ((values != Py_None && !is_array(values)) || ((ArrayObject*)a)->readonly) {
+        Py_RETURN_NONE;
+    }
+    const int nin = values != Py_None ? 2 : 1;
+    vp_dtype dts[3];
+    for (int i = 0; i <= nin; ++i) {
+        dts[i] = vp_array_dtype(array_of(a));
+    }
+    const vp_loop* loop = NULL;
+    char err[ERRLEN] = "";
+    int status = vp_ufunc_loop(g_rt, ufunc, nin, dts, &loop, err, sizeof err);
+    if (status == VP_OK) {
+        status =
+            vp_ufunc_at(g_rt, loop, array_of(a), array_of(idx),
+                        values != Py_None ? array_of(values) : NULL, issue_site(), err, sizeof err);
+    }
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_FALSE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    Py_RETURN_TRUE;
+}
+
+static PyObject* m_accumulate(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *ufunc, *a;
+    int axis;
+    if (!PyArg_ParseTuple(args, "OO!i", &ufunc, &ArrayType, &a, &axis) || check_runtime() < 0) {
+        return NULL;
+    }
+    vp_array* res = NULL;
+    char err[ERRLEN] = "";
+    const int status =
+        vp_accumulate(g_rt, ufunc, array_of(a), axis, &res, issue_site(), err, sizeof err);
     if (status == VP_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
@@ -3091,6 +4083,155 @@ static PyObject* where_delegate(PyObject* fargs, PyObject* fkw) {
     return r;
 }
 
+/* NumPy's sort table index of (kind, stable) (_sort._kind), or -1 for
+ * what the handlers in _sort.py pass on to NumPy. */
+static int sort_kind(PyObject* kind, PyObject* stable) {
+    if (stable != NULL && stable != Py_None) {
+        if (kind != NULL && kind != Py_None) {
+            return -1; /* NumPy's ValueError */
+        }
+        return stable == Py_True ? 2 : stable == Py_False ? 0 : -1;
+    }
+    if (kind == NULL || kind == Py_None) {
+        return 0;
+    }
+    if (!PyUnicode_CheckExact(kind)) {
+        return -1;
+    }
+    static const char* const names[] = {"quicksort", "heapsort", "mergesort", "stable"};
+    for (int i = 0; i < 4; ++i) {
+        if (PyUnicode_CompareWithASCIIString(kind, names[i]) == 0) {
+            return i < 2 ? 0 : 2; /* NumPy 2 maps heapsort to its introsort */
+        }
+    }
+    return -1;
+}
+
+/* np.sort / np.argsort (a, axis=-1, kind=None, order=None, *, stable=None)
+ * and a.sort(...) (`in_place`) with an int axis and order None as vp_sort:
+ * the result (None for a.sort), or NULL without an error for every other
+ * call (the handlers in _sort.py: axis=None, conversions, NumPy's errors).
+ * pos[0] is `a`; nkw keywords kwn/kwv. */
+static PyObject* sort_issue(PyObject* const* pos, Py_ssize_t npos, PyObject* const* kwn,
+                            PyObject* const* kwv, Py_ssize_t nkw, int arg, int in_place) {
+    if (npos < 1 || npos > 4 || !is_array(pos[0]) || check_runtime() < 0) {
+        PyErr_Clear();
+        return NULL;
+    }
+    PyObject* v[5] = {NULL, NULL, NULL, NULL, NULL}; /* a, axis, kind, order, stable */
+    for (Py_ssize_t i = 0; i < npos; ++i) {
+        v[i] = pos[i];
+    }
+    static const char* const kw[] = {"axis", "kind", "order", "stable"};
+    for (Py_ssize_t i = 0; i < nkw; ++i) {
+        int k = 0;
+        while (k < 4 &&
+               (!PyUnicode_Check(kwn[i]) || PyUnicode_CompareWithASCIIString(kwn[i], kw[k]))) {
+            ++k;
+        }
+        if (k == 4 || v[k + 1] != NULL) {
+            return NULL; /* NumPy's TypeError */
+        }
+        v[k + 1] = kwv[i];
+    }
+    const int kind = sort_kind(v[2], v[4]);
+    ArrayObject* ao = (ArrayObject*)v[0];
+    if (kind < 0 || (v[3] != NULL && v[3] != Py_None) || (in_place && ao->readonly)) {
+        return NULL;
+    }
+    vp_array* a = ao->a;
+    vp_array* flat = NULL; /* axis=None: NumPy's flatten(), here a view where it is one */
+    if (v[1] == Py_None && !in_place) {
+        int64_t size = 1;
+        for (int i = 0; i < vp_array_ndim(a); ++i) {
+            size *= vp_array_shape(a)[i];
+        }
+        if ((flat = vp_array_reshape(g_rt, a, 1, &size, 'C')) == NULL) {
+            return NULL; /* the copy in _sort.py */
+        }
+        a = flat;
+        v[1] = NULL;
+    }
+    const int nd = vp_array_ndim(a);
+    long axis = -1;
+    if (v[1] != NULL) {
+        if (!PyLong_CheckExact(v[1])) {
+            return NULL;
+        }
+        axis = PyLong_AsLong(v[1]);
+        if (axis == -1 && PyErr_Occurred()) {
+            PyErr_Clear();
+            return NULL;
+        }
+    }
+    if (nd == 0 || axis < -nd || axis >= nd) {
+        return NULL; /* NumPy's AxisError */
+    }
+    vp_array* r = NULL;
+    char err[ERRLEN] = "";
+    const int status = vp_sort(g_rt, a, axis < 0 ? (int)axis + nd : (int)axis, kind, arg, in_place,
+                               0, NULL, &r, issue_site(), err, sizeof err);
+    if (flat != NULL) {
+        vp_array_release(flat);
+    }
+    if (status != VP_OK) {
+        return NULL;
+    }
+    return in_place ? Py_NewRef(Py_None) : wrap_array(r);
+}
+
+static PyObject* sort_call(PyObject* fargs, PyObject* fkw, int arg) {
+    PyObject* kwn[8];
+    PyObject* kwv[8];
+    Py_ssize_t it = 0, n = 0;
+    PyObject *key, *value;
+    while (PyDict_Next(fkw, &it, &key, &value)) {
+        if (n == 8) {
+            return NULL;
+        }
+        kwn[n] = key;
+        kwv[n++] = value;
+    }
+    return sort_issue(&PyTuple_GET_ITEM(fargs, 0), PyTuple_GET_SIZE(fargs), kwn, kwv, n, arg, 0);
+}
+
+/* a.sort(...) and a.argsort(...): sort_issue, else the Python method
+ * (`name`: _sort_py, or NumPy's function for argsort). */
+static PyObject* sort_method(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
+                             PyObject* kwnames, int arg) {
+    PyObject* stack[8];
+    const Py_ssize_t nkw = kwnames != NULL ? PyTuple_GET_SIZE(kwnames) : 0;
+    if (nargs + nkw >= 8) {
+        PyErr_SetString(PyExc_TypeError, "sort: too many arguments");
+        return NULL;
+    }
+    stack[0] = self;
+    memcpy(stack + 1, args, (size_t)(nargs + nkw) * sizeof(PyObject*));
+    PyObject* r = sort_issue(stack, nargs + 1, nkw > 0 ? &PyTuple_GET_ITEM(kwnames, 0) : NULL,
+                             stack + nargs + 1, nkw, arg, !arg);
+    if (r != NULL || PyErr_Occurred()) {
+        return r;
+    }
+    if (arg) {
+        return PyObject_Vectorcall(g_argsort_func, stack, (size_t)(nargs + 1), kwnames);
+    }
+    static PyObject* name = NULL;
+    if (name == NULL && (name = PyUnicode_InternFromString("_sort_py")) == NULL) {
+        return NULL;
+    }
+    return PyObject_VectorcallMethod(name, stack, (size_t)(nargs + 1), kwnames);
+}
+
+static PyObject* Array_sort(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
+                            PyObject* kwnames) {
+    return sort_method(self, args, nargs, kwnames, 0);
+}
+
+static PyObject* Array_argsort(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
+                               PyObject* kwnames) {
+    return sort_method(self, args, nargs, kwnames, 1);
+}
+
 /* _Array.__array_function__(self, func, types, args, kwargs): NumPy's
  * reductions as the methods above, np.where of small ready data by NumPy;
  * every other function in _ndarray.py. */
@@ -3103,6 +4244,12 @@ static PyObject* Array_array_function(PyObject* self, PyObject* const* args, Py_
         return NULL;
     }
     PyObject *func = args[0], *fargs = args[2], *fkw = args[3];
+    if (func == g_sort_func || func == g_argsort_func) {
+        PyObject* r = sort_call(fargs, fkw, func == g_argsort_func);
+        if (r != NULL || PyErr_Occurred()) {
+            return r;
+        }
+    }
     if (func == g_where_func) {
         PyObject* r = where_select(fargs, fkw);
         if (r == NULL && !PyErr_Occurred()) {
@@ -3257,6 +4404,36 @@ static PyObject* m_astype(PyObject* self, PyObject* args) {
     return wrap_array(res);
 }
 
+static PyObject* m_sort(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *a, *order_t;
+    int axis, kind, arg, in_place;
+    if (!PyArg_ParseTuple(args, "O!iiipO!", &ArrayType, &a, &axis, &kind, &arg, &in_place,
+                          &PyTuple_Type, &order_t) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    int order[MAXDIMS];
+    const int order_n = int_tuple(order_t, order, MAXDIMS);
+    if (order_n < 0 || (in_place && ((ArrayObject*)a)->readonly)) {
+        Py_RETURN_NONE;
+    }
+    vp_array* res = NULL;
+    char err[ERRLEN] = "";
+    const int status = vp_sort(g_rt, array_of(a), axis, kind, arg, in_place, order_n, order, &res,
+                               issue_site(), err, sizeof err);
+    if (status == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(status, err) < 0) {
+        return NULL;
+    }
+    if (res == NULL) {
+        Py_RETURN_TRUE;
+    }
+    return wrap_array(res);
+}
+
 static PyObject* m_arg_reduce(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *a, *shape_o;
@@ -3324,7 +4501,9 @@ static int read_index_args(PyObject* idx_o, PyObject* axes_o, PyObject* res_o, v
 static PyObject* m_gather(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *a, *idx_o, *axes_o, *res_o, *strides_o;
-    if (!PyArg_ParseTuple(args, "O!OOOO", &ArrayType, &a, &idx_o, &axes_o, &res_o, &strides_o) ||
+    int mode = VP_INDEX_RAISE;
+    if (!PyArg_ParseTuple(args, "O!OOOO|i", &ArrayType, &a, &idx_o, &axes_o, &res_o, &strides_o,
+                          &mode) ||
         check_runtime() < 0) {
         return NULL;
     }
@@ -3345,7 +4524,7 @@ static PyObject* m_gather(PyObject* self, PyObject* args) {
     char err[ERRLEN] = "";
     const int status =
         vp_gather(g_rt, array_of(a), nidx, idx, axes, nres, res,
-                  strides_o == Py_None ? NULL : strides, &r, issue_site(), err, sizeof err);
+                  strides_o == Py_None ? NULL : strides, mode, &r, issue_site(), err, sizeof err);
     if (raise_status(status, err) < 0) {
         return NULL;
     }
@@ -3355,8 +4534,9 @@ static PyObject* m_gather(PyObject* self, PyObject* args) {
 static PyObject* m_scatter(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *a, *idx_o, *axes_o, *res_o, *values;
-    if (!PyArg_ParseTuple(args, "O!OOOO!", &ArrayType, &a, &idx_o, &axes_o, &res_o, &ArrayType,
-                          &values) ||
+    int mode = VP_INDEX_RAISE;
+    if (!PyArg_ParseTuple(args, "O!OOOO!|i", &ArrayType, &a, &idx_o, &axes_o, &res_o, &ArrayType,
+                          &values, &mode) ||
         check_runtime() < 0) {
         return NULL;
     }
@@ -3367,11 +4547,86 @@ static PyObject* m_scatter(PyObject* self, PyObject* args) {
     }
     char err[ERRLEN] = "";
     const int status = vp_scatter(g_rt, array_of(a), nidx, idx, axes, nres, res, array_of(values),
-                                  issue_site(), err, sizeof err);
+                                  mode, issue_site(), err, sizeof err);
     if (raise_status(status, err) < 0) {
         return NULL;
     }
     Py_RETURN_NONE;
+}
+
+/* place(dtype, shape, strides, parts): a new array of `dtype` and `shape`
+ * with the dense byte `strides` (None: C order), assembled from `parts`, a
+ * sequence of (src, shape, strides, offset): src copied into the result's
+ * view with that shape, byte strides and byte offset (vp_place). */
+static PyObject* m_place(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *dtype, *shape_o, *strides_o, *parts_o;
+    if (!PyArg_ParseTuple(args, "OOOO", &dtype, &shape_o, &strides_o, &parts_o) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    const int code = dtype_code(dtype);
+    int64_t shape[MAXDIMS], strides[MAXDIMS];
+    const int nd = read_dims(shape_o, shape);
+    if (code < 0 || nd < 0 || (strides_o != Py_None && read_dims(strides_o, strides) != nd)) {
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_ValueError, "place: unsupported dtype or wrong strides");
+        }
+        return NULL;
+    }
+    PyObject* parts = PySequence_Fast(parts_o, "place: parts must be a sequence");
+    if (parts == NULL) {
+        return NULL;
+    }
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(parts);
+    vp_array** srcs = PyMem_Malloc((size_t)(n + 1) * sizeof(vp_array*));
+    int* pnd = PyMem_Malloc((size_t)(n + 1) * sizeof(int));
+    int64_t* pshapes = PyMem_Malloc((size_t)(n * MAXDIMS + 1) * sizeof(int64_t));
+    int64_t* pstrides = PyMem_Malloc((size_t)(n * MAXDIMS + 1) * sizeof(int64_t));
+    int64_t* poffsets = PyMem_Malloc((size_t)(n + 1) * sizeof(int64_t));
+    PyObject* result = NULL;
+    if (srcs == NULL || pnd == NULL || pshapes == NULL || pstrides == NULL || poffsets == NULL) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    int64_t at = 0;
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject *src, *ps, *pst;
+        long long off;
+        if (!PyArg_ParseTuple(PySequence_Fast_GET_ITEM(parts, i),
+                              "O!OOL;place: a part is "
+                              "(src, shape, strides, offset)",
+                              &ArrayType, &src, &ps, &pst, &off)) {
+            goto done;
+        }
+        const int k = read_dims(ps, pshapes + at);
+        if (k < 0 || read_dims(pst, pstrides + at) != k) {
+            if (!PyErr_Occurred()) {
+                PyErr_SetString(PyExc_ValueError, "place: shape and strides differ in length");
+            }
+            goto done;
+        }
+        srcs[i] = array_of(src);
+        pnd[i] = k;
+        poffsets[i] = off;
+        at += k;
+    }
+    vp_array* r = NULL;
+    char err[ERRLEN] = "";
+    const int status =
+        vp_place(g_rt, (vp_dtype)code, nd, shape, strides_o == Py_None ? NULL : strides, (int)n,
+                 srcs, pnd, pshapes, pstrides, poffsets, &r, issue_site(), err, sizeof err);
+    if (raise_status(status, err) == 0) {
+        result = wrap_array(r);
+    }
+done:
+    PyMem_Free(srcs);
+    PyMem_Free(pnd);
+    PyMem_Free(pshapes);
+    PyMem_Free(pstrides);
+    PyMem_Free(poffsets);
+    Py_DECREF(parts);
+    return result;
 }
 
 /* matmul(a, b): np.matmul of two viproc arrays, or None if NumPy has to run
@@ -3467,7 +4722,7 @@ static PyObject* UfuncProxy_vectorcall(PyObject* self, PyObject* const* args, si
         }
         if (any) {
             PyObject* sc[MAXIN];
-            const int k = scalars_of(args, n, sc);
+            const int k = SCALARS_OF(args, n, sc);
             if (k < 0) {
                 return NULL;
             }
@@ -3619,16 +4874,19 @@ static PyMethodDef methods[] = {
      "basic_view(a, key): a[key] for ints, slices, None, Ellipsis as a view, else None"},
     {"transpose", (PyCFunction)(void (*)(void))m_transpose, METH_FASTCALL,
      "transpose(a, axes): view, None if axes invalid"},
+    {"own", m_own, METH_O, "own(v): v with base None (a view of a copy only v references)"},
     {"reshape", m_reshape, METH_VARARGS,
      "reshape(a, shape, order): view as NumPy's reshape, None if NumPy would copy"},
     {"broadcast_to", m_broadcast_to, METH_VARARGS,
      "broadcast_to(a, shape): read-only broadcast view, None if not broadcastable"},
     {"gather", m_gather, METH_VARARGS,
-     "gather(a, idx, idx_axes, result_axes, result_strides): a[idx...] (vp_gather)"},
+     "gather(a, idx, idx_axes, result_axes, result_strides[, mode]): a[idx...] (vp_gather)"},
     {"scatter", m_scatter, METH_VARARGS,
      "scatter(a, idx, idx_axes, result_axes, values): a[idx...] = values (vp_scatter)"},
     {"where", (PyCFunction)(void (*)(void))m_where, METH_FASTCALL | METH_KEYWORDS,
      "where(condition, [x, y]): numpy.where without NumPy's dispatch for viproc arrays"},
+    {"place", m_place, METH_VARARGS,
+     "place(dtype, shape, strides, parts): an array assembled from copies (vp_place)"},
     {"select", m_select, METH_VARARGS, "select(cond, x, y): np.where(cond, x, y) (vp_select)"},
     {"mask_assign", m_mask_assign, METH_VARARGS, "mask_assign(a, mask, value): a[mask] = value"},
     {"matmul", m_matmul, METH_VARARGS,
@@ -3639,8 +4897,29 @@ static PyMethodDef methods[] = {
      "astype(a, code, order): async cast (order 'K', 'C' or 'F'), or None if unsupported"},
     {"setup_reductions", m_setup_reductions, METH_VARARGS,
      "setup_reductions(entries, array_function, novalue, async_ok)"},
+    {"ufunc_typed", m_ufunc_typed, METH_VARARGS,
+     "ufunc_typed(ufunc, inputs, dtype codes, out[, where]): async ufunc with the loop "
+     "for exactly these dtypes (inputs cast, out= of any dtype, a bool where= mask), or None"},
+    {"ufunc_multi", m_ufunc_multi, METH_VARARGS,
+     "ufunc_multi(ufunc, inputs, dtype codes): async ufunc with several outputs, or None"},
+    {"sort", m_sort, METH_VARARGS,
+     "sort(a, axis, kind, arg, in_place, out_order): async sort/argsort along axis (vp_sort): "
+     "the result, True (in place) or None if unsupported"},
+    {"gufunc", m_gufunc, METH_VARARGS,
+     "gufunc(ufunc, inputs, outs|None, dtype codes, core_n, core_axes, label sizes, flags, "
+     "out_order, "
+     "invalid_error|None, work): async generalized ufunc (vp_gufunc): the outputs (a tuple) "
+     "or None"},
+    {"reduceat", m_reduceat, METH_VARARGS,
+     "reduceat(ufunc, a, axis, indices (int64 bytes), strides|None): async ufunc.reduceat "
+     "without casts, or None"},
+    {"ufunc_at", m_ufunc_at, METH_VARARGS,
+     "ufunc_at(ufunc, a, indices, values|None): async ufunc.at along axis 0; False if unsupported"},
+    {"accumulate", m_accumulate, METH_VARARGS,
+     "accumulate(ufunc, a, axis): async ufunc.accumulate without casts, or None"},
     {"reduce", m_reduce, METH_VARARGS,
-     "reduce(ufunc, a, axes, keepdims, dtype, initial): async reduction, or None if unsupported"},
+     "reduce(ufunc, a, axes, keepdims, dtype, initial[, out]): async reduction (into out), or "
+     "None if unsupported"},
     {NULL, NULL, 0, NULL},
 };
 
@@ -3657,7 +4936,8 @@ static struct PyModuleDef module = {
 };
 
 PyMODINIT_FUNC PyInit__viproc(void) {
-    if (PyType_Ready(&ArrayType) < 0 || PyType_Ready(&UfuncProxyType) < 0) {
+    if (PyType_Ready(&ArrayType) < 0 || PyType_Ready(&UfuncProxyType) < 0 ||
+        PyType_Ready(&FlagsType) < 0) {
         return NULL;
     }
     PyObject* m = PyModule_Create(&module);
@@ -3690,8 +4970,23 @@ PyMODINIT_FUNC PyInit__viproc(void) {
                                         bases, NULL)
             : NULL;
     Py_XDECREF(bases);
+    PyObject* linalg = PyImport_ImportModule("numpy.linalg");
+    PyObject* lin_err = linalg != NULL ? PyObject_GetAttrString(linalg, "LinAlgError") : NULL;
+    Py_XDECREF(linalg);
+    bases = AsyncError != NULL && lin_err != NULL ? PyTuple_Pack(2, AsyncError, lin_err) : NULL;
+    Py_XDECREF(lin_err);
+    AsyncLinAlgError =
+        bases != NULL
+            ? PyErr_NewExceptionWithDoc("viproc._viproc.AsyncLinAlgError",
+                                        "A numpy.linalg op that ran asynchronously failed (as "
+                                        "NumPy's LinAlgError: singular matrix, no convergence).",
+                                        bases, NULL)
+            : NULL;
+    Py_XDECREF(bases);
     if (s_call == NULL || s_out == NULL || AsyncError == NULL || AsyncIndexError == NULL ||
-        AsyncValueError == NULL || PyModule_AddObjectRef(m, "AsyncError", AsyncError) < 0 ||
+        AsyncValueError == NULL || AsyncLinAlgError == NULL ||
+        PyModule_AddObjectRef(m, "AsyncError", AsyncError) < 0 ||
+        PyModule_AddObjectRef(m, "AsyncLinAlgError", AsyncLinAlgError) < 0 ||
         PyModule_AddObjectRef(m, "AsyncIndexError", AsyncIndexError) < 0 ||
         PyModule_AddObjectRef(m, "AsyncValueError", AsyncValueError) < 0 ||
         PyModule_AddObjectRef(m, "_Array", (PyObject*)&ArrayType) < 0 ||

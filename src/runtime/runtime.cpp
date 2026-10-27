@@ -33,6 +33,27 @@ inline void cpu_relax() {
 #endif
 }
 
+// How long the main thread spins at a sync point before it sleeps. Sleeping
+// costs the completing thread a futex wake (a syscall) and the main thread a
+// wake-up: 10-20 us together, several times a medium-sized op (issue #45).
+// Only sync points spin, where the main thread waits for one result.
+constexpr auto kSyncSpin = std::chrono::microseconds(50);
+
+// Spins until done() holds or kSyncSpin has passed; returns done().
+template <class Done> bool spin_until(Done done) {
+    using clock = std::chrono::steady_clock;
+    const auto until = clock::now() + kSyncSpin;
+    do {
+        for (int i = 0; i < 16; ++i) {
+            if (done()) {
+                return true;
+            }
+            cpu_relax();
+        }
+    } while (clock::now() < until);
+    return done();
+}
+
 } // namespace
 
 Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_(options_.offload) {
@@ -174,8 +195,8 @@ void Runtime::acquire_slot() {
     active_.fetch_add(1, std::memory_order_acq_rel);
 }
 
-void Runtime::launch(const std::shared_ptr<Task>& task,
-                     const std::vector<std::shared_ptr<Task>>& producers, std::int64_t elements) {
+void Runtime::launch(const std::shared_ptr<Task>& task, const TaskList& producers,
+                     std::int64_t elements) {
     ++seq_;
     task->set_id(seq_);
     // While pending, the task's work is attributed to the decision that
@@ -186,10 +207,10 @@ void Runtime::launch(const std::shared_ptr<Task>& task,
             break;
         }
     }
-    for (const std::shared_ptr<Task>& p : producers) {
-        task->add_pending_input();
-        if (!p->add_consumer(task)) {
-            task->producer_already_done(*p); // cannot reach 0: issue guard held
+    task->add_pending_inputs(producers.size());
+    for (std::size_t i = 0; i < producers.size(); ++i) {
+        if (!producers[i]->add_consumer(task, i)) {
+            task->producer_already_done(*producers[i]); // cannot reach 0: issue guard held
         }
     }
     if (task->release_issue_guard()) {
@@ -201,10 +222,10 @@ void Runtime::issue_group_copy(AliasGroup& g) {
     std::shared_ptr<CountableArray> old = g.current_;
     auto fresh = make_pooled<CountableArray>(old->nbytes(),
                                              CountableArray::deferred); // the copy task allocates
-    std::vector<std::shared_ptr<Task>> producers;
+    TaskList producers;
     ErrorRef failed;
     if (!g.ready()) {
-        producers.push_back(g.last_writer_);
+        producers.emplace_back(g.last_writer_);
     } else {
         failed = g.last_error_;
     }
@@ -257,7 +278,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     // 1. Snapshot everything this op reads (inputs, then in/outs): buffer,
     //    layout and pending producer, before any copy-on-write switch. Reads
     //    always see the data as it was before this op.
-    std::vector<std::shared_ptr<Task>> producers;
+    TaskList producers;
     ErrorRef failed_input;
     // An error on an input or in/out passes to this op: data computed from a
     // failed op, or written into its result, is failed too (also when the op
@@ -265,7 +286,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     auto snapshot = [&](Array& a) {
         AliasGroup& g = *a.group_;
         if (!g.ready()) {
-            producers.push_back(g.last_writer_);
+            producers.emplace_back(g.last_writer_);
         } else if (g.last_error_ && !failed_input) {
             failed_input = g.last_error_;
         }
@@ -346,7 +367,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         // A group copy issued in step 2 must finish before this op writes.
         if (g.last_writer_ && g.last_writer_ != task &&
             std::find(producers.begin(), producers.end(), g.last_writer_) == producers.end()) {
-            producers.push_back(g.last_writer_);
+            producers.emplace_back(g.last_writer_);
         }
         g.last_writer_ = task;
         in_ops.push_back({g.current_, ap->meta_});
@@ -479,12 +500,19 @@ ErrorRef Runtime::wait(Array& a) {
     AliasGroup& g = *a.group_;
     if (g.last_writer_) {
         Task& p = *g.last_writer_;
+        if (!p.completed()) {
+            ++syncs_; // the main thread blocks
+        }
         // Any access right after issuing counts, finished or not: async had
         // nothing to overlap with in between.
         if (p.mark_blocked()) {
             policy_.on_blocked(p.blame(), seq_ - p.blame_seq());
         }
-        p.wait_completed();
+        // Spin first: a waiter that registers costs the completing thread a
+        // notify and itself a wake-up.
+        if (!spin_until([&] { return p.completed(); })) {
+            p.wait_completed();
+        }
     }
     g.ready();
     return g.last_error_;
@@ -501,10 +529,16 @@ ErrorRef Runtime::prepare_host_write(Array& a) {
     return e;
 }
 
-void Runtime::wait_all() { wait_active_below(1); }
+void Runtime::wait_all() {
+    // A sync point: spin first, as wait(). Back-pressure does not spin: it
+    // waits for many tasks while the workers use every core.
+    if (!spin_until([&] { return active_.load(std::memory_order_acquire) == 0; })) {
+        wait_active_below(1);
+    }
+}
 
-std::vector<std::shared_ptr<Task>> Runtime::run(const std::shared_ptr<Task>& task) {
-    std::vector<std::shared_ptr<Task>> runnable = task->execute(errors_.get());
+TaskList Runtime::run(const std::shared_ptr<Task>& task) {
+    TaskList runnable = task->execute(errors_.get());
     const std::size_t left = active_.fetch_sub(1, std::memory_order_seq_cst) - 1;
     if (active_waiters_.load(std::memory_order_seq_cst) > 0 &&
         left < wake_below_.load(std::memory_order_seq_cst)) {
@@ -582,10 +616,10 @@ void Runtime::worker_loop() {
         }
         // Trampoline: run() returns instead of calling consumers, so the stack
         // is unwound before the continuation starts.
-        std::vector<std::shared_ptr<Task>> runnable = run(next);
+        TaskList runnable = run(next);
         next.reset();
         if (!runnable.empty()) {
-            next = std::move(runnable.front());
+            next = std::move(runnable[0]);
             for (std::size_t i = 1; i < runnable.size(); ++i) {
                 enqueue(std::move(runnable[i]));
             }

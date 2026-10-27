@@ -121,6 +121,25 @@ def test_reshape_copies_like_numpy():
     same(r, np.reshape(n.copy(), (12,), copy=True))
 
 
+def test_ravel_copies_like_numpy():
+    """ravel views only contiguous data (PyArray_Ravel), unlike reshape: a
+    strided 1-d array is copied, which decides the strides of later calls."""
+    base = np.arange(24.0).reshape(4, 6)
+    vbase = viproc.asarray(base)
+    for key in [(slice(None, None, -3),), (slice(None), slice(None, None, 2)), (slice(None),),
+                (slice(None, None, -1), slice(None))]:
+        for t in (False, True):
+            n, v = base[key], vbase[key]
+            n, v = (n.T, v.T) if t else (n, v)
+            for x, y in [(n, v), (n.ravel(), v.ravel())]:
+                for order in "CFAK":
+                    want = np.ravel(x, order)
+                    got = np.ravel(y, order)
+                    same(got, want)
+                    assert (np.shares_memory(want, base)
+                            == np.shares_memory(np.asarray(got), np.asarray(vbase)))
+
+
 def test_views_share_storage_and_readonly():
     v = viproc.asarray(np.arange(12.0).reshape(3, 4))
     t = v.T

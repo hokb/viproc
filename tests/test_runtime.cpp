@@ -422,6 +422,101 @@ void test_error_reports() {
     check(rt.errors().size() == 0, "a reported record goes when nothing refers to it");
 }
 
+// Registration (main thread) racing with completion (producers on other
+// threads) and waits, on the Task API directly: every consumer is accounted
+// for exactly once by each producer (registered and notified, or told the
+// producer had completed), becomes runnable exactly once, inherits a failed
+// producer's error, and wait_completed() never misses a completion. Up to six
+// producers per consumer: more than Task::kInlineNodes nodes take the heap.
+void test_consumer_registration_races() {
+    auto errors = std::make_shared<ErrorTable>();
+    auto ok = std::make_shared<FnKernel>([](auto, auto) { return KernelResult{}; });
+    auto fail = std::make_shared<FnKernel>([](auto, auto) { return KernelResult{1, "x", 0}; });
+    constexpr int kRounds = 3000;
+    constexpr int kConsumers = 6;
+    std::mt19937 rng(7);
+    bool exactly_once = true;
+    bool errors_inherited = true;
+    std::size_t registered = 0, late = 0;
+    for (int round = 0; round < kRounds; ++round) {
+        const std::size_t np = 1 + round % 6;
+        const int failing = static_cast<int>(rng() % (2 * np)); // >= np: none fails
+        std::vector<std::shared_ptr<Task>> producers;
+        for (std::size_t p = 0; p < np; ++p) {
+            producers.push_back(
+                std::make_shared<Task>(static_cast<int>(p) == failing ? fail : ok, "p"));
+        }
+        std::vector<std::shared_ptr<Task>> consumers;
+        for (int c = 0; c < kConsumers; ++c) {
+            consumers.push_back(std::make_shared<Task>(ok, "c"));
+        }
+        std::atomic<bool> go{false};
+        std::vector<std::vector<std::shared_ptr<Task>>> unblocked(np);
+        std::vector<std::thread> threads;
+        const int delay = static_cast<int>(rng() % 64);
+        for (std::size_t p = 0; p < np; ++p) {
+            threads.emplace_back([&, p] {
+                while (!go.load(std::memory_order_acquire)) {
+                }
+                std::atomic<int> spin{0};
+                while (spin.fetch_add(1, std::memory_order_relaxed) <
+                       delay * static_cast<int>(p + 1)) {
+                }
+                for (auto& t : producers[p]->execute(errors.get())) {
+                    unblocked[p].push_back(std::move(t));
+                }
+            });
+        }
+        go.store(true, std::memory_order_release);
+        std::vector<std::shared_ptr<Task>> runnable;
+        for (auto& c : consumers) {
+            c->add_pending_inputs(np);
+            for (std::size_t p = 0; p < np; ++p) {
+                if (!producers[p]->add_consumer(c, p)) {
+                    c->producer_already_done(*producers[p]);
+                    ++late;
+                } else {
+                    ++registered;
+                }
+            }
+            if (c->release_issue_guard()) {
+                runnable.push_back(c);
+            }
+        }
+        for (auto& p : producers) {
+            p->wait_completed(); // must return: the completion sets or sees the waiter bit
+        }
+        for (auto& t : threads) {
+            t.join();
+        }
+        for (auto& u : unblocked) {
+            runnable.insert(runnable.end(), u.begin(), u.end());
+        }
+        std::set<Task*> seen;
+        for (auto& t : runnable) {
+            exactly_once = exactly_once && seen.insert(t.get()).second;
+        }
+        exactly_once = exactly_once && seen.size() == consumers.size();
+        for (auto& c : consumers) {
+            c->execute(errors.get());
+            errors_inherited = errors_inherited &&
+                               (static_cast<bool>(c->error()) == (failing < static_cast<int>(np)));
+        }
+        // The producers' lists are closed: only the test's references are left.
+        runnable.clear();
+        unblocked.clear();
+        for (auto& c : consumers) {
+            exactly_once = exactly_once && c.use_count() == 1;
+        }
+    }
+    std::printf("  %zu registrations, %zu on completed producers\n", registered, late);
+    check(registered > 1000 && late > 1000,
+          "registration racing with completion: both paths taken");
+    check(exactly_once, "registration racing with completion: each consumer runs exactly once");
+    check(errors_inherited,
+          "registration racing with completion: failed producers' errors pass on");
+}
+
 void test_active_limit() {
     std::atomic<int> running{0};
     std::atomic<int> max_seen{0};
@@ -832,6 +927,7 @@ int main() {
     test_overlapping_inplace();
     test_error_propagation();
     test_error_reports();
+    test_consumer_registration_races();
     test_active_limit();
     test_random_programs(3, false);
     test_random_programs(64, false);

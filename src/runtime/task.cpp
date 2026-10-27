@@ -31,15 +31,27 @@ void Metadata::destroy(const Metadata* s) {
 Task::Task(std::shared_ptr<Kernel> kernel, const char* issue_site)
     : kernel_(std::move(kernel)), issue_site_(issue_site) {}
 
+Task::~Task() {
+    // A task destroyed without completing (never launched) may still list
+    // consumers; drop their references.
+    std::uintptr_t h = consumers_.load(std::memory_order_acquire);
+    if (!closed(h)) {
+        for (auto* n = reinterpret_cast<ConsumerNode*>(h & ~kWaiter); n != nullptr;) {
+            ConsumerNode* next = n->next;
+            n->task.reset();
+            n = next;
+        }
+    }
+}
+
 void Task::wait_completed() const {
     if (completed()) {
         return;
     }
-    {
-        // Under the lock: either execute() sees the flag and notifies, or it
-        // completed before and the loop below does not block.
-        std::lock_guard lock(mutex_);
-        waiters_ = true;
+    // Either execute()'s exchange sees the bit and notifies, or it closed the
+    // list before and this one sees kClosed (and, acquired, the state).
+    if (closed(consumers_.fetch_or(kWaiter, std::memory_order_acq_rel))) {
+        return;
     }
     TaskState s = state();
     while (s != TaskState::Completed) {
@@ -54,28 +66,37 @@ void Task::advance(TaskState next) {
     state_.store(next, std::memory_order_release);
 }
 
-bool Task::add_consumer(const std::shared_ptr<Task>& consumer) {
-    std::lock_guard lock(mutex_);
-    if (state_.load(std::memory_order_relaxed) == TaskState::Completed) {
-        return false;
+void Task::add_pending_inputs(std::size_t n) {
+    if (n > kInlineNodes) {
+        more_nodes_ = std::make_unique<ConsumerNode[]>(n - kInlineNodes);
     }
-    consumers_.push_back(consumer);
-    return true;
+    pending_.fetch_add(static_cast<int>(n), std::memory_order_relaxed);
 }
 
-void Task::add_upstream_error(const ErrorRef& error) {
-    std::lock_guard lock(mutex_);
-    if (!upstream_error_) {
-        upstream_error_ = error;
+bool Task::add_consumer(const std::shared_ptr<Task>& consumer, std::size_t i) {
+    // Acquire: on kClosed, the caller reads this task's error_ (written before
+    // the release exchange in execute()).
+    std::uintptr_t h = consumers_.load(std::memory_order_acquire);
+    if (closed(h)) {
+        return false;
     }
+    ConsumerNode& n = consumer->node(i);
+    n.task = consumer; // the list's reference, taken over by execute()
+    do {
+        if (closed(h)) {
+            n.task.reset();
+            return false;
+        }
+        n.next = reinterpret_cast<ConsumerNode*>(h & ~kWaiter);
+    } while (
+        !consumers_.compare_exchange_weak(h, reinterpret_cast<std::uintptr_t>(&n) | (h & kWaiter),
+                                          std::memory_order_release, std::memory_order_acquire));
+    return true;
 }
 
 bool Task::input_done(const Task* producer) {
     if (producer != nullptr && producer->error_) {
-        std::lock_guard lock(mutex_);
-        if (!upstream_error_) {
-            upstream_error_ = producer->error_;
-        }
+        set_upstream_error(producer->error_);
     }
     return pending_.fetch_sub(1, std::memory_order_acq_rel) == 1;
 }
@@ -288,7 +309,7 @@ std::size_t ErrorTable::size() const {
     return records_.size();
 }
 
-std::vector<std::shared_ptr<Task>> Task::execute(ErrorTable* errors) {
+TaskList Task::execute(ErrorTable* errors) {
     // No lock: every write of upstream_error_ happens before the release
     // decrement of pending_ by its writer, and this thread observed the final
     // decrement (or got the task from the thread that did).
@@ -332,23 +353,35 @@ std::vector<std::shared_ptr<Task>> Task::execute(ErrorTable* errors) {
     operands_.clear();
     kernel_.reset();
 
-    std::vector<std::shared_ptr<Task>> consumers;
-    bool notify;
-    {
-        std::lock_guard lock(mutex_);
-        state_.store(TaskState::Completed, std::memory_order_release);
-        consumers.swap(consumers_);
-        notify = waiters_;
-    }
-    if (notify) {
+    state_.store(TaskState::Completed, std::memory_order_release);
+    // Close the list: registrations from now on fail and account for this
+    // task themselves. Release: they see error_ and the state; acquire: we see
+    // the nodes pushed.
+    const std::uintptr_t h = consumers_.exchange(kClosed, std::memory_order_acq_rel);
+    if ((h & kWaiter) != 0) {
         state_.notify_all();
     }
 
-    std::vector<std::shared_ptr<Task>> runnable;
-    for (auto& c : consumers) {
+    // The stack holds the consumers newest first; reverse it, so they are
+    // notified in registration order (the first one becomes the
+    // continuation, as before).
+    ConsumerNode* list = nullptr;
+    for (auto* n = reinterpret_cast<ConsumerNode*>(h & ~kWaiter); n != nullptr;) {
+        ConsumerNode* next = n->next;
+        n->next = list;
+        list = n;
+        n = next;
+    }
+    TaskList runnable;
+    while (list != nullptr) {
+        // Read the link and take the reference before the decrement: after
+        // it, another producer may run the consumer (whose node this is).
+        ConsumerNode* next = list->next;
+        std::shared_ptr<Task> c = std::move(list->task);
         if (c->input_done(this)) {
             runnable.push_back(std::move(c));
         }
+        list = next;
     }
     return runnable;
 }

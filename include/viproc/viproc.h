@@ -91,6 +91,13 @@ void vp_offload_counts(const vp_runtime* rt, uint64_t* inline_ops, uint64_t* off
 /* Ops that ran directly on the main thread, without a task (small, all
  * inputs ready; Runtime::issue). */
 uint64_t vp_direct_count(const vp_runtime* rt);
+/* Tasks issued so far (main thread): every op that did not run directly,
+ * whether its inputs were ready or pending, and copy-on-write copies. */
+uint64_t vp_task_count(const vp_runtime* rt);
+/* Sync points so far that found their array pending, so the main thread
+ * blocked (vp_array_wait, vp_array_prepare_write, ...; vp_wait_all is not
+ * counted). Waits on ready arrays (to read their error) are no syncs. */
+uint64_t vp_sync_count(const vp_runtime* rt);
 size_t vp_active_tasks(const vp_runtime* rt);
 
 /* --- Element memory pool (process-wide; docs/design/memory-management.md) */
@@ -143,6 +150,8 @@ int vp_array_ndim(const vp_array* a);
 const int64_t* vp_array_shape(const vp_array* a);
 const int64_t* vp_array_strides(const vp_array* a);
 vp_dtype vp_array_dtype(const vp_array* a);
+/* Byte offset of the first element in the array's storage. */
+int64_t vp_array_offset(const vp_array* a);
 /* 1 if the data is final (no pending task writes it). */
 int vp_array_ready(vp_array* a);
 /* 1 if both arrays share their storage (base and views). */
@@ -209,14 +218,37 @@ int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, 
              int out_ndim, const int64_t* out_shape, vp_array* out, vp_array** result,
              const char* site, char* err, size_t errlen);
 
+/* vp_ufunc_issue() with where=`mask` (a bool array broadcasting to
+ * out_shape): as NumPy runs a masked ufunc, on its iterator (no copies of
+ * short inputs), the loop called once per run of True values. Elements
+ * where the mask is False keep the values of `out`; without `out` they are
+ * undefined, as in NumPy's freshly allocated result. */
+int vp_ufunc_issue_masked(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
+                          vp_array* mask, int out_ndim, const int64_t* out_shape, vp_array* out,
+                          vp_array** result, const char* site, char* err, size_t errlen);
+
+/* Issues `ufunc(inputs...)` for a ufunc with several outputs (divmod, modf,
+ * frexp) with NumPy's loop for exactly `dtypes` (nin inputs, then nout
+ * outputs). As NumPy runs such ufuncs (never its trivial loop), the loop is
+ * driven by NumPy's iterator, which casts inputs of another dtype in its
+ * buffers, and the results get the layout that iterator allocates (order
+ * K). Inputs broadcast to out_shape; results[0..nout) receive the new
+ * arrays. Returns VP_UNSUPPORTED (reason in `err`) if no matching loop
+ * exists or NumPy cannot run it so; the caller then falls back. */
+int vp_ufunc_multi(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, int nout,
+                   const vp_dtype* dtypes, int out_ndim, const int64_t* out_shape,
+                   vp_array** results, const char* site, char* err, size_t errlen);
+
 /* Resolves NumPy's loop for `ufunc` with exactly `dtypes` (nin inputs, then
  * the output) once; the handle stays valid until the runtime is destroyed.
  * vp_ufunc_issue() then issues ops without any lookup. Returns
  * VP_UNSUPPORTED (and a reason in `err`) like vp_ufunc(). */
 int vp_ufunc_loop(vp_runtime* rt, PyObject* ufunc, int nin, const vp_dtype* dtypes,
                   const vp_loop** loop, char* err, size_t errlen);
-/* Like vp_ufunc(), with a loop from vp_ufunc_loop(). The inputs must have the
- * loop's input dtypes. */
+/* Like vp_ufunc(), with a loop from vp_ufunc_loop(). Inputs of another dtype
+ * than the loop's are cast as NumPy casts them (short ones into copies
+ * first, others in the iterator's buffers); an `out` of another dtype gets
+ * the results cast into it, as NumPy's iterator does. */
 int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs, int out_ndim,
                    const int64_t* out_shape, vp_array* out, vp_array** result, const char* site,
                    char* err, size_t errlen);
@@ -239,16 +271,20 @@ int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array
  * (result_axes[k] = -1 - d); NumPy's placement rules are the caller's.
  * Out-of-bounds indices fail the task: the next sync point raises
  * AsyncIndexError (an IndexError). */
+/* `mode` decides what an index outside [-n, n) does, as NumPy's take/put
+ * modes: VP_INDEX_RAISE (the task fails), VP_INDEX_WRAP (i mod n),
+ * VP_INDEX_CLIP (to 0 or n - 1; clip maps negative indices to 0 too). */
+enum { VP_INDEX_RAISE = 0, VP_INDEX_WRAP = 1, VP_INDEX_CLIP = 2 };
 /* r = src[idx...]: a new array with `result_strides` (NumPy's layout for the
  * indexing result; NULL for C order). */
 int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, const int* idx_axes,
-              int nres, const int* result_axes, const int64_t* result_strides, vp_array** result,
-              const char* site, char* err, size_t errlen);
+              int nres, const int* result_axes, const int64_t* result_strides, int mode,
+              vp_array** result, const char* site, char* err, size_t errlen);
 /* dst[idx...] = values (dst's dtype, broadcastable to the indexing result's
  * shape); the last of repeated indices wins, as in NumPy. */
 int vp_scatter(vp_runtime* rt, vp_array* dst, int nidx, vp_array* const* idx, const int* idx_axes,
-               int nres, const int* result_axes, vp_array* values, const char* site, char* err,
-               size_t errlen);
+               int nres, const int* result_axes, vp_array* values, int mode, const char* site,
+               char* err, size_t errlen);
 /* dst[mask] = value: `value` 0-d with dst's dtype, `mask` bool broadcastable
  * to dst. */
 int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* value, const char* site,
@@ -259,6 +295,18 @@ int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* valu
  * has NumPy's layout (order K over the three inputs). */
 int vp_select(vp_runtime* rt, vp_array* cond, vp_array* x, vp_array* y, vp_array** result,
               const char* site, char* err, size_t errlen);
+
+/* Issues a sort (`arg` 0) or argsort (`arg` != 0) of `in` along `axis` with
+ * NumPy's per-dtype sort functions (src/kernels/numpy_sort.hpp); `kind` is
+ * NumPy's sort table index (0 the default, 2 stable; NumPy maps heapsort to
+ * 0). A sort writes a new array, dense with its axes in `out_order`
+ * (order_n == ndim entries, outermost first; order_n == 0: the layout of
+ * np.sort's copy, empty_like(in) in order K), or,
+ * with `in_place`, sorts `in` itself (`a.sort()`, *result NULL); an argsort
+ * gives a new C-ordered int64 array. Returns VP_UNSUPPORTED for other
+ * arguments. */
+int vp_sort(vp_runtime* rt, vp_array* in, int axis, int kind, int arg, int in_place, int order_n,
+            const int* out_order, vp_array** result, const char* site, char* err, size_t errlen);
 
 /* Issues argmax (`argmax` != 0) or argmin of `in` along its last axis with
  * NumPy's per-dtype functions, one call per row, as PyArray_ArgMax calls
@@ -288,6 +336,89 @@ int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char
               int keepdims, PyObject* dtype, PyObject* identity, vp_array** result,
               const char* site, char* err, size_t errlen);
 
+/* Issues ufunc.accumulate(in, axis=axis) (np.cumsum, np.cumprod, ...) for a
+ * binary ufunc without casts: input and result have in's dtype, which must
+ * be the accumulator dtype NumPy picks (the caller casts first, as NumPy's
+ * iterator copies a cast input). The loop is the reduction loop called as
+ * PyUFunc_Accumulate calls it: per row along `axis`, the first element is
+ * copied, then one call over the rest of the row with args {out, in + 1,
+ * out + 1}. The result has NumPy's layout (C-contiguous for 1-d, else the
+ * input's axis order, as NumPy's iterator allocates it). Returns
+ * VP_UNSUPPORTED (reason in `err`) for an empty input, 0-d input, or a loop
+ * that is unavailable or needs the Python API; the caller then falls back. */
+int vp_accumulate(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, vp_array** result,
+                  const char* site, char* err, size_t errlen);
+
+/* vp_reduce() into an existing array `out` (in place, *result set to NULL):
+ * only where `out` has the dtype and layout of the result NumPy would
+ * allocate (strides of extents > 1), so the reduction iterates exactly as
+ * without out=; VP_UNSUPPORTED otherwise. */
+int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
+                  int keepdims, PyObject* dtype, PyObject* identity, vp_array* out,
+                  vp_array** result, const char* site, char* err, size_t errlen);
+
+/* Issues ufunc.reduceat(in, indices, axis) for a binary ufunc without casts
+ * (in has the reduction loop's dtype: the caller casts first), as
+ * PyUFunc_Reduceat runs it (make_reduceat_kernel). `indices` (host data,
+ * nindices >= 1) must lie in [0, extent); the result has extent nindices
+ * along `axis` and the dense byte strides `out_strides` (NumPy's layout,
+ * computed by the caller; NULL: C order). Returns
+ * VP_UNSUPPORTED (reason in `err`) for an index out of range, a 0-d input,
+ * an empty result or a loop that is not available; the caller then falls
+ * back (and NumPy raises its errors). */
+int vp_reduceat(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, const int64_t* indices,
+                int nindices, const int64_t* out_strides, vp_array** result, const char* site,
+                char* err, size_t errlen);
+
+/* Issues ufunc.at(a, indices, values) in place on `a` with `loop` (every
+ * operand of a's dtype; vp_ufunc_loop): `indices` a 1-d int32/int64 array
+ * into a's first axis, `values` (NULL for a unary ufunc) broadcasting to
+ * indices.shape + a.shape[1:]. Runs as NumPy's ufunc_at without casts
+ * (make_at_kernel): repeated indices accumulate; an index out of bounds
+ * fails the op (AsyncIndexError) before anything is written. Returns
+ * VP_UNSUPPORTED (reason in `err`) for other operands. */
+int vp_ufunc_at(vp_runtime* rt, const vp_loop* loop, vp_array* a, vp_array* indices,
+                vp_array* values, const char* site, char* err, size_t errlen);
+
+/* Issues a generalized ufunc (`ufunc.signature` set: vecdot, matvec, vecmat,
+ * numpy.linalg's and numpy.fft's gufuncs) with NumPy's loop for exactly
+ * `dtypes` (nin inputs, then nout outputs), called as
+ * PyUFunc_GeneralizedFunctionInternal calls it (src/kernels/numpy_gufunc.hpp).
+ *  - Operands have their core axes last (the caller applies axes=/axis=).
+ *    `core_n[i]` is the number of core axes of operand i in the signature,
+ *    `core_axes` (concatenated) their label indices, or -1 - label for a
+ *    missing flexible dimension (`m?` of a 1-d matmul operand).
+ *  - `sizes` (nlabels entries, -1 if unknown) receives each label's size;
+ *    a label only an output has needs its size from the caller or `outs`.
+ *  - Inputs of another dtype are cast into copies first, laid out as
+ *    NumPy's iterator lays them out.
+ *  - outs == NULL or outs[0] == NULL: new outputs into results[0..nout), in
+ *    NumPy's iterator's layout, or, with order_n > 0, dense with their axes
+ *    in `out_order` (order_n entries, outermost first; every output has
+ *    order_n axes): numpy.fft allocates `out` with empty_like (order K).
+ *    Otherwise all outputs are given (in/out semantics, exactly the loop's
+ *    dtypes and the batch shape) and results[] are set to NULL.
+ *  - `invalid_error` (or NULL): the loop reports failure through the
+ *    floating-point invalid flag (numpy.linalg); the op then fails with this
+ *    message ("LinAlgError: Singular matrix").
+ *  - VP_GUFUNC_CHECK_FINITE in `flags`: the op fails with "LinAlgError: Array
+ *    must not contain infs or NaNs" if input 0 has a non-finite element,
+ *    before the loop runs (numpy.linalg's _assert_finite, eig/eigvals).
+ *  - VP_GUFUNC_SERIAL in `flags`: the loop calls of all ops with this flag
+ *    run one at a time (LAPACK on matrices OpenBLAS threads itself: several
+ *    threaded calls at once oversubscribe its threads).
+ *  - `work` sizes the op for the dispatch policy (element-wise op units).
+ * Returns VP_UNSUPPORTED (reason in `err`) where NumPy raises or copies an
+ * operand for another reason (misaligned, out= overlapping an input, out=
+ * of another dtype or shape, shapes that do not match); the caller then
+ * falls back to NumPy. */
+enum { VP_GUFUNC_CHECK_FINITE = 2, VP_GUFUNC_SERIAL = 4 };
+int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, int nout,
+              vp_array* const* outs, const vp_dtype* dtypes, const int* core_n,
+              const int* core_axes, int nlabels, int64_t* sizes, int flags, int order_n,
+              const int* out_order, const char* invalid_error, int64_t work, vp_array** results,
+              const char* site, char* err, size_t errlen);
+
 /* Issues np.matmul(a, b) (the `@` operator) with NumPy's matmul gufunc loop
  * for (t, t) -> t, where t is the dtype of both operands; the loop is
  * called with the strides NumPy's gufunc machinery passes, so it makes the
@@ -305,6 +436,20 @@ int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_arra
  * comes from vp_intern. */
 int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, char* err,
               size_t errlen);
+
+/* Issues a new array (*result) of `dtype` and `shape` (`ndim` dimensions)
+ * with the dense byte `strides` (NULL: C order) assembled from `nparts`
+ * parts: part i is the view of the result with `part_ndim[i]` dimensions,
+ * the shapes and byte strides at `part_shapes` / `part_strides` (all parts'
+ * dimensions one after the other) and the byte offset `part_offsets[i]` from
+ * the result's first element; srcs[i] (`dtype`, broadcastable to the part's
+ * shape) is copied into it. One task copies all parts in order (a later part
+ * overwrites an earlier one); elements no part covers are undefined. Used for
+ * concatenate, stack, tile, repeat, pad, roll, delete and insert. */
+int vp_place(vp_runtime* rt, vp_dtype dtype, int ndim, const int64_t* shape, const int64_t* strides,
+             int nparts, vp_array* const* srcs, const int* part_ndim, const int64_t* part_shapes,
+             const int64_t* part_strides, const int64_t* part_offsets, vp_array** result,
+             const char* site, char* err, size_t errlen);
 
 #ifdef __cplusplus
 }
