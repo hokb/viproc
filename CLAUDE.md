@@ -693,8 +693,10 @@ Rules:
 - **Floating-point errors:** loops report divide-by-zero, overflow and
   invalid via the thread-local FP status flags (unless
   `no_floatingpoint_errors`). Workers clear the flags before and read them
-  after each loop and store them on the instruction; the bridge applies
-  `np.errstate` semantics at the next sync point.
+  around each kernel; the op reports them under the `np.errstate` captured
+  at issue (`Kernel::fp_name()`: NumPy's name in the message): raise fails
+  the op (`AsyncFloatingPointError`), warnings/call/log/print are queued and
+  reported in the main thread at the issue site (error-handling.md, E8).
 - **Reductions** (`sum`, `prod`, `min`, `max`, `any`, `all`, …;
   `src/kernels/numpy_reduce.*`) use the binary loop resolved with
   `reduction=True` and `fixed_strides` = the inner strides, called with
@@ -1356,8 +1358,9 @@ Rules:
 - Python objects whose memory a task still uses are released only on the
   main thread with the GIL: a worker dropping the last reference parks
   the object in a graveyard drained at the next C ABI call.
-- Not implemented yet: FP-flag reporting to
-  Python (NumPy warnings / `np.errstate`).
+- FP errors (`np.errstate`: warnings, `FloatingPointError`, call/log/print)
+  are reported as NumPy reports them, under the errstate of the issuing
+  code (error-handling.md, E8).
 
 ## Conventions
 

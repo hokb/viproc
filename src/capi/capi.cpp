@@ -193,6 +193,30 @@ int vp_take_error(vp_runtime* rt, char* err, size_t errlen) {
     return VP_ERROR;
 }
 
+void vp_set_fp_mode(vp_runtime* rt, int mode, int ctx) {
+    rt->rt->set_fp_mode(FpMode{static_cast<std::uint16_t>(mode), static_cast<std::uint16_t>(ctx)});
+}
+
+int vp_take_fp_events(vp_runtime* rt, PyObject** out) {
+    std::vector<FpEvent> events = rt->rt->errors().take_fp();
+    PyObject* list = PyList_New(static_cast<Py_ssize_t>(events.size()));
+    if (list == nullptr) {
+        return -1;
+    }
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        const FpEvent& e = events[i];
+        PyObject* t = Py_BuildValue("(iiiiss)", e.report, e.status, static_cast<int>(e.mode.mode),
+                                    static_cast<int>(e.mode.ctx), e.name, e.issue_site.c_str());
+        if (t == nullptr) {
+            Py_DECREF(list);
+            return -1;
+        }
+        PyList_SET_ITEM(list, static_cast<Py_ssize_t>(i), t);
+    }
+    *out = list;
+    return static_cast<int>(events.size());
+}
+
 size_t vp_worker_count(const vp_runtime* rt) { return rt->rt->worker_count(); }
 size_t vp_active_tasks(const vp_runtime* rt) { return rt->rt->active_tasks(); }
 

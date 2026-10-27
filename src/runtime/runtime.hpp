@@ -206,6 +206,9 @@ class Runtime {
     std::size_t worker_count() const { return workers_.size(); }
     // The one store of failed ops' errors (see ErrorTable). Any thread.
     ErrorTable& errors() { return *errors_; }
+    // Main thread: NumPy's errstate for the ops issued from now on (the
+    // bridge sets it when the issuing code's errstate changes).
+    void set_fp_mode(FpMode m) { fp_mode_ = m; }
 
   private:
     void worker_loop();
@@ -230,6 +233,7 @@ class Runtime {
     std::shared_ptr<ErrorTable> errors_ = std::make_shared<ErrorTable>();
     OffloadPolicy policy_;     // main thread only
     std::uint64_t seq_ = 0;    // ops issued so far (main thread only)
+    FpMode fp_mode_;           // errstate of the ops issued now (main thread only)
     std::uint64_t direct_ = 0; // ... of which ran directly, without a task
     std::uint64_t syncs_ = 0;  // waits that found the array pending (main thread only)
     std::atomic<std::size_t> active_{0};

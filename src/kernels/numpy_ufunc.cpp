@@ -273,6 +273,10 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve_reduction(PyObject* ufunc, DType d
     return loop;
 }
 
+bool UfuncLoop::reports_fp_errors() const {
+    return static_cast<const UfuncCallInfoPrefix*>(info_)->no_floatingpoint_errors == 0;
+}
+
 bool UfuncLoop::requires_pyapi() const {
     return static_cast<const UfuncCallInfoPrefix*>(info_)->requires_pyapi != 0;
 }
@@ -379,7 +383,8 @@ int UfuncLoop::call_watched(char* const* data, const std::intptr_t* dims,
 
 void UfuncLoop::init_info(const char* suffix) {
     auto* uf = reinterpret_cast<PyUFuncObject*>(ufunc_);
-    name_ = std::string("numpy.") + (uf->name != nullptr ? uf->name : "?") + suffix;
+    ufunc_name_ = uf->name != nullptr ? uf->name : "?";
+    name_ = std::string("numpy.") + ufunc_name_ + suffix;
     interp_ = PyInterpreterState_Get();
     // NumPy's own `power` with a signed integer exponent only.
     static PyObject* power = [] {
@@ -521,6 +526,7 @@ class ElementwiseKernel : public Kernel {
   public:
     explicit ElementwiseKernel(const UfuncLoop* loop) : loop_(loop) {}
     const char* name() const override { return loop_->name(); }
+    const char* fp_name() const override { return loop_->fp_name(); }
 
     // Element-wise loops read element i before writing it: an output may
     // share an input's memory with the same layout (NumPy's out= / elision).
@@ -579,6 +585,7 @@ class AtKernel : public Kernel {
     explicit AtKernel(const UfuncLoop* loop)
         : loop_(loop), name_(std::string(loop->name()) + ".at") {}
     const char* name() const override { return name_.c_str(); }
+    const char* fp_name() const override { return loop_->fp_name(); }
     bool writes_all() const override { return false; }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
@@ -698,6 +705,7 @@ class IterElementwiseKernel : public Kernel {
 
     ~IterElementwiseKernel() override { pool_->give_back(iter_, clean_); }
     const char* name() const override { return loop_->name(); }
+    const char* fp_name() const override { return loop_->fp_name(); }
 
     bool in_place_ok() const override { return true; }
     // where=: masked-off elements of the output keep their values
@@ -897,6 +905,7 @@ class CastKernel : public Kernel {
   public:
     CastKernel(NpyIter* iter, DeferRelease defer) : iter_(iter), defer_(std::move(defer)) {}
     const char* name() const override { return "astype"; }
+    const char* fp_name() const override { return "cast"; }
 
     ~CastKernel() override {
         NpyIter* iter = iter_;

@@ -63,6 +63,12 @@ class UfuncLoop {
     bool raises_through_pyapi() const { return raises_through_pyapi_; }
     // "numpy.<ufunc>", "numpy.<ufunc>.reduce" for reduction loops.
     const char* name() const { return name_.c_str(); }
+    // The ufunc's own name ("divide"), as NumPy's FP error messages use it.
+    const char* ufunc_name() const { return ufunc_name_.c_str(); }
+    // NumPy checks the FP flags after the loop (no no_floatingpoint_errors).
+    bool reports_fp_errors() const;
+    // Kernel::fp_name() of the loop's element-wise / gufunc call.
+    const char* fp_name() const { return reports_fp_errors() ? ufunc_name() : nullptr; }
 
     int nin() const { return nin_; }
     // Element-wise kernel for this loop, shared by all tasks using it.
@@ -82,6 +88,7 @@ class UfuncLoop {
     bool raises_through_pyapi_ = false;
     PyInterpreterState* interp_ = nullptr;
     std::string name_;
+    std::string ufunc_name_;
     // At resolution, with the GIL: name_, raises_through_pyapi_, interp_.
     void init_info(const char* suffix);
     int call_watched(char* const* data, const std::intptr_t* dims,

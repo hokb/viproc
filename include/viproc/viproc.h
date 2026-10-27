@@ -80,6 +80,20 @@ int vp_error_pending(const vp_runtime* rt);
  * again here. */
 int vp_take_error(vp_runtime* rt, char* err, size_t errlen);
 
+/* [main thread] NumPy's errstate for the ops issued from now on: three bits
+ * per category (NumPy's UFUNC_ERR_* modes: 0 ignore, 1 warn, 2 raise, 3
+ * call, 4 print, 5 log), divide in bits 0-2, over 3-5, under 6-8, invalid
+ * 9-11; `ctx` names the bridge's call/log object (0: none). Ops record their
+ * FP errors under it (docs/design/error-handling.md, E8): raise fails the
+ * op (a "FloatingPointError: ..." error), the other modes queue an event,
+ * reported like an error (vp_error_pending, the error notifier). */
+void vp_set_fp_mode(vp_runtime* rt, int mode, int ctx);
+/* [main thread, GIL] Takes the queued FP events, in issue order: *out gets a
+ * new list of tuples (report bits, status bits, mode, ctx, name, issue site);
+ * FPE bits as NumPy's: 1 divide, 2 over, 4 under, 8 invalid. Returns their
+ * number, or -1 with a Python error. */
+int vp_take_fp_events(vp_runtime* rt, PyObject** out);
+
 /* Dispatch policy for ops whose inputs are all ready (call before issuing):
  * ops with fewer than `sync_below` output elements run inline on the calling
  * thread; above that, `adaptive` != 0 lets each issue site switch to inline

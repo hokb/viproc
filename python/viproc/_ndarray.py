@@ -26,6 +26,7 @@ AsyncError = _viproc.AsyncError
 AsyncIndexError = _viproc.AsyncIndexError
 AsyncValueError = _viproc.AsyncValueError
 AsyncLinAlgError = _viproc.AsyncLinAlgError
+AsyncFloatingPointError = _viproc.AsyncFloatingPointError
 
 # dtype <-> runtime dtype code (vp_dtype in viproc.h)
 _CODES = {
@@ -1824,6 +1825,83 @@ _viproc.setup(
     _getitem,
     _setitem,
 )
+
+# --- Floating-point errors (docs/design/error-handling.md, E8) -------------
+# The C side passes NumPy's errstate of the issuing code to every op
+# (_fp_mode packs it); ops report FP errors under that mode, and _report_fp
+# reports them in the main thread as NumPy's _error_handler would.
+
+_FP_MODES = {"ignore": 0, "warn": 1, "raise": 2, "call": 3, "print": 4, "log": 5}
+_FP_KINDS = ("divide by zero", "overflow", "underflow", "invalid value")
+_fp_calls = [None]  # ctx -> errstate call/log object (ctx 0: none)
+_fp_registries = {}  # file -> warnings registry of ops issued there (no module)
+
+
+def _fp_mode(d):
+    mode = 0
+    for i, k in enumerate(("divide", "over", "under", "invalid")):
+        mode |= _FP_MODES.get(d.get(k), 0) << (3 * i)
+    call = d.get("call")
+    if call is None:
+        return mode, 0
+    for i in range(len(_fp_calls) - 1, 0, -1):
+        if _fp_calls[i] is call:
+            return mode, i
+    if len(_fp_calls) >= 65535:  # the mode's ctx is 16 bits: reuse the last slot
+        _fp_calls[-1] = call
+        return mode, len(_fp_calls) - 1
+    _fp_calls.append(call)
+    return mode, len(_fp_calls) - 1
+
+
+def _site(site):
+    """(filename, lineno) of an issue site "file:line in func"."""
+    where = site.rsplit(" in ", 1)[0]
+    filename, _, line = where.rpartition(":")
+    try:
+        return filename, int(line)
+    except ValueError:
+        return site, 0
+
+
+def _report_fp(events):
+    for report, status, mode, ctx, name, site in events:
+        for i, kind in enumerate(_FP_KINDS):
+            if not report >> i & 1:
+                continue
+            m = mode >> (3 * i) & 7
+            msg = f"{kind} encountered in {name}"
+            if m == 1:
+                filename, lineno = _site(site)
+                module = None
+                for mod in list(sys.modules.values()):
+                    if getattr(mod, "__file__", None) == filename:
+                        module = mod
+                        break
+                if module is not None:
+                    registry = module.__dict__.setdefault("__warningregistry__", {})
+                    name_ = module.__name__
+                else:
+                    registry = _fp_registries.setdefault(filename, {})
+                    name_ = "__main__" if filename == getattr(
+                        sys.modules.get("__main__"), "__file__", None) else None
+                warnings.warn_explicit(msg, RuntimeWarning, filename, lineno, name_, registry)
+            elif m == 3 or m == 5:
+                call = _fp_calls[ctx] if ctx < len(_fp_calls) else None
+                if call is None:
+                    raise NameError(f"python callback specified for {kind} (in  {name}) "
+                                    "but no function found.")
+                if m == 3:
+                    call(kind, status)
+                else:
+                    call.write(f"Warning: {msg}\n")
+            elif m == 4:
+                print(f"Warning: {msg}", file=sys.stderr)
+
+
+_viproc.set_fp_reporting(np._core._multiarray_umath._extobj_contextvar,
+                         np._core._multiarray_umath._get_extobj_dict, _fp_mode, _report_fp)
+
 
 _hook = [False]  # enable_hook(): the operator hook is wanted (and installed)
 
