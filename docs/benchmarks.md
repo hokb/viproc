@@ -670,6 +670,78 @@ shape map, 2 runs each: geomean over all points above 2,048 elements
 of single cases between two runs of the same build: +-10-20%); the five
 sync-heavy cases in 3 alternating targeted runs 0.95-1.02.
 
+### Array pipelining: ILNumerics' loop demo (`array_pipelining.py`)
+
+ILNumerics' array-pipelining demo (getting-started part IV; code in
+ILNumerics/decentralized-array-execution-artifacts2026, Appendix "Part
+2a/2b Loop Parallelization") as plain NumPy code, run in module mode (the
+`np` of `python -m viproc`): `loop` is `C[i] = np.sum(np.abs(np.sin(A[:,
+i])), axis=0)` over the n columns of A (ILNumerics' `counter`, columns
+contiguous), `loop_dep` writes `C[0:i+1]` instead (every iteration
+overwrites all earlier results: only the original order is right),
+`vectorized` is `np.sum(np.abs(np.sin(A)), axis=0)`. "NumPy 4 threads" is
+the Parallel.For of the demo: a thread pool over column blocks of `loop`.
+Same 4-vCPU VM, median of 5-7 samples, every result bit-identical.
+
+| A | program | NumPy ms | NumPy 4 threads | viproc w=1 | w=2 | w=3 | w=4 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 200 x 200 | `loop` | 0.88 | 0.50x | 1.00x | 0.91x | 0.97x | 1.03x |
+| | `loop_dep` | 0.97 | – | 0.89x | 0.93x | 0.92x | 1.00x |
+| | `vectorized` | 0.35 | – | 0.62x | 1.83x | 2.42x | 3.37x |
+| 1000 x 1000 | `loop` | 12.0 | 0.18x | 1.06x | 1.05x | 1.09x | 1.04x |
+| | `loop_dep` | 12.4 | – | 1.09x | 1.04x | 0.93x | 0.99x |
+| | `vectorized` | 14.6 | – | 1.50x | 2.95x | 3.98x | 5.01x |
+| 1500 x 1500 | `loop` | 23.9 | 0.25x | 0.93x | 1.48x | 1.96x | 1.73x |
+| | `loop_dep` | 25.4 | – | 0.95x | 1.42x | 1.66x | 1.70x |
+| | `vectorized` | 32.7 | – | 1.39x | 2.04x | 3.18x | 3.39x |
+| 3000 x 3000 | `loop` | 87.8 | 0.46x | 0.86x | 1.69x | 2.43x | 2.47x |
+| | `loop_dep` | 95.7 | – | 1.01x | 1.72x | 2.30x | 2.79x |
+| | `vectorized` | 125 | – | 1.26x | 1.90x | 3.48x | 3.48x |
+
+`main` before this change (`9c238fc`), w=4: 1500 x 1500 `loop` 0.88x,
+`loop_dep` 0.91x (every `sin` of a 1,500-element column was below
+`sync_below` and ran directly on the main thread: no parallelism at all);
+3000 x 3000 `loop` 1.84x, `loop_dep` 2.27x.
+
+- **Fine-grained array ILP works and keeps the order.** The loops scale
+  without any annotation, and `loop_dep`, which a Parallel.For gets wrong,
+  scales like `loop`: the writes into C stay ordered through C's alias
+  group while the `sin`/`abs`/`sum` work of different iterations overlaps.
+- **Manual threading does not work in Python.** The thread pool is 2-5x
+  *slower* than plain NumPy: the per-column Python code holds the GIL, and
+  NumPy releases it only inside its loops.
+- **The limit is the main thread's issue rate.** One iteration issues 5
+  instructions (view, `sin`, `abs`, `sum`, assignment): ~22,000
+  instructions, ~7 µs on the main thread, against ~16 µs of NumPy work at
+  1,500 x 1,500. That caps the loop at ~2-2.5x on 4 cores; with 4 workers
+  the main thread also shares the 4 CPUs with them (w=3 is often as fast).
+  At 200 x 200 an iteration has ~4 µs of NumPy work: parity, no gain. At
+  1,000 x 1,000 a column's `sin` (~8 µs) is below the direct-path budget
+  (10 µs, see below): it runs on the main thread, 1.0x.
+- **Two changes made it scale:** (1) the direct path times each shared
+  loop kernel (ns per element) and sends an op estimated above 10 µs of
+  NumPy time to the task path even below `sync_below` (adaptive mode
+  only); (2) in module mode `np.sum`, `np.max`, ... of a viproc array skip
+  NumPy's `__array_function__` dispatch (`np.sum(x, axis=0)`: 15,100 →
+  8,800 instructions).
+
+Budget of the direct path, quick shape map `--module` (each run twice,
+geomean of the speedups per case): with 2 µs `ind_cores_f32` at 1,000
+elements fell 0.6x → 0.15x (float32 `sin` of 1,000 takes ~2.2 µs; the
+promoted op makes its cheap consumers tasks too), with 5 µs `expr8` at
+1,000 elements 1.0x → 0.6x; 10 µs has neither loss.
+
+Quick shape map `--module`, `main` (`9c238fc`, 2 runs) vs. this change
+(build `#498cac56`, 2 runs), 715 points, all bit-identical: geomean
+0.943 → 0.984, points below 0.8x 248 → 206; per group loops 0.76 → 0.85,
+reductions 1.20 → 1.33, independent 1.11 → 1.17, sync 0.80 → 0.85, the
+others ±2%; per size < 1,000 elements 0.76 → 0.79, 1,000-2,047
+0.87 → 0.94, larger 1.09 → 1.11 and 1.45 → 1.50. Single points vary a
+lot between processes (a chain of `cos` on 10,000 elements measured
+0.9x and 1.8x on the same build), so judge by the groups.
+`break_even.py` (sb=2048): `chains_sin` at 2,000 elements 1.48 → 1.79,
+cheap ops and reads right away unchanged.
+
 ## Other machines
 
 **Iterator copies taken when the kernel runs.** The shape map found
