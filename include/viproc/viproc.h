@@ -80,6 +80,20 @@ int vp_error_pending(const vp_runtime* rt);
  * again here. */
 int vp_take_error(vp_runtime* rt, char* err, size_t errlen);
 
+/* [main thread] NumPy's errstate for the ops issued from now on: three bits
+ * per category (NumPy's UFUNC_ERR_* modes: 0 ignore, 1 warn, 2 raise, 3
+ * call, 4 print, 5 log), divide in bits 0-2, over 3-5, under 6-8, invalid
+ * 9-11; `ctx` names the bridge's call/log object (0: none). Ops record their
+ * FP errors under it (docs/design/error-handling.md, E8): raise fails the
+ * op (a "FloatingPointError: ..." error), the other modes queue an event,
+ * reported like an error (vp_error_pending, the error notifier). */
+void vp_set_fp_mode(vp_runtime* rt, int mode, int ctx);
+/* [main thread, GIL] Takes the queued FP events, in issue order: *out gets a
+ * new list of tuples (report bits, status bits, mode, ctx, name, issue site);
+ * FPE bits as NumPy's: 1 divide, 2 over, 4 under, 8 invalid. Returns their
+ * number, or -1 with a Python error. */
+int vp_take_fp_events(vp_runtime* rt, PyObject** out);
+
 /* Dispatch policy for ops whose inputs are all ready (call before issuing):
  * ops with fewer than `sync_below` output elements run inline on the calling
  * thread; above that, `adaptive` != 0 lets each issue site switch to inline
@@ -295,6 +309,18 @@ int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* valu
  * has NumPy's layout (order K over the three inputs). */
 int vp_select(vp_runtime* rt, vp_array* cond, vp_array* x, vp_array* y, vp_array** result,
               const char* site, char* err, size_t errlen);
+
+/* Issues a sort (`arg` 0) or argsort (`arg` != 0) of `in` along `axis` with
+ * NumPy's per-dtype sort functions (src/kernels/numpy_sort.hpp); `kind` is
+ * NumPy's sort table index (0 the default, 2 stable; NumPy maps heapsort to
+ * 0). A sort writes a new array, dense with its axes in `out_order`
+ * (order_n == ndim entries, outermost first; order_n == 0: the layout of
+ * np.sort's copy, empty_like(in) in order K), or,
+ * with `in_place`, sorts `in` itself (`a.sort()`, *result NULL); an argsort
+ * gives a new C-ordered int64 array. Returns VP_UNSUPPORTED for other
+ * arguments. */
+int vp_sort(vp_runtime* rt, vp_array* in, int axis, int kind, int arg, int in_place, int order_n,
+            const int* out_order, vp_array** result, const char* site, char* err, size_t errlen);
 
 /* Issues argmax (`argmax` != 0) or argmin of `in` along its last axis with
  * NumPy's per-dtype functions, one call per row, as PyArray_ArgMax calls

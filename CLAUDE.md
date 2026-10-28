@@ -139,9 +139,17 @@ back to its top-level task loop and runs the consumer from there
 callback frame. Nested execution would build deep stacks along dependency
 chains and, on errors, hide where the failing op came from.
 
-If one completion unblocks several consumers, the completing thread runs
-one of them as its continuation; the others go to idle workers / the
-pool's queue.
+If one completion unblocks several consumers, the small ones (largest
+operand below `RuntimeOptions::local_below`, 65,536 elements) stay with
+the completing worker (its local queue, run next; a spinning idle worker
+steals them), the large ones go to the pool's queue (with no small one,
+the first large one is the continuation). Handing a small task to another
+worker cost a wake-up and moved its inputs to another core: `np.where`
+of three branches of 1e4 elements took 35 µs per iteration on 4 workers,
+13 µs on 1; now ~15 µs. Trade-off: a small side branch that would run
+in parallel on an idle core now waits behind its sibling (shape map
+`sum_cores` at 1e4: 2.6-2.9x -> 1.6-1.7x, `expr_where` 1.3-1.8x ->
+2.1-4.1x).
 
 Each task records its **issue site** (Python file, line and function,
 captured by the main thread at issue time). Errors from a task are
@@ -244,10 +252,10 @@ ownership, release or reuse of memory.
   inputs give an F-order result), and copy-on-write keeps the array's
   layout. Importing a non-contiguous NumPy array (`asarray`) copies it
   densely, in its axis order.
-- Memory is handed to plain NumPy for *writing* only inside an eager
-  fallback, after the buffer was made exclusive (no pending writer, no
-  task reader, no live export); exports to the user are read-only and
-  count as readers (`CountableArray::host_views`, design doc D7).
+- Memory is handed to plain NumPy only after its writer and task readers
+  are done; exports are writable aliases, and while one lives
+  (`CountableArray::host_views`) ops on that memory run synchronously
+  (design doc D7).
 
 ### Goals and non-goals
 
@@ -256,20 +264,29 @@ change is judged by; read it before design decisions. In short: G1, the
 central claim, is to find the parallel potential within and throughout
 large sections of regular, un-annotated NumPy programs automatically and
 feed parallel hardware with it (strong scaling, array ILP only); G2, results identical
-to NumPy; G3, **never slower than NumPy** (hard: never below 0.95x for any
-expression; soft: at most 3% slower where there is no sufficient
-parallel potential).
+to NumPy; G3, **as fast as possible within G2**: no avoidable cost (no pass
+over the data, no fallback for a supported op, fewest main-thread
+instructions; below 0.95x on large data is a defect); "never slower than
+NumPy" (never below 0.95x for any expression, at most 3% slower where there
+is no sufficient parallel potential) is the target, not a guarantee.
+**G2 has priority over G3:** both cannot always hold together, because the
+per-op layer comes on top of NumPy's own loops and small ops cannot hide it.
 
 **Bit-identical results are mandatory (currently).** Every change must keep
 results bit-identical to plain NumPy of the installed version (values,
 dtypes, shapes, strides, warnings, errors), as the drop-in rule demands
 (see "Conventions"). Never trade bit-identity for speed: no own kernels, no
 reordered sums, no fusion or splitting of an op that changes rounding. The
-small per-op overhead on small data that this costs is accepted. A
-configurable mode that allows deviating but correct results (further
-(auto-)parallelization, optimizations, auto-offloading, partial
-re-implementation of NumPy internals) is planned (goals.md, G2), not
-started; it would be opt-in, and the bit-identical mode stays available.
+small per-op overhead on small data that this costs is accepted; work it
+down, never at G2's expense. Bit-identity is the property of optimization
+level **O1**, the current implementation (array ILP only, NumPy executes
+every function). Planned levels (goals.md, "Optimization levels"), not
+started, each adding to the one below and computing correct but possibly
+deviating results: **O2** stage pipelining and BLAS threading removed,
+**O3** micro kernels (own, fused or split kernels, re-implemented NumPy
+internals), **O4** automatic device offloading. O1 stays available. Until
+a level is decided and built, every change is O1 and must stay
+bit-identical.
 
 ### Phase 1 (current): MVP on CPUs
 
@@ -314,13 +331,15 @@ execution.
 
 ```
 docs/design/           Design documents (decisions with rationale)
-  goals.md             goals, non-goals, never-slower rule (G1-G3), roadmap
+  goals.md             goals, non-goals, G2 (bit-identical) before G3 (speed), roadmap
   error-handling.md    run-time errors on any thread, asynchronous reporting
   memory-management.md ownership, release, pools, NumPy interop, COW
   pipelining.md        array stages, partial completion, pending sizes (roadmap)
   array-data-model.md  array data model: Array, Metadata (SD + task),
                        AliasGroup, CountableArray; lifecycle, checks per op,
                        figure (array-data-model.svg), evaluation
+docs/optimizations.md  every optimization: case, implementation, state, effect
+                       (done, open, shelved, rejected); keep it up to date
 docs/benchmarks.md     benchmark results: current breakdown per category and
                        case, progress per change, external machines,
                        shape map (images in docs/benchmarks/; reference
@@ -359,6 +378,8 @@ src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
   numpy_gufunc.*       generic gufunc kernel (vecdot, matvec, vecmat, matmul
                        with casts/out=): NumPy's gufunc loop called per inner
                        batch row as PyUFunc_GeneralizedFunctionInternal
+  numpy_sort.*         sort/argsort kernel: NumPy's per-dtype sort functions
+                       (ArrFuncs->sort/argsort), one call per row
 src/capi/capi.cpp      Implementation of the C ABI (library `viproc_capi`)
 src/viproc_python.h    the only way to include Python.h (MSVC debug fix)
 python/viproc/         Python package
@@ -386,6 +407,8 @@ python/viproc/         Python package
                        solve, cholesky, eig*, svd; AsyncLinAlgError)
   _fft.py              numpy.fft wrappers ported onto vp_gufunc (fft, rfft,
                        irfft, hfft, n-d transforms)
+  _sort.py             np.sort/np.argsort/a.sort beyond the C path (axis=None
+                       copies, kinds, NumPy's errors)
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -400,7 +423,8 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
   suite_cases.py       its cases (plain NumPy programs, width P, variants)
   suite_report.py      its Markdown / HTML reports, multi-run comparison
   shape_map.py         speedup vs. NumPy over rows x cols (2-d, log grid):
-                       median + IQR over cases per point, heatmap images
+                       median + IQR over cases per point, heatmap images,
+                       best/median/worst per point, outlier list
   shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync/
                        expressions/loops/control; --groups selects groups)
   shape_map_ilnumerics.py  the same map for ILNumerics Accelerator (vs. NumPy)
@@ -680,8 +704,10 @@ Rules:
 - **Floating-point errors:** loops report divide-by-zero, overflow and
   invalid via the thread-local FP status flags (unless
   `no_floatingpoint_errors`). Workers clear the flags before and read them
-  after each loop and store them on the instruction; the bridge applies
-  `np.errstate` semantics at the next sync point.
+  around each kernel; the op reports them under the `np.errstate` captured
+  at issue (`Kernel::fp_name()`: NumPy's name in the message): raise fails
+  the op (`AsyncFloatingPointError`), warnings/call/log/print are queued and
+  reported in the main thread at the issue site (error-handling.md, E8).
 - **Reductions** (`sum`, `prod`, `min`, `max`, `any`, `all`, …;
   `src/kernels/numpy_reduce.*`) use the binary loop resolved with
   `reduction=True` and `fixed_strides` = the inner strides, called with
@@ -709,9 +735,10 @@ Rules:
   (ufunc, input layout, axes, keepdims, `dtype=`, initial or not, buffer
   size) as a template over a dummy address (`ReduceTemplate`; the result
   NumPy allocates there gives viproc's result layout). Per op the main
-  thread only looks the template up and takes a finished copy from its
-  pool (`NpyIter_Copy` on a miss): no element memory, no address. The
-  task fills the initial values, points the copy at its buffers
+  thread only looks the template up (and makes one more copy while the
+  template has fewer than the kernel threads + 1, `IterTemplate::reserve`):
+  no element memory, no address. The task takes a copy from the template's
+  pool when it runs, fills the initial values, points the copy at its buffers
   (`NpyIter_ResetBasePointers(iter, base, &errmsg)`, no GIL) and runs
   NumPy's `reduce_loop`. 0-d inputs are iterated as 1-element 1-d ones:
   NumPy casts a 0-d input into a copy when it builds the iterator, which a
@@ -730,8 +757,8 @@ Rules:
   `PyDataType_GetArrFuncs(descr)->argmax` / `->argmin`
   (`int f(void *data, npy_intp n, npy_intp *index, void *arr)`).
 - **Linalg** (`_linalg.py`, `LINALG`): `det`, `slogdet`, `inv`, `solve`,
-  `cholesky`, `eig`, `eigh`, `eigvals`, `eigvalsh`, `svd` (not
-  `hermitian=True`), `svdvals`. NumPy's wrappers are ported: the same
+  `cholesky`, `eig`, `eigh`, `eigvals`, `eigvalsh`, `svd` (`hermitian=True`
+  as NumPy composes it: eigh, argsort, take_along_axis), `svdvals`. NumPy's wrappers are ported: the same
   argument checks (`LinAlgError` at the call), `_commonType` (computation
   in double/cdouble, the input cast first, results cast back), the same
   gufunc and signature, run through `vp_gufunc` (labels only outputs have,
@@ -743,7 +770,7 @@ Rules:
   `_assert_finite` (eig, eigvals) runs in the kernel before the loop
   (`VP_GUFUNC_CHECK_FINITE`), no sync. `qr` (its `qr_r_raw` writes its
   input), `lstsq` (data-dependent residual shape), `pinv`, `matrix_rank`,
-  `cond`, `matrix_power` and `svd(hermitian=True)` still fall back. Linalg
+  `cond` and `matrix_power` still fall back. Linalg
   loops call LAPACK, which OpenBLAS threads itself for larger matrices:
   matrices of >= 64 x 64 elements run one loop call at a time
   (`VP_GUFUNC_SERIAL`, a process-wide mutex; `_linalg.SERIAL_FROM`).
@@ -814,6 +841,33 @@ Rules:
   `abs(ifft(fft(A)))`) ran at 0.65x of NumPy for n = 100; with the plans
   an issue takes ~30 µs (2.7x at n = 100, 4.4-5.7x from n = 200 on 4
   cores). Fuzzed in `python/tests/test_fft.py`.
+- **Sort** (`src/kernels/numpy_sort.*`, `vp_sort`): `np.sort`,
+  `np.argsort`, `a.sort()`, `a.argsort()` on NumPy's per-dtype sort
+  functions (`PyDataType_GetArrFuncs(descr)->sort[kind]` /
+  `->argsort[kind]`: the introsort, timsort and radix sort instances
+  NumPy's sort ArrayMethods call, SIMD dispatch included). NumPy
+  (`_new_sortlike`, `_new_argsortlike`) sorts each row along the axis on
+  its own, in place when the row is contiguous and aligned, else through a
+  contiguous buffer; argsort fills 0..n-1 and sorts the indices by the
+  row. A row's result depends only on its values and the function, so the
+  kernel's calls give NumPy's results, also the order of equal elements,
+  NaNs and signed zeros. Kinds: quicksort and heapsort are table index 0
+  (NumPy 2 maps heapsort to its introsort), mergesort/stable/`stable=True`
+  2. `np.sort` is NumPy's `copy(order="K")` sorted in place: the result has
+  `empty_like(a)`'s layout (order K, computed in `vp_sort`); a dense input
+  is copied in one pass first, as NumPy does, then each row sorted in
+  place. argsort's result is C-ordered intp. `axis=None` sorts the
+  C-ordered flat copy (a reshape view where there is one). The common
+  calls (`a`, int `axis`, `kind`, `stable`, also `axis=None` of a
+  C-contiguous array) are parsed in C (`sort_call` in
+  `_Array.__array_function__`, `a.sort`/`a.argsort` as C methods) and
+  issued directly, small ready data on the direct path: `np.sort` of 10
+  elements 0.76 µs (NumPy 0.79), `np.argsort` 0.75 µs (NumPy 1.3),
+  `a.sort()` 0.6 µs (NumPy 0.38); the rest goes to `_sort.py`; `order=`
+  falls back. `partition`, `argpartition` and `searchsorted` stay on the
+  fallback: NumPy's introselect and binsearch functions are not reachable
+  through its C API (`get_partition_func`, `get_binsearch_func` are
+  internal). Fuzzed in `python/tests/test_sort.py`.
 - **Dtype semantics follow NumPy exactly:** promotion, `divide` on integers
   yielding `float64`, overflow wrap-around, NaN handling.
 - **Broadcasting and scalars:** NumPy broadcasting rules apply to all
@@ -873,7 +927,9 @@ Rules:
   (error-handling.md);
   scalar indexing returns NumPy's scalar if the array is ready, else a 0-d
   copy (no sync); `np.where(cond, x, y)` as a select task (NumPy's result
-  dtype, x and y cast to it, layout order K);
+  dtype, x and y cast to it, layout order K; dense rows branch-free: a
+  random condition mispredicts a branch per element, 1e4 elements 5 µs,
+  NumPy 40 µs);
   index assignment with basic keys (assign kernel, see below); **reductions** (NumPy ≥
   2.3): `ufunc.reduce` of reorderable ufuncs (add, multiply, minimum,
   maximum, fmin, fmax, logical and/or/xor, bitwise and/or/xor) and
@@ -958,8 +1014,8 @@ Rules:
   operands, empty advanced-index results, 0-d boolean indices,
   `ufunc.at`, other NumPy functions. NumPy's semantics exactly (design doc
   D7, "Eager fallbacks"): each viproc argument becomes a writable NumPy
-  view after `vp_array_prepare_write` (wait for producer and task readers,
-  copy-on-write if read-only exports are alive), so `out=`, mutating
+  view after `vp_array_prepare_write` (wait for producer and task
+  readers; live exports alias it), so `out=`, mutating
   functions (`np.put`, `np.place`, …) and overlap work in place. Results
   are mapped back: an argument returned as is → that viproc array; a view
   of an argument (by memory overlap) → a viproc view of its alias group
@@ -1107,9 +1163,10 @@ Rules:
   `base is None`. A view keeps its base alive, so a view of a temporary is
   not elided (NumPy's `can_elide_temp` needs OWNDATA too). The ones with a NumPy function
   form delegate to it (`a.clip(...)` is `np.clip(a, ...)`), so they take
-  the function's path; in-place ones without one (`sort`, `partition`,
-  `setfield`, `flat[...] = v`) run NumPy's method in the eager
-  fallback; `fill` is an assignment; `resize` is NumPy's `PyArray_Resize`
+  the function's path; `sort` is a task (`vp_sort`, in place); the other
+  in-place ones without a function form (`partition`, `setfield`,
+  `flat[...] = v`) run NumPy's method in the eager fallback; `fill` is an
+  assignment; `resize` is NumPy's `PyArray_Resize`
   ported (`_Array.resize` in C takes the reference count where NumPy takes
   it, `_resize_py` checks as NumPy does and raises NumPy's messages, taken
   from the installed NumPy once at import (their text changed in 2.5); the data step is a copy and a zero fill as tasks; the
@@ -1150,15 +1207,17 @@ Rules:
 - **Sync points:** `np.asarray(x)`, `x.numpy()`, printing, `float(x)`,
   `bool(x)`, scalar indexing, iteration, `x.wait()`, `viproc.wait_all()`.
 - **Conversions (design doc D7):** exports (`np.asarray(x)`, `x.numpy()`,
-  `__array__`) are copy-free **read-only** NumPy views; each counts as a
-  reader of the buffer (`host_views`) while it lives, so later in-place
-  writes to `x` copy-on-write and the export keeps its values (copy
-  semantics without a copy). Imports copy user-held NumPy arrays
-  (`asarray(nd)`, `v + nd`: the user may write `nd` later); fresh memory
-  (creation functions, fallback results that own their data and are no
-  argument) is adopted without a copy. Never give user code a writable
-  view of viproc memory: NumPy calls on an ndarray bypass viproc and race
-  with the workers (fallback exports are made read-only after the call).
+  `__array__`) are copy-free NumPy views of the same memory, writable
+  (read-only only for read-only arrays): aliases, as `np.asarray` of an
+  ndarray. Making one waits for the producer and the task readers; while
+  it lives (`host_views`) every op reading or writing that memory runs
+  synchronously, in place, no copy-on-write (`Runtime::issue`), so NumPy
+  code on the export never races with a worker. Imports copy user-held
+  NumPy arrays (`asarray(nd)`, `v + nd`: the user may write `nd` later)
+  unless nobody can write them (read-only over bytes or a read-only mmap)
+  or, for operators, they are temporaries; fresh memory (creation
+  functions, fallback results that own their data and are no argument) is
+  adopted without a copy.
 - **Hot path in C** (`_viproc._Array`): everything that runs once per op —
   `__array_ufunc__` for element-wise calls, `a[key]` for ready integer and
   basic keys, all Python operators (number
@@ -1229,10 +1288,15 @@ Rules:
   everything else (strided, reversed, broadcast, mixed orders, casts) runs
   on NumPy's iterator, set up as `execute_ufunc_loop` sets it up
   (`LoopCache::iter_elementwise`: a template per (loop, layouts, buffer
-  size) over a dummy address; per op a finished iterator of that template
-  from its pool, else an `NpyIter_Copy`; `NpyIter_ResetBasePointers` on
-  the worker; a fresh copy per op allocated its buffers on the worker and
-  released them later on the main thread, which kept that memory cold). Casts happen in the
+  size) over a dummy address; the kernel takes a copy from the template's
+  pool when it runs and gives it back after, so at most one copy per
+  thread that runs kernels exists, its buffers stay warm, and the main
+  thread only tops the pool up, `IterTemplate::reserve`;
+  `NpyIter_ResetBasePointers` on the worker). Before, each op took a copy
+  at issue: with up to 1,000 ops in flight the pool of 16 ran dry, and
+  nearly every op ran on a new copy whose buffers faulted in on the worker
+  (`bool * float64` of 1e4 elements, chained: 30-40 µs per op, NumPy 6-10;
+  now 5 µs). Casts happen in the
   iterator's buffers, or, for 0-d and short 1-d inputs, as a separate cast
   task first (NumPy's `check_for_trivial_loop` copies those).
 - **Measurements live in `docs/benchmarks.md`** (suite scores per change,
@@ -1274,7 +1338,11 @@ Rules:
   consumers they unblock to the pool, so the main thread keeps issuing.
   Workers run one unblocked consumer as their continuation.
 - Worker pool: at most one idle worker spins (50 µs, `pause`) before
-  sleeping; `enqueue()` wakes a sleeper only if nobody spins. This avoids a
+  sleeping; `enqueue()` wakes a sleeper only if nobody spins. While tasks
+  stream in (an `enqueue()` had to wake a sleeper), a spinner that finds
+  work hands the spinning to a sleeper, so the wake-up is a worker's cost,
+  not the issuing main thread's (4 chains of cheap ops: 3.6 -> 1.2 µs per
+  op); a spin that finds nothing ends the stream. This avoids a
   wake-up syscall per small task without taking cores from busy threads.
 - Sync points spin too: the main thread spins up to 50 µs (`kSyncSpin`,
   `pause`) for the producer's completion (`Runtime::wait`, `wait_all`)
@@ -1315,8 +1383,9 @@ Rules:
 - Python objects whose memory a task still uses are released only on the
   main thread with the GIL: a worker dropping the last reference parks
   the object in a graveyard drained at the next C ABI call.
-- Not implemented yet: FP-flag reporting to
-  Python (NumPy warnings / `np.errstate`).
+- FP errors (`np.errstate`: warnings, `FloatingPointError`, call/log/print)
+  are reported as NumPy reports them, under the errstate of the issuing
+  code (error-handling.md, E8).
 
 ## Conventions
 
@@ -1355,7 +1424,8 @@ Rules:
   optimizations until there is a benchmark that shows the need.
 - Measure success as strong scaling: benchmark whole array programs
   (fixed problem size) against plain NumPy at 1, 2, 4, … worker threads,
-  and check the never-slower rule (`docs/design/goals.md`, G3).
+  and check the speed rules (`docs/design/goals.md`, G3: no avoidable
+  cost; NumPy's speed as the target where there is nothing to overlap).
 - **Benchmark suite** (`python/benchmarks/suite.py`): the yardstick for
   changes that affect performance; run it before and after. Score =
   100 x geomean over categories of geomean(efficiency), efficiency =
@@ -1464,8 +1534,8 @@ code, comments, docs and commit messages in English.
       ideal 20 and is not comparable. `suite.py --workers 1,max,threads`
       measures 12 and 20 workers in one run.
 - [ ] Remaining per-op overhead on small data (`docs/design/goals.md`,
-      G3: never below 0.95x of NumPy, at most 3% slower without
-      sufficient parallel potential): `np.abs(x)` and other ufunc calls
+      G3 target, within G2: never below 0.95x of NumPy, at most 3% slower
+      without sufficient parallel potential): `np.abs(x)` and other ufunc calls
       on real NumPy pay NumPy's override dispatch (~2,000 instructions;
       module mode skips it), the direct path itself ~800 over NumPy's
       ufunc call (P4: operand vector, buffer refcounts), masked

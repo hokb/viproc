@@ -223,7 +223,7 @@ ErrorTable::Record* ErrorTable::find(std::uint64_t id) {
 }
 
 void ErrorTable::update_pending() {
-    bool any = dropped_ > 0;
+    bool any = dropped_ > 0 || !fp_events_.empty();
     for (const Record& r : records_) {
         any = any || !r.reported;
     }
@@ -292,8 +292,68 @@ std::optional<TaskError> ErrorTable::take(std::size_t* more) {
     std::erase_if(records_, [](const Record& r) { return r.refs == 0; });
     orphans_ = 0;
     dropped_ = 0;
-    pending_.store(false, std::memory_order_release);
+    pending_.store(!fp_events_.empty(), std::memory_order_release);
     return first;
+}
+
+void ErrorTable::record_fp(FpEvent e) {
+    bool was_pending;
+    {
+        std::lock_guard lock(mutex_);
+        if (fp_events_.size() >= kMaxFpEvents) {
+            return; // the main thread is far behind: NumPy's dedup would hide them anyway
+        }
+        fp_events_.push_back(std::move(e));
+        was_pending = pending_.exchange(true, std::memory_order_acq_rel);
+    }
+    if (!was_pending) {
+        if (auto fn = notify_.load(std::memory_order_acquire)) {
+            fn(notify_arg_);
+        }
+    }
+}
+
+std::vector<FpEvent> ErrorTable::take_fp() {
+    std::lock_guard lock(mutex_);
+    std::vector<FpEvent> events;
+    events.swap(fp_events_);
+    std::stable_sort(events.begin(), events.end(),
+                     [](const FpEvent& a, const FpEvent& b) { return a.id < b.id; });
+    update_pending();
+    return events;
+}
+
+ErrorRef report_fp_errors(ErrorTable& errors, const Kernel& kernel, int fe_flags, FpMode mode,
+                          const char* issue_site, std::uint64_t id) {
+    const char* name = kernel.fp_name();
+    if (mode.mode == 0 || name == nullptr) {
+        return {};
+    }
+    const int status =
+        ((fe_flags & FE_DIVBYZERO) != 0 ? 1 : 0) | ((fe_flags & FE_OVERFLOW) != 0 ? 2 : 0) |
+        ((fe_flags & FE_UNDERFLOW) != 0 ? 4 : 0) | ((fe_flags & FE_INVALID) != 0 ? 8 : 0);
+    static const char* const kinds[4] = {"divide by zero", "overflow", "underflow",
+                                         "invalid value"};
+    int report = 0;
+    for (int c = 0; c < 4; ++c) {
+        const int m = (mode.mode >> (3 * c)) & 7;
+        if ((status & (1 << c)) == 0 || m == 0) {
+            continue;
+        }
+        if (m == kFpRaise) {
+            if (report != 0) {
+                errors.record_fp(FpEvent{report, status, mode, name, issue_site, id});
+            }
+            return errors.record(TaskError{std::string("FloatingPointError: ") + kinds[c] +
+                                               " encountered in " + name,
+                                           issue_site, kernel.name(), id});
+        }
+        report |= 1 << c;
+    }
+    if (report != 0) {
+        errors.record_fp(FpEvent{report, status, mode, name, issue_site, id});
+    }
+    return {};
 }
 
 TaskError ErrorTable::raise_at_sync_point(const ErrorRef& ref) {
@@ -340,6 +400,8 @@ TaskList Task::execute(ErrorTable* errors) {
                 error_ = errors->record(
                     TaskError{std::move(r.message), issue_site_, kernel_->name(), id_});
             }
+        } else if (fp_flags_ != 0 && fp_mode_.mode != 0 && errors != nullptr) {
+            error_ = report_fp_errors(*errors, *kernel_, fp_flags_, fp_mode_, issue_site_, id_);
         }
     }
 

@@ -168,10 +168,10 @@ def test_partial_writes_after_copy_on_write_keep_the_other_elements():
         before = e.copy()
         write(e)
         y = viproc.asarray(x) * 1.07
-        exported = np.asarray(y)  # a reader of y's buffer while it lives
+        exported = np.asarray(y)  # an alias of y's memory while it lives
         write(y)
         assert np.array_equal(np.asarray(y), e)
-        assert np.array_equal(exported, before)
+        assert np.array_equal(exported, e)
         y = viproc.asarray(x) * 1.07
         t = y + 0.0  # a (possibly still pending) task reader
         write(y)

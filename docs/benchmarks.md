@@ -595,7 +595,107 @@ with the previous `y` still referenced) and `strong_scaling.py --workers 4
 Equal within noise; pool misses in the chains roughly halved (138 → 66
 over the run), the pool test's loop misses only on its first iteration.
 
+### Small unblocked tasks stay with the completing worker
+
+Same 4-vCPU VM, quick shape map, 6 runs before (`17c2e38`) / 3 after,
+all bit-identical. When a completion unblocks several tasks, those whose
+largest operand has fewer than 65,536 elements now run on the completing
+worker (a local queue; a spinning idle worker may steal them), larger ones
+go to the shared queue. Geomean speedup after / before over all points
+above 2,048 elements: 1.02. By group and size (<= 65,536 / larger):
+expressions 1.12 / 1.01, control 1.08 / 1.07, mixed 0.92 / 1.04,
+reductions 0.85 / 1.03, others 0.97-1.07. The trade-off in two cases
+(median speedup vs. NumPy, before -> after):
+
+| case | 100 x 100 | 1000 x 10 | 1000 x 100 | 1000 x 1000 |
+|---|---:|---:|---:|---:|
+| `expr_where` (branches join right away) | 1.82 -> 4.05 | 1.26 -> 2.11 | 2.50 -> 2.90 | 3.49 -> 3.22 |
+| `sum_cores` (`sum` is a side branch) | 2.91 -> 1.56 | 2.62 -> 1.69 | 2.95 -> 2.89 | 2.87 -> 2.67 |
+
+Where the unblocked tasks join soon (`np.where(c, a, b)` of three
+branches), another core only adds a wake-up and moves the data; where one
+of them starts an independent side branch (`s += np.sum(x)` next to the
+chain on `x`), an idle core would have run it in parallel. Waking a
+sleeper for local tasks (tried) gave up the `expr_where` gain (35 µs per
+iteration again) without restoring `sum_cores`. Suite (quick, 42
+configurations of the affected categories, 3 alternating runs each):
+geomean 1.02, within noise.
+
+### Break-even of the task path (`sync_below`)
+
+Same 4-vCPU VM, `python/benchmarks/break_even.py` (adaptive policy, best of
+7, bit-identical). Speedup vs. NumPy per element count when ready ops at
+or above `sync_below` become tasks (sb=200) and when they all take the
+direct path (sb=1e6); NumPy's time per op in brackets:
+
+| elements | `chains_sin` (4 chains of sin/cos) | `chains_add` (4 chains of `x * 0.5 + 1.0`) | `read_now` (`float((a * b).sum())`) |
+|---:|---|---|---|
+| 500 | 1.82 / 0.91 (1.8 µs) | 0.29 / 0.93 (0.8 µs) | 0.62 / 1.28 (1.0 µs) |
+| 1,000 | 2.32 / 0.93 (3.1 µs) | 0.36 / 1.02 (1.0 µs) | 0.59 / 0.82 (0.8 µs) |
+| 2,000 | 2.36 / 1.01 (5.7 µs) | 0.42 / 1.14 (1.2 µs) | 0.73 / 1.03 (1.3 µs) |
+| 4,000 | 4.32 / 1.32 (14 µs) | 0.40 / 1.15 (1.7 µs) | 0.88 / 1.26 (2.1 µs) |
+| 8,000 | 3.66 / 1.04 (22 µs) | 1.69 / 1.09 (2.5 µs) | 1.21 / 1.39 (3.6 µs) |
+
+The break-even is a time, not an element count: the task path pays off
+from about 2 µs of NumPy work per op, ~700 elements for `sin`, ~6,000 for
+`add`. Below it, cheap ops on the task path cost ~3 µs per op (2.5-3.5x
+slower than NumPy) and a result read right away up to 6x (deterministic
+policy, 200-500 elements). A lower element threshold (200 or 500) would
+win for expensive ops and lose more for cheap ones; a threshold per loop
+cost (estimated NumPy time per op) fits both.
+
+### Spinner hand-off while tasks stream in
+
+Same 4-vCPU VM, bit-identical. Where workers finish cheap ops faster than
+the main thread issues them (4 chains of `x * 0.5 + 1.0`, 4,000 elements,
+3-4 workers), every op is ready when issued: the one spinner takes it, and
+the next `enqueue()` finds no spinner and wakes a sleeper. That futex call
+on the main thread made an op cost 3.5-3.8 µs (main-thread CPU time, 1.0
+with 1 worker; NumPy 1.8). Now, once an `enqueue()` had to wake a sleeper
+(a stream), a spinner that finds work hands the spinning to a sleeper, so
+the wake-up is paid by a worker; a spin that finds nothing ends the
+stream. Without that condition, every pickup woke a worker on the critical
+path of sync-heavy loops (`converge`, `cond_newton`: -12%).
+
+| `break_even.py`, sb=200 | 500 | 1,000 | 2,000 | 4,000 | 8,000 |
+|---|---:|---:|---:|---:|---:|
+| `chains_add` before | 0.29 | 0.35 | 0.38 | 0.44 | 1.05 |
+| `chains_add` after | 0.50 | 0.70 | 0.84 | 1.29 | 2.31 |
+| `read_now` before | 0.17 | 0.27 | 0.57 | 0.70 | 0.60 |
+| `read_now` after | 0.47 | 0.53 | 0.70 | 0.90 | 1.02 |
+
+The break-even of cheap ops moves from ~7,000 to ~3,000 elements. Quick
+shape map, 2 runs each: geomean over all points above 2,048 elements
+1.003; independent medium (<= 65,536) 1.14, others 0.95-1.03 (noise level
+of single cases between two runs of the same build: +-10-20%); the five
+sync-heavy cases in 3 alternating targeted runs 0.95-1.02.
+
 ## Other machines
+
+**Iterator copies taken when the kernel runs.** The shape map found
+`expr_where` below 0.8x of NumPy from 3,000 to 100,000 elements (0.22-0.39x),
+from two defects: (1) ufunc ops with a cast on NumPy's iterator (bool or
+float32 with float64) ran 5-15x slower than NumPy when they ran
+asynchronously (`c * x`, 1e4 elements, chained: ~30-60 µs vs. NumPy 8 µs;
+direct path 6 µs): the iterator pool kept 16 iterators per template, the
+look-ahead has up to 1,000 ops in flight, so nearly every op got a fresh
+copy whose buffers faulted in on the worker (~15 page faults and ~25 µs
+system time per op). Fixed: kernels take a copy when they run and give it
+back after, the main thread keeps at most kernel threads + 1 copies per
+template (4-vCPU VM, chained ops of 1e4 elements, µs per op, before / after
+/ NumPy: `bool * float64` 31.7-38.5 / 5.1-5.9 / 5.7-10.0, `float32 *
+float64` 39.7-41.8 / 7.4 / 9.1-12.3, `int32 * float64` 31.5-36.2 / 3.7-4.9 /
+5.6-9.9, `x + x.sum(axis=1, keepdims=True)` of int32 100 x 200 45 / 16-19 /
+19; strided ops without a cast unchanged; main thread ~2,400 instructions
+less per op, no `NpyIter_Copy`; worker instructions unchanged); (2) the
+select kernel of `np.where` was slower than NumPy's `where` (1e4 elements,
+chained: 41-49 µs vs. 34 µs): a branch per element. Fixed: dense rows are
+selected branch-free (mask and blend per element word), 5.4 µs (NumPy
+40 µs, whose contiguous loop branches too). `expr_where` (4-vCPU VM, quick)
+after both fixes: 1e4 elements 0.42x -> 1.3-1.5x, 1e5 1.75-2.5x, 1e6 3.8x.
+What remains at 1e4 is the fan-out of tiny tasks to other workers: per
+iteration (5 ops) 13 µs with 1 worker, 35 µs with 4 (wake-ups, ~0.9 context
+switches per op; NumPy 53 µs).
 
 **i7-12700K, 20 logical cores (8 P-cores with HT + 4 E-cores), 31 GiB,
 NumPy 2.5.4, Docker Linux image, 97 cases (state of `2d4c915`):** score

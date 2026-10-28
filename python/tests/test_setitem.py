@@ -80,8 +80,8 @@ def test_setitem_matches_numpy(state):
         assert np.array_equal(np.asarray(a), e, equal_nan=True), (dtype, shape, key, value)
         if reader is not None:
             assert np.array_equal(np.asarray(reader), before + 0, equal_nan=True)
-        if export is not None:
-            assert np.array_equal(export, before, equal_nan=True)
+        if export is not None:  # an alias, as np.asarray of a NumPy array
+            assert np.array_equal(export, e, equal_nan=True)
 
 
 class _noop:
@@ -174,6 +174,7 @@ def test_recurrence_in_place_with_pending_readers_matches_numpy():
         assert np.array_equal(np.asarray(x), xn)
         for k, kn in zip(kept, kept_n):
             assert np.array_equal(np.asarray(k), kn)
-        e = np.asarray(x)  # an export keeps its values over later writes
+        e = np.asarray(x)  # an export is an alias, as in NumPy
         x[0] = -1.0
+        xn[0] = -1.0
         assert np.array_equal(e, xn) and np.asarray(x)[0, 0] == -1.0

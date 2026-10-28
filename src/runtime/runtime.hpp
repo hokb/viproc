@@ -125,6 +125,19 @@ struct RuntimeOptions {
     // Overrides the policy if set: true -> worker, false -> run immediately on
     // the main thread.
     ShouldOffload should_offload;
+    // Called on the main thread right before and after each blocking wait
+    // inside issue() (back-pressure, live exports): the Python bridge
+    // releases the GIL there, since a running task may need it
+    // (UfuncLoop::call_watched). Null: nothing to do.
+    void (*block_enter)() = nullptr;
+    void (*block_leave)() = nullptr;
+    // When a worker's completion makes several tasks runnable, those with
+    // fewer elements than this stay with that worker (its local
+    // queue) and run there next (Task::work: the largest operand): handing one to another worker
+    // costs a wake-up and moves its inputs to another core, more than it computes. Larger ones go
+    // to the shared queue. A spinning (idle) worker takes local tasks over from busy ones. 0: all
+    // go to the shared queue.
+    std::int64_t local_below = 65536;
 };
 
 class Runtime {
@@ -206,9 +219,11 @@ class Runtime {
     std::size_t worker_count() const { return workers_.size(); }
     // The one store of failed ops' errors (see ErrorTable). Any thread.
     ErrorTable& errors() { return *errors_; }
+    // Main thread: NumPy's errstate for the ops issued from now on (the
+    // bridge sets it when the issuing code's errstate changes).
+    void set_fp_mode(FpMode m) { fp_mode_ = m; }
 
   private:
-    void worker_loop();
     // Executes `task` on the current thread and returns its runnable consumers.
     TaskList run(const std::shared_ptr<Task>& task);
     void enqueue(std::shared_ptr<Task> task);
@@ -230,6 +245,7 @@ class Runtime {
     std::shared_ptr<ErrorTable> errors_ = std::make_shared<ErrorTable>();
     OffloadPolicy policy_;     // main thread only
     std::uint64_t seq_ = 0;    // ops issued so far (main thread only)
+    FpMode fp_mode_;           // errstate of the ops issued now (main thread only)
     std::uint64_t direct_ = 0; // ... of which ran directly, without a task
     std::uint64_t syncs_ = 0;  // waits that found the array pending (main thread only)
     std::atomic<std::size_t> active_{0};
@@ -242,15 +258,35 @@ class Runtime {
     // Pool queue. Idle workers spin for a short while (checking `queued_`
     // without the lock) before they sleep on `queue_cv_`; enqueue() wakes a
     // sleeper only if no worker is spinning, so a stream of small tasks does
-    // not cost a wake-up syscall per task.
+    // not cost a wake-up syscall per task. Once an enqueue() found no spinner
+    // and had to wake a sleeper (`stream_`: tasks arrive faster than one
+    // spinner takes them), a spinner that finds work hands the role to a
+    // sleeper (`spin_wanted_`, set under `queue_mutex_`), so the next
+    // enqueue() again finds a spinner: the wake-up is paid by a worker, not
+    // by the issuing main thread. A spin that finds nothing ends the stream;
+    // without one, a hand-off would only delay the task the spinner found.
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Task>> queue_;
     std::atomic<std::size_t> queued_{0};
     std::atomic<int> spinning_{0};
     std::atomic<int> sleeping_{0};
+    std::atomic<bool> stream_{false};
+    bool spin_wanted_ = false; // guarded by queue_mutex_
     bool stopping_ = false;
     std::shared_ptr<Task> try_pop();
+    // Per worker: unblocked small tasks (RuntimeOptions::local_below). The
+    // owner pushes and pops at the back (most recent: its inputs are hot),
+    // a spinning worker steals from the front. `local_` counts all of them.
+    struct LocalQueue {
+        std::mutex mutex;
+        std::deque<std::shared_ptr<Task>> tasks;
+    };
+    std::vector<std::unique_ptr<LocalQueue>> locals_;
+    std::atomic<std::size_t> local_{0};
+    std::shared_ptr<Task> pop_local(std::size_t worker);
+    std::shared_ptr<Task> steal(std::size_t thief);
+    void worker_loop(std::size_t id);
     std::vector<std::thread> workers_;
 };
 

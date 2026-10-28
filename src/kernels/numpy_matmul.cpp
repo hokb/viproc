@@ -38,6 +38,7 @@ class MatmulKernel : public Kernel {
   public:
     explicit MatmulKernel(const UfuncLoop* loop) : loop_(loop) {}
     const char* name() const override { return loop_->name(); }
+    const char* fp_name() const override { return loop_->fp_name(); }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Layout& a = inputs[0].layout();

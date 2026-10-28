@@ -17,7 +17,7 @@ import sys
 import warnings
 import weakref
 
-import numpy as np
+import numpy as np  # imports the real NumPy, not viproc
 from numpy.lib.array_utils import normalize_axis_index, normalize_axis_tuple
 
 from . import _viproc
@@ -26,6 +26,7 @@ AsyncError = _viproc.AsyncError
 AsyncIndexError = _viproc.AsyncIndexError
 AsyncValueError = _viproc.AsyncValueError
 AsyncLinAlgError = _viproc.AsyncLinAlgError
+AsyncFloatingPointError = _viproc.AsyncFloatingPointError
 
 # dtype <-> runtime dtype code (vp_dtype in viproc.h)
 _CODES = {
@@ -150,8 +151,8 @@ class _Host:
     (design doc D7, "Eager fallbacks").
 
     Each viproc argument becomes a *writable* NumPy view of its buffer, made
-    exclusive first (export(a, True): waits for pending writers and readers,
-    copies-on-write if read-only exports of it are alive). NumPy code then
+    exclusive first (export(a, True): waits for pending writers and readers;
+    live exports are aliases and see the writes, as NumPy's views). NumPy code then
     reads and writes viproc memory as it would an ndarray's: in-place
     functions, ``out=`` and overlap handling are NumPy's own. Results are
     mapped back: an argument returned as is -> that viproc array; a view of
@@ -185,7 +186,6 @@ class _Host:
                 x._warn_on_write = False
                 if isinstance(x.base, ndarray):
                     x.base._warn_on_write = False
-            e.flags.writeable = False  # in case NumPy code kept a reference
         return r
 
     def _map(self, r):
@@ -1177,12 +1177,12 @@ class ndarray(_viproc._Array):
 
     # --- sync points ----------------------------------------------------------
     def numpy(self):
-        """Sync point: the data as a read-only NumPy array, without a copy.
-
-        The NumPy array keeps the values it shows: later writes to this
-        viproc array go to a new buffer (copy-on-write). Use ``np.array(x)``
-        or ``x.numpy().copy()`` for a writable copy."""
-        return _viproc.export(self)
+        """Sync point: the data as a NumPy array over the same memory, without
+        a copy, as ``np.asarray`` of a NumPy array gives the array itself:
+        writes through either show in the other (read-only only for
+        read-only arrays). While it lives, ops on this array's memory run
+        synchronously (memory-management.md, D7)."""
+        return _viproc.export(self, True)
 
     def __array__(self, dtype=None, copy=None):
         arr = self.numpy()
@@ -1254,7 +1254,8 @@ class ndarray(_viproc._Array):
             return None
         handler = (_REDUCTIONS.get(func) or _VIEW_HANDLERS.get(func) or _PRODUCTS.get(func)
                    or _COMPOSITIONS.get(func) or _JOINING.get(func) or _INDEXING.get(func)
-                   or _ACCUMULATING.get(func) or _LINALG.get(func) or _FFT.get(func))
+                   or _ACCUMULATING.get(func) or _LINALG.get(func) or _FFT.get(func)
+                   or _SORTING.get(func))
         if handler is not None:
             try:
                 r = handler(*args, **kwargs)
@@ -1379,8 +1380,6 @@ class ndarray(_viproc._Array):
     def nonzero(self):
         return np.nonzero(self)
 
-    def argsort(self, *args, **kwargs):
-        return np.argsort(self, *args, **kwargs)
 
     def argpartition(self, *args, **kwargs):
         return np.argpartition(self, *args, **kwargs)
@@ -1403,7 +1402,11 @@ class ndarray(_viproc._Array):
     def repeat(self, repeats, axis=None):
         return np.repeat(self, repeats, axis)
 
-    def sort(self, *args, **kwargs):
+    # sort and argsort are _Array's C methods (vp_sort); this is the Python
+    # path behind sort.
+    def _sort_py(self, *args, **kwargs):
+        if _sort.sort_in_place(self, *args, **kwargs):
+            return
         _host_call(lambda a, *ar, **kw: a.sort(*ar, **kw), (self,) + args, kwargs)
 
     def partition(self, *args, **kwargs):
@@ -1770,6 +1773,82 @@ _viproc.setup(
     _setitem,
 )
 
+# --- Floating-point errors (docs/design/error-handling.md, E8) -------------
+# The C side passes NumPy's errstate of the issuing code to every op
+# (_fp_mode packs it); ops report FP errors under that mode, and _report_fp
+# reports them in the main thread as NumPy's _error_handler would.
+
+_FP_MODES = {"ignore": 0, "warn": 1, "raise": 2, "call": 3, "print": 4, "log": 5}
+_FP_KINDS = ("divide by zero", "overflow", "underflow", "invalid value")
+_fp_calls = [None]  # ctx -> errstate call/log object (ctx 0: none)
+_fp_registries = {}  # file -> warnings registry of ops issued there (no module)
+
+
+def _fp_mode(d):
+    mode = 0
+    for i, k in enumerate(("divide", "over", "under", "invalid")):
+        mode |= _FP_MODES.get(d.get(k), 0) << (3 * i)
+    call = d.get("call")
+    if call is None:
+        return mode, 0
+    for i in range(len(_fp_calls) - 1, 0, -1):
+        if _fp_calls[i] is call:
+            return mode, i
+    if len(_fp_calls) >= 65535:  # the mode's ctx is 16 bits: reuse the last slot
+        _fp_calls[-1] = call
+        return mode, len(_fp_calls) - 1
+    _fp_calls.append(call)
+    return mode, len(_fp_calls) - 1
+
+
+def _site(site):
+    """(filename, lineno) of an issue site "file:line in func"."""
+    where = site.rsplit(" in ", 1)[0]
+    filename, _, line = where.rpartition(":")
+    try:
+        return filename, int(line)
+    except ValueError:
+        return site, 0
+
+
+def _report_fp(events):
+    for report, status, mode, ctx, name, site in events:
+        for i, kind in enumerate(_FP_KINDS):
+            if not report >> i & 1:
+                continue
+            m = mode >> (3 * i) & 7
+            msg = f"{kind} encountered in {name}"
+            if m == 1:
+                filename, lineno = _site(site)
+                module = None
+                for mod in list(sys.modules.values()):
+                    if getattr(mod, "__file__", None) == filename:
+                        module = mod
+                        break
+                if module is not None:
+                    registry = module.__dict__.setdefault("__warningregistry__", {})
+                    name_ = module.__name__
+                else:
+                    registry = _fp_registries.setdefault(filename, {})
+                    name_ = "__main__" if filename == getattr(
+                        sys.modules.get("__main__"), "__file__", None) else None
+                warnings.warn_explicit(msg, RuntimeWarning, filename, lineno, name_, registry)
+            elif m == 3 or m == 5:
+                call = _fp_calls[ctx] if ctx < len(_fp_calls) else None
+                if call is None:
+                    raise NameError(f"python callback specified for {kind} (in  {name}) "
+                                    "but no function found.")
+                if m == 3:
+                    call(kind, status)
+                else:
+                    call.write(f"Warning: {msg}\n")
+            elif m == 4:
+                print(f"Warning: {msg}", file=sys.stderr)
+
+
+_viproc.set_fp_reporting(np._core._multiarray_umath._extobj_contextvar,
+                         np._core._multiarray_umath._get_extobj_dict, _fp_mode, _report_fp)
+
 
 def wait_all():
     """Sync point: wait until all issued ops have completed."""
@@ -1845,5 +1924,7 @@ from ._join import JOINING as _JOINING  # noqa: E402
 from ._indexing import INDEXING as _INDEXING  # noqa: E402
 from ._linalg import LINALG as _LINALG  # noqa: E402
 from ._fft import FFT as _FFT  # noqa: E402
+from . import _sort  # noqa: E402
+from ._sort import SORTING as _SORTING  # noqa: E402
 from . import _ufuncs  # noqa: E402
 from ._ufuncs import ACCUMULATING as _ACCUMULATING  # noqa: E402

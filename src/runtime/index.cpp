@@ -275,6 +275,31 @@ class MaskAssignKernel : public Kernel {
     }
 };
 
+// Branch-free select of `n` contiguous elements of N bytes: the condition
+// of np.where is random data as often as not, and a branch per element
+// mispredicts (NumPy's contiguous loop is branch-free too).
+template <std::size_t N>
+void select_dense(const char* cond, const char* x, const char* y, char* out, std::intptr_t n) {
+    using W = std::conditional_t<N == 1, std::uint8_t,
+                                 std::conditional_t<N == 4, std::uint32_t, std::uint64_t>>;
+    constexpr std::size_t words = N <= 8 ? 1 : N / 8;
+    constexpr std::size_t step = N <= 8 ? N : 8;
+    for (std::intptr_t i = 0; i < n; ++i) {
+        const W m = static_cast<W>(-static_cast<W>(cond[i] != 0));
+        for (std::size_t k = 0; k < words; ++k) {
+            const std::size_t at = static_cast<std::size_t>(i) * N + k * step;
+            W a;
+            W b;
+            std::memcpy(&a, x + at, step);
+            std::memcpy(&b, y + at, step);
+            const W r = static_cast<W>((a & m) | (b & static_cast<W>(~m)));
+            std::memcpy(out + at, &r, step);
+        }
+    }
+}
+
+template <std::size_t N> constexpr std::size_t item_size_of(CopyElement<N>) { return N; }
+
 class SelectKernel : public Kernel {
   public:
     const char* name() const override { return "numpy.where"; }
@@ -291,6 +316,11 @@ class SelectKernel : public Kernel {
         with_copy(item, [&](auto copy) {
             for_each_row(out.shape, layouts, std::move(base),
                          [copy](char** p, std::intptr_t n, const std::intptr_t* st) {
+                             constexpr auto N = item_size_of(decltype(copy){});
+                             if (st[0] == 1 && st[1] == N && st[2] == N && st[3] == N) {
+                                 select_dense<N>(p[0], p[1], p[2], p[3], n);
+                                 return true;
+                             }
                              for (std::intptr_t i = 0; i < n; ++i) {
                                  const char* src =
                                      p[0][i * st[0]] != 0 ? p[1] + i * st[1] : p[2] + i * st[2];

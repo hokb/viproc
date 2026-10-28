@@ -23,10 +23,12 @@ Usage:
 
 Writes DIR/shape_map.json, DIR/shape_map.md and, with matplotlib installed,
 DIR/shape_map.png (median and spread), DIR/shape_map_groups.png (median
-per case group) and one DIR/shape_map_<class>.png per complexity class
+per case group), one DIR/shape_map_<class>.png per complexity class
 (shape_map_cases.CLASSES: single ops, chains without and with binary ops,
 whole algorithms): the class median with its spread and every case of the
-class on its own.
+class on its own, DIR/shape_map_extremes.png (best, median and worst case
+per point) and DIR/shape_map_outliers.md (the slowest measurements, and per
+case the points below 0.95x).
 """
 
 import argparse
@@ -232,6 +234,8 @@ def labels(run):
     out.update(run.get("labels") or {})
     if out["header"] is None:
         m = run["machine"]
+        if m.get("module"):
+            out["title"] += " (viproc arrays, viproc module)"
         out["header"] = (f"{m['cpu']}, {m['cores']} cores, {m['workers']} workers, "
                          f"NumPy {m['numpy']}, build {m['build']}")
     return out
@@ -542,6 +546,123 @@ def plot_classes(run, out_dir, cmap, norm, ticks):
     return files
 
 
+def _by_point(run):
+    """Per grid point (tuple of the shape): its measurements."""
+    out = {}
+    for r in run["results"]:
+        out.setdefault(tuple(r["shape"]), []).append(r)
+    return out
+
+
+def write_outliers(run, path, below=0.95, top=40):
+    """The measurements furthest below parity, and per case where it falls below."""
+    lb = labels(run)
+    sub_, base = lb["subject"], lb["baseline"]
+    res = run["results"]
+    worst = sorted(res, key=lambda r: r["speedup"])[:top]
+    lines = [f"# {lb['title']}: outliers", "", f"{lb['header']}.", "",
+             f"Speedup = {base} time / {sub_} time; per measurement the time of one "
+             "repetition of the case (`reps` per run).", "",
+             f"## The {top} slowest measurements", "",
+             "| # | case | group | shape | elements | speedup | NumPy µs/rep | "
+             f"{sub_} µs/rep | fallbacks |", "|---:|---|---|---|---:|---:|---:|---:|---:|"]
+    for k, r in enumerate(worst, 1):
+        shape = "x".join(map(str, r["shape"])) or "0-d"
+        lines.append(f"| {k} | {r['case']} | {r['group']} | {shape} | {r['elements']:,} | "
+                     f"**{r['speedup']:.2f}** | {r['numpy_s'] / r['reps'] * 1e6:.1f} | "
+                     f"{r['viproc_s'] / r['reps'] * 1e6:.1f} | {r['fallbacks']} |")
+    cases = {}
+    for r in res:
+        cases.setdefault(r["case"], []).append(r)
+    rows = []
+    for name, rs in cases.items():
+        bad = [r for r in rs if r["speedup"] < below]
+        w = min(rs, key=lambda r: r["speedup"])
+        big = [r["speedup"] for r in rs if r["elements"] > 2048]
+        geo = math.exp(sum(map(math.log, big)) / len(big)) if big else float("nan")
+        rows.append((len(bad), w["speedup"], name, rs[0]["group"], len(rs), w, geo, bad))
+    rows.sort(key=lambda t: (-t[0], t[1]))
+    lines += ["", f"## Cases below {below}x", "",
+              f"Per case: grid points below {below}x, the worst one, the geometric mean over "
+              "the points above 2,048 elements and the element counts of the points "
+              f"below {below}x.", "",
+              f"| case | group | points < {below}x | worst | at | geomean > 2,048 el. | "
+              f"elements below {below}x |", "|---|---|---:|---:|---|---:|---|"]
+    for n, wv, name, group, total, w, geo, bad in rows:
+        if n == 0:
+            continue
+        at = "x".join(map(str, w["shape"])) or "0-d"
+        els = ", ".join(f"{e:,}" for e in sorted({r["elements"] for r in bad}))
+        lines.append(f"| {name} | {group} | {n} / {total} | **{wv:.2f}** | {at} | "
+                     f"{geo:.2f} | {els} |")
+    clean = [name for n, _, name, *_ in rows if n == 0]
+    if clean:
+        lines += ["", f"Never below {below}x: " + ", ".join(sorted(clean)) + "."]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
+def plot_extremes(run, out_dir):
+    """Best, median and worst case per grid point, with the case names."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+    except ImportError:
+        return []
+    m = run["machine"]
+    lb = labels(run)
+    xe, ye = _edges(m["cols"]), _edges(m["rows"])
+    cmap = LinearSegmentedColormap.from_list("speedup", [SLOW, MID, FAST])
+    cmap.set_bad("#ffffff")
+    top = max(math.log10(2 * m["workers"]), 0.5)
+    norm = TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=top)
+    pts = _by_point(run)
+    shape = (len(m["rows"]), len(m["cols"]))
+
+    def pick(f):
+        z = np.full(shape, np.nan)
+        names = np.full(shape, "", dtype=object)
+        for i, r in enumerate(m["rows"]):
+            for j, c in enumerate(m["cols"]):
+                rs = pts.get((r, c))
+                if rs:
+                    v = f(rs)
+                    z[i, j], names[i, j] = v["speedup"], v["case"]
+        return z, names
+
+    best = pick(lambda rs: max(rs, key=lambda r: r["speedup"]))
+    worst = pick(lambda rs: min(rs, key=lambda r: r["speedup"]))
+    med = _grid(run, lambda p: p["median"])
+    fig, axs = plt.subplots(1, 3, figsize=(24, 8.2), facecolor="white", layout="constrained")
+    panels = [("Best case per point", best[0], best[1]),
+              (f"Median over {m['cases']} cases", med, None),
+              ("Worst case per point", worst[0], worst[1])]
+    for ax, (title, z, names) in zip(axs, panels):
+        mesh = ax.pcolormesh(xe, ye, np.log10(z), cmap=cmap, norm=norm)
+        _axes(ax, run, title)
+        if names is None:
+            _annotate(ax, run, np.log10(z), lambda i, j, z=z: f"{z[i, j]:.2f}x", cmap, norm,
+                      fontsize=8)
+        else:
+            _annotate(ax, run, np.log10(z),
+                      lambda i, j, z=z, n=names: f"{z[i, j]:.2f}x\n{n[i, j]}", cmap, norm,
+                      fontsize=5.5)
+    ticks = [t for t in (0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32) if -1 <= math.log10(t) <= top]
+    cb = fig.colorbar(mesh, ax=axs, ticks=[math.log10(t) for t in ticks], shrink=0.8)
+    cb.ax.set_yticklabels([f"{t:g}x" for t in ticks], fontsize=8)
+    cb.outline.set_visible(False)
+    fig.suptitle(f"{lb['subject']} vs. {lb['baseline']}: {lb['header']}", color=MUTED,
+                 fontsize=9, x=0.01, ha="left")
+    path = os.path.join(out_dir, f"{lb['prefix']}_extremes.png")
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return [path]
+
+
 def main():
     warnings.simplefilter("ignore", RuntimeWarning)
     np.seterr(all="ignore")
@@ -558,7 +679,8 @@ def main():
                    help="comma-separated case groups (default: all); with --plot: report "
                         "only these groups of the run")
     p.add_argument("--module", action="store_true",
-                   help="viproc runs call np.* through the viproc module (python -m viproc)")
+                   help="viproc runs call np.* through the viproc module on viproc arrays "
+                        "(python -m viproc)")
     p.add_argument("--plot", metavar="SHAPE_MAP_JSON", help="only redraw the reports of a run")
     p.add_argument("--reference", action="store_true",
                    help="allow --out to replace results committed to git (reference runs)")
@@ -574,7 +696,8 @@ def main():
         with open(os.path.join(args.out, "shape_map.json"), "w", encoding="utf-8") as f:
             json.dump(run, f, indent=1)
     write_markdown(run, os.path.join(args.out, "shape_map.md"))
-    files = plot(run, args.out)
+    files = plot(run, args.out) + plot_extremes(run, args.out)
+    files.append(write_outliers(run, os.path.join(args.out, "shape_map_outliers.md")))
     print(f"written: {args.out}/shape_map.md" + "".join(f", {f}" for f in files))
     if not all(r["identical"] for r in run["results"]):
         sys.exit(1)
