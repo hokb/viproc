@@ -338,6 +338,8 @@ docs/design/           Design documents (decisions with rationale)
   array-data-model.md  array data model: Array, Metadata (SD + task),
                        AliasGroup, CountableArray; lifecycle, checks per op,
                        figure (array-data-model.svg), evaluation
+docs/optimizations.md  every optimization: case, implementation, state, effect
+                       (done, open, shelved, rejected); keep it up to date
 docs/benchmarks.md     benchmark results: current breakdown per category and
                        case, progress per change, external machines,
                        shape map (images in docs/benchmarks/; reference
@@ -421,7 +423,8 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
   suite_cases.py       its cases (plain NumPy programs, width P, variants)
   suite_report.py      its Markdown / HTML reports, multi-run comparison
   shape_map.py         speedup vs. NumPy over rows x cols (2-d, log grid):
-                       median + IQR over cases per point, heatmap images
+                       median + IQR over cases per point, heatmap images,
+                       best/median/worst per point, outlier list
   shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync/
                        expressions/loops/control; --groups selects groups)
   shape_map_ilnumerics.py  the same map for ILNumerics Accelerator (vs. NumPy)

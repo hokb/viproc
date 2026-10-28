@@ -390,7 +390,7 @@ never reuses an exported buffer (`has_readers()` counts host views). When
 `np.array(v)`, `__array__(copy=True)` and `v.numpy().copy()` give a copy;
 `dtype=` casts (one copy).
 
-Decision (hook mode, user's choice "exactly as NumPy"): earlier exports
+Decision (the maintainer's choice "exactly as NumPy"): earlier exports
 were read-only and copy-on-write kept their values: cheaper for a writer,
 but not NumPy's semantics (`b = np.asarray(v); b[0] = 1` raised, and
 `v += 1` did not show in `b`). Read-only exports made libraries that write
