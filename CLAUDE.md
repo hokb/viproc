@@ -427,6 +427,9 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
                        best/median/worst per point, outlier list
   shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync/
                        expressions/loops/control; --groups selects groups)
+  array_pipelining.py  ILNumerics' array-pipelining demo (loop over columns,
+                       dependent loop, vectorized): NumPy, NumPy threads,
+                       viproc at 1..cores workers
   shape_map_ilnumerics.py  the same map for ILNumerics Accelerator (vs. NumPy)
                        and viproc vs. ILNumerics, on the grid/reps of a viproc run
   ilnumerics/          its C# side (.NET 8, needs a licensed ILNumerics build)
@@ -559,6 +562,21 @@ reference counting.
      decided *where* an op ran, not whether it paid for the task protocol
      (task, operand capture, read counting, look-ahead slot, completion),
      ~1 µs per op even for scalars. `offload_stats()["direct"]` counts them.
+     **Except expensive loops** (adaptive mode only): the direct path times
+     the kernels shared by many ops (one `ElementwiseKernel` per resolved
+     loop, `Kernel::direct_cost`, `DirectCost`): runs of >= `time_from` =
+     256 elements, the first two, then every 16th; the estimate is the
+     smaller of the last two samples (ns per element). An op whose estimated
+     NumPy time is above `direct_budget_ns` = 2 µs (the break-even of the
+     task path, `break_even.py`) is sized as `sync_below` and takes the task
+     path and rule 2 like a large op: `sin` of 1,500 doubles (~15 µs) is a
+     task, `add` (~0.6 µs) stays direct. Without it the loop of ILNumerics'
+     array-pipelining demo (`array_pipelining.py`: `C[i] =
+     np.sum(np.abs(np.sin(A[:, i])), axis=0)` over 1,500 columns) ran every
+     `sin` on the main thread: no parallelism at all (1.0x on 4 cores, now
+     2.0-2.3x). Rule 1 stays a fixed threshold in deterministic mode (a
+     timed decision is not deterministic; there a read-right-away `sin` of
+     1,000 would run 2x slower as a task).
   2. **Adaptive above N_min, per (issue site, log2 size class):** count
      async issues and how many of their results the main thread accessed
      "right away" — a sync point within `window` = 2 issued ops of the
@@ -572,8 +590,8 @@ reference counting.
   3. **Deterministic mode:** `adaptive = false` (`viproc.init(adaptive=False)`
      or `VIPROC_DETERMINISTIC=1`) keeps only rule 1. Results are identical
      in every mode; only where ops run changes.
-  Not done yet: per-op cost classes (N_min is in elements, calibrated on
-  sin/cos; cheap ops like `add` would warrant a higher N_min).
+  Not done yet: a higher N_min for cheap ops (`add` breaks even at ~3,000
+  elements), costs of kernels made per op (reductions, gathers, ...).
   **Decided against:** letting a waiting main thread run a queued, not yet
   started task itself. Ready work rarely sits in the queue: a task whose
   inputs complete runs at once as the continuation of the thread that
@@ -992,7 +1010,13 @@ Rules:
   and every attribute (`reduce`, `outer`, `at`, `nin`, ...) are the
   ufunc's, `__class__` is `numpy.ufunc` (isinstance holds), equality and
   hash are the ufunc's, pickling gives `numpy.<name>`. `viproc.where` is
-  the same for `np.where`. `shape_map.py --module` measures this mode.
+  the same for `np.where`. The reductions of the C path (`sum`, `prod`,
+  `max`, `min`, `amax`, `amin`, `any`, `all`, `mean`, `var`, `std`,
+  `argmax`, `argmin`) are `ufunc_proxy(func, True)`: a viproc array as the
+  first argument takes `Array_array_function`'s steps right away
+  (`ReduceProxy_vectorcall`), skipping NumPy's `__array_function__`
+  dispatch (`np.sum(x, axis=0)` 15,100 → 8,800 instructions); anything
+  else is NumPy's function. `shape_map.py --module` measures this mode.
 - **0-d results and the scalar shortcut.** Where NumPy returns a scalar
   (full reductions, `a[i, j]`, ufuncs on 0-d operands), viproc returns
   NumPy's scalar if the data is there already (the op ran directly), else
@@ -1519,8 +1543,13 @@ code, comments, docs and commit messages in English.
       (`tests/test_numpy_loops.cpp`, NumPy 2.5.3).
 - [x] `should_offload`: hybrid N_min + adaptive per-site policy (see
       "Dispatch decision").
-- [ ] Dispatch: op cost classes for N_min (a waiting main thread running a
-      queued task itself was decided against, see "Dispatch decision").
+- [x] Dispatch: expensive loops below N_min as tasks (measured per loop,
+      adaptive mode; a waiting main thread running a queued task itself was
+      decided against, see "Dispatch decision").
+- [ ] Main-thread issue cost of fine-grained loops: `array_pipelining.py`
+      issues ~22,000 instructions (~7 µs) per iteration (view, sin, abs,
+      sum, assignment), which caps the 1,500 x 1,500 loop at ~2.3x on 4
+      cores and the 200 x 200 loop at ~1x.
 - [x] `matmul`/`dot` asynchronously (NumPy's matmul loop; `matmul_batch`
       has no fallbacks left).
 - [ ] The remaining linalg functions (`qr`, `lstsq`,

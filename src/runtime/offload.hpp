@@ -4,7 +4,11 @@
 // Hybrid policy (after the ILNumerics Accelerator's "scalar shortcut" and
 // "adaptive fork suppression", see CLAUDE.md):
 //  1. Below `sync_below` elements a task always runs inline: deterministic
-//     and cheap, for ops whose hand-off costs more than the work.
+//     and cheap, for ops whose hand-off costs more than the work. Unless
+//     its loop is expensive: an op whose NumPy time (measured per loop on
+//     the direct path) exceeds `direct_budget_ns` is a task like a large
+//     one (sin of 1,500 doubles takes ~15 us, add ~0.6 us). Adaptive mode
+//     only: the measurement is a time, not deterministic.
 //  2. Above it, per (issue site, size class) statistics: if the main thread
 //     usually blocks on the result right after issuing (it needs the value
 //     anyway, so there is nothing to overlap), the site runs inline. Unlike
@@ -20,10 +24,28 @@
 
 namespace viproc {
 
+// NumPy time per element of a kernel that many ops share (one per resolved
+// loop), measured on the direct path: the dispatch policy sends ops of an
+// expensive loop to the task path although they have fewer than
+// `sync_below` elements (OffloadPolicy::too_expensive). Main thread only.
+struct DirectCost {
+    float ns_per_element = 0; // min of the last two samples; 0: not known yet
+    float last = 0;           // the last sample
+    std::uint32_t calls = 0;  // direct runs, for sampling
+};
+
 struct OffloadOptions {
     // Tasks with fewer output elements always run inline (N_min).
     std::int64_t sync_below = 2048;
-    // Per-site adaptive decision above `sync_below`; off = always offload.
+    // ... but not if the op's estimated NumPy time (DirectCost) is above
+    // this: the task path pays off from ~2 us of work per op (break_even.py).
+    double direct_budget_ns = 2000;
+    // Direct runs of at least this many elements are timed (the first two
+    // of a loop, then every 16th): below it the clock reads would cost more
+    // than the decision gains.
+    std::int64_t time_from = 256;
+    // Per-site adaptive decision above `sync_below`, and expensive loops
+    // below it as tasks; off = always offload above, always inline below.
     bool adaptive = true;
     // A sync point counts as "result needed right after issuing" if at most
     // this many ops were issued in between (measured from the main-thread
@@ -58,6 +80,20 @@ class OffloadPolicy {
     // For a task whose inputs are all ready, issued at `site` (interned)
     // producing `elements` output elements.
     Decision decide(const char* site, std::int64_t elements);
+
+    // True if an op of `elements` (< sync_below) on a kernel with this cost
+    // estimate takes the task path anyway: its loop is expensive.
+    // Adaptive mode only: deterministic mode keeps rule 1 a fixed threshold.
+    bool too_expensive(const DirectCost& c, std::int64_t elements) const {
+        return options_.adaptive &&
+               c.ns_per_element * static_cast<double>(elements) > options_.direct_budget_ns;
+    }
+    // True if this direct run is to be timed (record()).
+    bool time_direct(DirectCost& c, std::int64_t elements) const {
+        return options_.adaptive && elements >= options_.time_from &&
+               (c.calls++ < 2 || c.calls % 16 == 0);
+    }
+    static void record(DirectCost& c, double ns, std::int64_t elements);
 
     // The main thread is about to block on work it started with `stats`,
     // `distance` ops ago.

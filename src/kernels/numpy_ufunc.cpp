@@ -574,9 +574,12 @@ class ElementwiseKernel : public Kernel {
         return ok ? KernelResult{} : KernelResult{1, take_loop_error(), 0};
     }
 
+    DirectCost* direct_cost() override { return &cost_; }
+
   private:
     static constexpr std::size_t kMaxFlat = 8;
     const UfuncLoop* loop_;
+    DirectCost cost_; // one kernel per loop: learned across its ops
 };
 
 // ufunc.at(a, idx, b) with a 1-d index into axis 0 (see make_at_kernel).

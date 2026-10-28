@@ -41,6 +41,15 @@ OffloadPolicy::Decision OffloadPolicy::decide(const char* site, std::int64_t ele
     return {true, &s};
 }
 
+void OffloadPolicy::record(DirectCost& c, double ns, std::int64_t elements) {
+    // The smaller of two samples: one preempted or cold run (page faults,
+    // caches) must not make a cheap loop look expensive. The first sample
+    // alone decides nothing (min with 0).
+    const auto per = static_cast<float>(ns / static_cast<double>(elements));
+    c.ns_per_element = std::min(c.last, per);
+    c.last = per;
+}
+
 void OffloadPolicy::on_blocked(SiteStats* stats, std::uint64_t distance) {
     if (stats == nullptr || distance > options_.window) {
         return;
