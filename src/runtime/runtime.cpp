@@ -64,9 +64,13 @@ Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_
     if (options_.max_active_tasks == 0) {
         options_.max_active_tasks = 1;
     }
+    locals_.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        locals_.push_back(std::make_unique<LocalQueue>());
+    }
     workers_.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
-        workers_.emplace_back([this] { worker_loop(); });
+        workers_.emplace_back([this, i] { worker_loop(i); });
     }
 }
 
@@ -163,6 +167,27 @@ ArrayPtr Runtime::view(const ArrayPtr& base, Layout&& layout) {
     return ArrayPtr(&a);
 }
 
+namespace {
+
+// RuntimeOptions::block_enter / block_leave around a blocking wait.
+struct Blocking {
+    explicit Blocking(const RuntimeOptions& o) : leave(o.block_leave) {
+        if (o.block_enter != nullptr) {
+            o.block_enter();
+        }
+    }
+    ~Blocking() {
+        if (leave != nullptr) {
+            leave();
+        }
+    }
+    Blocking(const Blocking&) = delete;
+    Blocking& operator=(const Blocking&) = delete;
+    void (*leave)();
+};
+
+} // namespace
+
 void Runtime::wait_active_below(std::size_t limit) {
     if (active_.load(std::memory_order_acquire) < limit) {
         return;
@@ -173,6 +198,7 @@ void Runtime::wait_active_below(std::size_t limit) {
     // Completions notify only once active_ is below `limit` (wake_below_):
     // waking the main thread on every completion would cost a futex wake
     // and a context switch per task.
+    const Blocking blocking(options_);
     wake_below_.store(limit, std::memory_order_seq_cst);
     active_waiters_.fetch_add(1, std::memory_order_seq_cst);
     for (std::size_t n = active_.load(std::memory_order_seq_cst); n >= limit;
@@ -199,6 +225,7 @@ void Runtime::launch(const std::shared_ptr<Task>& task, const TaskList& producer
                      std::int64_t elements) {
     ++seq_;
     task->set_id(seq_);
+    task->set_fp_mode(fp_mode_);
     // While pending, the task's work is attributed to the decision that
     // started the work it waits for.
     for (const std::shared_ptr<Task>& p : producers) {
@@ -269,6 +296,25 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
                      output_buffers)) {
         return;
     }
+    // A live NumPy export (D7) aliases memory this op reads or writes: NumPy
+    // code may read or write it at any moment, as the same memory, so the op
+    // runs now, as NumPy runs it: its in/outs exclusive first (their writer
+    // done, no task reading them; no copy-on-write, the export must see the
+    // write), and the op completed before issue() returns.
+    bool host = false;
+    for (const ArrayPtr& a : inputs) {
+        host = host || a->group_->current_->host_views > 0;
+    }
+    for (const ArrayPtr& a : inouts) {
+        host = host || a->group_->current_->host_views > 0;
+    }
+    if (host) {
+        const Blocking blocking(options_);
+        for (const ArrayPtr& a : inouts) {
+            wait(*a);
+            a->group_->current_->wait_task_readers();
+        }
+    }
     // The task first (back-pressure: wait for a slot before creating it), so
     // the operands are built in place.
     acquire_slot();
@@ -309,7 +355,12 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         if (std::find(switched.begin(), switched.end(), &g) != switched.end()) {
             continue; // same group written twice by this op: switched already
         }
-        const bool pending_readers = g.current_->has_readers();
+        // Host memory (a live export): the readers were waited for above, the
+        // export itself must see the write.
+        const bool host_group = g.current_->host_views > 0;
+        const bool pending_readers =
+            host_group ? g.current_->async_reads.load(std::memory_order_acquire) > 0
+                       : g.current_->has_readers();
         // An input reading the same group through a different view would see
         // partly updated data if the op wrote in place; NumPy semantics are
         // "all inputs read before any output is written".
@@ -320,6 +371,19 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         }
         if (!pending_readers && !overlapping_input) {
             continue; // write in place
+        }
+        if (host_group) {
+            // NumPy writes the aliased memory in place and gives overlapping
+            // inputs a copy of their data first: so does this op (the group
+            // is ready, see above; the copy is the old data at issue).
+            auto copy = make_pooled<CountableArray>(g.current_->nbytes());
+            std::memcpy(copy->data(), g.current_->data(), g.current_->nbytes());
+            for (std::size_t j = 0; j < inputs.size(); ++j) {
+                if (inputs[j]->group_ == a.group_) {
+                    in_ops[j].buffer = copy;
+                }
+            }
+            continue;
         }
         switched.push_back(&g);
         const bool only_view = a.group_.use_count() == 1;
@@ -399,6 +463,10 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     // D11): from a dying input or from the pool, while it is hot in cache.
     task->advance(TaskState::SizeCompleted);
     launch(task, producers, elements);
+    if (host) {
+        const Blocking blocking(options_);
+        wait(!new_outputs.empty() ? *results[0] : *inouts[0]); // errors: at the sync points
+    }
 }
 
 bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
@@ -463,9 +531,16 @@ bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<cons
     } catch (...) {
         r = KernelResult{1, "unknown exception in kernel", 0};
     }
+    ErrorRef e;
     if (r.status != 0) {
-        const ErrorRef e =
-            errors_->record(TaskError{std::move(r.message), issue_site, kernel->name(), seq_});
+        e = errors_->record(TaskError{std::move(r.message), issue_site, kernel->name(), seq_});
+    } else if (fp_mode_.mode != 0) {
+        const int fe = r.fp_flags | std::fetestexcept(FE_ALL_EXCEPT);
+        if (fe != 0) {
+            e = report_fp_errors(*errors_, *kernel, fe, fp_mode_, issue_site, seq_);
+        }
+    }
+    if (e) {
         for (const ArrayPtr& a : inouts) {
             a->group_->last_error_ = e;
         }
@@ -519,13 +594,10 @@ ErrorRef Runtime::wait(Array& a) {
 }
 
 ErrorRef Runtime::prepare_host_write(Array& a) {
+    // No copy-on-write for live exports: they alias the memory NumPy writes,
+    // as NumPy's own views would (D7).
     ErrorRef e = wait(a);
-    AliasGroup& g = *a.group_;
-    if (g.current_->host_views > 0) {
-        issue_group_copy(g);
-        e = wait(a);
-    }
-    g.current_->wait_task_readers();
+    a.group_->current_->wait_task_readers();
     return e;
 }
 
@@ -558,6 +630,9 @@ void Runtime::enqueue(std::shared_ptr<Task> task) {
     // by its locked re-check of the queue) rules out a lost wake-up.
     if (spinning_.load(std::memory_order_seq_cst) == 0 &&
         sleeping_.load(std::memory_order_seq_cst) > 0) {
+        if (!stream_.load(std::memory_order_relaxed)) {
+            stream_.store(true, std::memory_order_relaxed);
+        }
         queue_cv_.notify_one();
     }
 }
@@ -573,31 +648,81 @@ std::shared_ptr<Task> Runtime::try_pop() {
     return t;
 }
 
-void Runtime::worker_loop() {
+std::shared_ptr<Task> Runtime::pop_local(std::size_t worker) {
+    LocalQueue& q = *locals_[worker];
+    std::lock_guard lock(q.mutex);
+    if (q.tasks.empty()) {
+        return nullptr;
+    }
+    std::shared_ptr<Task> t = std::move(q.tasks.back());
+    q.tasks.pop_back();
+    local_.fetch_sub(1, std::memory_order_relaxed);
+    return t;
+}
+
+std::shared_ptr<Task> Runtime::steal(std::size_t thief) {
+    const std::size_t n = locals_.size();
+    for (std::size_t k = 1; k < n; ++k) {
+        LocalQueue& q = *locals_[(thief + k) % n];
+        std::lock_guard lock(q.mutex);
+        if (!q.tasks.empty()) {
+            std::shared_ptr<Task> t = std::move(q.tasks.front());
+            q.tasks.pop_front();
+            local_.fetch_sub(1, std::memory_order_relaxed);
+            return t;
+        }
+    }
+    return nullptr;
+}
+
+void Runtime::worker_loop(std::size_t id) {
     using clock = std::chrono::steady_clock;
     constexpr auto kSpin = std::chrono::microseconds(50);
     std::shared_ptr<Task> next;
     for (;;) {
+        // Own small tasks first (their inputs were just computed here), then
+        // the shared queue. A worker never sleeps with a task of its own
+        // queued, so a local task is never lost.
+        if (!next) {
+            next = pop_local(id);
+        }
         if (!next) {
             next = try_pop();
         }
         if (!next) {
             // At most one worker spins (the others sleep), so spinning never
             // takes a core away from the main thread or a working worker.
+            // The spinner also takes small tasks over from busy workers.
             int expected = 0;
             if (spinning_.compare_exchange_strong(expected, 1, std::memory_order_seq_cst)) {
                 const auto until = clock::now() + kSpin;
                 while (!next && clock::now() < until) {
                     if (queued_.load(std::memory_order_relaxed) > 0) {
                         next = try_pop();
+                    } else if (local_.load(std::memory_order_relaxed) > 0) {
+                        next = steal(id);
                     } else {
                         cpu_relax();
                     }
                 }
                 spinning_.store(0, std::memory_order_seq_cst);
-                // Work found while others sleep: let the next worker spin.
-                if (next && queued_.load(std::memory_order_seq_cst) > 0 &&
+                if (!next) {
+                    stream_.store(false, std::memory_order_relaxed);
+                }
+                // Work found while others sleep: let the next worker spin if
+                // more work is queued or tasks stream in, so that the next
+                // enqueue() needs no wake-up (the issuing main thread would
+                // pay a futex call per op where workers outrun it: 4 chains
+                // of cheap ops, 1 -> 3.5 us per op).
+                if (next &&
+                    (stream_.load(std::memory_order_relaxed) ||
+                     queued_.load(std::memory_order_seq_cst) > 0 ||
+                     local_.load(std::memory_order_seq_cst) > 0) &&
                     sleeping_.load(std::memory_order_seq_cst) > 0) {
+                    {
+                        std::lock_guard lock(queue_mutex_);
+                        spin_wanted_ = true;
+                    }
                     queue_cv_.notify_one();
                 }
             }
@@ -605,10 +730,15 @@ void Runtime::worker_loop() {
         if (!next) {
             std::unique_lock lock(queue_mutex_);
             sleeping_.fetch_add(1, std::memory_order_seq_cst);
-            queue_cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+            queue_cv_.wait(lock,
+                           [this] { return stopping_ || spin_wanted_ || !queue_.empty(); });
             sleeping_.fetch_sub(1, std::memory_order_seq_cst);
             if (queue_.empty()) {
-                return; // stopping
+                if (stopping_) {
+                    return;
+                }
+                spin_wanted_ = false; // asked to take over spinning
+                continue;
             }
             next = std::move(queue_.front());
             queue_.pop_front();
@@ -618,10 +748,28 @@ void Runtime::worker_loop() {
         // is unwound before the continuation starts.
         TaskList runnable = run(next);
         next.reset();
-        if (!runnable.empty()) {
-            next = std::move(runnable[0]);
-            for (std::size_t i = 1; i < runnable.size(); ++i) {
-                enqueue(std::move(runnable[i]));
+        if (runnable.size() == 1) {
+            next = std::move(runnable[0]); // the continuation
+        } else if (!runnable.empty()) {
+            // Several consumers became runnable. Small ones stay here (local
+            // queue, run next, most recent first), large ones go to the
+            // shared queue, where another worker is worth waking for them;
+            // with no small one, the first large one is the continuation.
+            bool small = false;
+            for (const std::shared_ptr<Task>& t : runnable) {
+                small = small || t->work() < options_.local_below;
+            }
+            for (std::shared_ptr<Task>& t : runnable) {
+                if (t->work() < options_.local_below) {
+                    LocalQueue& q = *locals_[id];
+                    std::lock_guard lock(q.mutex);
+                    q.tasks.push_back(std::move(t));
+                    local_.fetch_add(1, std::memory_order_relaxed);
+                } else if (!small && !next) {
+                    next = std::move(t);
+                } else {
+                    enqueue(std::move(t));
+                }
             }
         }
     }

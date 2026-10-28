@@ -77,8 +77,8 @@ def test_where_without_out(path):
         with warnings.catch_warnings(record=True) as got_w:
             warnings.simplefilter("always")
             got = np.sin(layout(viproc.asarray(x)), where=layout(viproc.asarray(m)))
-        assert [str(w.message) for w in got_w] == [str(w.message) for w in want_w
-                                                   if "encountered" not in str(w.message)]
+            viproc.wait_all()  # FP warnings of the task (error-handling.md, E8)
+        assert [str(w.message) for w in got_w] == [str(w.message) for w in want_w]
         assert got_w[0].filename == __file__
         g = np.asarray(got)
         assert g.dtype == want.dtype and g.shape == want.shape and g.strides == want.strides

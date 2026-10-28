@@ -16,6 +16,7 @@
 #include <mutex>
 #include <random>
 #include <set>
+#include <string>
 #include <thread>
 
 using namespace viproc;
@@ -205,6 +206,40 @@ void test_continuation_on_same_thread() {
     check(same, "dependent chain runs as continuations on one thread");
 }
 
+void test_fan_out_small_stay_large_spread() {
+    // One completion makes four tasks runnable: three small ones stay with
+    // the completing worker (RuntimeOptions::local_below), the large one
+    // goes to another worker, so the small ones do not wait behind it.
+    Runtime rt(opts(4));
+    std::mutex m;
+    std::map<std::string, std::thread::id> where;
+    auto rec = [&](const char* name, std::chrono::milliseconds d) {
+        return std::make_shared<FnKernel>([&, name, d](auto in, auto out) {
+            {
+                std::lock_guard lock(m);
+                where[name] = std::this_thread::get_id();
+            }
+            std::this_thread::sleep_for(d);
+            at(out[0], 0) = at(in[0], 0) + 1;
+            return KernelResult{};
+        });
+    };
+    const std::int64_t big = 65536;
+    ArrayPtr x = issue1(rt, rec("gate", 30ms), {make_ready(rt, 1, 0.0)}, 1);
+    auto start = std::chrono::steady_clock::now();
+    ArrayPtr l = issue1(rt, rec("large", 120ms), {x, make_ready(rt, big, 0.0)}, big);
+    ArrayPtr a = issue1(rt, rec("a", 30ms), {x}, 1);
+    ArrayPtr b = issue1(rt, rec("b", 30ms), {x}, 1);
+    ArrayPtr c = issue1(rt, rec("c", 30ms), {x}, 1);
+    rt.wait_all();
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    check(value(rt, l) == 2.0 && value(rt, a) == 2.0 && value(rt, b) == 2.0 && value(rt, c) == 2.0,
+          "fan-out results");
+    check(where["large"] != where["gate"], "a large unblocked task goes to another worker");
+    // gate 30 + max(large 120, a + b + c 90): ~150 ms; one after the other 240.
+    check(elapsed < 220ms, "small unblocked tasks do not wait behind a large one");
+}
+
 void test_deep_chain_no_stack_growth() {
     Runtime rt(opts(2));
     // Gate makes all 100000 tasks pending, so they run as continuations;
@@ -246,13 +281,13 @@ void test_inout_chain_stays_in_place() {
 
 void test_prepare_host_write() {
     Runtime rt(opts(2));
-    // Live NumPy views (host_views): the storage moves to a copy first.
+    // Live NumPy views (host_views) are aliases, as NumPy's views: written in place.
     ArrayPtr a = make_ready(rt, 8, 3.0);
-    std::shared_ptr<CountableArray> exported = a->buffer(); // held, as a read-only export does
+    std::shared_ptr<CountableArray> exported = a->buffer(); // held, as an export does
     ++exported->host_views;
     rt.prepare_host_write(*a);
-    check(a->buffer() != exported && value(rt, a, 7) == 3.0,
-          "prepare_host_write: copy-on-write while NumPy views are alive");
+    check(a->buffer() == exported && value(rt, a, 7) == 3.0,
+          "prepare_host_write: writes in place while NumPy views are alive");
     --exported->host_views;
     // Issued readers: waits until they are done, keeps the buffer.
     ArrayPtr b = make_ready(rt, 8, 1.0);
@@ -915,6 +950,7 @@ int main() {
     test_main_thread_runs_ahead();
     test_independent_ops_overlap();
     test_continuation_on_same_thread();
+    test_fan_out_small_stay_large_spread();
     test_deep_chain_no_stack_growth();
     test_inout_in_place();
     test_inout_chain_stays_in_place();

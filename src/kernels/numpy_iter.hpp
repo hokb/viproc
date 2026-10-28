@@ -5,28 +5,47 @@
 
 #include "kernels/numpy_ufunc.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
 namespace viproc::numpy {
 
-// Iterators of kernels that finished are kept per template and reused: a
-// new copy (NpyIter_Copy) per op would also allocate its buffers on the
-// worker at the first reset (DELAY_BUFALLOC), and freeing them later on the
-// main thread keeps that memory cold. Main thread pops, any thread returns.
-constexpr std::size_t kMaxPooledIters = 16;
+// The pending Python error as a string (cleared). GIL held.
+std::string fetch_python_error();
+
+// An iterator copy with the accessors a kernel calls per inner loop.
+struct PooledIter {
+    NpyIter* iter = nullptr;
+    NpyIter_IterNextFunc* iternext = nullptr;
+    char** dataptr = nullptr;
+    npy_intp* strideptr = nullptr;
+    npy_intp* countptr = nullptr;
+};
 
 // An iterator built over template arrays (a dummy address, the operands'
-// layouts) and its finished copies. Kernels point a copy at the real
-// buffers (NpyIter_ResetBasePointers, no GIL) when they run.
+// layouts) and its copies. A kernel takes a copy when it runs, points it at
+// the real buffers (NpyIter_ResetBasePointers, no GIL) and gives it back
+// when it is done, so the copies, and the buffers they allocate at their
+// first reset (DELAY_BUFALLOC), are reused while they are warm. At most one
+// kernel per thread runs at a time, so `target` copies (workers + main
+// thread + 1) are enough: the main thread makes one more per issue until
+// there are that many (`reserve`, with the GIL), never one per op in flight.
+// Before, each op took a copy at issue: with up to 1,000 ops in flight the
+// pool (16) ran dry, and nearly every op ran on a new copy whose buffers
+// faulted in on the worker (bool * float64 of 1e4 elements: ~25 µs per op
+// in page faults, NumPy takes 8 µs for the whole op).
 struct IterTemplate {
     NpyIter* templ = nullptr;
     DeferRelease defer;
+    std::size_t target = 0;
+    std::atomic<std::size_t> alive{0}; // copies that exist (free or running)
     std::mutex mutex;
-    std::vector<NpyIter*> free; // finished iterators, ready for a reset
+    std::vector<PooledIter> free; // finished copies, ready for a reset
     // Set for iterators NpyIter_Copy cannot copy: a new one is made this
     // way instead (where= masks: NumPy 2.x's copy of a masked buffered
     // transfer frees its data twice). `owned`: Python references `fresh`
@@ -35,7 +54,10 @@ struct IterTemplate {
     std::vector<PyObject*> owned;
 
     ~IterTemplate() {
-        std::vector<NpyIter*> all = std::move(free);
+        std::vector<NpyIter*> all;
+        for (const PooledIter& p : free) {
+            all.push_back(p.iter);
+        }
         all.push_back(templ);
         std::vector<PyObject*> refs = std::move(owned);
         defer([all, refs] {
@@ -48,41 +70,85 @@ struct IterTemplate {
         });
     }
 
-    // A clean iterator to reuse, else a new copy of the template (nullptr
-    // with a Python error set if NumPy fails). Main thread with the GIL.
-    NpyIter* get() {
+    // One more copy while there are fewer than `target` (a kernel about to
+    // be issued may need it). False with a Python error set if NumPy fails.
+    // Main thread with the GIL.
+    bool reserve() {
+        if (alive.load(std::memory_order_relaxed) >= target) {
+            return true;
+        }
+        PooledIter p;
+        if (!make(p)) {
+            return false;
+        }
+        std::lock_guard lock(mutex);
+        free.push_back(p);
+        return true;
+    }
+
+    // A copy for a kernel that runs now. Any thread, without the GIL; only
+    // when none is free (all `target` copies running, or some dropped after
+    // an incomplete iteration) it takes the GIL and makes one. False with
+    // the reason in `error` if NumPy fails.
+    bool acquire(PooledIter& p, std::string& error) {
         {
             std::lock_guard lock(mutex);
             if (!free.empty()) {
-                NpyIter* it = free.back();
+                p = free.back();
                 free.pop_back();
-                return it;
+                return true;
             }
         }
-        return fresh ? fresh() : NpyIter_Copy(templ);
+        const PyGILState_STATE g = PyGILState_Ensure();
+        const bool ok = make(p);
+        if (!ok) {
+            error = fetch_python_error();
+        }
+        PyGILState_Release(g);
+        return ok;
     }
 
-    // Takes back an iterator after a complete iteration (nothing left in
-    // its buffers to write back); others are released. Any thread.
-    void give_back(NpyIter* it, bool clean) {
+    // Takes a copy back after a complete iteration (nothing left in its
+    // buffers to write back); others are released. Any thread.
+    void give_back(const PooledIter& p, bool clean) {
         if (clean) {
             std::lock_guard lock(mutex);
-            if (free.size() < kMaxPooledIters) {
-                free.push_back(it);
-                return;
-            }
+            free.push_back(p);
+            return;
         }
-        defer([it] { NpyIter_Deallocate(it); });
+        alive.fetch_sub(1, std::memory_order_relaxed);
+        defer([it = p.iter] { NpyIter_Deallocate(it); });
+    }
+
+  private:
+    // GIL held.
+    bool make(PooledIter& p) {
+        NpyIter* it = fresh ? fresh() : NpyIter_Copy(templ);
+        if (it == nullptr) {
+            return false;
+        }
+        p.iternext = NpyIter_GetIterNext(it, nullptr);
+        if (p.iternext == nullptr) {
+            NpyIter_Deallocate(it);
+            return false;
+        }
+        p.iter = it;
+        p.dataptr = NpyIter_GetDataPtrArray(it);
+        p.strideptr = NpyIter_GetInnerStrideArray(it);
+        p.countptr = NpyIter_GetInnerLoopSizePtr(it);
+        alive.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
 };
+
+// A new, empty template whose `target` is the number of threads that run
+// kernels (set_kernel_threads) plus one. Main thread.
+std::shared_ptr<IterTemplate> new_iter_template();
 
 // An array with `l`'s shape and strides over `data` (not owned, never read
 // or written: a template for an iterator's setup). New reference, nullptr
 // with a Python error set on failure. GIL held.
 PyArrayObject* template_array(const Layout& l, char* data, bool writable);
-
-// The pending Python error as a string (cleared). GIL held.
-std::string fetch_python_error();
 
 // Element-aligned dummy address for template arrays: nothing is read or
 // written through it.

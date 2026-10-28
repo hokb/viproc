@@ -139,9 +139,17 @@ back to its top-level task loop and runs the consumer from there
 callback frame. Nested execution would build deep stacks along dependency
 chains and, on errors, hide where the failing op came from.
 
-If one completion unblocks several consumers, the completing thread runs
-one of them as its continuation; the others go to idle workers / the
-pool's queue.
+If one completion unblocks several consumers, the small ones (largest
+operand below `RuntimeOptions::local_below`, 65,536 elements) stay with
+the completing worker (its local queue, run next; a spinning idle worker
+steals them), the large ones go to the pool's queue (with no small one,
+the first large one is the continuation). Handing a small task to another
+worker cost a wake-up and moved its inputs to another core: `np.where`
+of three branches of 1e4 elements took 35 µs per iteration on 4 workers,
+13 µs on 1; now ~15 µs. Trade-off: a small side branch that would run
+in parallel on an idle core now waits behind its sibling (shape map
+`sum_cores` at 1e4: 2.6-2.9x -> 1.6-1.7x, `expr_where` 1.3-1.8x ->
+2.1-4.1x).
 
 Each task records its **issue site** (Python file, line and function,
 captured by the main thread at issue time). Errors from a task are
@@ -244,10 +252,10 @@ ownership, release or reuse of memory.
   inputs give an F-order result), and copy-on-write keeps the array's
   layout. Importing a non-contiguous NumPy array (`asarray`) copies it
   densely, in its axis order.
-- Memory is handed to plain NumPy for *writing* only inside an eager
-  fallback, after the buffer was made exclusive (no pending writer, no
-  task reader, no live export); exports to the user are read-only and
-  count as readers (`CountableArray::host_views`, design doc D7).
+- Memory is handed to plain NumPy only after its writer and task readers
+  are done; exports are writable aliases, and while one lives
+  (`CountableArray::host_views`) ops on that memory run synchronously
+  (design doc D7).
 
 ### Goals and non-goals
 
@@ -330,6 +338,8 @@ docs/design/           Design documents (decisions with rationale)
   array-data-model.md  array data model: Array, Metadata (SD + task),
                        AliasGroup, CountableArray; lifecycle, checks per op,
                        figure (array-data-model.svg), evaluation
+docs/optimizations.md  every optimization: case, implementation, state, effect
+                       (done, open, shelved, rejected); keep it up to date
 docs/benchmarks.md     benchmark results: current breakdown per category and
                        case, progress per change, external machines,
                        shape map (images in docs/benchmarks/; reference
@@ -413,7 +423,8 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
   suite_cases.py       its cases (plain NumPy programs, width P, variants)
   suite_report.py      its Markdown / HTML reports, multi-run comparison
   shape_map.py         speedup vs. NumPy over rows x cols (2-d, log grid):
-                       median + IQR over cases per point, heatmap images
+                       median + IQR over cases per point, heatmap images,
+                       best/median/worst per point, outlier list
   shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync/
                        expressions/loops/control; --groups selects groups)
   shape_map_ilnumerics.py  the same map for ILNumerics Accelerator (vs. NumPy)
@@ -693,8 +704,10 @@ Rules:
 - **Floating-point errors:** loops report divide-by-zero, overflow and
   invalid via the thread-local FP status flags (unless
   `no_floatingpoint_errors`). Workers clear the flags before and read them
-  after each loop and store them on the instruction; the bridge applies
-  `np.errstate` semantics at the next sync point.
+  around each kernel; the op reports them under the `np.errstate` captured
+  at issue (`Kernel::fp_name()`: NumPy's name in the message): raise fails
+  the op (`AsyncFloatingPointError`), warnings/call/log/print are queued and
+  reported in the main thread at the issue site (error-handling.md, E8).
 - **Reductions** (`sum`, `prod`, `min`, `max`, `any`, `all`, …;
   `src/kernels/numpy_reduce.*`) use the binary loop resolved with
   `reduction=True` and `fixed_strides` = the inner strides, called with
@@ -722,9 +735,10 @@ Rules:
   (ufunc, input layout, axes, keepdims, `dtype=`, initial or not, buffer
   size) as a template over a dummy address (`ReduceTemplate`; the result
   NumPy allocates there gives viproc's result layout). Per op the main
-  thread only looks the template up and takes a finished copy from its
-  pool (`NpyIter_Copy` on a miss): no element memory, no address. The
-  task fills the initial values, points the copy at its buffers
+  thread only looks the template up (and makes one more copy while the
+  template has fewer than the kernel threads + 1, `IterTemplate::reserve`):
+  no element memory, no address. The task takes a copy from the template's
+  pool when it runs, fills the initial values, points the copy at its buffers
   (`NpyIter_ResetBasePointers(iter, base, &errmsg)`, no GIL) and runs
   NumPy's `reduce_loop`. 0-d inputs are iterated as 1-element 1-d ones:
   NumPy casts a 0-d input into a copy when it builds the iterator, which a
@@ -913,7 +927,9 @@ Rules:
   (error-handling.md);
   scalar indexing returns NumPy's scalar if the array is ready, else a 0-d
   copy (no sync); `np.where(cond, x, y)` as a select task (NumPy's result
-  dtype, x and y cast to it, layout order K);
+  dtype, x and y cast to it, layout order K; dense rows branch-free: a
+  random condition mispredicts a branch per element, 1e4 elements 5 µs,
+  NumPy 40 µs);
   index assignment with basic keys (assign kernel, see below); **reductions** (NumPy ≥
   2.3): `ufunc.reduce` of reorderable ufuncs (add, multiply, minimum,
   maximum, fmin, fmax, logical and/or/xor, bitwise and/or/xor) and
@@ -998,8 +1014,8 @@ Rules:
   operands, empty advanced-index results, 0-d boolean indices,
   `ufunc.at`, other NumPy functions. NumPy's semantics exactly (design doc
   D7, "Eager fallbacks"): each viproc argument becomes a writable NumPy
-  view after `vp_array_prepare_write` (wait for producer and task readers,
-  copy-on-write if read-only exports are alive), so `out=`, mutating
+  view after `vp_array_prepare_write` (wait for producer and task
+  readers; live exports alias it), so `out=`, mutating
   functions (`np.put`, `np.place`, …) and overlap work in place. Results
   are mapped back: an argument returned as is → that viproc array; a view
   of an argument (by memory overlap) → a viproc view of its alias group
@@ -1191,15 +1207,17 @@ Rules:
 - **Sync points:** `np.asarray(x)`, `x.numpy()`, printing, `float(x)`,
   `bool(x)`, scalar indexing, iteration, `x.wait()`, `viproc.wait_all()`.
 - **Conversions (design doc D7):** exports (`np.asarray(x)`, `x.numpy()`,
-  `__array__`) are copy-free **read-only** NumPy views; each counts as a
-  reader of the buffer (`host_views`) while it lives, so later in-place
-  writes to `x` copy-on-write and the export keeps its values (copy
-  semantics without a copy). Imports copy user-held NumPy arrays
-  (`asarray(nd)`, `v + nd`: the user may write `nd` later); fresh memory
-  (creation functions, fallback results that own their data and are no
-  argument) is adopted without a copy. Never give user code a writable
-  view of viproc memory: NumPy calls on an ndarray bypass viproc and race
-  with the workers (fallback exports are made read-only after the call).
+  `__array__`) are copy-free NumPy views of the same memory, writable
+  (read-only only for read-only arrays): aliases, as `np.asarray` of an
+  ndarray. Making one waits for the producer and the task readers; while
+  it lives (`host_views`) every op reading or writing that memory runs
+  synchronously, in place, no copy-on-write (`Runtime::issue`), so NumPy
+  code on the export never races with a worker. Imports copy user-held
+  NumPy arrays (`asarray(nd)`, `v + nd`: the user may write `nd` later)
+  unless nobody can write them (read-only over bytes or a read-only mmap)
+  or, for operators, they are temporaries; fresh memory (creation
+  functions, fallback results that own their data and are no argument) is
+  adopted without a copy.
 - **Hot path in C** (`_viproc._Array`): everything that runs once per op —
   `__array_ufunc__` for element-wise calls, `a[key]` for ready integer and
   basic keys, all Python operators (number
@@ -1270,10 +1288,15 @@ Rules:
   everything else (strided, reversed, broadcast, mixed orders, casts) runs
   on NumPy's iterator, set up as `execute_ufunc_loop` sets it up
   (`LoopCache::iter_elementwise`: a template per (loop, layouts, buffer
-  size) over a dummy address; per op a finished iterator of that template
-  from its pool, else an `NpyIter_Copy`; `NpyIter_ResetBasePointers` on
-  the worker; a fresh copy per op allocated its buffers on the worker and
-  released them later on the main thread, which kept that memory cold). Casts happen in the
+  size) over a dummy address; the kernel takes a copy from the template's
+  pool when it runs and gives it back after, so at most one copy per
+  thread that runs kernels exists, its buffers stay warm, and the main
+  thread only tops the pool up, `IterTemplate::reserve`;
+  `NpyIter_ResetBasePointers` on the worker). Before, each op took a copy
+  at issue: with up to 1,000 ops in flight the pool of 16 ran dry, and
+  nearly every op ran on a new copy whose buffers faulted in on the worker
+  (`bool * float64` of 1e4 elements, chained: 30-40 µs per op, NumPy 6-10;
+  now 5 µs). Casts happen in the
   iterator's buffers, or, for 0-d and short 1-d inputs, as a separate cast
   task first (NumPy's `check_for_trivial_loop` copies those).
 - **Measurements live in `docs/benchmarks.md`** (suite scores per change,
@@ -1315,7 +1338,11 @@ Rules:
   consumers they unblock to the pool, so the main thread keeps issuing.
   Workers run one unblocked consumer as their continuation.
 - Worker pool: at most one idle worker spins (50 µs, `pause`) before
-  sleeping; `enqueue()` wakes a sleeper only if nobody spins. This avoids a
+  sleeping; `enqueue()` wakes a sleeper only if nobody spins. While tasks
+  stream in (an `enqueue()` had to wake a sleeper), a spinner that finds
+  work hands the spinning to a sleeper, so the wake-up is a worker's cost,
+  not the issuing main thread's (4 chains of cheap ops: 3.6 -> 1.2 µs per
+  op); a spin that finds nothing ends the stream. This avoids a
   wake-up syscall per small task without taking cores from busy threads.
 - Sync points spin too: the main thread spins up to 50 µs (`kSyncSpin`,
   `pause`) for the producer's completion (`Runtime::wait`, `wait_all`)
@@ -1356,8 +1383,9 @@ Rules:
 - Python objects whose memory a task still uses are released only on the
   main thread with the GIL: a worker dropping the last reference parks
   the object in a graveyard drained at the next C ABI call.
-- Not implemented yet: FP-flag reporting to
-  Python (NumPy warnings / `np.errstate`).
+- FP errors (`np.errstate`: warnings, `FloatingPointError`, call/log/print)
+  are reported as NumPy reports them, under the errstate of the issuing
+  code (error-handling.md, E8).
 
 ## Conventions
 

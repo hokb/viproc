@@ -273,8 +273,8 @@ Each of these rules it out:
    decision against an `ndarray` subclass, D9).
 5. One host pointer, no device copies.
 
-Handing data to NumPy is copy-free already (D7: read-only exports counted
-as readers, adoption of fresh memory). NumPy's custom allocator (NEP 49,
+Handing data to NumPy is copy-free already (D7: aliasing exports counted
+as host views, adoption of fresh memory). NumPy's custom allocator (NEP 49,
 `PyDataMem_SetHandler`) would only let NumPy allocate fallback results from
 viproc's element pool; it is set per context and applies to every NumPy
 allocation there, so it would have to be set around viproc's own fallback

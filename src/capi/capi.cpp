@@ -143,6 +143,27 @@ vp_array* hand_out(ArrayPtr a) { return reinterpret_cast<vp_array*>(a.release())
 
 extern "C" {
 
+namespace {
+
+// RuntimeOptions::block_enter / block_leave: the GIL is released while the
+// main thread blocks inside an issue (a task may need it).
+thread_local PyThreadState* t_blocked = nullptr;
+
+void release_gil() {
+    if (PyGILState_Check()) {
+        t_blocked = PyEval_SaveThread();
+    }
+}
+
+void reacquire_gil() {
+    if (t_blocked != nullptr) {
+        PyEval_RestoreThread(t_blocked);
+        t_blocked = nullptr;
+    }
+}
+
+} // namespace
+
 vp_runtime* vp_runtime_create(size_t workers, size_t max_active_tasks, char* err, size_t errlen) {
     if (!numpy::init()) {
         PyErr_Clear();
@@ -151,12 +172,15 @@ vp_runtime* vp_runtime_create(size_t workers, size_t max_active_tasks, char* err
     }
     RuntimeOptions options;
     options.workers = workers;
+    options.block_enter = release_gil;
+    options.block_leave = reacquire_gil;
     if (max_active_tasks != 0) {
         options.max_active_tasks = max_active_tasks;
     }
     auto* r = new vp_runtime();
     r->rt = std::make_unique<Runtime>(options);
     r->loops = std::make_unique<numpy::LoopCache>();
+    numpy::set_kernel_threads(r->rt->worker_count() + 1);
     return r;
 }
 
@@ -191,6 +215,30 @@ int vp_take_error(vp_runtime* rt, char* err, size_t errlen) {
     }
     set_error(err, errlen, msg);
     return VP_ERROR;
+}
+
+void vp_set_fp_mode(vp_runtime* rt, int mode, int ctx) {
+    rt->rt->set_fp_mode(FpMode{static_cast<std::uint16_t>(mode), static_cast<std::uint16_t>(ctx)});
+}
+
+int vp_take_fp_events(vp_runtime* rt, PyObject** out) {
+    std::vector<FpEvent> events = rt->rt->errors().take_fp();
+    PyObject* list = PyList_New(static_cast<Py_ssize_t>(events.size()));
+    if (list == nullptr) {
+        return -1;
+    }
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        const FpEvent& e = events[i];
+        PyObject* t = Py_BuildValue("(iiiiss)", e.report, e.status, static_cast<int>(e.mode.mode),
+                                    static_cast<int>(e.mode.ctx), e.name, e.issue_site.c_str());
+        if (t == nullptr) {
+            Py_DECREF(list);
+            return -1;
+        }
+        PyList_SET_ITEM(list, static_cast<Py_ssize_t>(i), t);
+    }
+    *out = list;
+    return static_cast<int>(events.size());
 }
 
 size_t vp_worker_count(const vp_runtime* rt) { return rt->rt->worker_count(); }

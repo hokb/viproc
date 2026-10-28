@@ -27,7 +27,7 @@ current data version, last writer); a data version is a `CountableArray`
 | D4 | Pools for the per-op runtime objects (Task, Metadata, CountableArray, ArrayBlock) | Implemented |
 | D5 | Reuse the buffer of a temporary input for the output | Implemented |
 | D6 | Ownership: Python owns objects, the runtime owns element memory | Implemented |
-| D7 | Array conversions viproc ↔ ndarray: copy-free export, copy-free import of fresh memory, eager fallbacks with NumPy's semantics | Implemented |
+| D7 | Array conversions viproc ↔ ndarray: copy-free aliasing export, copy-free import of fresh memory, eager fallbacks with NumPy's semantics | Implemented |
 | D8 | Write-after-read safety by copy-on-write, not by locking | Implemented |
 | D9 | `viproc.ndarray` is a wrapper, not a subclass of `numpy.ndarray` | Decided, implemented |
 | D10 | Access model: pool allocations on the main thread only, releases from any thread | Superseded by D11 for element memory; holds for D4 |
@@ -360,35 +360,44 @@ same buffer*. Synchronous with respect to the main thread is not
 synchronous with respect to the workers. So a copy-free conversion needs a
 rule for that outside access.
 
-### Export: read-only view that counts as a reader
+### Export: an alias, as in NumPy
 
-`np.asarray(v)`, `v.__array__()` and `v.numpy()` wait for `v`'s producer,
-then return a **read-only** NumPy view of the buffer (shape, strides and
-offset of `v`; views of views work). Its base object holds the buffer and
-counts as **one reader** of it (`CountableArray::host_views`, main thread only)
-until the last NumPy view on it is gone. `CountableArray::has_readers()` is
-`host_views > 0 || async_reads > 0`; copy-on-write (D8) and temporary
-elision (D5) test that. Host views are kept apart from `async_reads`
-because a task's readers are waited for (a worker finishes them), host
-views are not (only the user can drop them). Hence:
+`np.asarray(v)`, `v.__array__()` and `v.numpy()` give what `np.asarray`
+gives for a NumPy array: **the same memory**, no copy. The export is
+writable (read-only only for read-only viproc arrays, as NumPy keeps the
+flag), and writes through either side show in the other, as with NumPy's
+own views. Before it is made, `v`'s producer and every issued task still
+reading the buffer are waited for (`Runtime::prepare_host_write`; no
+copy-on-write); from then on NumPy code may read or write that memory at
+any time. Its base object holds the buffer and counts **one host view**
+(`CountableArray::host_views`, main thread only) until the last NumPy view
+on it is gone.
 
-- Nobody writes through the export (read-only), so concurrent viproc
-  readers are safe.
-- A later in-place write to `v` sees a pending reader and copies-on-write
-  (D8): `v` moves to a new buffer, the export keeps the values it showed.
-  These are exactly the semantics of the former copy, paid only when `v`
-  is written while an export is alive.
-- Temporary elision (D5) never reuses an exported buffer (rule 2).
-- Short-lived exports (`print(v)`, `float(v)`, a NumPy function on `v`)
-  cost nothing afterwards.
-- `np.array(v)`, `__array__(copy=True)` and `v.numpy().copy()` give a
-  writable copy; `__array__(copy=False)` is allowed now, `dtype=` changes
-  cast (one copy).
-- Inside the bridge, NumPy code that viproc runs on its own behalf gets
-  *writable* views instead (next section).
+**While a host view lives, ops touching that memory run synchronously**
+(`Runtime::issue`): an op reading or writing a group whose current buffer
+has `host_views > 0` first waits for its in/outs' writer and task readers,
+writes in place (no copy-on-write: the export must see the write, as a
+NumPy view would), gives an input that overlaps a written group a copy of
+its old data (NumPy's "inputs read before outputs are written"), and is
+complete when `issue()` returns. So NumPy code on the export never races
+with a worker, and every value it sees is the one the sequential NumPy
+program would have produced at that point. Ops on other arrays stay
+asynchronous; `print(v)`, `float(v)` and NumPy functions on `v` create
+short-lived exports that cost nothing afterwards. Temporary elision (D5)
+never reuses an exported buffer (`has_readers()` counts host views). When
+`v` dies first, the export simply keeps the buffer (it holds a reference).
 
-Measured (1e7 float64): `np.asarray(v)` 18.8 ms → 0.001 ms; `np.sum(v)`
-(eager fallback) 25 ms → 3.5 ms.
+`np.array(v)`, `__array__(copy=True)` and `v.numpy().copy()` give a copy;
+`dtype=` casts (one copy).
+
+Decision (the maintainer's choice "exactly as NumPy"): earlier exports
+were read-only and copy-on-write kept their values: cheaper for a writer,
+but not NumPy's semantics (`b = np.asarray(v); b[0] = 1` raised, and
+`v += 1` did not show in `b`). Read-only exports made libraries that write
+into their arguments fail.
+
+Measured (1e7 float64): `np.asarray(v)` 18.8 ms (copy) → 0.001 ms;
+`np.sum(v)` (eager fallback) 25 ms → 3.5 ms.
 
 ### Borrowed view: NumPy computes small ready ops on the buffer
 
@@ -438,10 +447,8 @@ viproc memory itself, not copies:
 
 1. **Exclusive, writable export per viproc argument**
    (`vp_array_export(a, writable=1)` → `Runtime::prepare_host_write`): wait
-   for the array's producer; if read-only exports of the buffer are alive
-   (`host_views > 0`), copy-on-write first (a copy task, then wait) so
-   those exports keep their values; finally wait until no issued task
-   still reads the buffer (`CountableArray::wait_task_readers`). From then on no
+   for the array's producer, then until no issued task still reads the
+   buffer (live exports are aliases and see the writes, as NumPy's views) (`CountableArray::wait_task_readers`). From then on no
    worker touches the buffer: the main thread issues nothing while NumPy
    runs. A writable export is not counted as a reader. Read-only viproc
    arrays get a read-only export (NumPy then raises its own error).
@@ -463,9 +470,9 @@ viproc memory itself, not copies:
    Views are recognized by memory overlap (`np.may_share_memory`), not by
    the base chain: NumPy code builds views through other objects
    (`as_strided`'s `DummyArray`).
-4. **The exports are made read-only** after the call, in case NumPy code
-   kept a reference to one (a cache, an iterator): it can still read, but
-   no longer write behind viproc's back.
+4. **Exports NumPy code kept** (a cache, an iterator) stay writable
+   aliases, counted as host views: ops on that memory run synchronously
+   while they live (Export, above).
 
 **Read-only viproc arrays** (`_readonly`): views that NumPy returns
 read-only (`broadcast_to`, `sliding_window_view`, …) stay read-only in
