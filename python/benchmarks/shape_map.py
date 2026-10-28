@@ -72,7 +72,8 @@ def measure(case, shape, cores, workers, target, repeat, seed, mode="arrays"):
     `python -m viproc` / `import viproc as np` do (ufunc proxies, where), on
     numpy.ndarray inputs under the ndarray hook. "hook": numpy.ndarray inputs
     and NumPy's own functions, the hook routes their operators
-    (viproc.enable_hook())."""
+    (viproc.enable_hook()). "viproc": viproc arrays and the viproc module
+    (`import viproc as np` on viproc data), no hook."""
     import viproc
 
     width = cores if case.width == "cores" else case.width
@@ -85,20 +86,21 @@ def measure(case, shape, cores, workers, target, repeat, seed, mode="arrays"):
     t_np, _ = best_of(lambda: case.run(data, reps), repeats_for(warm, repeat))
 
     viproc.init(workers=workers)
-    vdata = [viproc.asarray(a) for a in data] if mode == "arrays" else data
+    vdata = [viproc.asarray(a) for a in data] if mode in ("arrays", "viproc") else data
+    hook = mode in ("module", "hook")
     viproc.wait_all()
 
     def run():
-        if mode != "arrays":
+        if hook:
             viproc.enable_hook()
-        if mode == "module":
+        if mode in ("module", "viproc"):
             shape_map_cases.np = viproc
         try:
             out = case.run(vdata, reps)
             viproc.wait_all()
         finally:
             shape_map_cases.np = np
-            if mode != "arrays":
+            if hook:
                 viproc.enable_hook(False)
         return out
 
@@ -223,7 +225,8 @@ def labels(run):
         m = run["machine"]
         mode = m.get("mode") or ("module" if m.get("module") else "arrays")
         out["title"] += {"arrays": "", "module": " (python -m viproc, ndarray inputs)",
-                         "hook": " (ndarray hook, ndarray inputs)"}[mode]
+                         "hook": " (ndarray hook, ndarray inputs)",
+                         "viproc": " (viproc arrays, viproc module)"}[mode]
         out["header"] = (f"{m['cpu']}, {m['cores']} cores, {m['workers']} workers, "
                          f"NumPy {m['numpy']}, build {m['build']}")
     return out
@@ -561,7 +564,8 @@ def plot_extremes(run, out_dir):
 
 
 MODE_TITLES = {"arrays": "viproc arrays as inputs", "module": "python -m viproc, ndarray inputs",
-               "hook": "enable_hook(), ndarray inputs"}
+               "hook": "enable_hook(), ndarray inputs",
+               "viproc": "viproc arrays, viproc module"}
 
 
 def run_mode(run):
@@ -632,10 +636,11 @@ def main():
     p.add_argument("--groups", type=lambda s: s.split(","),
                    help="comma-separated case groups (default: all); with --plot: report "
                         "only these groups of the run")
-    p.add_argument("--mode", choices=("arrays", "module", "hook"), default="arrays",
+    p.add_argument("--mode", choices=("arrays", "module", "hook", "viproc"), default="arrays",
                    help="arrays: viproc arrays as inputs (default); module: as `python -m "
                         "viproc` (np.* through the viproc module, numpy.ndarray inputs, the "
-                        "ndarray hook); hook: numpy.ndarray inputs, viproc.enable_hook()")
+                        "ndarray hook); hook: numpy.ndarray inputs, viproc.enable_hook(); "
+                        "viproc: viproc arrays and np.* through the viproc module, no hook")
     p.add_argument("--module", action="store_const", dest="mode", const="module",
                    help="same as --mode module")
     p.add_argument("--plot", metavar="SHAPE_MAP_JSON", help="only redraw the reports of a run")
