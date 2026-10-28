@@ -40,12 +40,13 @@ struct OffloadOptions {
     // Tasks with fewer output elements always run inline (N_min).
     std::int64_t sync_below = 2048;
     // ... but not if the op's estimated NumPy time (DirectCost) is above
-    // this. A promoted op makes the cheap ops that consume it tasks too:
-    // `break_even.py` chains of sin/cos break even at ~2 us per op, but
-    // `ind_cores_f32` (float32 sin of 1,000, ~2.2 us, then * 0.5 + 0.4)
-    // drops from 0.6x to 0.15x as tasks. 5 us leaves it direct and still
-    // promotes sin of 1,000 doubles (~8 us).
-    double direct_budget_ns = 5000;
+    // this. A promoted op makes the cheap ops that consume it tasks too, and
+    // the main thread then pays the task path for all of them: `break_even.py`
+    // chains of sin/cos break even at ~2 us per op, but with 2 us
+    // `ind_cores_f32` (float32 sin of 1,000, ~2.2 us) fell from 0.6x to
+    // 0.15x and with 5 us `expr8` (8 terms, 1,000 elements) from 1.0x to
+    // 0.6x. 10 us promotes sin of 1,500 doubles (~15 us), not of 1,000.
+    double direct_budget_ns = 10000;
     // Direct runs of at least this many elements are timed (the first two
     // of a loop, then every 16th): below it the clock reads would cost more
     // than the decision gains.
