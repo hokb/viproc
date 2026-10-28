@@ -567,14 +567,19 @@ reference counting.
      loop, `Kernel::direct_cost`, `DirectCost`): runs of >= `time_from` =
      256 elements, the first two, then every 16th; the estimate is the
      smaller of the last two samples (ns per element). An op whose estimated
-     NumPy time is above `direct_budget_ns` = 2 µs (the break-even of the
-     task path, `break_even.py`) is sized as `sync_below` and takes the task
-     path and rule 2 like a large op: `sin` of 1,500 doubles (~15 µs) is a
-     task, `add` (~0.6 µs) stays direct. Without it the loop of ILNumerics'
+     NumPy time is above `direct_budget_ns` = 5 µs is sized as `sync_below`
+     and takes the task path and rule 2 like a large op; every 32nd such op
+     runs directly again and is re-timed (a loop measured slow by accident
+     returns). `sin` of 1,500 doubles (~15 µs) is a
+     task, `add` (~0.6 µs) stays direct. The budget is above the 2 µs
+     break-even of sin/cos chains (`break_even.py`) because a promoted op
+     drags the cheap ops consuming it onto the task path: `ind_cores_f32`
+     (float32 `sin` of 1,000, ~2.2 µs, then `* 0.5 + 0.4`) fell from 0.6x
+     to 0.15x with a 2 µs budget. Without the rule the loop of ILNumerics'
      array-pipelining demo (`array_pipelining.py`: `C[i] =
      np.sum(np.abs(np.sin(A[:, i])), axis=0)` over 1,500 columns) ran every
      `sin` on the main thread: no parallelism at all (1.0x on 4 cores, now
-     2.0-2.3x). Rule 1 stays a fixed threshold in deterministic mode (a
+     ~2x). Rule 1 stays a fixed threshold in deterministic mode (a
      timed decision is not deterministic; there a read-right-away `sin` of
      1,000 would run 2x slower as a task).
   2. **Adaptive above N_min, per (issue site, log2 size class):** count

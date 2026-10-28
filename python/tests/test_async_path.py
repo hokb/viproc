@@ -194,7 +194,7 @@ def test_views_issue_no_task():
 def test_expensive_small_op_becomes_a_task():
     """Below sync_below, an op runs directly on the main thread unless its
     loop is expensive: the direct path times the loop (DirectCost) and ops
-    worth more than ~2 us of NumPy time become tasks, as large ones.
+    worth more than ~5 us of NumPy time become tasks, as large ones.
     Adaptive mode only: deterministic mode keeps the fixed threshold."""
     viproc.init(sync_below=2048, adaptive=True)
     try:

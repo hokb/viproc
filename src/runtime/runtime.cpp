@@ -295,8 +295,8 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     if (elements < policy_.options().sync_below) {
         // An expensive loop: the op is sized as a large one, for the direct
         // path and the dispatch policy alike (OffloadOptions::direct_budget_ns).
-        const DirectCost* c = kernel->direct_cost();
-        if (c != nullptr && policy_.too_expensive(*c, elements)) {
+        DirectCost* c = kernel->direct_cost();
+        if (c != nullptr && policy_.promote(*c, elements)) {
             elements = policy_.options().sync_below;
         }
     }

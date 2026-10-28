@@ -48,6 +48,7 @@ void OffloadPolicy::record(DirectCost& c, double ns, std::int64_t elements) {
     const auto per = static_cast<float>(ns / static_cast<double>(elements));
     c.ns_per_element = std::min(c.last, per);
     c.last = per;
+    c.retest = false;
 }
 
 void OffloadPolicy::on_blocked(SiteStats* stats, std::uint64_t distance) {
