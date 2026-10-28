@@ -340,6 +340,8 @@ docs/design/           Design documents (decisions with rationale)
   array-data-model.md  array data model: Array, Metadata (SD + task),
                        AliasGroup, CountableArray; lifecycle, checks per op,
                        figure (array-data-model.svg), evaluation
+docs/optimizations.md  every optimization: case, implementation, state, effect
+                       (done, open, shelved, rejected); keep it up to date
 docs/benchmarks.md     benchmark results: current breakdown per category and
                        case, progress per change, external machines,
                        shape map (images in docs/benchmarks/; reference
