@@ -64,11 +64,6 @@ Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_
     if (options_.max_active_tasks == 0) {
         options_.max_active_tasks = 1;
     }
-    if (options_.offload.scale_budget) {
-        options_.offload.direct_budget_ns *= issue_speed_scale();
-        options_.offload.scale_budget = false;
-        policy_ = OffloadPolicy(options_.offload);
-    }
     locals_.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
         locals_.push_back(std::make_unique<LocalQueue>());

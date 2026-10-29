@@ -1,8 +1,6 @@
 #include "cpu.hpp"
 
 #include <algorithm>
-#include <chrono>
-#include <cstdint>
 #include <thread>
 
 #if defined(_WIN32)
@@ -123,8 +121,6 @@ std::size_t os_physical_cores() { return 0; }
 
 #endif
 
-volatile std::uint32_t probe_sink = 0;
-
 } // namespace
 
 std::size_t physical_core_count() {
@@ -136,77 +132,6 @@ std::size_t physical_core_count() {
 std::size_t default_worker_count() {
     const std::size_t cores = physical_core_count();
     return cores > 1 ? cores - 1 : 1;
-}
-
-double issue_probe_ns() {
-    // Eight interleaved walks over a random cycle of 256 nodes (4 KB, L1),
-    // each step a load of the next node and of its value, a multiply-add
-    // and a store: the dependent loads, refcount updates and hashing of the
-    // issue path, with enough independent work that a wider core finishes
-    // it sooner (bound by load/store throughput and issue width, not by
-    // one load's latency). No SIMD, no data-dependent branch.
-    struct Node {
-        Node* next;
-        std::uintptr_t value;
-    };
-    static constexpr std::size_t kNodes = 256;
-    static constexpr int kSteps = 2048;
-    Node nodes[kNodes];
-    std::size_t order[kNodes];
-    std::uint32_t rng = 0x9e3779b9u;
-    for (std::size_t i = 0; i < kNodes; ++i) {
-        order[i] = i;
-    }
-    for (std::size_t i = kNodes - 1; i > 0; --i) {
-        rng = rng * 1664525u + 1013904223u;
-        std::swap(order[i], order[(rng >> 8) % (i + 1)]);
-    }
-    for (std::size_t i = 0; i < kNodes; ++i) {
-        nodes[order[i]] = {&nodes[order[(i + 1) % kNodes]], i};
-    }
-    using clock = std::chrono::steady_clock;
-    double best = 1e300;
-    std::uintptr_t sink = 0;
-    // The best run: until 16 runs in a row found nothing 2% faster (a
-    // preempted run, a core still ramping up its clock), at most 128 runs.
-    for (int run = 0, stale = 0; run < 128 && stale < 16; ++run) {
-        Node* p0 = &nodes[order[0]];
-        Node* p1 = &nodes[order[32]];
-        Node* p2 = &nodes[order[64]];
-        Node* p3 = &nodes[order[96]];
-        Node* p4 = &nodes[order[128]];
-        Node* p5 = &nodes[order[160]];
-        Node* p6 = &nodes[order[192]];
-        Node* p7 = &nodes[order[224]];
-        std::uintptr_t h0 = 0, h1 = 1, h2 = 2, h3 = 3, h4 = 4, h5 = 5, h6 = 6, h7 = 7;
-        const auto t0 = clock::now();
-        for (int k = 0; k < kSteps; ++k) {
-#define VIPROC_PROBE_STEP(p, h)                                                                    \
-    p = p->next;                                                                                   \
-    h = h * 0x9e3779b1u + p->value;                                                                \
-    ++p->value;
-            VIPROC_PROBE_STEP(p0, h0)
-            VIPROC_PROBE_STEP(p1, h1)
-            VIPROC_PROBE_STEP(p2, h2)
-            VIPROC_PROBE_STEP(p3, h3)
-            VIPROC_PROBE_STEP(p4, h4)
-            VIPROC_PROBE_STEP(p5, h5)
-            VIPROC_PROBE_STEP(p6, h6)
-            VIPROC_PROBE_STEP(p7, h7)
-#undef VIPROC_PROBE_STEP
-        }
-        const double ns = std::chrono::duration<double, std::nano>(clock::now() - t0).count();
-        stale = ns < 0.98 * best ? 0 : stale + 1;
-        best = std::min(best, ns);
-        sink += h0 + h1 + h2 + h3 + h4 + h5 + h6 + h7;
-    }
-    probe_sink = static_cast<std::uint32_t>(sink); // keeps the walks
-    return best;
-}
-
-double issue_speed_scale() {
-    static const double scale = std::clamp(issue_probe_ns() / kIssueProbeReferenceNs, 0.2, 5.0);
-    return scale;
 }
 
 } // namespace viproc

@@ -2601,6 +2601,19 @@ static PyObject* m_direct_budget_ns(PyObject* self, PyObject* noargs) {
     return PyFloat_FromDouble(vp_direct_budget_ns(g_rt));
 }
 
+static PyObject* m_set_direct_budget_ns(PyObject* self, PyObject* arg) {
+    (void)self;
+    const double ns = PyFloat_AsDouble(arg);
+    if (ns == -1.0 && PyErr_Occurred()) {
+        return NULL;
+    }
+    if (check_runtime() < 0) {
+        return NULL;
+    }
+    vp_set_direct_budget_ns(g_rt, ns);
+    Py_RETURN_NONE;
+}
+
 static PyObject* m_active_tasks(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
@@ -5047,6 +5060,7 @@ static PyMethodDef methods[] = {
     {"workers", m_workers, METH_NOARGS, NULL},
     {"physical_cores", m_physical_cores, METH_NOARGS, NULL},
     {"direct_budget_ns", m_direct_budget_ns, METH_NOARGS, NULL},
+    {"set_direct_budget_ns", m_set_direct_budget_ns, METH_O, NULL},
     {"active_tasks", m_active_tasks, METH_NOARGS, NULL},
     {"wait_all", m_wait_all, METH_NOARGS, NULL},
     {"from_ndarray", m_from_ndarray, METH_O, "Wrap a NumPy array (no copy)."},

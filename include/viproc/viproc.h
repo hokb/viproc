@@ -64,9 +64,10 @@ size_t vp_worker_count(const vp_runtime* rt);
  * affinity). The default worker count is one less, at least 1. */
 size_t vp_physical_core_count(void);
 /* [main thread] NumPy time above which a small ready op of a timed loop
- * takes the task path, in ns: 10 us on the calibration machine, scaled to
- * the speed of the core that started the runtime (offload.hpp). */
+ * takes the task path, in ns (OffloadOptions::direct_budget_ns): 10 us
+ * unless set; the Python bridge scales it to the machine. */
 double vp_direct_budget_ns(const vp_runtime* rt);
+void vp_set_direct_budget_ns(vp_runtime* rt, double ns);
 
 /* Asynchronous error reporting (docs/design/error-handling.md). An op that
  * fails on any thread records its error in the runtime, the one place errors

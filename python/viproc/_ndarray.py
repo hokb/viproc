@@ -56,6 +56,38 @@ def _ensure_runtime():
         sync_below, adaptive = _env_policy()
         _viproc.init(workers, 0, sync_below, adaptive)
         _small_ops[0] = 2048 if sync_below < 0 else sync_below
+        _scale_budget()
+
+
+# The direct-path budget (OffloadOptions::direct_budget_ns, 10 us) is a time
+# of the calibration machine, a 4-vCPU VM, where a direct `a * b` of 8
+# doubles takes _BUDGET_REFERENCE_NS. It stands for main-thread costs (the
+# task path of a promoted op and of the cheap ops consuming it), so it is
+# scaled by this machine's time of the same op: measured once per process,
+# on the code the main thread runs per op (bridge, runtime, NumPy's loop),
+# built by the same compiler. A probe of plain C code was tried first: it
+# measured a 12700K as fast as the VM, where NumPy's sin is 2.3x and a loop
+# iteration of `array_pipelining.py` 3x faster.
+_BUDGET_REFERENCE_NS = 525.0
+_budget_scale = []
+
+
+def _scale_budget():
+    if not _budget_scale:
+        if not 8 < _small_ops[0]:
+            return  # `a * b` would be a task: nothing to measure
+        import time
+        a = asarray(np.arange(8.0))
+        b = asarray(np.arange(8.0))
+        clock = time.perf_counter_ns
+        best = float("inf")
+        for _ in range(40):  # the best of 40 x 25 ops, ~0.5 ms
+            t = clock()
+            for _ in range(25):
+                a * b
+            best = min(best, (clock() - t) / 25)
+        _budget_scale.append(min(max(best / _BUDGET_REFERENCE_NS, 0.2), 5.0))
+    _viproc.set_direct_budget_ns(_viproc.direct_budget_ns() * _budget_scale[0])
 
 
 def _wrap_numpy(arr):
@@ -1876,6 +1908,7 @@ def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
         _viproc.init(workers, max_active_tasks, sync_below,
                      env_adaptive if adaptive is None else adaptive)
         _small_ops[0] = 2048 if sync_below < 0 else sync_below
+        _scale_budget()
 
 
 def offload_stats():
