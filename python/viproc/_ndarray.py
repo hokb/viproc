@@ -1859,7 +1859,8 @@ def wait_all():
 def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
     """(Re)starts the runtime.
 
-    workers: worker threads (0: one per physical core).
+    workers: worker threads (0: one per physical core but one, the main
+        thread's; at least 1).
     sync_below: ops whose inputs are ready and that produce fewer elements run
         inline on the calling thread (default 2048, env VIPROC_SYNC_BELOW).
     adaptive: let each issue site switch to inline execution while its results
@@ -1917,6 +1918,13 @@ def shutdown():
 def workers():
     _ensure_runtime()
     return _viproc.workers()
+
+
+def physical_cores():
+    """Physical cores this process may run on (SMT siblings once, affinity).
+    The default worker count is one less (the main thread issues on its own
+    core), at least 1."""
+    return _viproc.physical_cores()
 
 
 from ._compose import COMPOSITIONS as _COMPOSITIONS  # noqa: E402 (uses this module)

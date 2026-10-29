@@ -75,7 +75,7 @@ python -c "import viproc; print(viproc.__version__, 'workers:', viproc.workers()
 python -m viproc -c "import numpy; print(numpy.__name__)"
 ```
 
-The first command prints the version and the number of worker threads (one per physical core). The second
+The first command prints the version and the number of worker threads (one per physical core but one, which the main thread keeps). The second
 must print `viproc`; if it prints `numpy`, viproc is not active.
 
 ## 4. Running programs with viproc

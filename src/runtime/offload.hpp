@@ -18,6 +18,7 @@
 // Main thread only: all state here is touched by the issuing thread alone.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <unordered_map>
 #include <utility>
@@ -27,13 +28,17 @@ namespace viproc {
 // NumPy time per element of a kernel that many ops share (one per resolved
 // loop), measured on the direct path: the dispatch policy sends ops of an
 // expensive loop to the task path although they have fewer than
-// `sync_below` elements (OffloadPolicy::promote). Main thread only.
+// `sync_below` elements (OffloadPolicy::promote). Main thread only, except
+// `task_sample`.
 struct DirectCost {
     float ns_per_element = 0;   // min of the last two samples; 0: not known yet
     float last = 0;             // the last sample
     std::uint32_t calls = 0;    // direct runs, for sampling
     std::uint32_t promoted = 0; // ops sent to the task path, for re-tests
-    bool retest = false;        // this direct run re-tests a promoted loop
+    bool retest = false;        // the op being issued re-tests a promoted loop
+    // ns per element of a re-test, measured by the task on its worker
+    // (Task::time_kernel); 0: none arrived. Taken over by the next promote().
+    std::atomic<float> task_sample{0};
 };
 
 struct OffloadOptions {
@@ -90,31 +95,38 @@ class OffloadPolicy {
 
     // True if an op of `elements` (< sync_below) on a kernel with this cost
     // estimate takes the task path anyway: its loop is expensive. Every
-    // `kRetest`-th such op runs directly and is timed again, so a loop
-    // measured slow by accident (cold memory, a preempted run) returns to
-    // the direct path. Adaptive mode only: deterministic mode keeps rule 1
-    // a fixed threshold.
+    // `kRetest`-th such op is timed again (`c.retest`: its task times its
+    // kernel on the worker), so a loop measured slow by accident (cold
+    // memory, a preempted run) returns to the direct path. The re-test ran
+    // directly on the main thread before: a sin of 1,500 doubles every 32nd
+    // op stalled the issuing thread for ~15 us, 21% of its instructions in
+    // `array_pipelining.py`'s loop. Adaptive mode only: deterministic mode
+    // keeps rule 1 a fixed threshold.
     bool promote(DirectCost& c, std::int64_t elements) const {
-        if (!options_.adaptive ||
-            c.ns_per_element * static_cast<double>(elements) <= options_.direct_budget_ns) {
+        if (!options_.adaptive) {
             return false;
         }
-        if (++c.promoted % kRetest == 0 && elements >= options_.time_from) {
-            c.retest = true;
+        if (c.task_sample.load(std::memory_order_relaxed) > 0) {
+            record_sample(c, c.task_sample.exchange(0, std::memory_order_relaxed));
+        }
+        if (c.ns_per_element * static_cast<double>(elements) <= options_.direct_budget_ns) {
             return false;
         }
+        c.retest = ++c.promoted % kRetest == 0 && elements >= options_.time_from;
         return true;
     }
     // True if this direct run is to be timed (record()): the first two of a
-    // loop, then every 16th, and re-tests.
+    // loop, then every 16th.
     bool time_direct(DirectCost& c, std::int64_t elements) const {
         if (!options_.adaptive || elements < options_.time_from) {
             return false;
         }
         const std::uint32_t k = c.calls++;
-        return k < 2 || k % 16 == 0 || c.retest;
+        return k < 2 || k % 16 == 0;
     }
     static void record(DirectCost& c, double ns, std::int64_t elements);
+    // The same for a sample in ns per element.
+    static void record_sample(DirectCost& c, float ns_per_element);
 
     // The main thread is about to block on work it started with `stats`,
     // `distance` ops ago.

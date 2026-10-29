@@ -931,15 +931,18 @@ void test_element_pool() {
     pool.set_limit(saved_limit);
 }
 
-// The default worker count is one per physical core: at least 1, at most one
-// per hardware thread.
+// The default worker count is one per physical core but one (the main
+// thread's): at least 1, at most one per hardware thread.
 void test_default_workers() {
     const std::size_t cores = physical_core_count();
     const std::size_t logical = std::max(1u, std::thread::hardware_concurrency());
     std::printf("physical cores %zu, hardware threads %zu\n", cores, logical);
     check(cores >= 1 && cores <= logical, "physical cores within [1, hardware threads]");
     Runtime rt{RuntimeOptions{}};
-    check(rt.worker_count() == cores, "default runtime has one worker per physical core");
+    check(default_worker_count() == (cores > 1 ? cores - 1 : 1),
+          "default worker count: physical cores - 1, at least 1");
+    check(rt.worker_count() == default_worker_count(),
+          "default runtime has one worker per physical core but one");
 }
 
 int main() {

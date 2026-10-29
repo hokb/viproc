@@ -17,6 +17,19 @@
 #include <memory>
 #include <new>
 
+// Thread-locals of the hot paths in the initial-exec TLS model on ELF
+// targets: viproc is a shared object loaded with dlopen, whose thread-locals
+// default to the general-dynamic model, a __tls_get_addr call per access
+// (~470 instructions per iteration of array_pipelining.py's loop, three pool
+// accesses per op). Initial-exec is one load relative to the thread pointer;
+// the few bytes come from the static TLS surplus glibc keeps for dlopen'ed
+// modules. Windows TLS has no such call: nothing to do there.
+#if defined(__ELF__) && (defined(__GNUC__) || defined(__clang__))
+#define VIPROC_TLS_INITIAL_EXEC [[gnu::tls_model("initial-exec")]]
+#else
+#define VIPROC_TLS_INITIAL_EXEC
+#endif
+
 namespace viproc {
 
 template <std::size_t Size, std::size_t Align> class FixedPool {
@@ -64,7 +77,7 @@ template <std::size_t Size, std::size_t Align> class FixedPool {
         bool allocator = false; // this thread allocates from the pool
     };
     static Local& local() {
-        thread_local Local l;
+        VIPROC_TLS_INITIAL_EXEC thread_local Local l;
         return l;
     }
     static std::atomic<Node*>& shared() {

@@ -648,3 +648,13 @@ def test_waits_inside_an_issue_release_the_gil():
             viproc.wait_all()
     finally:
         viproc.init()
+
+
+def test_default_worker_count_leaves_the_main_thread_a_core():
+    viproc.init()
+    try:
+        cores = viproc.physical_cores()
+        assert cores >= 1
+        assert viproc.workers() == max(1, cores - 1)
+    finally:
+        viproc.init()

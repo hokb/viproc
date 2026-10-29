@@ -303,3 +303,38 @@ def test_argmin_argmax_run_asynchronously(dtype):
                     assert isinstance(got, (viproc.ndarray, np.generic))
                     assert same(got, fn(a, **kw)), (fn.__name__, shape, kw)
     assert fallbacks() == f0
+
+
+def test_shared_reduce_kernels_keep_each_identity():
+    """Ops of one reduction signature share a kernel (one per ufunc, input
+    layout, axes and identity): a different initial value, sign of zero or
+    dtype must not reuse another one's, and every column of a loop gets its
+    own result."""
+    a = np.arange(1.0, 401.0).reshape(20, 20).T.copy() - 200.0
+    v = viproc.asarray(a)
+    for i in range(a.shape[1]):
+        assert same(np.sum(v[:, i], axis=0), np.sum(a[:, i], axis=0))
+    z = np.full(5000, -0.0)
+    vz = viproc.asarray(z)
+    for initial in [0.0, -0.0, 1.5, 0, 2, True, -1.0, -0.0, 0.0]:
+        assert same(np.add.reduce(vz, initial=initial), np.add.reduce(z, initial=initial)), initial
+        assert same(np.add.reduce(vz, axis=0, initial=initial),
+                    np.add.reduce(z, axis=0, initial=initial)), initial
+    for dt in [np.int32, np.int64, np.float32, np.complex128]:
+        x = np.arange(3000).astype(dt)
+        vx = viproc.asarray(x)
+        for initial in [None, 0, 7, -3]:
+            kw = {} if initial is None else {"initial": initial}
+            assert same(np.add.reduce(vx, **kw), np.add.reduce(x, **kw)), (dt, initial)
+            assert same(np.multiply.reduce(vx[:5], **kw), np.multiply.reduce(x[:5], **kw))
+    b = np.ones(3000, bool)
+    vb = viproc.asarray(b)
+    for initial in [True, False]:
+        assert same(np.logical_and.reduce(vb, initial=initial),
+                    np.logical_and.reduce(b, initial=initial))
+    vi = viproc.asarray(np.zeros(3000, np.int32))
+    for _ in range(2):  # NumPy's conversion error, every time
+        with pytest.raises(OverflowError, match="out of bounds for int32"):
+            np.maximum.reduce(vi, initial=2**40)
+        with pytest.raises(OverflowError):
+            np.bitwise_or.reduce(viproc.asarray(np.zeros(3000, np.int64)), initial=2**70)

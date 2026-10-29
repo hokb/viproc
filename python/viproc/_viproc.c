@@ -2166,6 +2166,8 @@ static PyMethodDef Array_methods[] = {
 
 static PyObject* m_item(PyObject* self, PyObject* const* args, Py_ssize_t nargs);
 static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t nargs);
+static int basic_layout(vp_array* x, PyObject* key, int* out_nd, int64_t* nshape, int64_t* nstrides,
+                        int64_t* out_offset);
 
 /* a[key]. In C for what runs once per op, without a Python frame: an
  * integer key of a ready array (NumPy's scalar) and basic keys (a view).
@@ -2343,22 +2345,19 @@ static int Array_ass_subscript(PyObject* self, PyObject* key, PyObject* value) {
     if (writable && array_size(x) <= g_small) {
         return numpy_setitem(self, key, value, nkey);
     }
-    PyObject* target = NULL;
-    if (nkey == 0) {
-        PyObject* args[2] = {self, key};
-        target = m_basic_view(NULL, args, 2);
-        if (target == NULL) {
-            PyErr_Clear(); /* the hook raises NumPy's error */
-        } else if (target == Py_None) {
-            Py_CLEAR(target);
-        }
-    }
-    if (target == NULL) { /* advanced key: scatter / masked assignment tasks */
+    /* The written view: a runtime view only, no Python object (it would only
+     * live for this statement). */
+    int64_t vshape[MAXDIMS], vstrides[MAXDIMS], voffset = 0;
+    int vnd = 0;
+    if (nkey != 0 || !basic_layout(x, key, &vnd, vshape, vstrides, &voffset)) {
+        /* advanced key: scatter / masked assignment tasks; or NumPy's error */
         return call_setitem_hook(self, key, value);
     }
-    vp_array* t = ((ArrayObject*)target)->a;
-    if (writable && array_size(t) <= g_small) {
-        Py_DECREF(target);
+    int64_t tsize = 1;
+    for (int i = 0; i < vnd; ++i) {
+        tsize *= vshape[i];
+    }
+    if (writable && tsize <= g_small) {
         return numpy_setitem(self, key, value, nkey);
     }
     PyObject* src = NULL;
@@ -2367,19 +2366,18 @@ static int Array_ass_subscript(PyObject* self, PyObject* key, PyObject* value) {
     } else if (is_scalar_value(value)) {
         vp_array* s = NULL;
         if (vp_array_from_item(g_rt, value, vp_array_dtype(x), &s) != VP_OK) {
-            Py_DECREF(target);
             return -1; /* NumPy's conversion error, as a[i] = value raises it */
         }
         src = wrap_array(s);
     }
     if (src == NULL) {
-        Py_DECREF(target);
         return PyErr_Occurred() ? -1 : call_setitem_hook(self, key, value);
     }
+    vp_array* t = vp_array_view(g_rt, x, vp_array_dtype(x), vnd, vshape, vstrides, voffset);
     char err[ERRLEN] = "";
     const int status = vp_assign(g_rt, t, ((ArrayObject*)src)->a, issue_site(), err, sizeof err);
+    vp_array_release(t);
     Py_DECREF(src);
-    Py_DECREF(target);
     if (status == VP_OK) {
         return 0;
     }
@@ -2588,6 +2586,12 @@ static PyObject* m_workers(PyObject* self, PyObject* noargs) {
     return PyLong_FromSize_t(vp_worker_count(g_rt));
 }
 
+static PyObject* m_physical_cores(PyObject* self, PyObject* noargs) {
+    (void)self;
+    (void)noargs;
+    return PyLong_FromSize_t(vp_physical_core_count());
+}
+
 static PyObject* m_active_tasks(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
@@ -2656,15 +2660,12 @@ static PyObject* make_view(PyObject* a, vp_dtype dtype, int nd, const int64_t* s
 /* Basic indexing (ints, slices, None, one Ellipsis) as NumPy's
  * get_view_from_index computes it: slices through CPython's
  * PySlice_Unpack/PySlice_AdjustIndices, as NumPy's PySlice_GetIndicesEx.
- * Returns the view, or None for any other key (and for errors, which the
- * caller leaves to NumPy's messages). An all-int key gives a 0-d view. */
-static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
-    (void)self;
-    if (array_and_arg(args, nargs) < 0) {
-        return NULL;
-    }
-    PyObject *a = args[0], *key = args[1];
-    vp_array* x = array_of(a);
+ * The view's layout (*newnd dimensions, offset in bytes relative to x's
+ * first element): 1, or 0 for any other key and for errors, which the
+ * caller leaves to NumPy's messages (no Python error set). An all-int key
+ * gives a 0-d view. */
+static int basic_layout(vp_array* x, PyObject* key, int* out_nd, int64_t* nshape, int64_t* nstrides,
+                        int64_t* out_offset) {
     const int nd = vp_array_ndim(x);
     const int64_t* shape = vp_array_shape(x);
     const int64_t* strides = vp_array_strides(x);
@@ -2679,29 +2680,28 @@ static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t 
         } else if (k != Py_None) {
             if (!(PySlice_Check(k) || (PyLong_Check(k) && !PyBool_Check(k)) ||
                   (g_np_integer != NULL && PyObject_TypeCheck(k, (PyTypeObject*)g_np_integer)))) {
-                Py_RETURN_NONE; /* arrays, bools, lists, ...: not basic */
+                return 0; /* arrays, bools, lists, ...: not basic */
             }
             ++consumed;
         }
     }
     if (ellipses > 1 || consumed > nd) {
-        Py_RETURN_NONE;
+        return 0;
     }
-    int64_t nshape[MAXDIMS], nstrides[MAXDIMS];
     int newnd = 0, od = 0;
     int64_t offset = 0;
     for (Py_ssize_t i = 0; i < n; ++i) {
         PyObject* k = items[i];
         if (k == Py_None) {
             if (newnd >= MAXDIMS) {
-                Py_RETURN_NONE;
+                return 0;
             }
             nshape[newnd] = 1;
             nstrides[newnd++] = 0;
         } else if (k == Py_Ellipsis) {
             for (int j = 0; j < nd - consumed; ++j, ++od) {
                 if (newnd >= MAXDIMS) {
-                    Py_RETURN_NONE;
+                    return 0;
                 }
                 nshape[newnd] = shape[od];
                 nstrides[newnd++] = strides[od];
@@ -2710,7 +2710,7 @@ static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t 
             Py_ssize_t start, stop, step;
             if (PySlice_Unpack(k, &start, &stop, &step) < 0) {
                 PyErr_Clear();
-                Py_RETURN_NONE;
+                return 0;
             }
             Py_ssize_t len = PySlice_AdjustIndices((Py_ssize_t)shape[od], &start, &stop, step);
             if (len <= 0) { /* as NumPy: points to the start */
@@ -2719,7 +2719,7 @@ static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t 
                 start = 0;
             }
             if (newnd >= MAXDIMS) {
-                Py_RETURN_NONE;
+                return 0;
             }
             offset += strides[od] * start;
             nshape[newnd] = len;
@@ -2729,10 +2729,10 @@ static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t 
             const Py_ssize_t v = PyNumber_AsSsize_t(k, NULL);
             if (v == -1 && PyErr_Occurred()) {
                 PyErr_Clear();
-                Py_RETURN_NONE;
+                return 0;
             }
             if (v < -shape[od] || v >= shape[od]) {
-                Py_RETURN_NONE; /* NumPy raises its IndexError */
+                return 0; /* NumPy raises its IndexError */
             }
             offset += strides[od] * (v < 0 ? v + shape[od] : v);
             ++od;
@@ -2740,10 +2740,28 @@ static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t 
     }
     for (; od < nd; ++od) { /* implicit trailing Ellipsis */
         if (newnd >= MAXDIMS) {
-            Py_RETURN_NONE;
+            return 0;
         }
         nshape[newnd] = shape[od];
         nstrides[newnd++] = strides[od];
+    }
+    *out_nd = newnd;
+    *out_offset = offset;
+    return 1;
+}
+
+/* a[key] for a basic key as a view (basic_layout), or None. */
+static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
+    (void)self;
+    if (array_and_arg(args, nargs) < 0) {
+        return NULL;
+    }
+    PyObject *a = args[0], *key = args[1];
+    vp_array* x = array_of(a);
+    int64_t nshape[MAXDIMS], nstrides[MAXDIMS], offset = 0;
+    int newnd = 0;
+    if (!basic_layout(x, key, &newnd, nshape, nstrides, &offset)) {
+        Py_RETURN_NONE;
     }
     return make_view(a, vp_array_dtype(x), newnd, nshape, nstrides, offset, 0);
 }
@@ -5018,6 +5036,7 @@ static PyMethodDef methods[] = {
     {"pool_trim", m_pool_trim, METH_NOARGS, "Return all cached element memory."},
     {"pool_set_limit", m_pool_set_limit, METH_O, "Bound for cached element memory (bytes)."},
     {"workers", m_workers, METH_NOARGS, NULL},
+    {"physical_cores", m_physical_cores, METH_NOARGS, NULL},
     {"active_tasks", m_active_tasks, METH_NOARGS, NULL},
     {"wait_all", m_wait_all, METH_NOARGS, NULL},
     {"from_ndarray", m_from_ndarray, METH_O, "Wrap a NumPy array (no copy)."},

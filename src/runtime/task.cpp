@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cassert>
 #include <cfenv>
+#include <chrono>
 #include <cstring>
 #include <exception>
 
@@ -386,6 +387,8 @@ TaskList Task::execute(ErrorTable* errors) {
         const std::span<const Operand> inputs(operands_.data(), ninputs_);
         const std::span<Operand> outputs(operands_.data() + ninputs_, operands_.size() - ninputs_);
         std::feclearexcept(FE_ALL_EXCEPT);
+        const auto t0 = timed_elements_ > 0 ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
         KernelResult r;
         try {
             r = kernel_->run(inputs, outputs);
@@ -393,6 +396,15 @@ TaskList Task::execute(ErrorTable* errors) {
             r = KernelResult{1, e.what(), 0};
         } catch (...) {
             r = KernelResult{1, "unknown exception in kernel", 0};
+        }
+        if (timed_elements_ > 0 && r.status == 0) {
+            const std::chrono::duration<double, std::nano> ns =
+                std::chrono::steady_clock::now() - t0;
+            if (DirectCost* c = kernel_->direct_cost()) {
+                c->task_sample.store(
+                    static_cast<float>(ns.count() / static_cast<double>(timed_elements_)),
+                    std::memory_order_relaxed);
+            }
         }
         fp_flags_ = r.fp_flags | std::fetestexcept(FE_ALL_EXCEPT);
         if (r.status != 0) {
