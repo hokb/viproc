@@ -319,6 +319,16 @@ int vp_take_fp_events(vp_runtime* rt, PyObject** out) {
 size_t vp_worker_count(const vp_runtime* rt) { return rt->rt->worker_count(); }
 
 size_t vp_physical_core_count(void) { return physical_core_count(); }
+
+double vp_direct_budget_ns(const vp_runtime* rt) {
+    return rt->rt->offload_policy().options().direct_budget_ns;
+}
+
+void vp_set_direct_budget_ns(vp_runtime* rt, double ns) {
+    OffloadOptions o = rt->rt->offload_policy().options();
+    o.direct_budget_ns = ns;
+    rt->rt->set_offload_options(o);
+}
 size_t vp_active_tasks(const vp_runtime* rt) { return rt->rt->active_tasks(); }
 
 void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive) {

@@ -588,6 +588,22 @@ reference counting.
      ~2x). Rule 1 stays a fixed threshold in deterministic mode (a
      timed decision is not deterministic; there a read-right-away `sin` of
      1,000 would run 2x slower as a task).
+     **The budget is set per machine:** it stands for main-thread costs,
+     so the bridge sets it to 9 times what the main thread pays per op
+     there: a direct `a * b` of 8 doubles, timed once per process
+     (`_scale_budget` in `_ndarray.py`, best of 40 x 25 ops, ~0.5 ms;
+     `vp_set_direct_budget_ns`, clamped to 1-50 µs;
+     `_viproc.direct_budget_ns()` shows it; `VIPROC_DIRECT_BUDGET_NS`
+     overrides it). 4.7 µs on the 4-vCPU VM (525 ns per op), 3.0 µs on a
+     12700K (330 ns). The fixed 10 µs (in the paragraph above) were the
+     VM's time; on the 12700K (`sin` of 1,500 doubles 6.1 µs) the whole
+     loop of `array_pipelining.py` ran directly: 0 tasks, 1.03x at every
+     worker count; with 3 µs 2.9x (1,000²) and 4.2x (1,500²) at 4 workers,
+     `expr8` at 1,000 elements 1.0x -> 1.6x, quick module shape map
+     unchanged (1.08 -> 1.10). On the VM 4.7 µs and 10 µs measure the
+     same within noise (quick module map 1.04/1.03 vs. 1.04/1.02). A
+     probe of plain C code (pointer walks) was tried first: it rated the
+     12700K (MSVC build) as fast as the VM.
   2. **Adaptive above N_min, per (issue site, log2 size class):** count
      async issues and how many of their results the main thread accessed
      "right away" — a sync point within `window` = 2 issued ops of the

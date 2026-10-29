@@ -794,6 +794,36 @@ lot between processes (a chain of `cos` on 10,000 elements measured
 `break_even.py` (sb=2048): `chains_sin` at 2,000 elements 1.48 → 1.79,
 cheap ops and reads right away unchanged.
 
+**The budget per machine (i7-12700K, Windows, MSVC, 12 physical cores).**
+There the fixed 10 µs left the loop on the main thread: a column's `sin`
+(1,500 doubles) takes 6.1 µs (VM 14 µs), so no op was promoted (0 tasks,
+4,500 direct ops per run) and `loop`/`loop_dep` ran at ~1.03x at every
+worker count; `vectorized` 5.7x at 12 workers. The bridge now sets the
+budget to 9 direct `a * b` of 8 doubles (330 ns there, 525 ns on the VM).
+`array_pipelining.py --sizes 200:500,1000:20,1500:10 --workers 1,4,11`
+with fixed budgets (`VIPROC_DIRECT_BUDGET_NS`), speedup vs. NumPy at
+1/4/11 workers:
+
+| budget | 200² `loop` | 1000² `loop` | 1000² `loop_dep` | 1500² `loop` | 1500² `loop_dep` |
+|---|---:|---:|---:|---:|---:|
+| 9.7 µs (C probe, rejected) | 1.26-1.28 | – | – | 1.10-1.11 | 1.08-1.10 |
+| 6.2 µs (VM's 10 µs scaled by `a * b`, rejected) | 1.20-1.27 | – | – | 1.07-1.13 | – |
+| 5 µs | 1.25/1.14/1.23 | 1.13/1.13/1.12 | 1.11/1.11/1.10 | 1.20/4.11/3.15 | 1.12/3.90/3.13 |
+| 3 µs | 1.22/1.12/1.07 | 1.30/2.90/2.18 | 1.26/3.05/2.34 | 1.22/4.24/3.34 | 1.13/3.99/3.38 |
+| 1.5 µs | 1.25/1.25/1.24 | 1.27/2.92/2.44 | 1.19/3.06/2.55 | 1.21/4.24/3.12 | 1.13/4.01/3.38 |
+
+NumPy with 12 threads (Parallel.For over the columns): 0.43-0.74x. More
+workers than 4 are slower in the loops (the main thread issues ~3 µs per
+iteration; more workers only add hand-offs). Quick shape map `--module`,
+12 workers, all 715 points bit-identical: geomean of the point medians
+`main` 1.08, budget 6.2 µs 1.09, 3 µs 1.10, no point below 0.8x;
+`expr8` at 1,000 elements 1.0x (main) → 1.6x (3 µs), `loop_cols` at
+1000 x 1 0.97x → 2.44x, `ind_cores_f32` 0.63-0.66x with every budget
+(not the budget: it is that slow at 1 element too). On the VM the new
+budget (4.7 µs) and 10 µs measure the same (quick module map, two runs
+each: geomean 1.056/1.025 vs. 1.041/1.023, cells below 0.8x 169/180 vs.
+151/167 of 715).
+
 ## Other machines
 
 **Iterator copies taken when the kernel runs.** The shape map found
