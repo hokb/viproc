@@ -192,12 +192,15 @@ def test_views_issue_no_task():
 
 
 def test_direct_budget_is_scaled_to_the_machine():
-    """The direct-path budget (10 us on the calibration machine) stands for
-    main-thread costs: the runtime scales it to the issuing core's speed
-    when it starts (issue_speed_scale, clamped to 0.2x-5x)."""
+    """The direct-path budget stands for main-thread costs: the bridge sets
+    it to 9 times the measured time of a small direct op (clamped to
+    1-50 us), once per process."""
     viproc.init(sync_below=2048, adaptive=True)
     try:
-        assert 2000 <= viproc._viproc.direct_budget_ns() <= 50000
+        budget = viproc._viproc.direct_budget_ns()
+        assert 1000 <= budget <= 50000
+        viproc.init(sync_below=2048, adaptive=True)
+        assert viproc._viproc.direct_budget_ns() == budget
     finally:
         viproc.shutdown()
 

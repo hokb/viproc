@@ -59,18 +59,23 @@ def _ensure_runtime():
         _scale_budget()
 
 
-# The direct-path budget (OffloadOptions::direct_budget_ns, 10 us) is a time
-# of the calibration machine, a 4-vCPU VM, where a direct `a * b` of 8
-# doubles takes _BUDGET_REFERENCE_NS. It stands for main-thread costs (the
-# task path of a promoted op and of the cheap ops consuming it), so it is
-# scaled by this machine's time of the same op: measured once per process,
-# on the code the main thread runs per op (bridge, runtime, NumPy's loop),
-# built by the same compiler. A probe of plain C code was tried first: it
-# measured a 12700K as fast as the VM, where NumPy's sin is 2.3x and a loop
-# iteration of `array_pipelining.py` 3x faster. VIPROC_DIRECT_BUDGET_NS
-# sets the budget instead (ns, not scaled).
-_BUDGET_REFERENCE_NS = 525.0
-_budget_scale = []
+# The direct-path budget (OffloadOptions::direct_budget_ns): the NumPy time
+# above which a small ready op of an expensive loop takes the task path. It
+# stands for main-thread costs (the task path of a promoted op and of the
+# cheap ops consuming it), so it is set in units of what the main thread
+# pays per op on this machine: _BUDGET_OPS times a direct `a * b` of 8
+# doubles, measured once per process on the code the main thread runs per
+# op (bridge, runtime, NumPy's loop), built by the same compiler. 9 ops:
+# 4.7 us on the 4-vCPU VM (a * b 525 ns), 3.0 us on a 12700K (330 ns).
+# There a fixed 10 us ran the whole loop of `array_pipelining.py` on the
+# main thread (sin of 1,500 doubles 6.1 us: no task, 1.03x); with 3 us its
+# loops run 2.9x (1,000 x 1,000) and 4.2x (1,500 x 1,500) at 4 workers, and
+# the quick module shape map stays as it was (expr8 at 1,000 elements 1.0x
+# -> 1.6x). 5 us promoted only the 1,500 columns. A probe of plain C code
+# (pointer walks) was tried first: it rated the 12700K (MSVC build) as fast
+# as the VM. VIPROC_DIRECT_BUDGET_NS sets the budget instead (ns).
+_BUDGET_OPS = 9
+_op_ns = []
 
 
 def _scale_budget():
@@ -78,7 +83,7 @@ def _scale_budget():
     if env:  # an explicit budget for this machine (experiments)
         _viproc.set_direct_budget_ns(float(env))
         return
-    if not _budget_scale:
+    if not _op_ns:
         if not 8 < _small_ops[0]:
             return  # `a * b` would be a task: nothing to measure
         import time
@@ -91,8 +96,8 @@ def _scale_budget():
             for _ in range(25):
                 a * b
             best = min(best, (clock() - t) / 25)
-        _budget_scale.append(min(max(best / _BUDGET_REFERENCE_NS, 0.2), 5.0))
-    _viproc.set_direct_budget_ns(_viproc.direct_budget_ns() * _budget_scale[0])
+        _op_ns.append(best)
+    _viproc.set_direct_budget_ns(min(max(_BUDGET_OPS * _op_ns[0], 1000.0), 50000.0))
 
 
 def _wrap_numpy(arr):
