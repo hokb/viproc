@@ -332,9 +332,12 @@ def test_shared_reduce_kernels_keep_each_identity():
     for initial in [True, False]:
         assert same(np.logical_and.reduce(vb, initial=initial),
                     np.logical_and.reduce(b, initial=initial))
-    vi = viproc.asarray(np.zeros(3000, np.int32))
-    for _ in range(2):  # NumPy's conversion error, every time
-        with pytest.raises(OverflowError, match="out of bounds for int32"):
-            np.maximum.reduce(vi, initial=2**40)
-        with pytest.raises(OverflowError):
-            np.bitwise_or.reduce(viproc.asarray(np.zeros(3000, np.int64)), initial=2**70)
+    for dt, initial, f in [(np.int32, 2**40, np.maximum), (np.int64, 2**70, np.bitwise_or)]:
+        x = np.zeros(3000, dt)
+        with pytest.raises(OverflowError) as want:  # its text depends on the platform
+            f.reduce(x, initial=initial)
+        vx = viproc.asarray(x)
+        for _ in range(2):  # NumPy's conversion error, every time
+            with pytest.raises(OverflowError) as got:
+                f.reduce(vx, initial=initial)
+            assert str(got.value) == str(want.value)
