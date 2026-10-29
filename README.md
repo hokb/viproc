@@ -150,6 +150,9 @@ missing; the C++20 compiler named above must be installed. The build takes about
 `pip wheel .` instead keeps the wheel (`viproc-*.whl`), to install on other machines with the same
 platform, Python version and architecture.
 
+Testing viproc on your own code, in your existing Python and IDE (PyCharm, VS Code, Spyder,
+Jupyter): see [docs/testing.md](docs/testing.md).
+
 ## Usage
 
 Installing makes viproc available to your Python. To bring it into an existing NumPy program,
