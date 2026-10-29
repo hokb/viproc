@@ -354,9 +354,7 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
   offload.*            OffloadPolicy: inline vs. worker for ready tasks
   cpu.*                physical_core_count() (SMT siblings once, affinity),
                        default_worker_count(): physical cores - 1 (the
-                       main thread keeps a core to issue on), at least 1;
-                       issue_speed_scale(): the issuing core's speed
-                       (probe at runtime start) for time budgets
+                       main thread keeps a core to issue on), at least 1
   element_pool.*       ElementPool: process-wide pool for element memory
                        (quantized bins, LIFO, bound, huge pages)
   countable_array.*    CountableArray: one data version, one handle per device
@@ -592,15 +590,16 @@ reference counting.
      1,000 would run 2x slower as a task).
      **The budget is scaled to the machine:** 10 µs is a time of the
      4-vCPU calibration VM, and it stands for main-thread costs, which a
-     faster core pays faster. The runtime measures a probe when it starts
-     (`issue_probe_ns`: eight interleaved pointer walks with a
-     multiply-add and a store per step, L1-resident, best of 16-128 runs
-     of ~8 µs, 0.2-1 ms in all) and multiplies the budget by its time over
-     the calibration machine's (`kIssueProbeReferenceNs`, clamped to
-     0.2-5x; `_viproc.direct_budget_ns()` shows the result). With the
-     fixed 10 µs a 12700K (`sin` of 1,500 doubles 6.1 µs) ran the whole
-     loop of `array_pipelining.py` directly: 0 tasks, 1.03x at every
-     worker count. GCC and Clang builds of the probe differ by up to 20%.
+     faster core pays faster. The bridge times a direct `a * b` of 8
+     doubles once per process (`_scale_budget` in `_ndarray.py`, best of
+     40 x 25 ops, ~0.5 ms; 525 ns on the VM) and scales the budget by it
+     (`vp_set_direct_budget_ns`, clamped to 0.2-5x;
+     `_viproc.direct_budget_ns()` shows the result). With the fixed 10 µs
+     a 12700K (`sin` of 1,500 doubles 6.1 µs) ran the whole loop of
+     `array_pipelining.py` directly: 0 tasks, 1.03x at every worker
+     count. A probe of plain C code (pointer walks) was tried first: it
+     rated the 12700K (MSVC build) as fast as the VM, although NumPy's
+     `sin` is 2.3x and a loop iteration 3x faster there.
   2. **Adaptive above N_min, per (issue site, log2 size class):** count
      async issues and how many of their results the main thread accessed
      "right away" — a sync point within `window` = 2 issued ops of the
