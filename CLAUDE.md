@@ -352,8 +352,9 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
   ref.hpp              Ref<T>: non-atomic intrusive refcount (Array, AliasGroup)
   pool.hpp             FixedPool / make_pooled: per-thread pools (Task, CountableArray, …)
   offload.*            OffloadPolicy: inline vs. worker for ready tasks
-  cpu.*                physical_core_count(): default worker count (one
-                       per physical core, SMT siblings once, affinity)
+  cpu.*                physical_core_count() (SMT siblings once, affinity),
+                       default_worker_count(): physical cores - 1 (the
+                       main thread keeps a core to issue on), at least 1
   element_pool.*       ElementPool: process-wide pool for element memory
                        (quantized bins, LIFO, bound, huge pages)
   countable_array.*    CountableArray: one data version, one handle per device
@@ -569,8 +570,10 @@ reference counting.
      smaller of the last two samples (ns per element). An op whose estimated
      NumPy time is above `direct_budget_ns` = 10 µs is sized as
      `sync_below` and takes the task path and rule 2 like a large op; every
-     32nd such op runs directly again and is re-timed (a loop measured slow
-     by accident returns). `sin` of 1,500 doubles (~15 µs) is a task, `add`
+     32nd such op is re-timed by its task, on the worker (`Task::time_kernel`,
+     `DirectCost::task_sample`, taken over at the next promotion), so a loop
+     measured slow by accident returns. The re-test ran directly on the main
+     thread before: 21% of its instructions in `array_pipelining.py`'s loop. `sin` of 1,500 doubles (~15 µs) is a task, `add`
      (~0.6 µs) stays direct. The budget is far above the 2 µs break-even of
      sin/cos chains (`break_even.py`) because a promoted op drags the cheap
      ops consuming it onto the task path, whose issue cost the main thread
@@ -968,7 +971,13 @@ Rules:
   `argmin`/`argmax` (NumPy's per-dtype functions, one call per row of a
   C-contiguous copy with the axis last, as `PyArray_ArgMax`). Per-call
   preparation is cached per (ufunc, dtype, ndim, axis, keepdims)
-  (`_reduce_plans`).
+  (`_reduce_plans`). In C, the fast path's reduce kernel (plan, loop,
+  identity bytes) is shared per (ufunc, input layout without offset,
+  reduced axes, identity) (`vp_runtime::reduce_kernels`; identities that are
+  exact Python bools, ints and floats, keyed by value): a loop of
+  `np.sum(a[:, i], axis=0)` converted the identity into an ndarray and
+  built a kernel per op (~2,700 instructions; `x.sum(axis=0)` of 100
+  elements 9,800 → 6,000).
 - **Reductions and methods in C, NumPy delegate for small ready data.**
   `sum prod max min any all mean var std argmax argmin copy astype` are
   C methods of `_Array`, and `_Array.__array_function__` takes the
@@ -1001,7 +1010,10 @@ Rules:
   (`vp_array_from_item`, NumPy's conversion and errors); the task only
   copies. Advanced keys, sequences as values and errors of `vp_assign` go
   to the hook `_setitem` (scatter / masked assignment tasks, fallback).
-  `out[3] = s` 0.22 µs (NumPy 0.16; it was 3.1 µs in Python).
+  `out[3] = s` 0.22 µs (NumPy 0.16; it was 3.1 µs in Python). The written
+  view of a basic key is a runtime view only (`basic_layout`, shared with
+  `m_basic_view`): no Python object for it (`C[i] = pending 0-d` 5,180 →
+  4,050 instructions).
 - **`np.where` in C** (`_Array.__array_function__`, `where_select` /
   `where_delegate` in `_viproc.c`): a bool viproc condition with x and y
   of one dtype, or one of them a Python scalar NEP 50 promotes weakly to
@@ -1402,7 +1414,10 @@ Rules:
 - Pools (`FixedPool`): per-thread free lists without atomics for the
   allocating thread; other threads return blocks through a lock-free stack
   that an allocating thread takes over whole (exchange, so no ABA). Pools
-  only grow, to the peak number of live objects.
+  only grow, to the peak number of live objects. Their thread-locals use
+  the initial-exec TLS model on ELF targets (`VIPROC_TLS_INITIAL_EXEC`):
+  as a dlopen'ed module viproc otherwise paid a `__tls_get_addr` call per
+  access (~100 instructions per op).
 - Copy-on-write copy tasks are counted as active but do not wait on the
   look-ahead limit: the op needing the copy already holds its slot.
 - **GIL:** the bridge must release the GIL while waiting on the runtime
@@ -1555,9 +1570,15 @@ code, comments, docs and commit messages in English.
       adaptive mode; a waiting main thread running a queued task itself was
       decided against, see "Dispatch decision").
 - [ ] Main-thread issue cost of fine-grained loops: `array_pipelining.py`
-      issues ~22,000 instructions (~7 µs) per iteration (view, sin, abs,
-      sum, assignment), which caps the 1,500 x 1,500 loop at ~2.3x on 4
-      cores and the 200 x 200 loop at ~1x.
+      issued ~26,200 instructions per iteration (view, sin, abs, sum,
+      assignment), as many as NumPy's own call overhead for the same line
+      (~26,000 at 8 elements); now ~16,700 (re-tests on the worker, shared
+      reduce kernels, initial-exec TLS, element assignment without a view
+      object; issue 4.7-5.1 → 3.2-3.6 µs per iteration on 4 vCPUs). Per
+      instruction the main thread is still ~1.6x slower than NumPy's
+      (L1 misses 117 vs. 26 per iteration, cache lines shared with the
+      workers): next steps in docs/optimizations.md (plan cache per issue
+      site, locality of the issue path).
 - [x] `matmul`/`dot` asynchronously (NumPy's matmul loop; `matmul_batch`
       has no fallbacks left).
 - [ ] The remaining linalg functions (`qr`, `lstsq`,

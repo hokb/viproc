@@ -11,7 +11,7 @@ SIZE_ORDER = ["scalar", "tiny", "small", "medium", "large"]
 
 SCORE_EXPLAINED = """\
 **How the score works.** Each configuration runs as plain NumPy and on viproc
-(one worker per physical core). *Speedup* = NumPy time / viproc time. Its
+(at `max` workers: one per physical core). *Speedup* = NumPy time / viproc time. Its
 *ideal* is min(cores, P) for medium and large data, where cores are physical
 cores (SMT siblings count once) and P is the program's parallel width
 (independent instruction streams), and 1x (parity with NumPy) for

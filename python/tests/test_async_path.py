@@ -209,6 +209,15 @@ def test_expensive_small_op_becomes_a_task():
         assert after["tasks"] - before["tasks"] == 4
         expected = np.power(data, 1.5 + 0.5j)
         assert all(np.array_equal(np.asarray(r), expected) for r in results)
+        # Every 32nd promoted op re-tests the loop, as a task timed on its
+        # worker: none runs on the main thread.
+        before = viproc.offload_stats()
+        results = [np.power(x, 1.5 + 0.5j) for _ in range(70)]
+        viproc.wait_all()
+        after = viproc.offload_stats()
+        assert after["direct"] == before["direct"]
+        assert after["tasks"] - before["tasks"] == 70
+        assert all(np.array_equal(np.asarray(r), expected) for r in results)
         # A cheap loop stays on the direct path.
         y = viproc.asarray(np.arange(1500.0))
         before = viproc.offload_stats()

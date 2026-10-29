@@ -236,6 +236,8 @@ compare directly.
 | 10-23 | `0ac2184` | scalar operands cached, task lists inline (#47) (2.10) | 100 | 81 | 2.03x | 1.16x | 99 | 66 | 93 | 78 | 64 | 90 | 96 | 82 | 93 | 68 | 81 |
 | 10-23 | `8e0fbd6` | same-VM baseline for the lock-free consumer list: `main` (2.10) | 100 | 83 | 2.11x | 1.20x | 104 | 71 | 86 | 77 | 70 | 94 | 97 | 94 | 95 | 69 | 89 |
 | 10-23 | this PR | lock-free consumer list, no mutex in the task (2.10) | 100 | 83 | 2.13x | 1.21x | 108 | 73 | 101 | 79 | 64 | 80 | 65 | 100 | 102 | 67 | 93 |
+| 10-29 | `464ae7a` | same-VM baseline for the issue-rate fixes: `main` (#55) | 100 | 84 | 2.12x | 1.21x | 97 | 81 | 100 | 74 | 69 | 89 | 99 | 102 | 100 | 70 | 82 |
+| 10-29 | this PR | issue rate: re-tests on the worker, shared reduce kernels, initial-exec TLS, `C[i] = v` without a view object | 100 | 87 | 2.21x | 1.21x | 98 | 92 | 104 | 83 | 67 | 81 | 90 | 86 | 98 | 75 | 89 |
 
 View changes, same VM (`3111820` → `5db8972`): score 64.0 → 63.7,
 unchanged within noise; the programs dominated by slicing gained:
@@ -288,6 +290,23 @@ main thread ~50 instructions less per op (`add_consumer` 118 → 49, no
 mutex), worker ~180 less per task besides the kernel (~900 → ~720: no
 lock at completion, no lock for an upstream error). Issue time per op
 (best of 8): 1.02 → 0.87 µs, total 2.43 → 2.41 µs.
+
+Issue rate, same VM (`464ae7a` → this PR, builds `#498cac56` /
+`#f2866e4a`): score 84 → 87, 4 workers 2.12x → 2.21x geomean, every
+configuration bit-identical. Single configurations moved by up to 2x in
+both directions (noise, as above); `chain_serial` tiny, the largest drop
+of a case that runs on the direct path (1.47x → 0.98x), measured
+0.91-1.04x (main) and 0.87-0.95x (PR) in three refiltered runs each and
+0.58-0.63 µs per op for both builds in a timed loop; callgrind counts 3%
+fewer instructions per op with the PR. Both runs used explicit worker
+counts (1 and 4): the new default (physical cores - 1) is not part of the
+score. Callgrind, main thread per iteration of `array_pipelining.py`'s
+loop (1,500 x 1,500): 26,221 → 16,658 instructions (`sin` with its
+re-tests 9,205 → 3,991, `sum` 7,153 → 3,734, assignment 3,483 → 2,801);
+`x.sum(axis=0)` of 100 ready elements 9,789 → 5,959; `x * y` of 8 elements
+4,457 → 4,350; `x = x * 0.5` chained at 1e4 4,430 → 4,325. Issue time
+of 200 iterations below the look-ahead limit, 3 workers, best of 60:
+4.68-5.07 → 3.20-3.55 µs per iteration (5 runs each).
 
 The Windows build (Wine image) scored 46 (Linux 41 in the same Docker
 run) at `7b2846f` and 48 (Linux 42) with 89 cases: it tracks the Linux
@@ -724,6 +743,39 @@ Same 4-vCPU VM, median of 5-7 samples, every result bit-identical.
   only); (2) in module mode `np.sum`, `np.max`, ... of a viproc array skip
   NumPy's `__array_function__` dispatch (`np.sum(x, axis=0)`: 15,100 →
   8,800 instructions).
+
+Issue-rate fixes (re-tests of expensive loops timed on the worker,
+shared reduce kernels, initial-exec TLS, `C[i] = v` without a view object;
+main thread 26,221 → 16,658 instructions per iteration), same VM, median
+of 5 samples, `main` (`464ae7a`) → this change:
+
+| A | program | NumPy ms | `main` w=3 | w=4 | PR w=1 | w=2 | w=3 | w=4 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 200 x 200 | `loop` | 0.97 | 1.06x | 0.97x | 1.13x | 1.09x | 1.08x | 1.12x |
+| | `loop_dep` | 1.12 | 0.90x | 0.94x | 1.15x | 1.14x | 1.12x | 1.14x |
+| | `vectorized` | 0.38 | 2.63x | 3.58x | 0.98x | 1.90x | 2.81x | 3.44x |
+| 1000 x 1000 | `loop` | 13.4 | 1.10x | 1.05x | 1.09x | 1.11x | 1.14x | 1.08x |
+| | `loop_dep` | 14.6 | 1.08x | 1.02x | 1.15x | 1.18x | 1.35x | 1.17x |
+| | `vectorized` | 12.1 | 3.62x | 4.04x | 1.20x | 2.37x | 3.61x | 4.62x |
+| 1500 x 1500 | `loop` | 28.4 | 2.85x | 2.39x | 1.14x | 1.95x | 2.74x | 2.30x |
+| | `loop_dep` | 29.3 | 2.91x | 2.17x | 1.07x | 1.78x | 2.81x | 2.41x |
+| | `vectorized` | 28.3 | 3.18x | 3.75x | 1.20x | 2.44x | 3.14x | 4.29x |
+| 3000 x 3000 | `loop` | 102 | 2.86x | 3.04x | 1.07x | 2.14x | 3.03x | 3.47x |
+| | `loop_dep` | 104 | 2.83x | 3.05x | 1.00x | 2.08x | 2.88x | 3.55x |
+| | `vectorized` | 126 | 3.50x | 3.25x | 1.35x | 1.58x | 3.49x | 3.55x |
+
+- At 1,500 x 1,500 the loop is bound by the workers on this VM now: 3
+  workers do ~28 ms of NumPy work in ~10 ms, in both builds (on this day
+  `main` also reached 2.85x; the 1.7-2.0x above were measured on another
+  day of the VM). The main thread's lower issue cost shows where it was
+  the limit: 200 x 200 `loop` 0.97x → 1.12x (w=4), 3000 x 3000 3.04x →
+  3.47x (w=4).
+- **Workers = physical cores - 1, the new default:** w=3 beats w=4 for
+  the 1,500 x 1,500 loops (2.74x vs. 2.30x: with 4 workers the issuing
+  main thread shares a core), but costs data-parallel programs whose main
+  thread idles: `vectorized` 4.29x → 3.14x at 1,500 x 1,500, and the
+  3,000 x 3,000 loops 3.5x → 3.0x. `viproc.init(workers=n)` sets it per
+  program.
 
 Budget of the direct path, quick shape map `--module` (each run twice,
 geomean of the speedups per case): with 2 µs `ind_cores_f32` at 1,000

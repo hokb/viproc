@@ -141,6 +141,39 @@ def test_setitem_overlap_and_errors_as_numpy():
     assert np.asarray(ints)[1] == 3
 
 
+def test_element_assignment_of_pending_results():
+    """C[i] = <pending 0-d result> (a loop over columns): the written element
+    is a runtime view only; negative and NumPy integer keys, other dtypes
+    and errors as NumPy."""
+    a = np.arange(1.0, 5001.0).reshape(50, 100)
+    v = viproc.asarray(a)
+    c = viproc.zeros(100)
+    expected = np.zeros(100)
+    for i in range(100):
+        c[i] = np.sum(np.sin(v[:, i]), axis=0)
+        expected[i] = np.sum(np.sin(a[:, i]), axis=0)
+    c[-1] = np.sum(v[:, 0], axis=0)
+    expected[-1] = np.sum(a[:, 0], axis=0)
+    c[np.int64(3)] = np.max(v[:, 5], axis=0)
+    expected[np.int64(3)] = np.max(a[:, 5], axis=0)
+    assert np.array_equal(np.asarray(c), expected)
+    ints = viproc.zeros(100, np.int32)
+    ints[7] = np.sum(v[:, 1], axis=0)  # float64 into int32: cast as NumPy
+    ref = np.zeros(100, np.int32)
+    ref[7] = np.sum(a[:, 1], axis=0)
+    assert np.array_equal(np.asarray(ints), ref)
+    m = viproc.zeros((4, 3000))
+    m[2] = np.sin(viproc.asarray(np.arange(3000.0)))  # a row of a pending result
+    mr = np.zeros((4, 3000))
+    mr[2] = np.sin(np.arange(3000.0))
+    assert np.array_equal(np.asarray(m), mr)
+    with pytest.raises(IndexError) as got:
+        c[100] = np.sum(v[:, 0], axis=0)
+    with pytest.raises(IndexError) as want:
+        expected[100] = np.sum(a[:, 0], axis=0)
+    assert str(got.value) == str(want.value)
+
+
 def test_small_ready_assignment_runs_in_numpy_without_tasks():
     a = viproc.asarray(np.zeros(100))
     viproc.wait_all()

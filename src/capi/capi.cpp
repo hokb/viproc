@@ -8,6 +8,7 @@
 #include "kernels/numpy_sort.hpp"
 #include "kernels/numpy_ufunc.hpp"
 #include "runtime/assign.hpp"
+#include "runtime/cpu.hpp"
 #include "runtime/element_pool.hpp"
 #include "runtime/index.hpp"
 #include "runtime/runtime.hpp"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -114,6 +116,77 @@ struct vp_loop {
     std::vector<DType> dtypes;    // inputs, then the output
 };
 
+namespace {
+
+// A reduction's identity as a cache key: exact Python bools, ints (within
+// int64) and floats only; their value alone gives the bytes NumPy converts
+// them to. Other objects (0-d arrays as `initial=`, which may be written
+// later, NumPy scalars, big ints) are converted per op.
+struct IdentityKey {
+    int kind = 0; // 0 none, 1 bool, 2 int, 3 float
+    std::uint64_t bits = 0;
+    bool operator==(const IdentityKey&) const = default;
+};
+
+bool identity_key(PyObject* v, IdentityKey& k) {
+    if (v == Py_None) {
+        k = {0, 0};
+    } else if (PyBool_Check(v)) {
+        k = {1, v == Py_True ? 1u : 0u};
+    } else if (PyLong_CheckExact(v)) {
+        int overflow = 0;
+        const long long x = PyLong_AsLongLongAndOverflow(v, &overflow);
+        if (overflow != 0 || (x == -1 && PyErr_Occurred())) {
+            PyErr_Clear();
+            return false;
+        }
+        k = {2, static_cast<std::uint64_t>(x)};
+    } else if (PyFloat_CheckExact(v)) {
+        const double d = PyFloat_AS_DOUBLE(v);
+        k.kind = 3;
+        std::memcpy(&k.bits, &d, sizeof d); // -0.0 and NaN payloads differ
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// The reduce kernel of a fast-path reduction (ReducePlan, no cast) depends
+// on the ufunc, the input layout without its offset, the reduced axes and
+// the identity only: one kernel per such key, shared by its ops, as the
+// element-wise kernel per loop. A loop over columns (`np.sum(a[:, i],
+// axis=0)`) planned, converted the identity (an ndarray per op) and built a
+// kernel for every op: ~2,700 instructions.
+struct ReduceKey {
+    PyObject* ufunc; // alive: LoopCache holds a reference to every ufunc
+    Layout layout;   // offset 0
+    std::uint64_t axes;
+    IdentityKey identity;
+    bool operator==(const ReduceKey& o) const {
+        return ufunc == o.ufunc && axes == o.axes && identity == o.identity &&
+               layout.dtype == o.layout.dtype && layout.shape == o.layout.shape &&
+               layout.strides == o.layout.strides;
+    }
+};
+
+struct ReduceKeyHash {
+    std::size_t operator()(const ReduceKey& k) const {
+        std::size_t h = std::hash<const void*>()(k.ufunc);
+        auto mix = [&h](std::uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
+        mix(static_cast<std::uint64_t>(k.layout.dtype));
+        for (std::size_t i = 0; i < k.layout.shape.size(); ++i) {
+            mix(static_cast<std::uint64_t>(k.layout.shape[i]));
+            mix(static_cast<std::uint64_t>(k.layout.strides[i]));
+        }
+        mix(k.axes);
+        mix(static_cast<std::uint64_t>(k.identity.kind));
+        mix(k.identity.bits);
+        return h;
+    }
+};
+
+} // namespace
+
 struct vp_runtime {
     std::unique_ptr<Runtime> rt;
     // Issue sites, interned: tasks keep a `const char*` to them. Grows with
@@ -132,6 +205,8 @@ struct vp_runtime {
     std::map<std::tuple<const numpy::UfuncLoop*, std::vector<std::vector<int>>, std::string, int>,
              std::shared_ptr<Kernel>>
         gufunc_kernels;
+    // Fast-path reduce kernels (ReduceKey), cleared when it grows large.
+    std::unordered_map<ReduceKey, std::shared_ptr<Kernel>, ReduceKeyHash> reduce_kernels;
 };
 
 // A vp_array* is an Array* holding one reference (no wrapper allocation).
@@ -242,6 +317,8 @@ int vp_take_fp_events(vp_runtime* rt, PyObject** out) {
 }
 
 size_t vp_worker_count(const vp_runtime* rt) { return rt->rt->worker_count(); }
+
+size_t vp_physical_core_count(void) { return physical_core_count(); }
 size_t vp_active_tasks(const vp_runtime* rt) { return rt->rt->active_tasks(); }
 
 void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive) {
@@ -1427,6 +1504,44 @@ static bool same_result_layout(const Layout& out, const Layout& want) {
     return true;
 }
 
+namespace {
+
+// The fast path's kernel: no cast, a dense input (in any axis order) whose
+// reduced axes coalesce: the loop calls follow from the plan. Null if the
+// reduction does not qualify, or with a Python error set if the identity
+// does not convert. Everything else, NumPy's iterator drives: it may buffer
+// strided inputs even without a cast, and a loop called on a buffer can
+// round differently than on strided data (complex multiply has a SIMD path
+// for contiguous operands only).
+std::shared_ptr<Kernel> make_fast_reduce_kernel(vp_runtime* rt, PyObject* ufunc, const Layout& l,
+                                                std::span<const bool> reduced,
+                                                const Layout& out_layout, PyObject* dtype,
+                                                PyObject* identity) {
+    if (dtype != Py_None) {
+        return nullptr;
+    }
+    numpy::ReducePlan plan = numpy::plan_reduction(l, reduced, out_layout);
+    Layout dense_check = l;
+    dense_check.offset = 0;
+    if (!plan.supported() || !dense_check.dense()) {
+        return nullptr;
+    }
+    std::string e;
+    const numpy::UfuncLoop* loop =
+        rt->loops->get_reduction(ufunc, l.dtype, plan.inner_strides(), e);
+    if (loop == nullptr) {
+        PyErr_Clear();
+        return nullptr;
+    }
+    std::vector<std::byte> init;
+    if (identity != Py_None && !numpy::scalar_bytes(identity, l.dtype, init)) {
+        return nullptr; // the Python error stays set
+    }
+    return numpy::make_reduce_kernel(loop, std::move(plan), std::move(init));
+}
+
+} // namespace
+
 int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
                   int keepdims, PyObject* dtype, PyObject* identity, vp_array* out,
                   vp_array** result, const char* site, char* err, size_t errlen) {
@@ -1437,14 +1552,18 @@ int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned 
         return VP_UNSUPPORTED;
     }
     const std::size_t nd = l.shape.size();
-    std::vector<char> flags(nd); // std::vector<bool> has no data()
+    SmallVector<char, kInlineRank> flags(nd, 0); // no std::vector<bool>: data()
     Shape out_shape;
+    std::uint64_t axis_bits = 0;
     for (std::size_t i = 0; i < nd; ++i) {
         flags[i] = axes[i] != 0;
         if (!flags[i]) {
             out_shape.push_back(l.shape[i]);
-        } else if (keepdims) {
-            out_shape.push_back(1);
+        } else {
+            axis_bits |= std::uint64_t{1} << (i % 64);
+            if (keepdims) {
+                out_shape.push_back(1);
+            }
         }
     }
     Layout out_layout = Layout::contiguous(l.dtype, std::move(out_shape));
@@ -1455,21 +1574,30 @@ int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned 
     if (identity == nullptr) {
         identity = Py_None;
     }
-    numpy::ReducePlan plan = numpy::plan_reduction(l, reduced, out_layout);
-    std::string e;
-    // Fast path: no cast, a dense input (in any axis order) whose reduced axes
-    // coalesce: the loop calls follow from the plan. Everything else, NumPy's
-    // iterator drives: it may buffer strided inputs even without a cast, and
-    // a loop called on a buffer can round differently than on strided data
-    // (complex multiply has a SIMD path for contiguous operands only).
-    Layout dense_check = l;
-    dense_check.offset = 0;
-    const numpy::UfuncLoop* loop =
-        dtype == Py_None && plan.supported() && dense_check.dense()
-            ? rt->loops->get_reduction(ufunc, l.dtype, plan.inner_strides(), e)
-            : nullptr;
-    if (loop == nullptr) {
-        PyErr_Clear();
+    ReduceKey key{ufunc, l, axis_bits, {}};
+    key.layout.offset = 0;
+    const bool cacheable = dtype == Py_None && nd <= 64 && identity_key(identity, key.identity);
+    std::shared_ptr<Kernel> kernel;
+    if (cacheable) {
+        auto it = rt->reduce_kernels.find(key);
+        if (it != rt->reduce_kernels.end()) {
+            kernel = it->second;
+        }
+    }
+    if (!kernel) {
+        kernel = make_fast_reduce_kernel(rt, ufunc, l, reduced, out_layout, dtype, identity);
+        if (!kernel && PyErr_Occurred()) {
+            return VP_PYERR;
+        }
+        if (kernel && cacheable) {
+            if (rt->reduce_kernels.size() >= 4096) {
+                rt->reduce_kernels.clear();
+            }
+            rt->reduce_kernels.emplace(std::move(key), kernel);
+        }
+    }
+    if (!kernel) {
+        std::string e;
         Layout rl;
         std::shared_ptr<Kernel> k = rt->loops->iter_reduction(
             ufunc, l, reduced, keepdims != 0, dtype, identity, defer_release(rt->graveyard), rl, e);
@@ -1494,11 +1622,6 @@ int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned 
         *result = hand_out(std::move(res));
         return VP_OK;
     }
-    std::vector<std::byte> init;
-    if (identity != nullptr && identity != Py_None &&
-        !numpy::scalar_bytes(identity, l.dtype, init)) {
-        return VP_PYERR;
-    }
     const ArrayPtr ins[] = {ref(in)};
     if (out != nullptr) {
         if (!same_result_layout(arr(out).layout(), out_layout)) {
@@ -1506,14 +1629,12 @@ int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned 
             return VP_UNSUPPORTED;
         }
         const ArrayPtr io[] = {ref(out)};
-        rt->rt->issue(numpy::make_reduce_kernel(loop, std::move(plan), std::move(init)), ins, io,
-                      {}, site, {}, l.size());
+        rt->rt->issue(kernel, ins, io, {}, site, {}, l.size());
         *result = nullptr;
         return VP_OK;
     }
     ArrayPtr res;
-    rt->rt->issue(numpy::make_reduce_kernel(loop, std::move(plan), std::move(init)), ins, {},
-                  std::span(&out_layout, 1), site, std::span(&res, 1), l.size());
+    rt->rt->issue(kernel, ins, {}, std::span(&out_layout, 1), site, std::span(&res, 1), l.size());
     *result = hand_out(std::move(res));
     return VP_OK;
 }

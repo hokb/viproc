@@ -60,6 +60,9 @@ void vp_wait_all(vp_runtime* rt);
  * afterwards must only be released. */
 void vp_runtime_destroy(vp_runtime* rt);
 size_t vp_worker_count(const vp_runtime* rt);
+/* [any thread] Physical cores this process may run on (SMT siblings once,
+ * affinity). The default worker count is one less, at least 1. */
+size_t vp_physical_core_count(void);
 
 /* Asynchronous error reporting (docs/design/error-handling.md). An op that
  * fails on any thread records its error in the runtime, the one place errors

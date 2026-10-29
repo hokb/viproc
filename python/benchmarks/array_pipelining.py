@@ -165,9 +165,7 @@ def main():
                    help="threads of the NumPy Parallel.For (default: cores)")
     p.add_argument("--samples", type=int, default=7)
     args = p.parse_args()
-    viproc.init()
-    cores = viproc.workers()
-    viproc.shutdown()
+    cores = viproc.physical_cores()
     workers = ([int(w) for w in args.workers.split(",")] if args.workers
                else sorted({1, 2, *range(4, cores + 1, 4), cores}))
     threads = args.threads or cores

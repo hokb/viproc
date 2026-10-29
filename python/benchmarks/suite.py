@@ -51,15 +51,12 @@ import suite_report  # noqa: E402
 
 
 def usable_cores():
-    """Physical cores this process may use: viproc's default worker count
-    (affinity counts, SMT siblings once), at most the hardware threads it
-    may use (a cgroup CPU quota counts)."""
+    """Physical cores this process may use (affinity counts, SMT siblings
+    once), at most the hardware threads it may use (a cgroup CPU quota
+    counts)."""
     import viproc
 
-    viproc.init()
-    physical = viproc.workers()
-    viproc.shutdown()
-    return min(physical, usable_threads())
+    return min(viproc.physical_cores(), usable_threads())
 
 
 def usable_threads():
@@ -369,7 +366,7 @@ def run_suite(args):
 
     cores = args.cores or usable_cores()
     ram = physical_memory()
-    viproc.init()  # the runtime's default worker count (one per physical core)
+    viproc.init()  # the runtime's default worker count (physical cores - 1)
     default = viproc.workers()
     viproc.shutdown()
     spec = (args.workers.replace("max", str(cores)).replace("default", str(default))
@@ -452,7 +449,7 @@ def main():
     p.add_argument("--filter", help="regular expression on case/size/layout")
     p.add_argument("--workers", default="1,max",
                    help="viproc worker counts, 'max' = cores (physical), 'default' = viproc's "
-                        "default (one per physical core), 'threads' = hardware threads "
+                        "default (physical cores - 1), 'threads' = hardware threads "
                         "(default 1,max)")
     p.add_argument("--cores", type=int, help="override the detected physical core count")
     p.add_argument("--repeat", type=int, help="timed runs per measurement (best of)")

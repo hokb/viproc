@@ -59,7 +59,7 @@ template <class Done> bool spin_until(Done done) {
 Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_(options_.offload) {
     std::size_t n = options_.workers;
     if (n == 0) {
-        n = physical_core_count();
+        n = default_worker_count();
     }
     if (options_.max_active_tasks == 0) {
         options_.max_active_tasks = 1;
@@ -292,11 +292,13 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
                             : !new_outputs.empty() ? new_outputs[0].size()
                             : !inouts.empty()      ? inouts[0]->layout().size()
                                                    : 0;
+    std::int64_t retest = 0; // > 0: an expensive loop's re-test, its elements
     if (elements < policy_.options().sync_below) {
         // An expensive loop: the op is sized as a large one, for the direct
         // path and the dispatch policy alike (OffloadOptions::direct_budget_ns).
         DirectCost* c = kernel->direct_cost();
         if (c != nullptr && policy_.promote(*c, elements)) {
+            retest = c->retest ? elements : 0;
             elements = policy_.options().sync_below;
         }
     }
@@ -327,6 +329,9 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     // the operands are built in place.
     acquire_slot();
     auto task = make_pooled<Task>(kernel, issue_site);
+    if (retest > 0) {
+        task->time_kernel(retest);
+    }
     Operands& in_ops = task->operands_for_issue(); // inputs, then outputs
 
     // 1. Snapshot everything this op reads (inputs, then in/outs): buffer,
