@@ -120,6 +120,31 @@ other: several independent expressions, chains over different arrays, reductions
 element-wise work, iterative algorithms over arrays (k-means, simulations, image and signal
 pipelines), on medium and large data. The more complex a program gets the more parallel potential it brings. viproc shines on real-world algorithms not on too simple toy examples. 
 
+viproc turns complexity into performance. A benchmark of one operation cannot get faster:
+there is nothing to run next to it. Real programs consist of many operations, and complexity
+always brings parallel potential with it; viproc turns that potential into parallelism. The
+goal: every program runs at 0.8x NumPy's speed or faster, complex programs run clearly faster.
+
+Example: ILNumerics' array-pipelining demo, a plain Python loop over the columns of a matrix
+(`python/benchmarks/array_pipelining.py`), 1,500 x 1,500 doubles, 4 cores, bit-identical:
+
+```python
+for i in range(A.shape[1]):
+    C[i] = np.sum(np.abs(np.sin(A[:, i])), axis=0)        # loop
+    # C[0:i+1] = ...   every iteration overwrites the earlier ones (loop_dep)
+```
+
+| | NumPy | NumPy + thread pool (manual Parallel.For) | viproc, 4 workers |
+|---|---:|---:|---:|
+| `loop` | 1.0x | 0.25x | 1.7-2.0x |
+| `loop_dep` | 1.0x | wrong results | 1.7x |
+| `np.sum(np.abs(np.sin(A)), axis=0)` | 1.0x | – | 3.4x |
+
+Nothing in the loop is annotated: viproc overlaps the small operations of different
+iterations and keeps the order where it matters (`loop_dep`). The gain is bounded by how fast
+the Python thread issues the operations (~7 µs per iteration here); details in
+[docs/benchmarks.md](docs/benchmarks.md).
+
 Programs that spend their time in algorithms or loops over **scalar** data, one element
 at a time, offer little array-level parallelism and gain little from viproc today (the
 target is NumPy's speed for them; the per-op overhead can make them slightly slower). For

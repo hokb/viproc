@@ -288,10 +288,18 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
                     std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
                     const char* issue_site, std::span<ArrayPtr> results, std::int64_t work_elements,
                     std::span<const std::shared_ptr<CountableArray>> output_buffers) {
-    const std::int64_t elements = work_elements >= 0     ? work_elements
-                                  : !new_outputs.empty() ? new_outputs[0].size()
-                                  : !inouts.empty()      ? inouts[0]->layout().size()
-                                                         : 0;
+    std::int64_t elements = work_elements >= 0     ? work_elements
+                            : !new_outputs.empty() ? new_outputs[0].size()
+                            : !inouts.empty()      ? inouts[0]->layout().size()
+                                                   : 0;
+    if (elements < policy_.options().sync_below) {
+        // An expensive loop: the op is sized as a large one, for the direct
+        // path and the dispatch policy alike (OffloadOptions::direct_budget_ns).
+        DirectCost* c = kernel->direct_cost();
+        if (c != nullptr && policy_.promote(*c, elements)) {
+            elements = policy_.options().sync_below;
+        }
+    }
     if (issue_direct(kernel, inputs, inouts, new_outputs, issue_site, results, elements,
                      output_buffers)) {
         return;
@@ -521,6 +529,10 @@ bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<cons
     }
     ++seq_;
     ++direct_;
+    DirectCost* cost = kernel->direct_cost();
+    const bool timed = cost != nullptr && policy_.time_direct(*cost, elements);
+    const auto t0 =
+        timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::feclearexcept(FE_ALL_EXCEPT);
     KernelResult r;
     try {
@@ -530,6 +542,10 @@ bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<cons
         r = KernelResult{1, e.what(), 0};
     } catch (...) {
         r = KernelResult{1, "unknown exception in kernel", 0};
+    }
+    if (timed) {
+        const std::chrono::duration<double, std::nano> ns = std::chrono::steady_clock::now() - t0;
+        OffloadPolicy::record(*cost, ns.count(), elements);
     }
     ErrorRef e;
     if (r.status != 0) {

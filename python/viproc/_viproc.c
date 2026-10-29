@@ -4791,8 +4791,9 @@ static PyObject* m_issue_site(PyObject* self, PyObject* noargs) {
  * itself; __class__ is numpy.ufunc, so isinstance(viproc.add, np.ufunc)
  * holds. */
 typedef struct {
-    PyObject_HEAD PyObject* ufunc;
+    PyObject_HEAD PyObject* ufunc; /* the ufunc, or the reduction function (np.sum, ...) */
     vectorcallfunc vectorcall;
+    int red; /* reduction proxies: index in g_red, -1 until the first call */
 } UfuncProxy;
 
 static PyTypeObject UfuncProxyType; /* forward */
@@ -4827,16 +4828,89 @@ static PyObject* UfuncProxy_vectorcall(PyObject* self, PyObject* const* args, si
     return PyObject_Vectorcall(uf, args, nargsf, kwnames);
 }
 
+/* viproc.sum, prod, min, max, amin, amax, any, all, mean, var, std, argmin,
+ * argmax (module mode): np.<reduction>(a, ...) of a viproc array `a` without
+ * NumPy's __array_function__ dispatch (dispatcher call, relevant-argument
+ * tuple, types tuple, kwargs dict: ~8,000 instructions, more than the
+ * reduction's issue). The same steps as Array_array_function, in the same
+ * order: vp_reduce for an array result, NumPy's implementation on a borrowed
+ * view for small ready data, vp_reduce for a full reduction; every other
+ * call is NumPy's function itself, which dispatches as usual. */
+static PyObject* ReduceProxy_vectorcall(PyObject* self, PyObject* const* args, size_t nargsf,
+                                        PyObject* kwnames) {
+    UfuncProxy* p = (UfuncProxy*)self;
+    const Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+    const Py_ssize_t nkw = kwnames != NULL ? PyTuple_GET_SIZE(kwnames) : 0;
+    if (g_rt == NULL || nargs < 1 || Py_TYPE(args[0]) != g_array_cls || nkw > RA_N + 4 ||
+        g_array_function == NULL) {
+        return PyObject_Vectorcall(p->ufunc, args, nargsf, kwnames);
+    }
+    if (p->red < 0 || p->red >= g_nred || g_red[p->red].func != p->ufunc) {
+        p->red = -1;
+        for (int i = 0; i < g_nred && p->red < 0; ++i) {
+            p->red = g_red[i].func == p->ufunc ? i : -1;
+        }
+        if (p->red < 0) {
+            return PyObject_Vectorcall(p->ufunc, args, nargsf, kwnames);
+        }
+    }
+    if (check_runtime() < 0) {
+        return NULL;
+    }
+    const RedSpec* sp = &g_red[p->red];
+    PyObject* target = args[0];
+    PyObject* const* pos = args + 1;
+    PyObject* const* kwv = args + nargs;
+    PyObject* const* kwn = nkw > 0 ? &PyTuple_GET_ITEM(kwnames, 0) : NULL;
+    PyObject* v[RA_N];
+    const int parsed =
+        sp->kind != RK_OTHER && red_parse(sp->kind, pos, nargs - 1, kwn, kwv, nkw, v);
+    if (parsed && red_array_result(v)) {
+        PyObject* result = NULL;
+        const int h = red_async(sp, target, v, &result);
+        if (h != 0) {
+            return h > 0 ? result : NULL;
+        }
+    }
+    if (sp->impl != NULL && red_delegates(target, pos, nargs - 1) &&
+        red_delegates(target, kwv, nkw)) {
+        PyObject* view = red_borrow(((ArrayObject*)target)->a);
+        if (view == NULL) {
+            return NULL;
+        }
+        PyObject* stack[RA_N + 5 + RA_N + 4];
+        if (nargs + nkw > (Py_ssize_t)(sizeof stack / sizeof stack[0])) {
+            Py_DECREF(view);
+            return PyObject_Vectorcall(p->ufunc, args, nargsf, kwnames);
+        }
+        stack[0] = view;
+        memcpy(stack + 1, args + 1, (size_t)(nargs - 1 + nkw) * sizeof(PyObject*));
+        PyObject* r = PyObject_Vectorcall(sp->impl, stack, (size_t)nargs, kwnames);
+        return red_return(target, view, r);
+    }
+    if (parsed && !red_array_result(v)) {
+        PyObject* result = NULL;
+        const int h = red_async(sp, target, v, &result);
+        if (h != 0) {
+            return h > 0 ? result : NULL;
+        }
+    }
+    return PyObject_Vectorcall(p->ufunc, args, nargsf, kwnames);
+}
+
+/* ufunc_proxy(ufunc) or ufunc_proxy(func, True): a reduction function. */
 static PyObject* UfuncProxy_new(PyTypeObject* type, PyObject* args, PyObject* kw) {
     PyObject* uf;
-    if (kw != NULL || !PyArg_ParseTuple(args, "O", &uf)) {
-        PyErr_SetString(PyExc_TypeError, "ufunc_proxy(ufunc)");
+    int reduction = 0;
+    if (kw != NULL || !PyArg_ParseTuple(args, "O|p", &uf, &reduction)) {
+        PyErr_SetString(PyExc_TypeError, "ufunc_proxy(ufunc) or ufunc_proxy(func, True)");
         return NULL;
     }
     UfuncProxy* p = (UfuncProxy*)type->tp_alloc(type, 0);
     if (p != NULL) {
         p->ufunc = Py_NewRef(uf);
-        p->vectorcall = UfuncProxy_vectorcall;
+        p->vectorcall = reduction ? ReduceProxy_vectorcall : UfuncProxy_vectorcall;
+        p->red = -1;
     }
     return (PyObject*)p;
 }

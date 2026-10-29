@@ -4,7 +4,11 @@
 // Hybrid policy (after the ILNumerics Accelerator's "scalar shortcut" and
 // "adaptive fork suppression", see CLAUDE.md):
 //  1. Below `sync_below` elements a task always runs inline: deterministic
-//     and cheap, for ops whose hand-off costs more than the work.
+//     and cheap, for ops whose hand-off costs more than the work. Unless
+//     its loop is expensive: an op whose NumPy time (measured per loop on
+//     the direct path) exceeds `direct_budget_ns` is a task like a large
+//     one (sin of 1,500 doubles takes ~15 us, add ~0.6 us). Adaptive mode
+//     only: the measurement is a time, not deterministic.
 //  2. Above it, per (issue site, size class) statistics: if the main thread
 //     usually blocks on the result right after issuing (it needs the value
 //     anyway, so there is nothing to overlap), the site runs inline. Unlike
@@ -20,10 +24,35 @@
 
 namespace viproc {
 
+// NumPy time per element of a kernel that many ops share (one per resolved
+// loop), measured on the direct path: the dispatch policy sends ops of an
+// expensive loop to the task path although they have fewer than
+// `sync_below` elements (OffloadPolicy::promote). Main thread only.
+struct DirectCost {
+    float ns_per_element = 0;   // min of the last two samples; 0: not known yet
+    float last = 0;             // the last sample
+    std::uint32_t calls = 0;    // direct runs, for sampling
+    std::uint32_t promoted = 0; // ops sent to the task path, for re-tests
+    bool retest = false;        // this direct run re-tests a promoted loop
+};
+
 struct OffloadOptions {
     // Tasks with fewer output elements always run inline (N_min).
     std::int64_t sync_below = 2048;
-    // Per-site adaptive decision above `sync_below`; off = always offload.
+    // ... but not if the op's estimated NumPy time (DirectCost) is above
+    // this. A promoted op makes the cheap ops that consume it tasks too, and
+    // the main thread then pays the task path for all of them: `break_even.py`
+    // chains of sin/cos break even at ~2 us per op, but with 2 us
+    // `ind_cores_f32` (float32 sin of 1,000, ~2.2 us) fell from 0.6x to
+    // 0.15x and with 5 us `expr8` (8 terms, 1,000 elements) from 1.0x to
+    // 0.6x. 10 us promotes sin of 1,500 doubles (~15 us), not of 1,000.
+    double direct_budget_ns = 10000;
+    // Direct runs of at least this many elements are timed (the first two
+    // of a loop, then every 16th): below it the clock reads would cost more
+    // than the decision gains.
+    std::int64_t time_from = 256;
+    // Per-site adaptive decision above `sync_below`, and expensive loops
+    // below it as tasks; off = always offload above, always inline below.
     bool adaptive = true;
     // A sync point counts as "result needed right after issuing" if at most
     // this many ops were issued in between (measured from the main-thread
@@ -59,6 +88,34 @@ class OffloadPolicy {
     // producing `elements` output elements.
     Decision decide(const char* site, std::int64_t elements);
 
+    // True if an op of `elements` (< sync_below) on a kernel with this cost
+    // estimate takes the task path anyway: its loop is expensive. Every
+    // `kRetest`-th such op runs directly and is timed again, so a loop
+    // measured slow by accident (cold memory, a preempted run) returns to
+    // the direct path. Adaptive mode only: deterministic mode keeps rule 1
+    // a fixed threshold.
+    bool promote(DirectCost& c, std::int64_t elements) const {
+        if (!options_.adaptive ||
+            c.ns_per_element * static_cast<double>(elements) <= options_.direct_budget_ns) {
+            return false;
+        }
+        if (++c.promoted % kRetest == 0 && elements >= options_.time_from) {
+            c.retest = true;
+            return false;
+        }
+        return true;
+    }
+    // True if this direct run is to be timed (record()): the first two of a
+    // loop, then every 16th, and re-tests.
+    bool time_direct(DirectCost& c, std::int64_t elements) const {
+        if (!options_.adaptive || elements < options_.time_from) {
+            return false;
+        }
+        const std::uint32_t k = c.calls++;
+        return k < 2 || k % 16 == 0 || c.retest;
+    }
+    static void record(DirectCost& c, double ns, std::int64_t elements);
+
     // The main thread is about to block on work it started with `stats`,
     // `distance` ops ago.
     void on_blocked(SiteStats* stats, std::uint64_t distance);
@@ -68,6 +125,7 @@ class OffloadPolicy {
     std::uint64_t offload_count() const { return offload_count_; }
 
   private:
+    static constexpr std::uint32_t kRetest = 32;
     struct KeyHash {
         std::size_t operator()(const std::pair<const char*, int>& k) const {
             return std::hash<const void*>()(k.first) * 31u + static_cast<std::size_t>(k.second);

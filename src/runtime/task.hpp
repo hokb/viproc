@@ -183,6 +183,9 @@ class Kernel {
     // if NumPy does not check the FP flags for it (copies, indexing, sort,
     // loops flagged no_floatingpoint_errors). Error handling, E8.
     virtual const char* fp_name() const { return nullptr; }
+    // The cost estimate of a kernel shared by many ops, or null (kernels made
+    // per op learn nothing across ops). Main thread only.
+    virtual DirectCost* direct_cost() { return nullptr; }
 };
 
 // NumPy's floating-point error modes (np.errstate), captured at issue: three

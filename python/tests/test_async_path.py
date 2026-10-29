@@ -189,3 +189,38 @@ def test_views_issue_no_task():
     same(assert_async(lambda: v.T, ops=0), x.T)
     same(assert_async(np.swapaxes, v, 0, 1, ops=0), np.swapaxes(x, 0, 1))
     same(assert_async(operator.getitem, v, (slice(None, None, 2), 3), ops=0), x[::2, 3])
+
+
+def test_expensive_small_op_becomes_a_task():
+    """Below sync_below, an op runs directly on the main thread unless its
+    loop is expensive: the direct path times the loop (DirectCost) and ops
+    worth more than ~10 us of NumPy time become tasks, as large ones.
+    Adaptive mode only: deterministic mode keeps the fixed threshold."""
+    viproc.init(sync_below=2048, adaptive=True)
+    try:
+        data = np.exp(1j * np.arange(1500.0))
+        x = viproc.asarray(data)
+        viproc.wait_all()
+        before = viproc.offload_stats()
+        results = [np.power(x, 1.5 + 0.5j) for _ in range(6)]  # ~100 ns per element
+        viproc.wait_all()
+        after = viproc.offload_stats()
+        assert after["direct"] - before["direct"] == 2  # the two timed runs
+        assert after["tasks"] - before["tasks"] == 4
+        expected = np.power(data, 1.5 + 0.5j)
+        assert all(np.array_equal(np.asarray(r), expected) for r in results)
+        # A cheap loop stays on the direct path.
+        y = viproc.asarray(np.arange(1500.0))
+        before = viproc.offload_stats()
+        for _ in range(6):
+            np.add(y, y)
+        assert viproc.offload_stats()["direct"] - before["direct"] == 6
+    finally:
+        viproc.init()
+    with deterministic():
+        x = viproc.asarray(data)
+        viproc.wait_all()
+        before = viproc.offload_stats()
+        for _ in range(6):
+            np.power(x, 1.5 + 0.5j)
+        assert viproc.offload_stats()["direct"] - before["direct"] == 6

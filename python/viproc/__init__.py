@@ -154,7 +154,7 @@ def disabled():
         _ndarray._enabled[0] = previous
 
 
-# Element-wise ufuncs and np.where without NumPy's dispatch when called
+# Element-wise ufuncs, reductions and np.where without NumPy's dispatch when called
 # through this module (`import viproc as np`, python -m viproc): a viproc
 # argument takes the C hot path right away; everything else is NumPy's own
 # function (attributes, other arguments, `isinstance(np.add, np.ufunc)`).
@@ -163,6 +163,10 @@ for _name in dir(_np):
     if isinstance(_f, _np.ufunc) and _f.signature is None and _f.nout == 1:
         globals()[_name] = _viproc.ufunc_proxy(_f)
 where = _viproc.where
+# The reductions the C path takes (setup_reductions), the same way.
+for _name in ("sum", "prod", "max", "min", "amax", "amin", "any", "all", "mean", "var", "std",
+              "argmax", "argmin"):
+    globals()[_name] = _viproc.ufunc_proxy(getattr(_np, _name), True)
 del _name, _f
 # Pickled as NumPy's ufunc: unpickling gives numpy.<name>, no viproc needed.
 _copyreg.pickle(_viproc.ufunc_proxy,

@@ -109,3 +109,68 @@ def test_ufunc_proxies_match_numpy():
     assert np.array_equal(np.asarray(viproc.multiply.outer(x, x)), np.multiply.outer(
         np.arange(6.0), np.arange(6.0)))
     assert np.asarray(viproc.sqrt(x, dtype=np.float32)).dtype == np.float32
+
+
+REDUCTIONS = ["sum", "prod", "max", "min", "amax", "amin", "any", "all", "mean", "var", "std",
+              "argmax", "argmin"]
+
+
+def _reduction_kwargs(rng, name, ndim):
+    kw = {}
+    axes = [None] + list(range(-ndim, ndim)) + ([(0, ndim - 1)] if ndim > 1 else [])
+    if name not in ("argmax", "argmin") or rng.random() < 0.5:
+        kw["axis"] = axes[rng.integers(len(axes))]
+        if isinstance(kw["axis"], tuple) and name in ("argmax", "argmin"):
+            kw["axis"] = 0 if ndim else None
+    if rng.random() < 0.3:
+        kw["keepdims"] = bool(rng.integers(2))
+    if name in ("sum", "prod", "mean") and rng.random() < 0.2:
+        kw["dtype"] = ["f8", "i8", "c16"][rng.integers(3)]
+    if name in ("sum", "prod", "max", "min", "amax", "amin") and rng.random() < 0.2:
+        kw["initial"] = 3
+    if name in ("var", "std") and rng.random() < 0.3:
+        kw["ddof"] = 1
+    return kw
+
+
+def test_reduction_proxies_match_numpy():
+    """viproc.sum, ... (module mode): NumPy's function without its
+    __array_function__ dispatch; results, dtypes and errors as NumPy's."""
+    rng = np.random.default_rng(9)
+    kinds = ["viproc", "pending", "numpy", "list", "scalar"]
+    shapes = [(4, 5), (5,), (), (300, 30)]
+    for name in REDUCTIONS:
+        f, proxy = getattr(np, name), getattr(viproc, name)
+        assert proxy == f and isinstance(proxy, type(f)) and proxy.__name__ == f.__name__
+        assert pickle.loads(pickle.dumps(proxy)) is f
+        for trial in range(40):
+            shape = shapes[rng.integers(len(shapes))]
+            kind = kinds[rng.integers(len(kinds))]
+            v, n = _value(rng, kind, shape, DTYPES[rng.integers(len(DTYPES))])
+            kw = _reduction_kwargs(rng, name, len(shape))
+            if rng.random() < 0.15:
+                args = (v, kw.pop("axis", None))  # the axis as a positional argument
+                ref = (n, args[1])
+            else:
+                args, ref = (v,), (n,)
+            with np.errstate(all="ignore"):
+                expected = _outcome(lambda *a: f(*a, **kw), *ref)
+                got = _outcome(lambda *a: proxy(*a, **kw), *args)
+            assert got == expected, (name, trial, kind, shape, kw)
+
+
+def test_reduction_proxies_take_the_c_path():
+    from async_path import SIZE, assert_async, deterministic, pending
+
+    with deterministic():
+        data = np.arange(SIZE, dtype=np.float64).reshape(50, -1)
+        x = viproc.asarray(data)
+        r = assert_async(viproc.sum, pending(x), axis=0)
+        assert np.array_equal(np.asarray(r), data.sum(axis=0))
+        r = assert_async(viproc.max, pending(x))
+        assert float(r) == data.max()
+        small = viproc.asarray(np.arange(10.0))
+        viproc.wait_all()
+        f0 = viproc._ndarray.fallback_calls
+        assert viproc.sum(small) == 45.0 and viproc.mean(small, axis=0) == 4.5
+        assert viproc._ndarray.fallback_calls == f0
