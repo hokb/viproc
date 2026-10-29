@@ -2592,6 +2592,15 @@ static PyObject* m_physical_cores(PyObject* self, PyObject* noargs) {
     return PyLong_FromSize_t(vp_physical_core_count());
 }
 
+static PyObject* m_direct_budget_ns(PyObject* self, PyObject* noargs) {
+    (void)self;
+    (void)noargs;
+    if (check_runtime() < 0) {
+        return NULL;
+    }
+    return PyFloat_FromDouble(vp_direct_budget_ns(g_rt));
+}
+
 static PyObject* m_active_tasks(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
@@ -5037,6 +5046,7 @@ static PyMethodDef methods[] = {
     {"pool_set_limit", m_pool_set_limit, METH_O, "Bound for cached element memory (bytes)."},
     {"workers", m_workers, METH_NOARGS, NULL},
     {"physical_cores", m_physical_cores, METH_NOARGS, NULL},
+    {"direct_budget_ns", m_direct_budget_ns, METH_NOARGS, NULL},
     {"active_tasks", m_active_tasks, METH_NOARGS, NULL},
     {"wait_all", m_wait_all, METH_NOARGS, NULL},
     {"from_ndarray", m_from_ndarray, METH_O, "Wrap a NumPy array (no copy)."},

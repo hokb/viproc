@@ -19,4 +19,19 @@ std::size_t physical_core_count();
 // it, docs/optimizations.md). Thread-safe.
 std::size_t default_worker_count();
 
+// Time of a fixed piece of pointer-chasing scalar code on the calling
+// thread (the kind of code the issue path is), in ns: the best of a few
+// runs of ~8 us each. A measure of the calling core's single-thread
+// speed, to scale per-op time budgets that stand for main-thread costs
+// (OffloadOptions::direct_budget_ns) to the machine. Thread-safe; 0.2-1 ms.
+double issue_probe_ns();
+
+// issue_probe_ns() on the machine the budgets were calibrated on (4-vCPU
+// Xeon VM at 2.8 GHz, GCC Release; docs/benchmarks.md).
+inline constexpr double kIssueProbeReferenceNs = 7840;
+
+// issue_probe_ns() / kIssueProbeReferenceNs, measured once per process and
+// clamped to [0.2, 5]: < 1 on a faster core. Thread-safe.
+double issue_speed_scale();
+
 } // namespace viproc

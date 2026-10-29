@@ -169,8 +169,12 @@ def main():
     workers = ([int(w) for w in args.workers.split(",")] if args.workers
                else sorted({1, 2, *range(4, cores + 1, 4), cores}))
     threads = args.threads or cores
+    viproc.init()
+    budget = viproc._viproc.direct_budget_ns() / 1e3
+    viproc.shutdown()
     print(f"array pipelining, {os.cpu_count()} CPUs, {cores} physical cores, "
-          f"NumPy {numpy.__version__}, viproc {viproc.__version__}, Python {sys.version.split()[0]}")
+          f"NumPy {numpy.__version__}, viproc {viproc.__version__}, Python {sys.version.split()[0]}, "
+          f"direct-path budget {budget:.1f} us")
     for spec in args.sizes.split(","):
         n, reps = (int(x) for x in spec.split(":"))
         rows = measure(n, reps, workers, args.samples, threads)

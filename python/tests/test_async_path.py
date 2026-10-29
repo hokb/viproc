@@ -191,6 +191,17 @@ def test_views_issue_no_task():
     same(assert_async(operator.getitem, v, (slice(None, None, 2), 3), ops=0), x[::2, 3])
 
 
+def test_direct_budget_is_scaled_to_the_machine():
+    """The direct-path budget (10 us on the calibration machine) stands for
+    main-thread costs: the runtime scales it to the issuing core's speed
+    when it starts (issue_speed_scale, clamped to 0.2x-5x)."""
+    viproc.init(sync_below=2048, adaptive=True)
+    try:
+        assert 2000 <= viproc._viproc.direct_budget_ns() <= 50000
+    finally:
+        viproc.shutdown()
+
+
 def test_expensive_small_op_becomes_a_task():
     """Below sync_below, an op runs directly on the main thread unless its
     loop is expensive: the direct path times the loop (DirectCost) and ops

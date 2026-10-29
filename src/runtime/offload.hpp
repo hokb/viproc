@@ -51,7 +51,14 @@ struct OffloadOptions {
     // `ind_cores_f32` (float32 sin of 1,000, ~2.2 us) fell from 0.6x to
     // 0.15x and with 5 us `expr8` (8 terms, 1,000 elements) from 1.0x to
     // 0.6x. 10 us promotes sin of 1,500 doubles (~15 us), not of 1,000.
+    // These are times of the calibration machine (kIssueProbeReferenceNs):
+    // the budget stands for main-thread costs, so the runtime scales it to
+    // the issuing core's speed (`scale_budget`, issue_speed_scale()). With
+    // a fixed 10 us a 12700K (sin of 1,500 doubles 6.1 us) ran the whole
+    // loop of `array_pipelining.py` on the main thread: no task at all.
     double direct_budget_ns = 10000;
+    // Scale direct_budget_ns by issue_speed_scale() when the runtime starts.
+    bool scale_budget = true;
     // Direct runs of at least this many elements are timed (the first two
     // of a loop, then every 16th): below it the clock reads would cost more
     // than the decision gains.
