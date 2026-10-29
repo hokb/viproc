@@ -67,12 +67,17 @@ def _ensure_runtime():
 # on the code the main thread runs per op (bridge, runtime, NumPy's loop),
 # built by the same compiler. A probe of plain C code was tried first: it
 # measured a 12700K as fast as the VM, where NumPy's sin is 2.3x and a loop
-# iteration of `array_pipelining.py` 3x faster.
+# iteration of `array_pipelining.py` 3x faster. VIPROC_DIRECT_BUDGET_NS
+# sets the budget instead (ns, not scaled).
 _BUDGET_REFERENCE_NS = 525.0
 _budget_scale = []
 
 
 def _scale_budget():
+    env = os.environ.get("VIPROC_DIRECT_BUDGET_NS")
+    if env:  # an explicit budget for this machine (experiments)
+        _viproc.set_direct_budget_ns(float(env))
+        return
     if not _budget_scale:
         if not 8 < _small_ops[0]:
             return  # `a * b` would be a task: nothing to measure
