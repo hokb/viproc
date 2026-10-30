@@ -1936,8 +1936,8 @@ def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
     try:
         shutdown()  # raises an error of the old runtime nothing reported yet
     finally:
-        _viproc.init(workers, max_active_tasks, sync_below,
-                     env_adaptive if adaptive is None else adaptive)
+        adaptive = env_adaptive if adaptive is None else adaptive
+        _viproc.init(workers, max_active_tasks, sync_below, adaptive)
         _small_ops[0] = 2048 if sync_below < 0 else sync_below
         _scale_budget(adaptive)
 
