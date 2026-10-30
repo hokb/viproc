@@ -870,8 +870,81 @@ took turns. `array_pipelining.py --sizes 1500:10`, ms per run:
 | + lock-free queue, LIFO wake | 2.92 | 3.17 | 3.18 | 3.21 | 3.29 | 3.25 | 2.53 |
 
 With all three, 11 workers lose 9% against 4 in `loop` (was 31%) and
-1% in `loop_dep`; 4 workers gained 8%. Pinned to the P-cores (bounded
+1% in `loop_dep`; 4 workers gained 8%.
+Speedups of the last row (`--workers 4,7,11 --samples 7`, NumPy 12.43 /
+12.87 / 14.50 ms for `loop` / `loop_dep` / `vectorized`): `loop`
+4.25x / 3.92x / 3.91x at w=4/7/11, `loop_dep` 4.01x / 3.91x / 3.96x,
+`vectorized` 3.70x / 4.64x / 5.73x; NumPy with 12 threads (`loop`)
+18.85 ms, 0.66x. Pinned to the P-cores (bounded
 wake-ups only): `loop` w=4/7/11 3.16/3.41/3.50 ms.
+
+### Real-world programs (`realworld.py`)
+
+`python/benchmarks/realworld.py`: four programs of typical shape (logistic
+regression by gradient descent, a 2-d heat-equation stencil, column-wise
+feature engineering, Black-Scholes price/delta/vega), each as plain NumPy
+and in module mode, best of 5. 2026-10-23, same 4-CPU VM (Xeon @ 2.80 GHz)
+and build as the suite run of that day (`#c122f810`, score 78), every
+result bit-identical:
+
+| program | NumPy ms | viproc ms | speedup |
+|---|---:|---:|---:|
+| logreg 200 x 10, 200 steps | 4.71 | 5.03 | 0.94x |
+| logreg 5,000 x 50, 50 steps | 18.72 | 23.31 | 0.80x |
+| logreg 100,000 x 50, 10 steps | 100.30 | 106.52 | 0.94x |
+| heat 32 x 32, 500 steps | 9.73 | 10.63 | 0.92x |
+| heat 256 x 256, 200 steps | 121.67 | 123.21 | 0.99x |
+| heat 2,048 x 2,048, 20 steps | 2,420 | 1,092 | 2.22x |
+| features 100 x 8 | 0.09 | 0.31 | 0.29x |
+| features 10,000 x 20 | 10.76 | 8.61 | 1.25x |
+| features 200,000 x 20 | 346.84 | 194.11 | 1.79x |
+| bs_greeks 100 | 0.08 | 0.09 | 0.80x |
+| bs_greeks 10,000 | 2.89 | 1.28 | 2.26x |
+| bs_greeks 1,000,000 | 327.80 | 116.06 | 2.82x |
+
+Logistic regression is a dependent chain of matrix-vector products with a
+sync per step: nothing to overlap.
+
+### README figures (2026-10-30)
+
+The README's figures (`docs/benchmarks/readme/`: data in `data/`, drawn
+with ILNumerics by `plots/`, see `make_charts.py`). Code of `03c16cb`
+(`main` after #58), Release build `2026-10-30T20:57:09 #f92697ba`;
+Linux VM, Intel Xeon @ 2.10 GHz, 4 cores, 15.7 GiB, Python 3.13.17,
+NumPy 2.5.3. All results bit-identical.
+
+**Shape map**, `shape_map.py --max-rows 3162 --max-cols 3162`, 4 workers,
+43 cases, 8 x 8 points + 0-d, 2,779 measurements bit-identical. Median
+speedup per point:
+
+| | < 1,000 elements | 1,000-9,999 | >= 10,000 |
+|---|---:|---:|---:|
+| single ops (`x = op(x)`, 5 cases) | 0.44-0.87x | 0.63-1.59x | 0.93-1.73x (median 1.30x) |
+| all 43 cases | 0.63-0.96x | 0.93-1.22x | 0.99-2.06x (median 1.38x) |
+
+0-d scalars 1.00x; 3162 x 3162 1.78x, 1000 x 3162 2.06x.
+
+**Column loop**, `array_pipelining.py --sizes
+200:200,500:50,1000:20,1500:10,2000:5,3000:3 --workers 3,4 --samples 5`,
+speedup vs. NumPy (the figure shows w=3, the default: cores - 1):
+
+| n | NumPy 4 threads (`loop`) | `loop` w=3 | `loop_dep` w=3 | `loop` w=4 | `loop_dep` w=4 | `vectorized` w=4 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 200 | 0.59x | 1.25x | 1.20x | 1.10x | 1.04x | 3.07x |
+| 500 | 0.67x | 1.82x | 1.69x | 1.19x | 1.29x | 4.37x |
+| 1,000 | 0.24x | 2.25x | 2.07x | 2.80x | 2.99x | 4.34x |
+| 1,500 | 0.36x | 3.10x | 2.16x | 3.04x | 3.06x | 3.60x |
+| 2,000 | 0.41x | 1.97x | 2.80x | 2.73x | 3.09x | 3.25x |
+| 3,000 | 0.67x | 2.96x | 2.69x | 3.64x | 3.18x | 2.66x |
+
+**k-means**, ILNumerics' Part 3 NumPy script (`Part3_noopt.py`, 1203 x
+1203, k = 50, 5 iterations) for 20 s each, median time per run: NumPy
+2,668 ms, NumPy with `MALLOC_MMAP_THRESHOLD_=100000000
+MALLOC_TRIM_THRESHOLD_=1000000000` 789 ms, `python -m viproc` 265 ms
+(3.0x the tuned NumPy), same classes and iterations. With glibc's
+defaults every 481 KB temporary of `X[:, i, newaxis] - centers` is mapped
+and unmapped (203 page faults per distance step, 421 vs. 191 µs);
+viproc's element pool reuses its blocks.
 
 ## Other machines
 

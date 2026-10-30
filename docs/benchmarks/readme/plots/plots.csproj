@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Draws the README's benchmark figures with ILNumerics (Drawing, SVGDriver).
+       dotnet run -c Release (data dir, output dir); the data is written by
+       ../make_charts.py from the benchmark results. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="ILNumerics.Computing" Version="7.4.56" />
+    <PackageReference Include="ILNumerics.Drawing" Version="7.4.56" />
+  </ItemGroup>
+</Project>
