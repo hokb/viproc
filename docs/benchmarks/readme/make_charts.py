@@ -40,34 +40,36 @@ def label_bars(ax, bars, fmt="{:.1f}x"):
 
 
 def loop_chart():
-    # docs/benchmarks.md, "Array pipelining", "Measured costs, chains":
-    # i7-12700K, Windows, 1500 x 1500, build b7ee06d, speedup vs. NumPy at
-    # 1/4/11 workers; NumPy with 12 threads (Parallel.For over the columns):
-    # 0.43-0.74x (best shown); loop_dep gives wrong results with threads.
-    workers = ["NumPy +\n12 threads", "viproc\n1 worker", "viproc\n4 workers", "viproc\n11 workers"]
-    loop = [0.74, 1.23, 4.21, 3.11]
-    dep = [None, 1.17, 4.17, 3.09]
+    # docs/benchmarks.md, "Worker pool: bounded wake-ups, ...": i7-12700K,
+    # Windows, 1500 x 1500, main after #58, `array_pipelining.py --sizes
+    # 1500:10 --workers 4,7,11 --samples 7`, speedup vs. NumPy. NumPy with 12
+    # threads is the demo's Parallel.For over the columns of `loop`; for
+    # `loop_dep` it gives wrong results.
+    from matplotlib.patches import Patch
+    cols = ["NumPy +\n12 threads", "viproc\n4 workers", "viproc\n7 workers", "viproc\n11 workers"]
+    series = [
+        ("loop: C[i] = sum(abs(sin(A[:, i])))", [0.66, 4.25, 3.92, 3.91]),
+        ("loop_dep: C[:i+1] = ... (order matters)", [None, 4.01, 3.91, 3.96]),
+        ("vectorized: sum(abs(sin(A)), axis=0)", [None, 3.70, 4.64, 5.73]),
+    ]
     fig, ax = plt.subplots(figsize=(7.2, 3.6))
-    x = range(len(workers))
-    w = 0.38
-    b1 = ax.bar([i - w / 2 for i in x], loop, w * 0.92, color=[NUMPY] + [SERIES[0]] * 3,
-                label="loop: C[i] = sum(abs(sin(A[:, i])))")
-    b2 = ax.bar([i + w / 2 for i in x[1:]], dep[1:], w * 0.92, color=SERIES[1],
-                label="loop_dep: C[:i+1] = ... (order matters)")
-    label_bars(ax, b1)
-    label_bars(ax, b2)
-    ax.annotate("wrong\nresults", (0 + w / 2, 0.05), ha="center", va="bottom",
+    w = 0.27
+    for j, (name, vals) in enumerate(series):
+        xs = [i + (j - 1) * w for i, v in enumerate(vals) if v is not None]
+        vs = [v for v in vals if v is not None]
+        colors = [NUMPY if (j == 0 and k == 0) else SERIES[j] for k in range(len(vs))]
+        bars = ax.bar(xs, vs, w * 0.92, color=colors)
+        label_bars(ax, bars)
+    ax.annotate("loop_dep:\nwrong results", (0, 1.25), ha="center", va="bottom",
                 fontsize=8, color=INK2)
     ax.axhline(1.0, color=INK2, lw=1, ls="--")
-    ax.set_xticks(list(x), workers)
+    ax.set_xticks(range(len(cols)), cols)
     ax.set_ylabel("speedup vs. NumPy")
-    ax.set_ylim(0, 6)
+    ax.set_ylim(0, 7.5)
     ax.yaxis.grid(True, color=GRID)
     ax.set_axisbelow(True)
-    from matplotlib.patches import Patch
-    ax.legend(handles=[Patch(color=SERIES[0], label=b1.get_label()),
-                       Patch(color=SERIES[1], label=b2.get_label()),
-                       Patch(color=NUMPY, label="NumPy + thread pool (loop)")],
+    ax.legend(handles=[Patch(color=SERIES[j], label=n) for j, (n, _) in enumerate(series)]
+              + [Patch(color=NUMPY, label="NumPy + thread pool (loop)")],
               frameon=False, fontsize=9, loc="upper left")
     ax.set_title("A plain Python loop over 1,500 columns (i7-12700K)", loc="left", fontsize=12)
     save(fig, "loop.png")

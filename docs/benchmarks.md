@@ -870,7 +870,12 @@ took turns. `array_pipelining.py --sizes 1500:10`, ms per run:
 | + lock-free queue, LIFO wake | 2.92 | 3.17 | 3.18 | 3.21 | 3.29 | 3.25 | 2.53 |
 
 With all three, 11 workers lose 9% against 4 in `loop` (was 31%) and
-1% in `loop_dep`; 4 workers gained 8%. Pinned to the P-cores (bounded
+1% in `loop_dep`; 4 workers gained 8%.
+Speedups of the last row (`--workers 4,7,11 --samples 7`, NumPy 12.43 /
+12.87 / 14.50 ms for `loop` / `loop_dep` / `vectorized`): `loop`
+4.25x / 3.92x / 3.91x at w=4/7/11, `loop_dep` 4.01x / 3.91x / 3.96x,
+`vectorized` 3.70x / 4.64x / 5.73x; NumPy with 12 threads (`loop`)
+18.85 ms, 0.66x. Pinned to the P-cores (bounded
 wake-ups only): `loop` w=4/7/11 3.16/3.41/3.50 ms.
 
 ### Real-world programs (`realworld.py`)

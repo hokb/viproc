@@ -39,11 +39,12 @@ python -m viproc prog.py          # your unchanged NumPy program, now in paralle
 
 All results bit-identical to NumPy; speedup = NumPy time / viproc time.
 
-![A plain Python loop over columns: 4.2x with 4 workers, NumPy with a thread pool 0.7x](docs/benchmarks/readme/loop.png)
+![A plain Python loop over columns: 3.9-4.2x, the vectorized form 5.7x, NumPy with a thread pool 0.7x](docs/benchmarks/readme/loop.png)
 
 ILNumerics' array-pipelining demo (`python/benchmarks/array_pipelining.py`): a Python loop
 over the columns of a 1,500 x 1,500 matrix, nothing annotated. A thread pool makes NumPy
-slower (the GIL) and the order-dependent variant wrong; viproc overlaps the iterations.
+slower (the GIL) and the order-dependent variant wrong; viproc overlaps the iterations and
+keeps their order where it matters.
 
 ![Speedups of unchanged NumPy programs on 4 cores](docs/benchmarks/readme/programs.png)
 
