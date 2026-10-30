@@ -65,8 +65,11 @@ Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_
         options_.max_active_tasks = 1;
     }
     locals_.reserve(n);
+    slots_.reserve(n);
+    sleepers_.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
         locals_.push_back(std::make_unique<LocalQueue>());
+        slots_.push_back(std::make_unique<WorkerSlot>());
     }
     workers_.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
@@ -77,10 +80,15 @@ Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_
 Runtime::~Runtime() {
     wait_all();
     {
-        std::lock_guard lock(queue_mutex_);
-        stopping_ = true;
+        std::lock_guard lock(sleep_mutex_);
+        stopping_.store(true, std::memory_order_seq_cst);
+        for (std::size_t id : sleepers_) {
+            wakes_pending_.fetch_add(1, std::memory_order_seq_cst);
+            slots_[id]->wake.release();
+        }
+        sleepers_.clear();
+        sleeping_.store(0, std::memory_order_seq_cst);
     }
-    queue_cv_.notify_all();
     for (std::thread& t : workers_) {
         t.join();
     }
@@ -640,48 +648,80 @@ TaskList Runtime::run(const std::shared_ptr<Task>& task) {
     return runnable;
 }
 
-bool Runtime::claim_wake(std::size_t wanted) {
-    // A spinning worker will pick the task up. The seq_cst order between this
-    // load and the worker's decrement of spinning_ before it sleeps (followed
-    // by its locked re-check of the queue) rules out a lost wake-up. Pending
-    // wake-ups reach sleepers: sleeping_ changes only under the lock, so it
-    // counts the threads inside the wait, never fewer than wakes_pending_,
-    // and each of them takes one off when it returns from the wait.
-    const std::size_t sleeping =
-        static_cast<std::size_t>(sleeping_.load(std::memory_order_seq_cst));
-    if (spinning_.load(std::memory_order_seq_cst) != 0 || wakes_pending_ >= sleeping ||
-        wakes_pending_ >= wanted) {
+bool Runtime::wake_one(std::size_t wanted) {
+    // The seq_cst order between a waker's increment of queued_ and its load
+    // of sleeping_, and a sleeper's registration and its load of queued_
+    // (sleep()), rules out a lost wake-up: one of them sees the other.
+    if (spinning_.load(std::memory_order_seq_cst) != 0 ||
+        sleeping_.load(std::memory_order_seq_cst) == 0 ||
+        wakes_pending_.load(std::memory_order_seq_cst) >= wanted) {
         return false;
     }
-    ++wakes_pending_;
+    std::size_t id;
+    {
+        std::lock_guard lock(sleep_mutex_);
+        if (sleepers_.empty() || wakes_pending_.load(std::memory_order_relaxed) >= wanted) {
+            return false;
+        }
+        id = sleepers_.back(); // last in, first out: its caches are warm
+        sleepers_.pop_back();
+        sleeping_.store(static_cast<int>(sleepers_.size()), std::memory_order_seq_cst);
+        wakes_pending_.fetch_add(1, std::memory_order_seq_cst);
+    }
+    slots_[id]->wake.release();
     return true;
 }
 
-void Runtime::enqueue(std::shared_ptr<Task> task) {
-    bool wake;
+void Runtime::sleep(std::size_t id) {
     {
-        std::lock_guard lock(queue_mutex_);
-        queue_.push_back(std::move(task));
-        queued_.fetch_add(1, std::memory_order_seq_cst);
-        wake = claim_wake(queue_.size());
+        std::lock_guard lock(sleep_mutex_);
+        if (stopping_.load(std::memory_order_seq_cst)) {
+            return;
+        }
+        sleepers_.push_back(id);
+        sleeping_.store(static_cast<int>(sleepers_.size()), std::memory_order_seq_cst);
     }
-    if (wake) {
+    if (queued_.load(std::memory_order_seq_cst) > 0 || stopping_.load(std::memory_order_seq_cst)) {
+        // Work (or the end) showed up while registering: leave again, unless
+        // a waker took this worker off the list already; then its release
+        // is on the way and must be consumed.
+        std::lock_guard lock(sleep_mutex_);
+        for (std::size_t i = 0; i < sleepers_.size(); ++i) {
+            if (sleepers_[i] == id) {
+                sleepers_.erase(sleepers_.begin() + static_cast<std::ptrdiff_t>(i));
+                sleeping_.store(static_cast<int>(sleepers_.size()), std::memory_order_seq_cst);
+                return;
+            }
+        }
+    }
+    slots_[id]->wake.acquire();
+    wakes_pending_.fetch_sub(1, std::memory_order_seq_cst);
+}
+
+void Runtime::enqueue(std::shared_ptr<Task> task) {
+    // Counted before the push: a sleeper that sees the count but not yet the
+    // task spins for it instead of sleeping.
+    const std::size_t queued = queued_.fetch_add(1, std::memory_order_seq_cst) + 1;
+    queue_.push(std::move(task));
+    if (wake_one(queued)) {
         if (!stream_.load(std::memory_order_relaxed)) {
             stream_.store(true, std::memory_order_relaxed);
         }
         wakes_.fetch_add(1, std::memory_order_relaxed);
-        queue_cv_.notify_one();
     }
 }
 
 std::shared_ptr<Task> Runtime::try_pop() {
-    std::lock_guard lock(queue_mutex_);
-    if (queue_.empty()) {
-        return nullptr;
+    std::shared_ptr<Task> t = queue_.pop();
+    if (t) {
+        // More queued: the next sleeper is woken by this worker, not by the
+        // next enqueue() (.NET's ThreadPool re-requests a thread the same
+        // way after a dequeue). A spinning caller wakes nobody.
+        const std::size_t left = queued_.fetch_sub(1, std::memory_order_seq_cst) - 1;
+        if (left > 0) {
+            wake_one(left);
+        }
     }
-    std::shared_ptr<Task> t = std::move(queue_.front());
-    queue_.pop_front();
-    queued_.fetch_sub(1, std::memory_order_relaxed);
     return t;
 }
 
@@ -750,56 +790,21 @@ void Runtime::worker_loop(std::size_t id) {
                 // more work is queued or tasks stream in, so that the next
                 // enqueue() needs no wake-up (the issuing main thread would
                 // pay a futex call per op where workers outrun it: 4 chains
-                // of cheap ops, 1 -> 3.5 us per op).
-                if (next &&
-                    (stream_.load(std::memory_order_relaxed) ||
-                     queued_.load(std::memory_order_seq_cst) > 0 ||
-                     local_.load(std::memory_order_seq_cst) > 0) &&
-                    sleeping_.load(std::memory_order_seq_cst) > 0) {
-                    bool wake;
-                    {
-                        std::lock_guard lock(queue_mutex_);
-                        spin_wanted_ = true;
-                        // A wake-up already on its way brings a worker that
-                        // spins if it finds the queue empty.
-                        wake = claim_wake(1);
-                    }
-                    if (wake) {
-                        queue_cv_.notify_one();
-                    }
+                // of cheap ops, 1 -> 3.5 us per op). A wake-up already on its
+                // way brings a worker that spins if it finds nothing.
+                if (next && (stream_.load(std::memory_order_relaxed) ||
+                             queued_.load(std::memory_order_seq_cst) > 0 ||
+                             local_.load(std::memory_order_seq_cst) > 0)) {
+                    wake_one(1);
                 }
             }
         }
         if (!next) {
-            std::unique_lock lock(queue_mutex_);
-            sleeping_.fetch_add(1, std::memory_order_seq_cst);
-            // Every return from the wait takes a pending wake-up off, also
-            // one that goes back to sleep (another worker took the task
-            // first): a count nobody takes off would keep enqueue() from
-            // waking anyone.
-            while (!stopping_ && !spin_wanted_ && queue_.empty()) {
-                queue_cv_.wait(lock);
-                wakes_pending_ -= wakes_pending_ > 0 ? 1 : 0;
+            if (stopping_.load(std::memory_order_acquire)) {
+                return;
             }
-            sleeping_.fetch_sub(1, std::memory_order_seq_cst);
-            if (queue_.empty()) {
-                if (stopping_) {
-                    return;
-                }
-                spin_wanted_ = false; // asked to take over spinning
-                continue;
-            }
-            next = std::move(queue_.front());
-            queue_.pop_front();
-            queued_.fetch_sub(1, std::memory_order_relaxed);
-            // More queued: the next sleeper is woken by this worker, not by
-            // the next enqueue() (.NET's ThreadPool re-requests a thread the
-            // same way after a dequeue).
-            const bool wake = claim_wake(queue_.size());
-            lock.unlock();
-            if (wake) {
-                queue_cv_.notify_one();
-            }
+            sleep(id);
+            continue;
         }
         // Trampoline: run() returns instead of calling consumers, so the stack
         // is unwound before the continuation starts.
