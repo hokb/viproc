@@ -903,9 +903,48 @@ result bit-identical:
 | bs_greeks 1,000,000 | 327.80 | 116.06 | 2.82x |
 
 Logistic regression is a dependent chain of matrix-vector products with a
-sync per step: nothing to overlap. The README's charts
-(`docs/benchmarks/readme/make_charts.py`) take their numbers from this
-file.
+sync per step: nothing to overlap.
+
+### README figures (2026-10-30)
+
+The README's figures (`docs/benchmarks/readme/`: data in `data/`, drawn
+with ILNumerics by `plots/`, see `make_charts.py`). Code of `03c16cb`
+(`main` after #58), Release build `2026-10-30T20:57:09 #f92697ba`;
+Linux VM, Intel Xeon @ 2.10 GHz, 4 cores, 15.7 GiB, Python 3.13.17,
+NumPy 2.5.3. All results bit-identical.
+
+**Shape map**, `shape_map.py --max-rows 3162 --max-cols 3162`, 4 workers,
+43 cases, 8 x 8 points + 0-d, 2,779 measurements bit-identical. Median
+speedup per point:
+
+| | < 1,000 elements | 1,000-9,999 | >= 10,000 |
+|---|---:|---:|---:|
+| single ops (`x = op(x)`, 5 cases) | 0.44-0.87x | 0.63-1.59x | 0.93-1.73x (median 1.30x) |
+| all 43 cases | 0.63-0.96x | 0.93-1.22x | 0.99-2.06x (median 1.38x) |
+
+0-d scalars 1.00x; 3162 x 3162 1.78x, 1000 x 3162 2.06x.
+
+**Column loop**, `array_pipelining.py --sizes
+200:200,500:50,1000:20,1500:10,2000:5,3000:3 --workers 3,4 --samples 5`,
+speedup vs. NumPy (the figure shows w=3, the default: cores - 1):
+
+| n | NumPy 4 threads (`loop`) | `loop` w=3 | `loop_dep` w=3 | `loop` w=4 | `loop_dep` w=4 | `vectorized` w=4 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 200 | 0.59x | 1.25x | 1.20x | 1.10x | 1.04x | 3.07x |
+| 500 | 0.67x | 1.82x | 1.69x | 1.19x | 1.29x | 4.37x |
+| 1,000 | 0.24x | 2.25x | 2.07x | 2.80x | 2.99x | 4.34x |
+| 1,500 | 0.36x | 3.10x | 2.16x | 3.04x | 3.06x | 3.60x |
+| 2,000 | 0.41x | 1.97x | 2.80x | 2.73x | 3.09x | 3.25x |
+| 3,000 | 0.67x | 2.96x | 2.69x | 3.64x | 3.18x | 2.66x |
+
+**k-means**, ILNumerics' Part 3 NumPy script (`Part3_noopt.py`, 1203 x
+1203, k = 50, 5 iterations) for 20 s each, median time per run: NumPy
+2,668 ms, NumPy with `MALLOC_MMAP_THRESHOLD_=100000000
+MALLOC_TRIM_THRESHOLD_=1000000000` 789 ms, `python -m viproc` 265 ms
+(3.0x the tuned NumPy), same classes and iterations. With glibc's
+defaults every 481 KB temporary of `X[:, i, newaxis] - centers` is mapped
+and unmapped (203 page faults per distance step, 421 vs. 191 µs);
+viproc's element pool reuses its blocks.
 
 ## Other machines
 

@@ -37,28 +37,43 @@ python -m viproc prog.py          # your unchanged NumPy program, now in paralle
 
 ## Benchmarks
 
-All results bit-identical to NumPy; speedup = NumPy time / viproc time.
+All measurements on 4 cores (Linux VM), all results bit-identical to NumPy; speedup = NumPy
+time / viproc time. Figures drawn with [ILNumerics](https://ilnumerics.net).
 
-![A plain Python loop over columns: 3.9-4.2x, the vectorized form 5.7x, NumPy with a thread pool 0.7x](docs/benchmarks/readme/loop.png)
+![Shape map: speedup of single operations and of all 43 programs over rows x columns](docs/benchmarks/readme/shape_map.png)
 
-ILNumerics' array-pipelining demo (`python/benchmarks/array_pipelining.py`): a Python loop
-over the columns of a 1,500 x 1,500 matrix, nothing annotated. A thread pool makes NumPy
-slower (the GIL) and the order-dependent variant wrong; viproc overlaps the iterations and
-keeps their order where it matters.
+**Single operations pay off from ~10,000 elements.** The shape map runs 43 NumPy programs on
+every grid point of rows x columns. Left, single operations (`x = op(x)`): below the dashed
+line of 10,000 elements viproc is slightly slower than NumPy (median 0.75x), because each
+operation pays the asynchronous layer (task, dispatch) on top of NumPy's own call and a
+single operation has nothing to overlap with; reducing this overhead is on the roadmap.
+Above it, single operations run at 0.93-1.73x. Right, the median over all 43 programs:
+complexity brings parallel potential, which hides the overhead earlier and gains more
+(0.99-2.06x from 10,000 elements).
+
+![A Python loop over the columns of A: viproc 1.2-3.1x, NumPy with a thread pool 0.24-0.67x](docs/benchmarks/readme/loop.png)
+
+**A plain Python loop, parallel without changes.** ILNumerics' loop demo in NumPy
+(`python/benchmarks/array_pipelining.py`): `C[i] = sum(abs(sin(A[:, i])))` over the columns.
+The manual way, a thread pool over the columns (`Parallel.For`), makes NumPy slower (the GIL)
+and cannot run the variant whose iterations overwrite earlier results (`C[:i+1] = ...`) at
+all. viproc runs both unchanged, at 1.2x (200 x 200) to 3.1x.
+
+![k-means: 265 ms per run on viproc, 789 ms on NumPy](docs/benchmarks/readme/kmeans.png)
+
+**A whole algorithm: k-means.** ILNumerics' k-means program (Part 3 of the
+[paper's artifacts](https://github.com/hokb/decentralized-array-execution-artifacts2026)),
+the unchanged NumPy script run with `python -m viproc`: 265 ms per run, 3.0x faster than
+NumPy with its temporaries' page faults tuned away (789 ms; 2,670 ms with glibc's defaults on
+this VM, where every 481 KB temporary is mapped fresh). Same clusters, same iterations.
 
 ![Speedups of unchanged NumPy programs on 4 cores](docs/benchmarks/readme/programs.png)
 
-Whole programs on 4 cores, from independent chains to k-means, FFT pipelines and
-simulations. A strictly dependent chain (logistic regression) has nothing to overlap.
-
-![Median speedup over data size, per program group](docs/benchmarks/readme/sizes.png)
-
-Shape map: 19 programs over 1 to 5 x 10^7 elements per array, 4 cores (2026-10-15).
-viproc pays off from ~10,000 elements; below that, the per-operation overhead on top of
-NumPy shows (work in progress, see [goals](docs/design/goals.md)).
+More programs: independent chains, an FFT pipeline, finance, a stencil and preprocessing gain
+1.8-7.5x; a strictly dependent chain (logistic regression) has nothing to overlap.
 
 Suite scores, all shape maps, other machines and how to measure:
-[docs/benchmarks.md](docs/benchmarks.md). Chart data: `docs/benchmarks/readme/make_charts.py`.
+[docs/benchmarks.md](docs/benchmarks.md). Figure data and scripts: `docs/benchmarks/readme/`.
 
 ## Quick start
 
@@ -80,7 +95,7 @@ VIPROC=1 python prog.py             #    the same, through an environment variab
 ```python
 import viproc as np                 # 2. one line changed
 
-x = np.random.default_rng(0).standard_normal((2000, 2000))
+x = np.random.default_rng(0).standard_normal((1000, 1000))
 y = np.sin(x) * np.cos(x)           # returns immediately, computed in the background
 print(float(y.sum()))               # sync point
 ```
@@ -126,10 +141,11 @@ described in the paper [*A Virtual Processor brings back the Free Lunch*](https:
   Element-wise ufuncs, reductions, indexing, `np.where`, matmul/dot, most of `numpy.linalg`
   and `numpy.fft`, sort and many composed functions run asynchronously; the rest falls back
   to NumPy.
-- **Goal:** every program at 0.8x of NumPy or faster, complex programs clearly faster. Small
-  arrays (below ~10,000 elements) and programs that read a result after nearly every step
-  are not there yet.
-- **Planned levels**, each correct but no longer bit-identical: O2 stage pipelining and
+- **Goal:** every program at 0.8x of NumPy or faster, complex programs clearly faster. From
+  ~1,000 elements per array the shape map's programs are there (median 0.93x and up); on
+  tiny arrays the median is 0.63-0.96x, single operations down to 0.44x: the per-operation
+  overhead is being worked down.
+- **Planned levels**, each correct and faster but no longer bit-identical: O2 stage pipelining and
   viproc-owned BLAS threading, O3 own and fused kernels, O4 automatic device offloading
   (GPUs). O1 stays available.
 
@@ -147,9 +163,11 @@ described in the paper [*A Virtual Processor brings back the Free Lunch*](https:
 
 ## Development
 
+To work on viproc itself, build it from a checkout and run its tests:
+
 ```bash
-./dev.sh                     # Linux: pull, build into .venv, run the tests (dev.cmd on Windows)
-cmake -S . -B build -G Ninja && cmake --build build
-ctest --test-dir build --output-on-failure            # needs: pip install pytest
-PYTHONPATH=build/python python3 python/benchmarks/suite.py   # benchmark suite
+./dev.sh          # Linux; dev.cmd on Windows: git pull, build into .venv, run all tests
+.venv/bin/python -m viproc prog.py      # try the build (Windows: .venv\Scripts\python)
 ```
+
+CMake builds, the benchmark suite and the Docker images: [CLAUDE.md](CLAUDE.md), "Commands".
