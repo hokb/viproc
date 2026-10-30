@@ -824,6 +824,32 @@ budget (4.7 µs) and 10 µs measure the same (quick module map, two runs
 each: geomean 1.056/1.025 vs. 1.041/1.023, cells below 0.8x 169/180 vs.
 151/167 of 715).
 
+**Measured costs, chains (12700K, 12 workers).** The budget of 9 x `a * b`
+never promoted an op below 256 elements (not timed). Now kernel costs per
+size class from 64 elements, task costs measured at start (task surcharge
+0.3-1.1 µs, follower surcharge ~0.06 µs) and the followers' NumPy time
+credited to the op they follow, close promotions confirmed by an A/B
+measurement of the site's issue period (CLAUDE.md, "Dispatch decision").
+`array_pipelining.py`, speedup at 1/4/11 workers (NumPy 0.58 / 6.40 /
+13.09 ms):
+
+| build | 200² `loop` | 1000² `loop` | 1000² `loop_dep` | 1500² `loop` | 1500² `loop_dep` |
+|---|---:|---:|---:|---:|---:|
+| main 4963a59 | 1.25/1.26/1.26 | 1.29/2.99/2.49 | 1.20/3.01/2.44 | 1.23/4.04/3.20 | 1.14/4.06/3.31 |
+| model only, budget 1 µs (ce0327c, rejected) | 1.26/1.25/1.22 | 1.28/2.95/2.10 | 1.22/3.08/1.84 | 1.19/4.19/2.34 | 1.14/4.11/2.41 |
+| chains + A/B (b7ee06d) | 1.24/1.25/1.26 | 1.13/2.89/2.43 | 1.12/2.94/2.50 | 1.23/4.21/3.11 | 1.17/4.17/3.09 |
+
+200² stays on the direct path: with random data all ops as tasks
+(`sync_below=0`) take 502 µs per run at 4 workers, directly ~480 µs (the
+main thread issues ~2.3 µs per iteration either way). Quick shape map
+`--module`, same load, back to back: geomean of the point medians main
+1.096, new 1.093 / 1.097 (all 715 points 1.173 vs. 1.179 / 1.192), no
+point below 0.8x; 42 cases better and 17 worse by more than 25% (many of
+them noisy on main too: `ind8_cheap` 1000x100 8.6x and 13.3x on main);
+stable losses `ind_cores_f32` 100x10 (0.86 -> 0.63) and `loop_accum`
+100x1000 (1.38 -> 0.93). Before the blame fix (chain blame from its last
+op) `dep3_sync`/`ind3_sync` fell to 0.72x.
+
 ## Other machines
 
 **Iterator copies taken when the kernel runs.** The shape map found
