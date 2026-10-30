@@ -38,9 +38,9 @@ struct DirectCost {
     // Size classes: bit width of the element count (64..127 -> 7, ...).
     static constexpr int kClasses = 16;
     struct Class {
-        float per = 0;      // ns per element, min of the last two samples; 0: not known
-        float last = 0;     // the last sample
-        float elements = 0; // elements of the last sample
+        float per = 0;           // ns per element, min of the last two samples; 0: not known
+        float last = 0;          // the last sample
+        float elements = 0;      // elements of the last sample
         std::uint32_t calls = 0; // direct runs of this class, for sampling
     };
     Class classes[kClasses];
@@ -85,6 +85,23 @@ struct OffloadOptions {
     int explore_max = 1024;
 };
 
+// A/B probe of one issue site below `sync_below` (OffloadPolicy::promote):
+// whether its ops run faster for the program directly or as tasks, measured
+// as the main thread's time between two issues at the site (a loop's
+// iteration: the ops a promoted op drags onto the task path are in it).
+// Main thread only.
+struct SiteProbe {
+    static constexpr int kPeriods = 8; // periods per variant and probe
+    const char* site = nullptr;
+    std::int64_t last_ns = 0;        // the previous issue during a probe; 0: none
+    float periods[2][kPeriods] = {}; // [direct, task]
+    std::uint8_t count = 0;          // periods of the current variant
+    std::uint8_t phase = 0;          // 0: probe direct, 1: probe task, 2: decided
+    bool task = false;               // the decision
+    std::uint32_t calls = 0;         // issues since the decision
+    std::uint32_t next = 0;          // ... until the next probe
+};
+
 // Statistics of one (issue site, size class). Main thread only.
 struct SiteStats {
     int observed = 0; // async issues since the last decision
@@ -116,14 +133,29 @@ class OffloadPolicy {
     // op stalled the issuing thread for ~15 us, 21% of its instructions in
     // `array_pipelining.py`'s loop. Adaptive mode only: deterministic mode
     // keeps rule 1 a fixed threshold.
-    bool promote(DirectCost& c, std::int64_t elements) const {
+    //
+    // On top of the estimate, every issue site measures both variants (a
+    // SiteProbe, from its first call: kPeriods iterations directly, then as
+    // tasks) and keeps the faster one, re-probed after 64 calls, doubling up
+    // to 4096 while the decision holds. The estimate sees one op; the gain
+    // of a loop over 200 x 200 columns comes from the ops that follow its
+    // sin onto the task path (abs, sum, the assignment): the sin alone
+    // (~0.8 us on a 12700K) costs less than a task's issue (~1 us).
+    bool promote(DirectCost& c, std::int64_t elements, const char* site) {
         if (!options_.adaptive || elements < options_.time_from) {
             return false;
         }
         if (c.task_sample.load(std::memory_order_relaxed) != 0) {
             take_task_sample(c);
         }
-        if (estimate(c, elements) <= options_.direct_budget_ns) {
+        SiteProbe& p = probe_of(site);
+        bool task;
+        if (p.phase == 2 && ++p.calls < p.next) {
+            task = p.task;
+        } else {
+            task = probe(p);
+        }
+        if (!task && estimate(c, elements) <= options_.direct_budget_ns) {
             return false;
         }
         c.retest = ++c.promoted % kRetest == 0;
@@ -150,12 +182,23 @@ class OffloadPolicy {
     void on_blocked(SiteStats* stats, std::uint64_t distance);
 
     const OffloadOptions& options() const { return options_; }
+    void set_workers(std::size_t n) { workers_ = n; }
     std::uint64_t inline_count() const { return inline_count_; }
     std::uint64_t offload_count() const { return offload_count_; }
 
   private:
     static constexpr std::uint32_t kRetest = 32;
     static void take_task_sample(DirectCost& c);
+    static constexpr int kProbes = 64; // direct-mapped by site
+    SiteProbe& probe_of(const char* site) {
+        SiteProbe& p = probes_[(reinterpret_cast<std::uintptr_t>(site) >> 4) % kProbes];
+        if (p.site != site) {
+            p = SiteProbe{};
+            p.site = site;
+        }
+        return p;
+    }
+    bool probe(SiteProbe& p);
     struct KeyHash {
         std::size_t operator()(const std::pair<const char*, int>& k) const {
             return std::hash<const void*>()(k.first) * 31u + static_cast<std::size_t>(k.second);
@@ -164,6 +207,8 @@ class OffloadPolicy {
     void maybe_switch(SiteStats& s);
 
     OffloadOptions options_;
+    std::size_t workers_ = 1;
+    SiteProbe probes_[kProbes];
     std::unordered_map<std::pair<const char*, int>, SiteStats, KeyHash> sites_;
     std::uint64_t inline_count_ = 0;
     std::uint64_t offload_count_ = 0;

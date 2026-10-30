@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 
 namespace viproc {
 
@@ -93,6 +94,43 @@ void OffloadPolicy::take_task_sample(DirectCost& c) {
     const std::uint64_t v = c.task_sample.exchange(0, std::memory_order_relaxed);
     record_sample(c, std::bit_cast<float>(static_cast<std::uint32_t>(v >> 32)),
                   static_cast<std::int64_t>(v & 0xffffffffu));
+}
+
+bool OffloadPolicy::probe(SiteProbe& p) {
+    if (p.phase == 2) { // a re-probe
+        p.phase = 0;
+        p.count = 0;
+        p.last_ns = 0;
+    }
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+    // The first period of a variant spans the switch: not counted.
+    if (p.last_ns != 0) {
+        p.periods[p.phase][p.count++] = static_cast<float>(now - p.last_ns);
+    }
+    p.last_ns = now;
+    if (p.count == SiteProbe::kPeriods) {
+        p.count = 0;
+        p.last_ns = 0;
+        if (++p.phase == 2) {
+            auto median = [](float* v) {
+                std::nth_element(v, v + SiteProbe::kPeriods / 2, v + SiteProbe::kPeriods);
+                return v[SiteProbe::kPeriods / 2];
+            };
+            const double direct = median(p.periods[0]);
+            // As tasks the workers must keep up too: at most the direct
+            // time (kernels included) spread over all of them.
+            const double task =
+                std::max<double>(median(p.periods[1]), direct / static_cast<double>(workers_));
+            const bool t = task < 0.95 * direct;
+            p.next = t == p.task && p.next != 0 ? std::min<std::uint32_t>(2 * p.next, 4096) : 64;
+            p.task = t;
+            p.calls = 0;
+            return p.task;
+        }
+    }
+    return p.phase == 1;
 }
 
 void OffloadPolicy::on_blocked(SiteStats* stats, std::uint64_t distance) {

@@ -72,6 +72,7 @@ Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_
     for (std::size_t i = 0; i < n; ++i) {
         workers_.emplace_back([this, i] { worker_loop(i); });
     }
+    policy_.set_workers(n);
 }
 
 Runtime::~Runtime() {
@@ -297,7 +298,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         // An expensive loop: the op is sized as a large one, for the direct
         // path and the dispatch policy alike (OffloadOptions::direct_budget_ns).
         DirectCost* c = kernel->direct_cost();
-        if (c != nullptr && policy_.promote(*c, elements)) {
+        if (c != nullptr && policy_.promote(*c, elements, issue_site)) {
             retest = c->retest ? elements : 0;
             elements = policy_.options().sync_below;
         }

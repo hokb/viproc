@@ -215,7 +215,10 @@ class Runtime {
     // thread; wait_all() not counted).
     std::uint64_t sync_count() const { return syncs_; }
     // Main thread, before issuing ops: replaces the dispatch policy.
-    void set_offload_options(const OffloadOptions& o) { policy_ = OffloadPolicy(o); }
+    void set_offload_options(const OffloadOptions& o) {
+        policy_ = OffloadPolicy(o);
+        policy_.set_workers(workers_.size());
+    }
     std::size_t worker_count() const { return workers_.size(); }
     // The one store of failed ops' errors (see ErrorTable). Any thread.
     ErrorTable& errors() { return *errors_; }
