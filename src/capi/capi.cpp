@@ -329,6 +329,11 @@ void vp_set_direct_budget_ns(vp_runtime* rt, double ns) {
     o.direct_budget_ns = ns;
     rt->rt->set_offload_options(o);
 }
+void vp_set_chain_ns(vp_runtime* rt, double ns) {
+    OffloadOptions o = rt->rt->offload_policy().options();
+    o.chain_ns = ns;
+    rt->rt->set_offload_options(o);
+}
 size_t vp_active_tasks(const vp_runtime* rt) { return rt->rt->active_tasks(); }
 
 void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive) {

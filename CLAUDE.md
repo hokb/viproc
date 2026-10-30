@@ -272,6 +272,12 @@ is no sufficient parallel potential) is the target, not a guarantee.
 **G2 has priority over G3:** both cannot always hold together, because the
 per-op layer comes on top of NumPy's own loops and small ops cannot hide it.
 
+**Complexity becomes performance** (goals.md, G1): the yardstick is whether
+whole programs scale strongly, not whether single ops beat NumPy. A program
+of one op does not get faster; complexity brings parallel potential, which
+viproc turns into parallelism. Current milestone: every program at 0.8x of
+NumPy or faster, complex programs clearly faster.
+
 **Bit-identical results are mandatory (currently).** Every change must keep
 results bit-identical to plain NumPy of the installed version (values,
 dtypes, shapes, strides, warnings, errors), as the drop-in rule demands
@@ -564,53 +570,51 @@ reference counting.
      decided *where* an op ran, not whether it paid for the task protocol
      (task, operand capture, read counting, look-ahead slot, completion),
      ~1 µs per op even for scalars. `offload_stats()["direct"]` counts them.
-     **Except expensive loops** (adaptive mode only): the direct path times
-     the kernels shared by many ops (one `ElementwiseKernel` per resolved
-     loop, `Kernel::direct_cost`, `DirectCost`): runs of >= `time_from` =
-     256 elements, the first two, then every 16th; the estimate is the
-     smaller of the last two samples (ns per element). An op whose estimated
-     NumPy time is above `direct_budget_ns` = 10 µs is sized as
-     `sync_below` and takes the task path and rule 2 like a large op; every
-     32nd such op is re-timed by its task, on the worker (`Task::time_kernel`,
-     `DirectCost::task_sample`, taken over at the next promotion), so a loop
-     measured slow by accident returns. The re-test ran directly on the main
-     thread before: 21% of its instructions in `array_pipelining.py`'s loop. `sin` of 1,500 doubles (~15 µs) is a task, `add`
-     (~0.6 µs) stays direct. The budget is far above the 2 µs break-even of
-     sin/cos chains (`break_even.py`) because a promoted op drags the cheap
-     ops consuming it onto the task path, whose issue cost the main thread
-     pays: with 5 µs `expr8` at 1,000 elements fell from 1.0x to 0.6x, with
-     2 µs `ind_cores_f32` (float32 `sin` of 1,000, ~2.2 µs, then
-     `* 0.5 + 0.4`) from 0.6x
-     to 0.15x. A per-site measured decision would fit both (open). Without
-     the rule the loop of ILNumerics'
-     array-pipelining demo (`array_pipelining.py`: `C[i] =
-     np.sum(np.abs(np.sin(A[:, i])), axis=0)` over 1,500 columns) ran every
-     `sin` on the main thread: no parallelism at all (1.0x on 4 cores, now
-     ~2x). Rule 1 stays a fixed threshold in deterministic mode (a
-     timed decision is not deterministic; there a read-right-away `sin` of
-     1,000 would run 2x slower as a task).
-     **The budget is set per machine:** it stands for main-thread costs,
-     so the bridge sets it to 9 times what the main thread pays per op
-     there: a direct `a * b` of 8 doubles, timed once per process
-     (`_scale_budget` in `_ndarray.py`, best of 40 x 25 ops, ~0.5 ms;
-     `vp_set_direct_budget_ns`, clamped to 1-50 µs;
-     `_viproc.direct_budget_ns()` shows it; `VIPROC_DIRECT_BUDGET_NS`
-     overrides it). 4.7 µs on the 4-vCPU VM (525 ns per op), 3.0 µs on a
-     12700K (330 ns). The fixed 10 µs (in the paragraph above) were the
-     VM's time; on the 12700K (`sin` of 1,500 doubles 6.1 µs) the whole
-     loop of `array_pipelining.py` ran directly: 0 tasks, 1.03x at every
-     worker count; with 3 µs 2.9x (1,000²) and 4.2x (1,500²) at 4 workers,
-     `expr8` at 1,000 elements 1.0x -> 1.6x, quick module shape map
-     unchanged (1.08 -> 1.10). On the VM 4.7 µs and 10 µs measure the
-     same within noise (quick module map 1.04/1.03 vs. 1.04/1.02). A
-     probe of plain C code (pointer walks) was tried first: it rated the
-     12700K (MSVC build) as fast as the VM.
+     **Except expensive ops and chains** (adaptive mode only;
+     `OffloadPolicy::promote`, `offload.hpp`). Costs of an op: the direct
+     path times the kernels shared by many ops (`ElementwiseKernel` per
+     resolved loop, `ReduceKernel` per plan; `Kernel::direct_cost`,
+     `DirectCost`) per log2 size class: runs of >= `time_from` = 64
+     elements, per class the first two, then every 16th, the smaller of the
+     last two samples; other sizes are interpolated between the nearest
+     measured classes or extrapolated per element. Costs of the task path:
+     measured by the bridge once per process (`_calibrate` in
+     `_ndarray.py`, ~5 ms, interleaved best-of rounds of 64 `a * b` of 8
+     doubles: direct d, task of ready inputs t, task of a pending input c;
+     `direct_budget_ns` = t - d, `chain_ns` = c - d, `vp_set_chain_ns`;
+     `VIPROC_DIRECT_BUDGET_NS` overrides). 12700K: t - d 0.3-1.1 µs; VM
+     ~2 µs. **Chains:** a small op's result carries its issue site
+     (`AliasGroup::chain_`, for 32 ops); small ops reading it (and their
+     results) credit their estimated NumPy time to that site (`ChainScore`,
+     decaying average per issue): a promoted op takes them onto the task
+     path. Promote if own + followers' time > `direct_budget_ns` +
+     followers x `chain_ns` (no observations: 2 followers of no time). A
+     promotion within 4x of its cost is confirmed by measuring (the
+     Accelerator's measurement is the same idea, on the worker, of issue
+     costs only): the main thread's time between two issues at the site, 8
+     periods directly, then 8 as tasks after a warm-up of 16 (sleeping
+     workers), the task side at least the direct time / workers; the faster
+     holds for 64 issues, doubling up to 4096. A promoted op is sized as
+     `sync_below` and takes rule 2 like a large op; if its site runs inline
+     there, it takes the direct path instead (`prefers_inline`: an inline
+     task costs more). Every 32nd promoted op is re-timed by its task on
+     the worker (`Task::time_kernel`, `DirectCost::task_sample`). History:
+     a fixed 10 µs budget (VM) ran every op of `array_pipelining.py`'s loop
+     directly on a 12700K; 9 x d (3 µs there) promoted the 1,000 and 1,500
+     columns (2.9x, 4.2x at 4 workers) but never an op below 256 elements
+     (not timed). With the chains: 1,000² and 1,500² as before, 200² direct
+     (all ops as tasks are no faster there with random data: 502 vs.
+     480 µs), quick module shape map as main. Rule 1 stays a fixed
+     threshold in deterministic mode (a timed decision is not
+     deterministic).
   2. **Adaptive above N_min, per (issue site, log2 size class):** count
      async issues and how many of their results the main thread accessed
      "right away" — a sync point within `window` = 2 issued ops of the
      decision that started the work, **whether the task had finished or
      not** (counting only unfinished ones made fast sites oscillate between
-     modes). Consumers issued while it was pending inherit the attribution.
+     modes). Consumers issued while it was pending inherit the attribution,
+     at their own distance: a sync right after a chain counts whatever the
+     chain's length (as the Accelerator's `ExecutionBranch`).
      After `sample` = 8 issues: ≥ 3/4 accessed right away → the site runs
      inline; in inline mode an exploration call still goes async, first
      every 16th call, doubling up to every 1024th while explorations confirm

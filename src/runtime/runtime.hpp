@@ -74,6 +74,10 @@ class AliasGroup : public MainThreadCounted {
     std::shared_ptr<Task> last_writer_;
     ErrorRef last_error_;
     ArrayBlock* block_;
+    // The issue site whose op's data flow this data is in, and the op count
+    // at that issue (OffloadPolicy::credit, ChainScore); null: none.
+    const char* chain_ = nullptr;
+    std::uint64_t chain_seq_ = 0;
 };
 
 // An array as seen by the main thread (docs/design/array-data-model.md, A1): its
@@ -219,7 +223,10 @@ class Runtime {
     // Sleeping workers enqueue() woke (any thread; relaxed).
     std::uint64_t wake_count() const { return wakes_.load(std::memory_order_relaxed); }
     // Main thread, before issuing ops: replaces the dispatch policy.
-    void set_offload_options(const OffloadOptions& o) { policy_ = OffloadPolicy(o); }
+    void set_offload_options(const OffloadOptions& o) {
+        policy_ = OffloadPolicy(o);
+        policy_.set_workers(workers_.size());
+    }
     std::size_t worker_count() const { return workers_.size(); }
     // The one store of failed ops' errors (see ErrorTable). Any thread.
     ErrorTable& errors() { return *errors_; }

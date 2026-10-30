@@ -75,6 +75,7 @@ Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_
     for (std::size_t i = 0; i < n; ++i) {
         workers_.emplace_back([this, i] { worker_loop(i); });
     }
+    policy_.set_workers(n);
 }
 
 Runtime::~Runtime() {
@@ -235,10 +236,15 @@ void Runtime::launch(const std::shared_ptr<Task>& task, const TaskList& producer
     task->set_id(seq_);
     task->set_fp_mode(fp_mode_);
     // While pending, the task's work is attributed to the decision that
-    // started the work it waits for.
+    // started the work it waits for, at the distance of the chain's last op:
+    // a sync right after a chain blocks on it whatever its length (as the
+    // Accelerator's ExecutionBranch counts). From the decision itself, a
+    // small op promoted with its followers (OffloadPolicy::promote) was 3-4
+    // ops from the sync of `x = cos((-x) ** 3); float(x.max())` and never
+    // switched to inline: 0.72x of NumPy.
     for (const std::shared_ptr<Task>& p : producers) {
         if (p->blame() != nullptr) {
-            task->set_blame(p->blame(), p->blame_seq());
+            task->set_blame(p->blame(), seq_);
             break;
         }
     }
@@ -301,17 +307,47 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
                             : !inouts.empty()      ? inouts[0]->layout().size()
                                                    : 0;
     std::int64_t retest = 0; // > 0: an expensive loop's re-test, its elements
-    if (elements < policy_.options().sync_below) {
-        // An expensive loop: the op is sized as a large one, for the direct
-        // path and the dispatch policy alike (OffloadOptions::direct_budget_ns).
+    // The chain this op is in (ChainScore): the first input in one's window.
+    const char* chain = nullptr;
+    std::uint64_t chain_seq = 0;
+    const OffloadOptions& po = policy_.options();
+    if (po.adaptive && elements < po.sync_below) {
+        for (const ArrayPtr& a : inputs) {
+            const AliasGroup& g = *a->group_;
+            if (g.chain_ != nullptr && seq_ - g.chain_seq_ <= po.chain_window) {
+                chain = g.chain_;
+                chain_seq = g.chain_seq_;
+                break;
+            }
+        }
+        // An expensive loop or chain: the op is sized as a large one, for the
+        // direct path and the dispatch policy alike (OffloadPolicy::promote).
         DirectCost* c = kernel->direct_cost();
-        if (c != nullptr && policy_.promote(*c, elements)) {
+        if (chain != nullptr) {
+            policy_.credit(chain, c != nullptr ? OffloadPolicy::estimate(*c, elements) : 0.0);
+        } else if (c != nullptr && elements >= po.time_from) {
+            policy_.start_chain(issue_site);
+            chain = issue_site;
+            chain_seq = seq_;
+        }
+        if (c != nullptr && policy_.promote(*c, elements, issue_site) &&
+            !policy_.prefers_inline(issue_site)) {
             retest = c->retest ? elements : 0;
-            elements = policy_.options().sync_below;
+            elements = po.sync_below;
         }
     }
+    // The new outputs carry the chain on.
+    auto tag = [&] {
+        if (chain != nullptr) {
+            for (std::size_t i = 0; i < new_outputs.size(); ++i) {
+                results[i]->group_->chain_ = chain;
+                results[i]->group_->chain_seq_ = chain_seq;
+            }
+        }
+    };
     if (issue_direct(kernel, inputs, inouts, new_outputs, issue_site, results, elements,
                      output_buffers)) {
+        tag();
         return;
     }
     // A live NumPy export (D7) aliases memory this op reads or writes: NumPy
@@ -484,6 +520,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     // D11): from a dying input or from the pool, while it is hot in cache.
     task->advance(TaskState::SizeCompleted);
     launch(task, producers, elements);
+    tag();
     if (host) {
         const Blocking blocking(options_);
         wait(!new_outputs.empty() ? *results[0] : *inouts[0]); // errors: at the sync points

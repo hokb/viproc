@@ -1,7 +1,6 @@
 # viproc
 
-**viproc strongly scales regular NumPy programs for any data on common (parallel)
-hardware without code changes.**
+**viproc compultes bit-equal results for unchanged NumPy programs faster: single node strong scaling.**
 
 viproc, a **vi**rtual **proc**essor for numerical programs, turns array instructions into
 autonomously scheduling workloads. At runtime, thousands of such tasks cooperatively make
@@ -22,6 +21,35 @@ and there is no central scheduler.
 Parallelism thus appears wherever the data allows it, across loops, functions and modules,
 in unchanged programs (`python -m viproc prog.py`). Today the tasks run on the cores of a
 multi-core CPU; the model is designed for heterogeneous hardware.
+
+## Complexity becomes performance
+
+The question viproc answers is not whether a single array operation runs as fast as, or
+faster than, NumPy. It is: **can whole programs scale strongly**, a fixed program with a
+fixed problem size getting faster with more cores?
+
+A benchmark that consists of a single operation does not get faster with viproc: there is
+nothing to overlap it with, and viproc does not split single operations. Real programs are
+not single operations. They compute several quantities, branch into independent
+sub-expressions, mix reductions with element-wise work, loop over arrays and call functions
+in modules. **In practice, complexity always comes with parallel potential**: the more a
+program does, the more of its array instructions do not depend on each other. viproc finds
+that potential at runtime, without analysis or annotations, and turns it into parallel
+execution. **viproc turns complexity into performance.**
+
+The goals follow from this, and they are stated for whole programs, not for single
+operations:
+
+- **Every program runs at 0.8x of NumPy's speed or faster** (current goal), also where it
+  offers little parallel potential.
+- **Complex programs run clearly faster than NumPy**, more so with more cores.
+- **Parallel potential becomes parallelism**: wherever independent array instructions
+  exist, they run concurrently.
+
+Benchmarks are judged accordingly: by whole programs of growing complexity (the
+[benchmark suite](docs/benchmarks.md), the shape maps over program groups, ILNumerics'
+k-means program at 3.9x of NumPy on 4 cores), not by the speed of one operation in
+isolation.
 
 ## How it works
 
@@ -72,14 +100,16 @@ The execution model follows the
 - **Planned: optimization levels.** Bit-identity is today's level, O1. Higher levels are
   to compute correct but not bit-identical results faster (see
   [Optimization levels](#optimization-levels-planned)).
-- **Faster where there is parallel potential; NumPy's speed as the target elsewhere.**
-  Array operations on medium-sized and large data viproc commonly runs efficiently in
-  parallel. For small data and algorithms without much parallel potential, the target is
-  NumPy's speed (at most 3% slower, never below 0.95x), but bit-identical results come
-  first: the small per-op overhead described above cannot always be hidden, so "never
-  slower than NumPy" is a target, not a guarantee, in the bit-identical mode (not quite
-  there yet on small data). The planned optimization levels above O1 are where speed may
-  win over bit-identity.
+- **Faster where there is parallel potential; at least 0.8x of NumPy elsewhere.** Programs
+  with independent array operations on medium-sized and large data viproc commonly runs
+  efficiently in parallel. Every program is to run at 0.8x of NumPy's speed or faster (the
+  current goal, see [Complexity becomes performance](#complexity-becomes-performance)); for
+  single expressions on small data without parallel potential, the long-term target is
+  NumPy's speed (at most 3% slower, never below 0.95x). Bit-identical results come first:
+  the small per-op overhead described above cannot always be hidden behind parallel work,
+  so these are targets, not guarantees, in the bit-identical mode (small data is not quite
+  there yet). The planned optimization levels above O1 are where speed may win over
+  bit-identity.
 - **Designed for heterogeneous hardware and further JIT optimizations.** viproc runs on
   multi-core CPUs today, but the approach is designed to include heterogeneous compute
   resources into execution fully automatically, by adding cost-based device scheduling to
@@ -118,7 +148,9 @@ longer has to call NumPy's code exactly as NumPy does. Details:
 viproc gains where a program issues many array instructions that do not all depend on each
 other: several independent expressions, chains over different arrays, reductions next to
 element-wise work, iterative algorithms over arrays (k-means, simulations, image and signal
-pipelines), on medium and large data. The more complex a program gets the more parallel potential it brings. viproc shines on real-world algorithms not on too simple toy examples. 
+pipelines), on medium and large data. The more complex a program gets, the more parallel
+potential it brings: viproc shines on real-world algorithms, not on toy examples of one or
+two operations.
 
 viproc turns complexity into performance. A benchmark of one operation cannot get faster:
 there is nothing to run next to it. Real programs consist of many operations, and complexity
