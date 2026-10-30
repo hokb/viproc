@@ -305,7 +305,7 @@ class ErrorTable : public std::enable_shared_from_this<ErrorTable> {
     std::atomic<void (*)(void*)> notify_{nullptr};
     void* notify_arg_ = nullptr;
     mutable std::mutex mutex_;
-    std::vector<Record> records_; // few: one per failed op still referenced
+    std::vector<Record> records_;    // few: one per failed op still referenced
     std::vector<FpEvent> fp_events_; // bounded: kMaxFpEvents
     static constexpr std::size_t kMaxFpEvents = 1024;
     std::size_t orphans_ = 0;
