@@ -1,7 +1,6 @@
 # viproc
 
-**viproc strongly scales regular NumPy programs for any data on common (parallel)
-hardware without code changes.**
+**viproc compultes bit-equal results for unchanged NumPy programs faster: single node strong scaling.**
 
 viproc, a **vi**rtual **proc**essor for numerical programs, turns array instructions into
 autonomously scheduling workloads. At runtime, thousands of such tasks cooperatively make
