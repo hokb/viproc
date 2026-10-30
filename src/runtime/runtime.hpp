@@ -6,6 +6,7 @@
 #include "offload.hpp"
 #include "ref.hpp"
 #include "task.hpp"
+#include "task_queue.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -15,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <semaphore>
 #include <span>
 #include <string>
 #include <thread>
@@ -218,6 +220,8 @@ class Runtime {
     // Sync points so far that found their array pending (wait() blocked; main
     // thread; wait_all() not counted).
     std::uint64_t sync_count() const { return syncs_; }
+    // Sleeping workers enqueue() woke (any thread; relaxed).
+    std::uint64_t wake_count() const { return wakes_.load(std::memory_order_relaxed); }
     // Main thread, before issuing ops: replaces the dispatch policy.
     void set_offload_options(const OffloadOptions& o) {
         policy_ = OffloadPolicy(o);
@@ -262,25 +266,50 @@ class Runtime {
     // Blocks until fewer than `limit` tasks are active.
     void wait_active_below(std::size_t limit);
 
-    // Pool queue. Idle workers spin for a short while (checking `queued_`
-    // without the lock) before they sleep on `queue_cv_`; enqueue() wakes a
-    // sleeper only if no worker is spinning, so a stream of small tasks does
-    // not cost a wake-up syscall per task. Once an enqueue() found no spinner
-    // and had to wake a sleeper (`stream_`: tasks arrive faster than one
-    // spinner takes them), a spinner that finds work hands the role to a
-    // sleeper (`spin_wanted_`, set under `queue_mutex_`), so the next
-    // enqueue() again finds a spinner: the wake-up is paid by a worker, not
-    // by the issuing main thread. A spin that finds nothing ends the stream;
-    // without one, a hand-off would only delay the task the spinner found.
-    std::mutex queue_mutex_;
-    std::condition_variable queue_cv_;
-    std::deque<std::shared_ptr<Task>> queue_;
-    std::atomic<std::size_t> queued_{0};
+    // Pool queue (`queue_`, lock-free, task_queue.hpp). Idle workers spin
+    // for a short while (checking `queued_`) before they sleep; enqueue()
+    // wakes a sleeper only if no worker is spinning, so a stream of small
+    // tasks does not cost a wake-up syscall per task. Once an enqueue() found
+    // no spinner and had to wake a sleeper (`stream_`: tasks arrive faster
+    // than one spinner takes them), a spinner that finds work hands the role
+    // to a sleeper, so the next enqueue() again finds a spinner: the wake-up
+    // is paid by a worker, not by the issuing main thread. A spin that finds
+    // nothing ends the stream; without one, a hand-off would only delay the
+    // task the spinner found.
+    // No more wake-ups are outstanding than tasks are queued
+    // (`wakes_pending_`; .NET's ThreadPool keeps one thread request):
+    // enqueue() wakes only then, a woken worker takes one off when it runs,
+    // and a worker that took a task and leaves more queued wakes the next
+    // one. Without it the main thread notified on every enqueue() in the
+    // window between a notify and the woken worker's start (1,500^2 column
+    // loop, 8 workers: ~2 of 3 tasks, a futex call each on the thread that
+    // limits the loop).
+    // Sleepers are woken last in, first out (`sleepers_`, one semaphore
+    // per worker), as .NET's LowLevelLifoSemaphore: the worker that slept
+    // last has its caches warm, and workers the load does not need stay
+    // asleep instead of taking turns. Only sleeping and waking take
+    // `sleep_mutex_`; enqueue() takes no lock unless it wakes someone.
+    TaskQueue queue_;
+    std::atomic<std::size_t> queued_{0}; // incremented before the push
     std::atomic<int> spinning_{0};
-    std::atomic<int> sleeping_{0};
+    std::atomic<int> sleeping_{0}; // == sleepers_.size(), changed under sleep_mutex_
     std::atomic<bool> stream_{false};
-    bool spin_wanted_ = false; // guarded by queue_mutex_
-    bool stopping_ = false;
+    std::atomic<std::size_t> wakes_pending_{0}; // woken, not yet running
+    std::atomic<std::uint64_t> wakes_{0};       // wake-ups by enqueue()
+    std::atomic<bool> stopping_{false};
+    std::mutex sleep_mutex_;
+    std::vector<std::size_t> sleepers_; // guarded by sleep_mutex_, LIFO
+    struct WorkerSlot {
+        std::binary_semaphore wake{0};
+    };
+    std::vector<std::unique_ptr<WorkerSlot>> slots_;
+    // Wakes the last sleeper if no worker spins and fewer wake-ups are
+    // pending than `wanted` (the tasks a woken worker would find). Any
+    // thread; takes sleep_mutex_ only when it wakes. True if it woke one.
+    bool wake_one(std::size_t wanted);
+    // Sleeps until woken (or until work or stopping shows up while it
+    // registers). Worker threads only.
+    void sleep(std::size_t id);
     std::shared_ptr<Task> try_pop();
     // Per worker: unblocked small tasks (RuntimeOptions::local_below). The
     // owner pushes and pops at the back (most recent: its inputs are hot),

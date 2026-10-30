@@ -123,6 +123,9 @@ uint64_t vp_task_count(const vp_runtime* rt);
  * blocked (vp_array_wait, vp_array_prepare_write, ...; vp_wait_all is not
  * counted). Waits on ready arrays (to read their error) are no syncs. */
 uint64_t vp_sync_count(const vp_runtime* rt);
+/* Sleeping workers woken by the thread that queued a task (mostly the main
+ * thread issuing ready ops; a futex call each). */
+uint64_t vp_wake_count(const vp_runtime* rt);
 size_t vp_active_tasks(const vp_runtime* rt);
 
 /* --- Element memory pool (process-wide; docs/design/memory-management.md) */

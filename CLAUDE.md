@@ -370,6 +370,7 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
                        interface; Metadata (SD + task), Operand
   runtime.*            Array (main-thread view), Runtime: issue protocol,
                        worker pool, trampoline, look-ahead limit, wait
+  task_queue.hpp       TaskQueue: the pool's lock-free MPMC queue
   assign.*             element copy kernels (dst[...] = src; a new array
                        placed from parts: concatenate, tile, pad, ...)
   index.*              gather / scatter / masked assignment / select (indexing, np.where)
@@ -1408,6 +1409,27 @@ Rules:
   not the issuing main thread's (4 chains of cheap ops: 3.6 -> 1.2 µs per
   op); a spin that finds nothing ends the stream. This avoids a
   wake-up syscall per small task without taking cores from busy threads.
+  No more wake-ups are outstanding than tasks are queued
+  (`wakes_pending_`, after .NET's ThreadPool, which keeps one thread
+  request; a single flag made fan-outs wake their workers one after the
+  other: `chains_wide` small 2.4x -> 1.4x): `enqueue()` notifies only
+  then, a worker returning from the wait takes one off, and a worker that
+  takes a task and leaves more queued wakes the next sleeper. Before,
+  every `enqueue()` in the window between a notify and the woken worker's
+  start notified again: in `array_pipelining.py`'s loop with more workers
+  than the issue rate feeds (8 on 4 vCPUs, 11 on a 12700K) about two of
+  three tasks cost the main thread, which limits the loop, a futex call.
+  `offload_stats()["wakes"]` counts the notifies by `enqueue()`.
+  The shared queue is lock-free (`TaskQueue`, `task_queue.hpp`: Vyukov's
+  bounded MPMC ring of 4,096 cells, a locked overflow list when full), so
+  `enqueue()` takes no lock unless it wakes someone; before, the main
+  thread took `queue_mutex_` per op against the polling workers. Sleepers
+  are woken last in, first out (one `std::binary_semaphore` per worker, a
+  stack of sleepers under `sleep_mutex_`), as .NET's LowLevelLifoSemaphore:
+  the worker that slept last has warm caches, and workers the load does not
+  need stay asleep instead of taking turns (the condition variable woke
+  any of them). The workers' local queues keep their mutex: only their
+  owner and a spinning thief touch them.
 - Sync points spin too: the main thread spins up to 50 µs (`kSyncSpin`,
   `pause`) for the producer's completion (`Runtime::wait`, `wait_all`)
   before it registers as a waiter and sleeps. The back-pressure wait does

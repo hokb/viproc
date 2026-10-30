@@ -857,6 +857,22 @@ stable losses `ind_cores_f32` 100x10 (0.86 -> 0.63) and `loop_accum`
 100x1000 (1.38 -> 0.93). Before the blame fix (chain blame from its last
 op) `dep3_sync`/`ind3_sync` fell to 0.72x.
 
+**Worker pool: bounded wake-ups, lock-free queue, LIFO wake order
+(i7-12700K, Windows, MSVC).** With more workers than the main thread's
+issue rate feeds, the loops got slower: the main thread woke a sleeper
+on most enqueues, took the pool's mutex per op, and all idle workers
+took turns. `array_pipelining.py --sizes 1500:10`, ms per run:
+
+| build | `loop` w=4 | w=7 | w=11 | `loop_dep` w=4 | w=7 | w=11 | `vectorized` w=11 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `main` | 3.17 | – | 4.16 | 3.33 | – | 4.31 | 2.84 |
+| bounded wake-ups | 3.21 | – | 3.77 | 3.48 | – | 3.96 | 3.02 |
+| + lock-free queue, LIFO wake | 2.92 | 3.17 | 3.18 | 3.21 | 3.29 | 3.25 | 2.53 |
+
+With all three, 11 workers lose 9% against 4 in `loop` (was 31%) and
+1% in `loop_dep`; 4 workers gained 8%. Pinned to the P-cores (bounded
+wake-ups only): `loop` w=4/7/11 3.16/3.41/3.50 ms.
+
 ## Other machines
 
 **Iterator copies taken when the kernel runs.** The shape map found
