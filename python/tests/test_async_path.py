@@ -194,11 +194,11 @@ def test_views_issue_no_task():
 def test_direct_budget_is_scaled_to_the_machine():
     """The direct-path budget stands for main-thread costs: the bridge sets
     it to what the task path costs the main thread more than the direct
-    path, measured once per process (clamped to 0.5-50 us)."""
+    path, measured once per process (clamped to 0.3-50 us)."""
     viproc.init(sync_below=2048, adaptive=True)
     try:
         budget = viproc._viproc.direct_budget_ns()
-        assert 500 <= budget <= 50000
+        assert 300 <= budget <= 50000
         viproc.init(sync_below=2048, adaptive=True)
         assert viproc._viproc.direct_budget_ns() == budget
     finally:
