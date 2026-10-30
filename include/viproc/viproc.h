@@ -68,6 +68,9 @@ size_t vp_physical_core_count(void);
  * unless set; the Python bridge scales it to the machine. */
 double vp_direct_budget_ns(const vp_runtime* rt);
 void vp_set_direct_budget_ns(vp_runtime* rt, double ns);
+/* What a small op costs the main thread more as a task of a pending input
+ * than directly (OffloadOptions::chain_ns). Main thread. */
+void vp_set_chain_ns(vp_runtime* rt, double ns);
 
 /* Asynchronous error reporting (docs/design/error-handling.md). An op that
  * fails on any thread records its error in the runtime, the one place errors

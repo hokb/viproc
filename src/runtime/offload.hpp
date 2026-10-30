@@ -70,6 +70,12 @@ struct OffloadOptions {
     // 256 a loop over 200 x 200 columns (`array_pipelining.py`) ran every sin
     // directly, at 1.3x of NumPy on a 12700K; as tasks 1.7x.
     std::int64_t time_from = 64;
+    // What a small op costs the main thread more as a task of a pending input
+    // than directly (a promoted op's follower, ChainScore); measured by the
+    // bridge (vp_set_task_costs).
+    double chain_ns = 0;
+    // Ops after an issue whose readers count as its followers.
+    std::uint64_t chain_window = 32;
     // Per-site adaptive decision above `sync_below`, and expensive loops
     // below it as tasks; off = always offload above, always inline below.
     bool adaptive = true;
@@ -85,21 +91,31 @@ struct OffloadOptions {
     int explore_max = 1024;
 };
 
-// A/B probe of one issue site below `sync_below` (OffloadPolicy::promote):
-// whether its ops run faster for the program directly or as tasks, measured
-// as the main thread's time between two issues at the site (a loop's
-// iteration: the ops a promoted op drags onto the task path are in it).
-// Main thread only.
-struct SiteProbe {
-    static constexpr int kPeriods = 8; // periods per variant and probe
+// The ops that follow one issue site's op in the program's data flow (a
+// chain: the ops reading its result, their results, ...), observed for a
+// window of ops after each issue (OffloadPolicy::credit). An op of the site
+// that goes to the task path takes the small ones among them along (their
+// input is pending then): it saves the main thread their kernel time and
+// costs it their task issue. Main thread only.
+struct ChainScore {
     const char* site = nullptr;
-    std::int64_t last_ns = 0;        // the previous issue during a probe; 0: none
+    float kernel_ns = 0; // followers' NumPy time per issue (decaying average)
+    float followers = 0; // followers per issue (decaying average)
+    float acc_ns = 0;    // ... of the current issue
+    std::uint16_t acc_followers = 0;
+    std::uint16_t issues = 0; // issues seen, saturating
+    // A/B check of a promotion the estimate proposes: the main thread's time
+    // between two issues at the site (a loop's iteration), kPeriods of them
+    // directly, then as tasks; the faster variant holds for `next` issues
+    // (64, doubling up to 4096 while the decision holds).
+    static constexpr int kPeriods = 8;
+    std::int64_t last_ns = 0;        // the previous issue during a check; 0: none
     float periods[2][kPeriods] = {}; // [direct, task]
     std::uint8_t count = 0;          // periods of the current variant
-    std::uint8_t phase = 0;          // 0: probe direct, 1: probe task, 2: decided
+    std::uint8_t phase = 0;          // 0: check direct, 1: check task, 2: decided
     bool task = false;               // the decision
     std::uint32_t calls = 0;         // issues since the decision
-    std::uint32_t next = 0;          // ... until the next probe
+    std::uint32_t next = 0;          // ... until the next check
 };
 
 // Statistics of one (issue site, size class). Main thread only.
@@ -134,13 +150,15 @@ class OffloadPolicy {
     // `array_pipelining.py`'s loop. Adaptive mode only: deterministic mode
     // keeps rule 1 a fixed threshold.
     //
-    // On top of the estimate, every issue site measures both variants (a
-    // SiteProbe, from its first call: kPeriods iterations directly, then as
-    // tasks) and keeps the faster one, re-probed after 64 calls, doubling up
-    // to 4096 while the decision holds. The estimate sees one op; the gain
-    // of a loop over 200 x 200 columns comes from the ops that follow its
-    // sin onto the task path (abs, sum, the assignment): the sin alone
-    // (~0.8 us on a 12700K) costs less than a task's issue (~1 us).
+    // The op's own time is not all the main thread saves: the small ops
+    // following it in the data flow become tasks too. Per issue site the
+    // policy keeps their NumPy time and count (ChainScore, credit()) and
+    // promotes if own + followers' time > direct_budget_ns (the task's
+    // surcharge) + followers x chain_ns (a follower's surcharge as a task of
+    // a pending input). A loop over 200 x 200 columns, `sum(abs(sin(A[:,
+    // i])))`: the sin alone (~0.8 us on a 12700K) costs less than a task's
+    // issue (~1 us), with abs and sum (~1 us) more. Without observations the
+    // site counts 2 followers of no time.
     bool promote(DirectCost& c, std::int64_t elements, const char* site) {
         if (!options_.adaptive || elements < options_.time_from) {
             return false;
@@ -148,18 +166,46 @@ class OffloadPolicy {
         if (c.task_sample.load(std::memory_order_relaxed) != 0) {
             take_task_sample(c);
         }
-        SiteProbe& p = probe_of(site);
-        bool task;
-        if (p.phase == 2 && ++p.calls < p.next) {
-            task = p.task;
-        } else {
-            task = probe(p);
+        ChainScore& s = chain_of(site, false);
+        const double own = estimate(c, elements);
+        const bool known = s.site == site && s.issues >= 2;
+        const double gain = own + (known ? s.kernel_ns : 0.0);
+        const double cost =
+            options_.direct_budget_ns + (known ? s.followers : 2.0) * options_.chain_ns;
+        if (gain <= cost) {
+            return false;
         }
-        if (!task && estimate(c, elements) <= options_.direct_budget_ns) {
+        // The estimate's costs are those of `a * b`: a site's own ops may
+        // cost more as tasks. A close promotion is checked by measuring both.
+        if (known && gain < 4 * cost &&
+            !(s.phase == 2 && ++s.calls < s.next ? s.task : check(s, gain))) {
             return false;
         }
         c.retest = ++c.promoted % kRetest == 0;
         return true;
+    }
+    // A new issue at `site` (with no chain among its inputs): the
+    // observations of its previous issue are folded into its score.
+    void start_chain(const char* site) {
+        ChainScore& s = chain_of(site, true);
+        if (s.issues <= 1) {
+            s.kernel_ns = s.acc_ns;
+            s.followers = s.acc_followers;
+        } else {
+            s.kernel_ns = 0.75f * s.kernel_ns + 0.25f * s.acc_ns;
+            s.followers = 0.75f * s.followers + 0.25f * static_cast<float>(s.acc_followers);
+        }
+        s.issues = s.issues < 0xffff ? s.issues + 1 : s.issues;
+        s.acc_ns = 0;
+        s.acc_followers = 0;
+    }
+    // A small op of estimated NumPy time `ns` follows the op issued at `site`.
+    void credit(const char* site, double ns) {
+        ChainScore& s = chain_of(site, false);
+        if (s.site == site) {
+            s.acc_ns += static_cast<float>(ns);
+            s.acc_followers = s.acc_followers < 0xffff ? s.acc_followers + 1 : s.acc_followers;
+        }
     }
     // True if this direct run is to be timed (record()): per size class the
     // first two, then every 16th.
@@ -189,16 +235,17 @@ class OffloadPolicy {
   private:
     static constexpr std::uint32_t kRetest = 32;
     static void take_task_sample(DirectCost& c);
-    static constexpr int kProbes = 64; // direct-mapped by site
-    SiteProbe& probe_of(const char* site) {
-        SiteProbe& p = probes_[(reinterpret_cast<std::uintptr_t>(site) >> 4) % kProbes];
-        if (p.site != site) {
-            p = SiteProbe{};
-            p.site = site;
+    // One step of the A/B check: true if this issue runs as a task.
+    bool check(ChainScore& s, double kernel_ns);
+    static constexpr int kChains = 64; // direct-mapped by site
+    ChainScore& chain_of(const char* site, bool claim) {
+        ChainScore& s = chains_[(reinterpret_cast<std::uintptr_t>(site) >> 4) % kChains];
+        if (claim && s.site != site) {
+            s = ChainScore{};
+            s.site = site;
         }
-        return p;
+        return s;
     }
-    bool probe(SiteProbe& p);
     struct KeyHash {
         std::size_t operator()(const std::pair<const char*, int>& k) const {
             return std::hash<const void*>()(k.first) * 31u + static_cast<std::size_t>(k.second);
@@ -208,7 +255,7 @@ class OffloadPolicy {
 
     OffloadOptions options_;
     std::size_t workers_ = 1;
-    SiteProbe probes_[kProbes];
+    ChainScore chains_[kChains];
     std::unordered_map<std::pair<const char*, int>, SiteStats, KeyHash> sites_;
     std::uint64_t inline_count_ = 0;
     std::uint64_t offload_count_ = 0;

@@ -294,17 +294,46 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
                             : !inouts.empty()      ? inouts[0]->layout().size()
                                                    : 0;
     std::int64_t retest = 0; // > 0: an expensive loop's re-test, its elements
-    if (elements < policy_.options().sync_below) {
-        // An expensive loop: the op is sized as a large one, for the direct
-        // path and the dispatch policy alike (OffloadOptions::direct_budget_ns).
+    // The chain this op is in (ChainScore): the first input in one's window.
+    const char* chain = nullptr;
+    std::uint64_t chain_seq = 0;
+    const OffloadOptions& po = policy_.options();
+    if (po.adaptive && elements < po.sync_below) {
+        for (const ArrayPtr& a : inputs) {
+            const AliasGroup& g = *a->group_;
+            if (g.chain_ != nullptr && seq_ - g.chain_seq_ <= po.chain_window) {
+                chain = g.chain_;
+                chain_seq = g.chain_seq_;
+                break;
+            }
+        }
+        // An expensive loop or chain: the op is sized as a large one, for the
+        // direct path and the dispatch policy alike (OffloadPolicy::promote).
         DirectCost* c = kernel->direct_cost();
+        if (chain != nullptr) {
+            policy_.credit(chain, c != nullptr ? OffloadPolicy::estimate(*c, elements) : 0.0);
+        } else if (c != nullptr && elements >= po.time_from) {
+            policy_.start_chain(issue_site);
+            chain = issue_site;
+            chain_seq = seq_;
+        }
         if (c != nullptr && policy_.promote(*c, elements, issue_site)) {
             retest = c->retest ? elements : 0;
-            elements = policy_.options().sync_below;
+            elements = po.sync_below;
         }
     }
+    // The new outputs carry the chain on.
+    auto tag = [&] {
+        if (chain != nullptr) {
+            for (std::size_t i = 0; i < new_outputs.size(); ++i) {
+                results[i]->group_->chain_ = chain;
+                results[i]->group_->chain_seq_ = chain_seq;
+            }
+        }
+    };
     if (issue_direct(kernel, inputs, inouts, new_outputs, issue_site, results, elements,
                      output_buffers)) {
+        tag();
         return;
     }
     // A live NumPy export (D7) aliases memory this op reads or writes: NumPy
@@ -477,6 +506,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     // D11): from a dying input or from the pool, while it is hot in cache.
     task->advance(TaskState::SizeCompleted);
     launch(task, producers, elements);
+    tag();
     if (host) {
         const Blocking blocking(options_);
         wait(!new_outputs.empty() ? *results[0] : *inouts[0]); // errors: at the sync points
@@ -752,8 +782,7 @@ void Runtime::worker_loop(std::size_t id) {
         if (!next) {
             std::unique_lock lock(queue_mutex_);
             sleeping_.fetch_add(1, std::memory_order_seq_cst);
-            queue_cv_.wait(lock,
-                           [this] { return stopping_ || spin_wanted_ || !queue_.empty(); });
+            queue_cv_.wait(lock, [this] { return stopping_ || spin_wanted_ || !queue_.empty(); });
             sleeping_.fetch_sub(1, std::memory_order_seq_cst);
             if (queue_.empty()) {
                 if (stopping_) {

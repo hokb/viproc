@@ -59,20 +59,19 @@ def _ensure_runtime():
         _scale_budget(adaptive)
 
 
-# The direct-path budget (OffloadOptions::direct_budget_ns): the NumPy time
-# above which a small ready op of an expensive loop takes the task path. It
-# is what the task path costs the main thread more than the direct path, for
-# the promoted op and for the cheap ops it drags onto the task path (their
-# input is pending now), measured once per process on this machine, with the
-# code the main thread runs per op (bridge, runtime, NumPy's loop): `a * b`
-# of 8 doubles run directly (d), as a task of ready inputs (t) and as a task
-# of a pending input (c); budget = (t - d) + _BUDGET_CONSUMERS * (c - d).
-# Each the best of several rounds of 25 ops (~2 ms in all). Before, the
-# budget was 9 times d: 3.3 us on a 12700K, above a sin of 200 doubles
-# (~0.8 us), so a loop over 200 x 200 columns (`array_pipelining.py`) ran
-# every op on the main thread, 1.3x of NumPy where tasks give 1.7x.
-# VIPROC_DIRECT_BUDGET_NS sets the budget instead (ns).
-_BUDGET_CONSUMERS = 2
+# The direct-path budget (OffloadOptions::direct_budget_ns, chain_ns): what
+# the task path costs the main thread more than the direct path, for a small
+# op of ready inputs (its own task: t - d) and for each small op following it
+# in the data flow (a task of a pending input: c - d), measured once per
+# process on this machine with the code the main thread runs per op (bridge,
+# runtime, NumPy's loop): `a * b` of 8 doubles run directly (d), as a task of
+# ready inputs (t) and of a pending input (c), the best of interleaved
+# rounds (~5 ms in all). A small op takes the task path when its NumPy time
+# and that of its followers (OffloadPolicy::promote) exceed these costs.
+# Before, the budget was 9 times d: 3.3 us on a 12700K, above a sin of 200
+# doubles (~0.8 us), so a loop over 200 x 200 columns
+# (`array_pipelining.py`) ran every op on the main thread.
+# VIPROC_DIRECT_BUDGET_NS sets the budget instead (ns; chain_ns 0).
 _op_ns = []  # [d, t, c]
 _CAL_OPS = 64
 
@@ -117,8 +116,8 @@ def _scale_budget(adaptive):
             return  # `a * b` would be a task / deterministic: no promotion
         _calibrate()
     d, t, c = _op_ns
-    budget = max(t - d, 0.0) + _BUDGET_CONSUMERS * max(c - d, 0.0)
-    _viproc.set_direct_budget_ns(min(max(budget, 500.0), 50000.0))
+    _viproc.set_direct_budget_ns(min(max(t - d, 300.0), 50000.0))
+    _viproc.set_chain_ns(min(max(c - d, 0.0), 50000.0))
 
 
 def _wrap_numpy(arr):

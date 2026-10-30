@@ -178,6 +178,8 @@ class ReduceKernel : public Kernel {
         return ok ? KernelResult{} : KernelResult{1, "NumPy reduction loop failed", 0};
     }
 
+    DirectCost* direct_cost() override { return &cost_; }
+
   private:
     // Visits the positions of the first `n` plan axes (outermost first),
     // calling fn(in_ptr, out_ptr, first) where `first` tells whether
@@ -219,6 +221,7 @@ class ReduceKernel : public Kernel {
     const UfuncLoop* loop_;
     ReducePlan plan_;
     std::vector<std::byte> identity_;
+    DirectCost cost_; // shared kernel: learned across its ops
 };
 
 } // namespace

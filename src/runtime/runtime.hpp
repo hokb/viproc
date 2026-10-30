@@ -72,6 +72,10 @@ class AliasGroup : public MainThreadCounted {
     std::shared_ptr<Task> last_writer_;
     ErrorRef last_error_;
     ArrayBlock* block_;
+    // The issue site whose op's data flow this data is in, and the op count
+    // at that issue (OffloadPolicy::credit, ChainScore); null: none.
+    const char* chain_ = nullptr;
+    std::uint64_t chain_seq_ = 0;
 };
 
 // An array as seen by the main thread (docs/design/array-data-model.md, A1): its

@@ -96,41 +96,45 @@ void OffloadPolicy::take_task_sample(DirectCost& c) {
                   static_cast<std::int64_t>(v & 0xffffffffu));
 }
 
-bool OffloadPolicy::probe(SiteProbe& p) {
-    if (p.phase == 2) { // a re-probe
-        p.phase = 0;
-        p.count = 0;
-        p.last_ns = 0;
+bool OffloadPolicy::check(ChainScore& s, double kernel_ns) {
+    if (s.phase == 2) { // a new check
+        s.phase = 0;
+        s.count = 0;
+        s.last_ns = 0;
     }
     const std::int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now().time_since_epoch())
                                  .count();
     // The first period of a variant spans the switch: not counted.
-    if (p.last_ns != 0) {
-        p.periods[p.phase][p.count++] = static_cast<float>(now - p.last_ns);
+    if (s.last_ns != 0) {
+        s.periods[s.phase][s.count++] = static_cast<float>(now - s.last_ns);
     }
-    p.last_ns = now;
-    if (p.count == SiteProbe::kPeriods) {
-        p.count = 0;
-        p.last_ns = 0;
-        if (++p.phase == 2) {
-            auto median = [](float* v) {
-                std::nth_element(v, v + SiteProbe::kPeriods / 2, v + SiteProbe::kPeriods);
-                return v[SiteProbe::kPeriods / 2];
-            };
-            const double direct = median(p.periods[0]);
-            // As tasks the workers must keep up too: at most the direct
-            // time (kernels included) spread over all of them.
-            const double task =
-                std::max<double>(median(p.periods[1]), direct / static_cast<double>(workers_));
-            const bool t = task < 0.95 * direct;
-            p.next = t == p.task && p.next != 0 ? std::min<std::uint32_t>(2 * p.next, 4096) : 64;
-            p.task = t;
-            p.calls = 0;
-            return p.task;
-        }
+    s.last_ns = now;
+    if (s.count < ChainScore::kPeriods) {
+        return s.phase == 1;
     }
-    return p.phase == 1;
+    s.count = 0;
+    s.last_ns = 0;
+    if (++s.phase < 2) {
+        return true; // the task variant next
+    }
+    auto median = [](float* v) {
+        std::nth_element(v, v + ChainScore::kPeriods / 2, v + ChainScore::kPeriods);
+        return v[ChainScore::kPeriods / 2];
+    };
+    const double direct = median(s.periods[0]);
+    // As tasks the workers must keep up too: at most the direct time
+    // (kernels included) spread over all of them. The chain's NumPy time
+    // alone left out the workers' task overhead: with 1 worker on the VM the
+    // 200 x 200 loop chose tasks and ran 20% slower.
+    (void)kernel_ns;
+    const double task =
+        std::max<double>(median(s.periods[1]), direct / static_cast<double>(workers_));
+    const bool t = task < 0.95 * direct;
+    s.next = t == s.task && s.next != 0 ? std::min<std::uint32_t>(2 * s.next, 4096) : 64;
+    s.task = t;
+    s.calls = 0;
+    return t;
 }
 
 void OffloadPolicy::on_blocked(SiteStats* stats, std::uint64_t distance) {
