@@ -29,7 +29,9 @@ OffloadPolicy::Decision OffloadPolicy::decide(const char* site, std::int64_t ele
     // Decide on the previous issues first: their waits have been seen by now.
     maybe_switch(s);
     bool offload = true;
-    if (s.inline_mode) {
+    if (s.explore) {
+        s.explore = false;
+    } else if (s.inline_mode) {
         // Re-test now and then whether the site has overlap after all.
         offload = s.period > 0 && ++s.calls % s.period == 0;
     }
@@ -74,6 +76,20 @@ double OffloadPolicy::estimate(const DirectCost& c, std::int64_t elements) {
         return c.classes[hi].per * n; // underestimates: never promotes by accident
     }
     return 0;
+}
+
+bool OffloadPolicy::prefers_inline(const char* site) {
+    const auto it = sites_.find({site, size_class(options_.sync_below)});
+    if (it == sites_.end()) {
+        return false;
+    }
+    SiteStats& s = it->second;
+    maybe_switch(s);
+    if (!s.inline_mode) {
+        return false;
+    }
+    s.explore = s.period > 0 && ++s.calls % s.period == 0;
+    return !s.explore;
 }
 
 void OffloadPolicy::record(DirectCost& c, double ns, std::int64_t elements) {

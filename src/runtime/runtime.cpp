@@ -228,10 +228,15 @@ void Runtime::launch(const std::shared_ptr<Task>& task, const TaskList& producer
     task->set_id(seq_);
     task->set_fp_mode(fp_mode_);
     // While pending, the task's work is attributed to the decision that
-    // started the work it waits for.
+    // started the work it waits for, at the distance of the chain's last op:
+    // a sync right after a chain blocks on it whatever its length (as the
+    // Accelerator's ExecutionBranch counts). From the decision itself, a
+    // small op promoted with its followers (OffloadPolicy::promote) was 3-4
+    // ops from the sync of `x = cos((-x) ** 3); float(x.max())` and never
+    // switched to inline: 0.72x of NumPy.
     for (const std::shared_ptr<Task>& p : producers) {
         if (p->blame() != nullptr) {
-            task->set_blame(p->blame(), p->blame_seq());
+            task->set_blame(p->blame(), seq_);
             break;
         }
     }
@@ -317,7 +322,8 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
             chain = issue_site;
             chain_seq = seq_;
         }
-        if (c != nullptr && policy_.promote(*c, elements, issue_site)) {
+        if (c != nullptr && policy_.promote(*c, elements, issue_site) &&
+            !policy_.prefers_inline(issue_site)) {
             retest = c->retest ? elements : 0;
             elements = po.sync_below;
         }

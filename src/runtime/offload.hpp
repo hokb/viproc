@@ -125,8 +125,9 @@ struct SiteStats {
     int observed = 0; // async issues since the last decision
     int blocked = 0;  // ... of which the main thread waited on right away
     bool inline_mode = false;
-    int calls = 0;  // calls in inline mode (for exploration)
-    int period = 0; // current exploration period (0: explore_every)
+    int calls = 0;        // calls in inline mode (for exploration)
+    int period = 0;       // current exploration period (0: explore_every)
+    bool explore = false; // prefers_inline() chose this call to explore
 };
 
 class OffloadPolicy {
@@ -141,6 +142,11 @@ class OffloadPolicy {
     // For a task whose inputs are all ready, issued at `site` (interned)
     // producing `elements` output elements.
     Decision decide(const char* site, std::int64_t elements);
+    // For an op promoted below `sync_below` (promote()): true if its site
+    // runs inline (rule 2), so the op takes the direct path after all: run
+    // inline, a task costs the main thread more than the direct op. Else,
+    // and on an exploration call, decide() offloads it.
+    bool prefers_inline(const char* site);
 
     // True if an op of `elements` (< sync_below) on a kernel with this cost
     // estimate takes the task path anyway: its loop is expensive. Every
