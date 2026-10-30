@@ -435,6 +435,8 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
                        best/median/worst per point, outlier list
   shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync/
                        expressions/loops/control; --groups selects groups)
+  realworld.py         logreg, heat stencil, features, Black-Scholes:
+                       NumPy vs. viproc (module mode)
   array_pipelining.py  ILNumerics' array-pipelining demo (loop over columns,
                        dependent loop, vectorized): NumPy, NumPy threads,
                        viproc at 1..cores workers

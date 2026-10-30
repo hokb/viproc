@@ -873,6 +873,35 @@ With all three, 11 workers lose 9% against 4 in `loop` (was 31%) and
 1% in `loop_dep`; 4 workers gained 8%. Pinned to the P-cores (bounded
 wake-ups only): `loop` w=4/7/11 3.16/3.41/3.50 ms.
 
+### Real-world programs (`realworld.py`)
+
+`python/benchmarks/realworld.py`: four programs of typical shape (logistic
+regression by gradient descent, a 2-d heat-equation stencil, column-wise
+feature engineering, Black-Scholes price/delta/vega), each as plain NumPy
+and in module mode, best of 5. 2026-10-23, same 4-CPU VM (Xeon @ 2.80 GHz)
+and build as the suite run of that day (`#c122f810`, score 78), every
+result bit-identical:
+
+| program | NumPy ms | viproc ms | speedup |
+|---|---:|---:|---:|
+| logreg 200 x 10, 200 steps | 4.71 | 5.03 | 0.94x |
+| logreg 5,000 x 50, 50 steps | 18.72 | 23.31 | 0.80x |
+| logreg 100,000 x 50, 10 steps | 100.30 | 106.52 | 0.94x |
+| heat 32 x 32, 500 steps | 9.73 | 10.63 | 0.92x |
+| heat 256 x 256, 200 steps | 121.67 | 123.21 | 0.99x |
+| heat 2,048 x 2,048, 20 steps | 2,420 | 1,092 | 2.22x |
+| features 100 x 8 | 0.09 | 0.31 | 0.29x |
+| features 10,000 x 20 | 10.76 | 8.61 | 1.25x |
+| features 200,000 x 20 | 346.84 | 194.11 | 1.79x |
+| bs_greeks 100 | 0.08 | 0.09 | 0.80x |
+| bs_greeks 10,000 | 2.89 | 1.28 | 2.26x |
+| bs_greeks 1,000,000 | 327.80 | 116.06 | 2.82x |
+
+Logistic regression is a dependent chain of matrix-vector products with a
+sync per step: nothing to overlap. The README's charts
+(`docs/benchmarks/readme/make_charts.py`) take their numbers from this
+file.
+
 ## Other machines
 
 **Iterator copies taken when the kernel runs.** The shape map found
