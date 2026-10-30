@@ -1404,6 +1404,17 @@ Rules:
   not the issuing main thread's (4 chains of cheap ops: 3.6 -> 1.2 µs per
   op); a spin that finds nothing ends the stream. This avoids a
   wake-up syscall per small task without taking cores from busy threads.
+  No more wake-ups are outstanding than tasks are queued
+  (`wakes_pending_`, after .NET's ThreadPool, which keeps one thread
+  request; a single flag made fan-outs wake their workers one after the
+  other: `chains_wide` small 2.4x -> 1.4x): `enqueue()` notifies only
+  then, a worker returning from the wait takes one off, and a worker that
+  takes a task and leaves more queued wakes the next sleeper. Before,
+  every `enqueue()` in the window between a notify and the woken worker's
+  start notified again: in `array_pipelining.py`'s loop with more workers
+  than the issue rate feeds (8 on 4 vCPUs, 11 on a 12700K) about two of
+  three tasks cost the main thread, which limits the loop, a futex call.
+  `offload_stats()["wakes"]` counts the notifies by `enqueue()`.
 - Sync points spin too: the main thread spins up to 50 µs (`kSyncSpin`,
   `pause`) for the producer's completion (`Runtime::wait`, `wait_all`)
   before it registers as a waiter and sleeps. The back-pressure wait does

@@ -640,20 +640,36 @@ TaskList Runtime::run(const std::shared_ptr<Task>& task) {
     return runnable;
 }
 
+bool Runtime::claim_wake(std::size_t wanted) {
+    // A spinning worker will pick the task up. The seq_cst order between this
+    // load and the worker's decrement of spinning_ before it sleeps (followed
+    // by its locked re-check of the queue) rules out a lost wake-up. Pending
+    // wake-ups reach sleepers: sleeping_ changes only under the lock, so it
+    // counts the threads inside the wait, never fewer than wakes_pending_,
+    // and each of them takes one off when it returns from the wait.
+    const std::size_t sleeping =
+        static_cast<std::size_t>(sleeping_.load(std::memory_order_seq_cst));
+    if (spinning_.load(std::memory_order_seq_cst) != 0 || wakes_pending_ >= sleeping ||
+        wakes_pending_ >= wanted) {
+        return false;
+    }
+    ++wakes_pending_;
+    return true;
+}
+
 void Runtime::enqueue(std::shared_ptr<Task> task) {
+    bool wake;
     {
         std::lock_guard lock(queue_mutex_);
         queue_.push_back(std::move(task));
         queued_.fetch_add(1, std::memory_order_seq_cst);
+        wake = claim_wake(queue_.size());
     }
-    // A spinning worker will pick the task up. The seq_cst order between this
-    // load and the worker's decrement of spinning_ before it sleeps (followed
-    // by its locked re-check of the queue) rules out a lost wake-up.
-    if (spinning_.load(std::memory_order_seq_cst) == 0 &&
-        sleeping_.load(std::memory_order_seq_cst) > 0) {
+    if (wake) {
         if (!stream_.load(std::memory_order_relaxed)) {
             stream_.store(true, std::memory_order_relaxed);
         }
+        wakes_.fetch_add(1, std::memory_order_relaxed);
         queue_cv_.notify_one();
     }
 }
@@ -740,19 +756,31 @@ void Runtime::worker_loop(std::size_t id) {
                      queued_.load(std::memory_order_seq_cst) > 0 ||
                      local_.load(std::memory_order_seq_cst) > 0) &&
                     sleeping_.load(std::memory_order_seq_cst) > 0) {
+                    bool wake;
                     {
                         std::lock_guard lock(queue_mutex_);
                         spin_wanted_ = true;
+                        // A wake-up already on its way brings a worker that
+                        // spins if it finds the queue empty.
+                        wake = claim_wake(1);
                     }
-                    queue_cv_.notify_one();
+                    if (wake) {
+                        queue_cv_.notify_one();
+                    }
                 }
             }
         }
         if (!next) {
             std::unique_lock lock(queue_mutex_);
             sleeping_.fetch_add(1, std::memory_order_seq_cst);
-            queue_cv_.wait(lock,
-                           [this] { return stopping_ || spin_wanted_ || !queue_.empty(); });
+            // Every return from the wait takes a pending wake-up off, also
+            // one that goes back to sleep (another worker took the task
+            // first): a count nobody takes off would keep enqueue() from
+            // waking anyone.
+            while (!stopping_ && !spin_wanted_ && queue_.empty()) {
+                queue_cv_.wait(lock);
+                wakes_pending_ -= wakes_pending_ > 0 ? 1 : 0;
+            }
             sleeping_.fetch_sub(1, std::memory_order_seq_cst);
             if (queue_.empty()) {
                 if (stopping_) {
@@ -764,6 +792,14 @@ void Runtime::worker_loop(std::size_t id) {
             next = std::move(queue_.front());
             queue_.pop_front();
             queued_.fetch_sub(1, std::memory_order_relaxed);
+            // More queued: the next sleeper is woken by this worker, not by
+            // the next enqueue() (.NET's ThreadPool re-requests a thread the
+            // same way after a dequeue).
+            const bool wake = claim_wake(queue_.size());
+            lock.unlock();
+            if (wake) {
+                queue_cv_.notify_one();
+            }
         }
         // Trampoline: run() returns instead of calling consumers, so the stack
         // is unwound before the continuation starts.

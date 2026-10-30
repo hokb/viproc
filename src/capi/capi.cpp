@@ -344,6 +344,8 @@ uint64_t vp_task_count(const vp_runtime* rt) { return rt->rt->task_count(); }
 
 uint64_t vp_sync_count(const vp_runtime* rt) { return rt->rt->sync_count(); }
 
+uint64_t vp_wake_count(const vp_runtime* rt) { return rt->rt->wake_count(); }
+
 void vp_offload_counts(const vp_runtime* rt, uint64_t* inline_ops, uint64_t* offloaded_ops) {
     *inline_ops = rt->rt->offload_policy().inline_count();
     *offloaded_ops = rt->rt->offload_policy().offload_count();

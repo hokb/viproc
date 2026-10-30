@@ -214,6 +214,8 @@ class Runtime {
     // Sync points so far that found their array pending (wait() blocked; main
     // thread; wait_all() not counted).
     std::uint64_t sync_count() const { return syncs_; }
+    // Sleeping workers enqueue() woke (any thread; relaxed).
+    std::uint64_t wake_count() const { return wakes_.load(std::memory_order_relaxed); }
     // Main thread, before issuing ops: replaces the dispatch policy.
     void set_offload_options(const OffloadOptions& o) { policy_ = OffloadPolicy(o); }
     std::size_t worker_count() const { return workers_.size(); }
@@ -265,6 +267,14 @@ class Runtime {
     // enqueue() again finds a spinner: the wake-up is paid by a worker, not
     // by the issuing main thread. A spin that finds nothing ends the stream;
     // without one, a hand-off would only delay the task the spinner found.
+    // No more wake-ups are outstanding than tasks are queued
+    // (`wakes_pending_`; .NET's ThreadPool keeps one thread request):
+    // enqueue() notifies only then, every worker returning from the wait
+    // takes one off, and a worker that took a task and leaves more queued
+    // wakes the next one. Without it the
+    // main thread notified on every enqueue() in the window between a
+    // notify and the woken worker's start (1,500^2 column loop, 8 workers:
+    // ~2 of 3 tasks, a futex call each on the thread that limits the loop).
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::deque<std::shared_ptr<Task>> queue_;
@@ -272,7 +282,13 @@ class Runtime {
     std::atomic<int> spinning_{0};
     std::atomic<int> sleeping_{0};
     std::atomic<bool> stream_{false};
-    bool spin_wanted_ = false; // guarded by queue_mutex_
+    bool spin_wanted_ = false;            // guarded by queue_mutex_
+    std::size_t wakes_pending_ = 0;       // guarded by queue_mutex_
+    std::atomic<std::uint64_t> wakes_{0}; // notifies by enqueue()
+    // Under queue_mutex_: true if the caller is to notify one sleeper (no
+    // spinner, fewer wake-ups pending than sleepers and than `wanted`, the
+    // tasks a woken worker would find); counts the wake-up as pending.
+    bool claim_wake(std::size_t wanted);
     bool stopping_ = false;
     std::shared_ptr<Task> try_pop();
     // Per worker: unblocked small tasks (RuntimeOptions::local_below). The
