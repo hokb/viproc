@@ -272,6 +272,12 @@ is no sufficient parallel potential) is the target, not a guarantee.
 **G2 has priority over G3:** both cannot always hold together, because the
 per-op layer comes on top of NumPy's own loops and small ops cannot hide it.
 
+**Complexity becomes performance** (goals.md, G1): the yardstick is whether
+whole programs scale strongly, not whether single ops beat NumPy. A program
+of one op does not get faster; complexity brings parallel potential, which
+viproc turns into parallelism. Current milestone: every program at 0.8x of
+NumPy or faster, complex programs clearly faster.
+
 **Bit-identical results are mandatory (currently).** Every change must keep
 results bit-identical to plain NumPy of the installed version (values,
 dtypes, shapes, strides, warnings, errors), as the drop-in rule demands

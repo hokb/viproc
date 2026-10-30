@@ -31,6 +31,35 @@ to feed parallel hardware efficiently.**
   programs against plain NumPy at 1, 2, 4, … worker threads
   (`python/benchmarks/suite.py`, `shape_map.py`; `docs/benchmarks.md`).
 
+### Complexity becomes performance
+
+The question is not whether single operations run as fast as, or faster
+than, NumPy; it is whether **whole programs scale strongly**. A program of
+one operation does not get faster with viproc: there is nothing to overlap
+it with, and viproc does not split single operations (see "Non-goals").
+Real programs compute several quantities, branch into independent
+sub-expressions, mix reductions with element-wise work and loop over
+arrays across functions and modules. In practice, **complexity always
+comes with parallel potential**, and viproc turns that potential into
+parallelism: **viproc turns complexity into performance.** This is the
+story `README.md` and the other documents tell; benchmarks follow it by
+measuring whole programs of growing complexity rather than single
+operations in isolation.
+
+Goals for programs (decided 2026-10-28, current milestone):
+
+- **Every program runs at 0.8x of NumPy's speed or faster**, also where it
+  offers little parallel potential (the per-op layer of G3 must stay
+  small enough for that).
+- **Complex programs run clearly faster than NumPy**, more so with more
+  cores.
+- **Parallel potential becomes parallelism:** wherever independent array
+  instructions exist, they run concurrently.
+
+The 0.95x / 3% target of G3 for single expressions stays the long-term
+target; the 0.8x floor for whole programs is the goal that changes are
+judged by now.
+
 ## G2 — Results identical to NumPy
 
 Results are always identical to plain sequential NumPy execution:
@@ -91,6 +120,9 @@ Within G2, viproc must be as fast as it can be:
   Small data misses it today (`docs/benchmarks.md`, shape map).
 - **Speed-up where there is parallel potential** (G1): medium and large
   data with independent array instructions run faster than NumPy.
+- **Programs: at least 0.8x of NumPy** (current milestone, G1, "Complexity
+  becomes performance"): a whole program below 0.8x of NumPy is a defect
+  to work on, whatever its data size.
 
 Example: `x = a[x + 1]` on a scalar `x` has nothing to overlap and is not
 expected to be faster than NumPy; the target is NumPy's speed. The same

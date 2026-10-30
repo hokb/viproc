@@ -5,6 +5,13 @@ breakdown, the progress per change and runs on other machines. Update
 this file with every change that is judged by a benchmark (see "Adding a
 run" at the end).
 
+**What the numbers are for** (`docs/design/goals.md`, G1, "Complexity
+becomes performance"): viproc is judged by whole programs, not single
+operations. A case of one or two operations has nothing to overlap and
+measures the per-op layer; programs of growing complexity measure how much
+of their parallel potential becomes parallelism. Current goal: every
+program at 0.8x of NumPy or faster, complex programs clearly faster.
+
 ## How to measure
 
 - **Benchmark suite** (`python/benchmarks/suite.py`): ~100 configurations
