@@ -100,19 +100,26 @@ bool OffloadPolicy::check(ChainScore& s, double kernel_ns) {
     if (s.phase == 2) { // a new check
         s.phase = 0;
         s.count = 0;
+        s.seen = 0;
         s.last_ns = 0;
     }
     const std::int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now().time_since_epoch())
                                  .count();
-    // The first period of a variant spans the switch: not counted.
-    if (s.last_ns != 0) {
+    // The first periods of a variant are not counted: the switch, and as
+    // tasks the warm-up (sleeping workers woken by the main thread, ~5 us
+    // each, before the pool streams). With only the switch skipped the 200 x
+    // 200 loop measured tasks as slow as the direct path on a 12700K, where
+    // it runs 1.3x faster as tasks.
+    const int warm = s.phase == 1 ? ChainScore::kWarmTask : 1;
+    if (s.last_ns != 0 && ++s.seen > warm) {
         s.periods[s.phase][s.count++] = static_cast<float>(now - s.last_ns);
     }
     s.last_ns = now;
     if (s.count < ChainScore::kPeriods) {
         return s.phase == 1;
     }
+    s.seen = 0;
     s.count = 0;
     s.last_ns = 0;
     if (++s.phase < 2) {

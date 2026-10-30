@@ -109,13 +109,15 @@ struct ChainScore {
     // directly, then as tasks; the faster variant holds for `next` issues
     // (64, doubling up to 4096 while the decision holds).
     static constexpr int kPeriods = 8;
-    std::int64_t last_ns = 0;        // the previous issue during a check; 0: none
-    float periods[2][kPeriods] = {}; // [direct, task]
-    std::uint8_t count = 0;          // periods of the current variant
-    std::uint8_t phase = 0;          // 0: check direct, 1: check task, 2: decided
-    bool task = false;               // the decision
-    std::uint32_t calls = 0;         // issues since the decision
-    std::uint32_t next = 0;          // ... until the next check
+    static constexpr int kWarmTask = 16; // periods as tasks before counting
+    std::int64_t last_ns = 0;            // the previous issue during a check; 0: none
+    float periods[2][kPeriods] = {};     // [direct, task]
+    std::uint8_t count = 0;              // periods of the current variant counted
+    std::uint8_t seen = 0;               // ... and not counted (warm-up)
+    std::uint8_t phase = 0;              // 0: check direct, 1: check task, 2: decided
+    bool task = false;                   // the decision
+    std::uint32_t calls = 0;             // issues since the decision
+    std::uint32_t next = 0;              // ... until the next check
 };
 
 // Statistics of one (issue site, size class). Main thread only.
