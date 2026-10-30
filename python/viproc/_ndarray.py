@@ -56,48 +56,69 @@ def _ensure_runtime():
         sync_below, adaptive = _env_policy()
         _viproc.init(workers, 0, sync_below, adaptive)
         _small_ops[0] = 2048 if sync_below < 0 else sync_below
-        _scale_budget()
+        _scale_budget(adaptive)
 
 
 # The direct-path budget (OffloadOptions::direct_budget_ns): the NumPy time
 # above which a small ready op of an expensive loop takes the task path. It
-# stands for main-thread costs (the task path of a promoted op and of the
-# cheap ops consuming it), so it is set in units of what the main thread
-# pays per op on this machine: _BUDGET_OPS times a direct `a * b` of 8
-# doubles, measured once per process on the code the main thread runs per
-# op (bridge, runtime, NumPy's loop), built by the same compiler. 9 ops:
-# 4.7 us on the 4-vCPU VM (a * b 525 ns), 3.0 us on a 12700K (330 ns).
-# There a fixed 10 us ran the whole loop of `array_pipelining.py` on the
-# main thread (sin of 1,500 doubles 6.1 us: no task, 1.03x); with 3 us its
-# loops run 2.9x (1,000 x 1,000) and 4.2x (1,500 x 1,500) at 4 workers, and
-# the quick module shape map stays as it was (expr8 at 1,000 elements 1.0x
-# -> 1.6x). 5 us promoted only the 1,500 columns. A probe of plain C code
-# (pointer walks) was tried first: it rated the 12700K (MSVC build) as fast
-# as the VM. VIPROC_DIRECT_BUDGET_NS sets the budget instead (ns).
-_BUDGET_OPS = 9
-_op_ns = []
+# is what the task path costs the main thread more than the direct path, for
+# the promoted op and for the cheap ops it drags onto the task path (their
+# input is pending now), measured once per process on this machine, with the
+# code the main thread runs per op (bridge, runtime, NumPy's loop): `a * b`
+# of 8 doubles run directly (d), as a task of ready inputs (t) and as a task
+# of a pending input (c); budget = (t - d) + _BUDGET_CONSUMERS * (c - d).
+# Each the best of several rounds of 25 ops (~2 ms in all). Before, the
+# budget was 9 times d: 3.3 us on a 12700K, above a sin of 200 doubles
+# (~0.8 us), so a loop over 200 x 200 columns (`array_pipelining.py`) ran
+# every op on the main thread, 1.3x of NumPy where tasks give 1.7x.
+# VIPROC_DIRECT_BUDGET_NS sets the budget instead (ns).
+_BUDGET_CONSUMERS = 2
+_op_ns = []  # [d, t, c]
+_CAL_OPS = 64
 
 
-def _scale_budget():
+def _calibrate():
+    import time
+    clock = time.perf_counter_ns
+    a = asarray(np.arange(8.0))
+    b = asarray(np.arange(8.0))
+    big = asarray(np.full(1 << 14, 0.5))
+    ns = [float("inf")] * 3
+
+    def run(i, x):
+        t = clock()
+        for _ in range(_CAL_OPS):
+            x * b
+        ns[i] = min(ns[i], (clock() - t) / _CAL_OPS)
+        if i > 0:
+            wait_all()
+
+    # Interleaved rounds: a noisy phase of the machine hits all three alike.
+    for _ in range(6):
+        run(0, a)
+        _viproc.set_offload_policy(0, False)  # every op a task
+        try:
+            run(1, a)
+        finally:
+            _viproc.set_offload_policy(_small_ops[0], True)
+        # a view of a pending result (a sin of 16k doubles, ~0.05-0.2 ms on a
+        # worker, longer than the 25 ops take to issue)
+        run(2, np.sin(big)[:8])
+    _op_ns.extend(ns)
+
+
+def _scale_budget(adaptive):
     env = os.environ.get("VIPROC_DIRECT_BUDGET_NS")
     if env:  # an explicit budget for this machine (experiments)
         _viproc.set_direct_budget_ns(float(env))
         return
     if not _op_ns:
-        if not 8 < _small_ops[0]:
-            return  # `a * b` would be a task: nothing to measure
-        import time
-        a = asarray(np.arange(8.0))
-        b = asarray(np.arange(8.0))
-        clock = time.perf_counter_ns
-        best = float("inf")
-        for _ in range(40):  # the best of 40 x 25 ops, ~0.5 ms
-            t = clock()
-            for _ in range(25):
-                a * b
-            best = min(best, (clock() - t) / 25)
-        _op_ns.append(best)
-    _viproc.set_direct_budget_ns(min(max(_BUDGET_OPS * _op_ns[0], 1000.0), 50000.0))
+        if not 8 < _small_ops[0] or not adaptive:
+            return  # `a * b` would be a task / deterministic: no promotion
+        _calibrate()
+    d, t, c = _op_ns
+    budget = max(t - d, 0.0) + _BUDGET_CONSUMERS * max(c - d, 0.0)
+    _viproc.set_direct_budget_ns(min(max(budget, 500.0), 50000.0))
 
 
 def _wrap_numpy(arr):
@@ -1918,7 +1939,7 @@ def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
         _viproc.init(workers, max_active_tasks, sync_below,
                      env_adaptive if adaptive is None else adaptive)
         _small_ops[0] = 2048 if sync_below < 0 else sync_below
-        _scale_budget()
+        _scale_budget(adaptive)
 
 
 def offload_stats():

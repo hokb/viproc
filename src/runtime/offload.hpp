@@ -25,43 +25,51 @@
 
 namespace viproc {
 
-// NumPy time per element of a kernel that many ops share (one per resolved
-// loop), measured on the direct path: the dispatch policy sends ops of an
-// expensive loop to the task path although they have fewer than
-// `sync_below` elements (OffloadPolicy::promote). Main thread only, except
+// NumPy time of a kernel that many ops share (one per resolved loop), per
+// log2 size class of the op, measured on the direct path: the dispatch policy
+// sends ops of an expensive loop to the task path although they have fewer
+// than `sync_below` elements (OffloadPolicy::promote). A size without samples
+// of its own is estimated from its neighbours: interpolated between the
+// nearest measured classes below and above, extrapolated per element from the
+// nearest one below (a kernel's time per element falls with the size, so this
+// overestimates; above the largest sample only). Main thread only, except
 // `task_sample`.
 struct DirectCost {
-    float ns_per_element = 0;   // min of the last two samples; 0: not known yet
-    float last = 0;             // the last sample
-    std::uint32_t calls = 0;    // direct runs, for sampling
+    // Size classes: bit width of the element count (64..127 -> 7, ...).
+    static constexpr int kClasses = 16;
+    struct Class {
+        float per = 0;      // ns per element, min of the last two samples; 0: not known
+        float last = 0;     // the last sample
+        float elements = 0; // elements of the last sample
+        std::uint32_t calls = 0; // direct runs of this class, for sampling
+    };
+    Class classes[kClasses];
     std::uint32_t promoted = 0; // ops sent to the task path, for re-tests
     bool retest = false;        // the op being issued re-tests a promoted loop
-    // ns per element of a re-test, measured by the task on its worker
-    // (Task::time_kernel); 0: none arrived. Taken over by the next promote().
-    std::atomic<float> task_sample{0};
+    // A re-test, measured by the task on its worker (Task::time_kernel): the
+    // float bits of its ns per element, shifted left by 32, | its elements;
+    // 0: none arrived. Taken over by the next promote().
+    std::atomic<std::uint64_t> task_sample{0};
 };
 
 struct OffloadOptions {
     // Tasks with fewer output elements always run inline (N_min).
     std::int64_t sync_below = 2048;
     // ... but not if the op's estimated NumPy time (DirectCost) is above
-    // this. A promoted op makes the cheap ops that consume it tasks too, and
-    // the main thread then pays the task path for all of them: `break_even.py`
-    // chains of sin/cos break even at ~2 us per op, but with 2 us
-    // `ind_cores_f32` (float32 sin of 1,000, ~2.2 us) fell from 0.6x to
-    // 0.15x and with 5 us `expr8` (8 terms, 1,000 elements) from 1.0x to
-    // 0.6x. 10 us promotes sin of 1,500 doubles (~15 us), not of 1,000.
-    // These are times of a 4-vCPU VM. The budget stands for main-thread
-    // costs, so the Python bridge sets it per machine, to 9 times the
-    // measured time of a small direct op (`_scale_budget` in _ndarray.py,
-    // vp_set_direct_budget_ns): with a fixed 10 us a 12700K (sin of 1,500
-    // doubles 6.1 us) ran the whole loop of `array_pipelining.py` on the
-    // main thread, no task at all.
+    // this: what the task path costs the main thread more than the direct
+    // path, for the op and for the cheap ops consuming it (a promoted op makes
+    // them tasks too). The Python bridge measures it per machine at start
+    // (`_scale_budget` in _ndarray.py, vp_set_direct_budget_ns): a direct op,
+    // a task of ready inputs and a task of a pending input, the budget is the
+    // surcharge of the task plus two consumers' surcharges. The default is a
+    // 4-vCPU VM's time.
     double direct_budget_ns = 10000;
-    // Direct runs of at least this many elements are timed (the first two
-    // of a loop, then every 16th): below it the clock reads would cost more
-    // than the decision gains.
-    std::int64_t time_from = 256;
+    // Direct runs of at least this many elements are timed (per size class
+    // the first two, then every 16th): below it the clock reads would cost
+    // more than the decision gains, and such ops are never promoted. With
+    // 256 a loop over 200 x 200 columns (`array_pipelining.py`) ran every sin
+    // directly, at 1.3x of NumPy on a 12700K; as tasks 1.7x.
+    std::int64_t time_from = 64;
     // Per-site adaptive decision above `sync_below`, and expensive loops
     // below it as tasks; off = always offload above, always inline below.
     bool adaptive = true;
@@ -109,30 +117,33 @@ class OffloadPolicy {
     // `array_pipelining.py`'s loop. Adaptive mode only: deterministic mode
     // keeps rule 1 a fixed threshold.
     bool promote(DirectCost& c, std::int64_t elements) const {
-        if (!options_.adaptive) {
+        if (!options_.adaptive || elements < options_.time_from) {
             return false;
         }
-        if (c.task_sample.load(std::memory_order_relaxed) > 0) {
-            record_sample(c, c.task_sample.exchange(0, std::memory_order_relaxed));
+        if (c.task_sample.load(std::memory_order_relaxed) != 0) {
+            take_task_sample(c);
         }
-        if (c.ns_per_element * static_cast<double>(elements) <= options_.direct_budget_ns) {
+        if (estimate(c, elements) <= options_.direct_budget_ns) {
             return false;
         }
-        c.retest = ++c.promoted % kRetest == 0 && elements >= options_.time_from;
+        c.retest = ++c.promoted % kRetest == 0;
         return true;
     }
-    // True if this direct run is to be timed (record()): the first two of a
-    // loop, then every 16th.
+    // True if this direct run is to be timed (record()): per size class the
+    // first two, then every 16th.
     bool time_direct(DirectCost& c, std::int64_t elements) const {
         if (!options_.adaptive || elements < options_.time_from) {
             return false;
         }
-        const std::uint32_t k = c.calls++;
+        const std::uint32_t k = c.classes[cost_class(elements)].calls++;
         return k < 2 || k % 16 == 0;
     }
+    // Estimated NumPy time (ns) of `elements` on this kernel; 0: unknown.
+    static double estimate(const DirectCost& c, std::int64_t elements);
     static void record(DirectCost& c, double ns, std::int64_t elements);
     // The same for a sample in ns per element.
-    static void record_sample(DirectCost& c, float ns_per_element);
+    static void record_sample(DirectCost& c, float ns_per_element, std::int64_t elements);
+    static int cost_class(std::int64_t elements);
 
     // The main thread is about to block on work it started with `stats`,
     // `distance` ops ago.
@@ -144,6 +155,7 @@ class OffloadPolicy {
 
   private:
     static constexpr std::uint32_t kRetest = 32;
+    static void take_task_sample(DirectCost& c);
     struct KeyHash {
         std::size_t operator()(const std::pair<const char*, int>& k) const {
             return std::hash<const void*>()(k.first) * 31u + static_cast<std::size_t>(k.second);

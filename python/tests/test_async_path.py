@@ -193,12 +193,12 @@ def test_views_issue_no_task():
 
 def test_direct_budget_is_scaled_to_the_machine():
     """The direct-path budget stands for main-thread costs: the bridge sets
-    it to 9 times the measured time of a small direct op (clamped to
-    1-50 us), once per process."""
+    it to what the task path costs the main thread more than the direct
+    path, measured once per process (clamped to 0.5-50 us)."""
     viproc.init(sync_below=2048, adaptive=True)
     try:
         budget = viproc._viproc.direct_budget_ns()
-        assert 1000 <= budget <= 50000
+        assert 500 <= budget <= 50000
         viproc.init(sync_below=2048, adaptive=True)
         assert viproc._viproc.direct_budget_ns() == budget
     finally:
@@ -232,6 +232,15 @@ def test_expensive_small_op_becomes_a_task():
         assert after["direct"] == before["direct"]
         assert after["tasks"] - before["tasks"] == 70
         assert all(np.array_equal(np.asarray(r), expected) for r in results)
+        # Another size of the same loop is estimated from the measured one
+        # (per size class, inter- and extrapolated): no direct run first.
+        before = viproc.offload_stats()
+        small = np.power(x[:200], 1.5 + 0.5j)
+        viproc.wait_all()
+        after = viproc.offload_stats()
+        assert after["direct"] == before["direct"]
+        assert after["tasks"] - before["tasks"] == 1
+        assert np.array_equal(np.asarray(small), expected[:200])
         # A cheap loop stays on the direct path.
         y = viproc.asarray(np.arange(1500.0))
         before = viproc.offload_stats()

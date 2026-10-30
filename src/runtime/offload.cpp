@@ -41,16 +41,58 @@ OffloadPolicy::Decision OffloadPolicy::decide(const char* site, std::int64_t ele
     return {true, &s};
 }
 
-void OffloadPolicy::record(DirectCost& c, double ns, std::int64_t elements) {
-    record_sample(c, static_cast<float>(ns / static_cast<double>(elements)));
+int OffloadPolicy::cost_class(std::int64_t elements) {
+    return std::min(size_class(elements), DirectCost::kClasses - 1);
 }
 
-void OffloadPolicy::record_sample(DirectCost& c, float per) {
+double OffloadPolicy::estimate(const DirectCost& c, std::int64_t elements) {
+    const int k = cost_class(elements);
+    const double n = static_cast<double>(elements);
+    if (c.classes[k].per > 0) {
+        return c.classes[k].per * n;
+    }
+    int lo = k - 1;
+    while (lo >= 0 && c.classes[lo].per <= 0) {
+        --lo;
+    }
+    int hi = k + 1;
+    while (hi < DirectCost::kClasses && c.classes[hi].per <= 0) {
+        ++hi;
+    }
+    if (lo >= 0 && hi < DirectCost::kClasses) {
+        const DirectCost::Class& a = c.classes[lo];
+        const DirectCost::Class& b = c.classes[hi];
+        const double ta = a.per * a.elements;
+        const double tb = b.per * b.elements;
+        return ta + (tb - ta) * (n - a.elements) / (b.elements - a.elements);
+    }
+    if (lo >= 0) {
+        return c.classes[lo].per * n;
+    }
+    if (hi < DirectCost::kClasses) {
+        return c.classes[hi].per * n; // underestimates: never promotes by accident
+    }
+    return 0;
+}
+
+void OffloadPolicy::record(DirectCost& c, double ns, std::int64_t elements) {
+    record_sample(c, static_cast<float>(ns / static_cast<double>(elements)), elements);
+}
+
+void OffloadPolicy::record_sample(DirectCost& c, float per, std::int64_t elements) {
     // The smaller of two samples: one preempted or cold run (page faults,
     // caches) must not make a cheap loop look expensive. The first sample
     // alone decides nothing (min with 0).
-    c.ns_per_element = std::min(c.last, per);
-    c.last = per;
+    DirectCost::Class& s = c.classes[cost_class(elements)];
+    s.per = std::min(s.last, per);
+    s.last = per;
+    s.elements = static_cast<float>(elements);
+}
+
+void OffloadPolicy::take_task_sample(DirectCost& c) {
+    const std::uint64_t v = c.task_sample.exchange(0, std::memory_order_relaxed);
+    record_sample(c, std::bit_cast<float>(static_cast<std::uint32_t>(v >> 32)),
+                  static_cast<std::int64_t>(v & 0xffffffffu));
 }
 
 void OffloadPolicy::on_blocked(SiteStats* stats, std::uint64_t distance) {

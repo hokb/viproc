@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <cfenv>
 #include <chrono>
@@ -401,8 +402,11 @@ TaskList Task::execute(ErrorTable* errors) {
             const std::chrono::duration<double, std::nano> ns =
                 std::chrono::steady_clock::now() - t0;
             if (DirectCost* c = kernel_->direct_cost()) {
+                const float per =
+                    static_cast<float>(ns.count() / static_cast<double>(timed_elements_));
                 c->task_sample.store(
-                    static_cast<float>(ns.count() / static_cast<double>(timed_elements_)),
+                    static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(per)) << 32 |
+                        static_cast<std::uint64_t>(timed_elements_),
                     std::memory_order_relaxed);
             }
         }
