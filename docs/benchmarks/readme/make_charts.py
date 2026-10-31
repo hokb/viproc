@@ -5,12 +5,17 @@ All results were bit-identical to NumPy. Steps:
 1. `--import` copies the raw results of a run into data/ as small CSV files:
        python make_charts.py --import --shape-map <shape_map.json>
            --loop <array_pipelining output> --kmeans <Part 3 values.csv>
-2. The figures of measurements are drawn with ILNumerics (plots/, .NET 8):
+   data/programs.tsv (bar chart) is written by hand from numbers documented
+   in docs/benchmarks.md ("Real-world programs", strong_scaling.py, FFT).
+   data/loop.csv's numpy_ft_threads column: the loop's thread pool on a
+   free-threaded CPython 3.13t, measured with
+   python/benchmarks/free_threaded_loop.py (speedup vs. NumPy there).
+2. The figures are drawn with ILNumerics (plots/, .NET 8; ILNumerics.Drawing
+   and ILNumerics.Toolboxes.Drawing2 for the bars):
        dotnet run -c Release --project plots -- data .
-   shape_map, loop, kmeans as .svg and .bmp (GDI)
+   shape_map, loop, kmeans, programs as .svg and .bmp (GDI)
 3. This script turns the .bmp files into the .png files the README shows
-   (Pillow) and draws programs.png (matplotlib) from numbers documented in
-   docs/benchmarks.md and CLAUDE.md, listed below.
+   (Pillow):
        python make_charts.py
 """
 import argparse
@@ -76,48 +81,6 @@ def import_kmeans(path):
                 out.write(",".join(v.strip() for v in line.split(",")) + "\n")
 
 
-def programs_chart():
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
-    plt.rcParams.update({
-        "font.size": 11, "axes.edgecolor": INK2, "axes.labelcolor": INK2,
-        "xtick.color": INK2, "ytick.color": INK2, "text.color": INK,
-        "axes.spines.top": False, "axes.spines.right": False,
-    })
-    # 4-core Xeon VM, bit-identical. Sources: CLAUDE.md / docs/benchmarks.md
-    # (strong_scaling.py, FFT) and "Real-world programs" in docs/benchmarks.md
-    # (python/benchmarks/realworld.py).
-    rows = [
-        ("8 independent sin/cos chains, 1e7", 7.5, None),
-        ("FFT: 100x abs(ifft(fft(A))), n = 200+", 4.4, "4.4-5.7x"),
-        ("Black-Scholes greeks, 1e6 options", 2.8, None),
-        ("Heat equation stencil, 2048 x 2048", 2.2, None),
-        ("Feature engineering, 200,000 x 20", 1.8, None),
-        ("Logistic regression, 100,000 x 50", 0.94, None),
-    ]
-    rows.reverse()
-    fig, ax = plt.subplots(figsize=(7.2, 3.2))
-    ys = range(len(rows))
-    vals = [r[1] for r in rows]
-    bars = ax.barh(list(ys), vals, 0.62, color=["#2a78d6" if v >= 1 else "#a8a7a0" for v in vals])
-    for b, (_, v, text) in zip(bars, rows):
-        ax.annotate(text or (f"{v:.2f}x" if v < 1 else f"{v:.1f}x"),
-                    (v, b.get_y() + b.get_height() / 2), xytext=(4, 0),
-                    textcoords="offset points", va="center", fontsize=9)
-    ax.set_yticks(list(ys), [r[0] for r in rows], fontsize=9)
-    ax.axvline(1.0, color=INK2, lw=1, ls="--")
-    ax.set_xlabel("speedup vs. NumPy, 4 cores")
-    ax.set_xlim(0, 8.6)
-    ax.xaxis.grid(True, color=GRID)
-    ax.set_axisbelow(True)
-    ax.set_title("Unchanged NumPy programs, bit-identical results", loc="left", fontsize=12)
-    fig.savefig(os.path.join(HERE, "programs.png"), dpi=150, bbox_inches="tight", facecolor="white")
-
-
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--import", dest="do_import", action="store_true")
@@ -137,9 +100,8 @@ if __name__ == "__main__":
     else:
         from PIL import Image
 
-        for name in ("shape_map", "loop", "kmeans"):
+        for name in ("shape_map", "loop", "kmeans", "programs"):
             bmp = os.path.join(HERE, name + ".bmp")
             if os.path.exists(bmp):
                 Image.open(bmp).save(os.path.join(HERE, name + ".png"))
                 os.remove(bmp)
-        programs_chart()

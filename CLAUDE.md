@@ -440,6 +440,8 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
   array_pipelining.py  ILNumerics' array-pipelining demo (loop over columns,
                        dependent loop, vectorized): NumPy, NumPy threads,
                        viproc at 1..cores workers
+  free_threaded_loop.py  array_pipelining.py's loop as a thread pool on
+                       free-threaded CPython (no GIL; NumPy only)
   shape_map_ilnumerics.py  the same map for ILNumerics Accelerator (vs. NumPy)
                        and viproc vs. ILNumerics, on the grid/reps of a viproc run
   ilnumerics/          its C# side (.NET 8, needs a licensed ILNumerics build)

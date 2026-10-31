@@ -40,24 +40,21 @@ python -m viproc prog.py          # your unchanged NumPy program, now in paralle
 All measurements on 4 cores (Linux VM), all results bit-identical to NumPy; speedup = NumPy
 time / viproc time. Figures drawn with [ILNumerics](https://ilnumerics.net).
 
-![Shape map: speedup of single operations and of all 43 programs over rows x columns](docs/benchmarks/readme/shape_map.png)
+### A toy program: one operation per step
 
-**Single operations pay off from ~10,000 elements.** The shape map runs 43 NumPy programs on
-every grid point of rows x columns. Left, single operations (`x = op(x)`): below the dashed
-line of 10,000 elements viproc is slightly slower than NumPy (median 0.75x), because each
-operation pays the asynchronous layer (task, dispatch) on top of NumPy's own call and a
-single operation has nothing to overlap with; reducing this overhead is on the roadmap.
-Above it, single operations run at 0.93-1.73x. Right, the median over all 43 programs:
-complexity brings parallel potential, which hides the overhead earlier and gains more
-(0.99-2.06x from 10,000 elements).
+![Shape map: median speedup of single operations over rows x columns](docs/benchmarks/readme/shape_map.png)
 
-![A Python loop over the columns of A: viproc 1.2-3.1x, NumPy with a thread pool 0.24-0.67x](docs/benchmarks/readme/loop.png)
+The worst case for viproc: a program that does one operation per step (`x = op(x)`), so
+there is no array ILP to find. The map shows the median speedup of such toy programs over
+array shapes. From ~10,000 elements (dashed line) they run at 0.93-1.73x; below that viproc
+is slightly slower than NumPy (median 0.75x), because each operation pays the asynchronous
+layer (task, dispatch) on top of NumPy's own call and has nothing to overlap with. Reducing
+this overhead is on the roadmap.
 
-**A plain Python loop, parallel without changes.** ILNumerics' loop demo in NumPy
-(`python/benchmarks/array_pipelining.py`): `C[i] = sum(abs(sin(A[:, i])))` over the columns.
-The manual way, a thread pool over the columns (`Parallel.For`), makes NumPy slower (the GIL)
-and cannot run the variant whose iterations overwrite earlier results (`C[:i+1] = ...`) at
-all. viproc runs both unchanged, at 1.2x (200 x 200) to 3.1x.
+### Real programs
+
+Real programs are not single operations: the more a program does, the more of its array
+instructions are independent. viproc uses that automatically, and it hides the overhead.
 
 ![k-means: 265 ms per run on viproc, 789 ms on NumPy](docs/benchmarks/readme/kmeans.png)
 
@@ -67,10 +64,21 @@ the unchanged NumPy script run with `python -m viproc`: 265 ms per run, 3.0x fas
 NumPy with its temporaries' page faults tuned away (789 ms; 2,670 ms with glibc's defaults on
 this VM, where every 481 KB temporary is mapped fresh). Same clusters, same iterations.
 
+![A Python loop over the columns of A: viproc 1.2-3.1x, free-threaded Python with a thread pool 1.1-2.8x, NumPy with a thread pool 0.24-0.67x](docs/benchmarks/readme/loop.png)
+
+**A plain Python loop, parallel without changes.** ILNumerics' loop demo in NumPy
+(`python/benchmarks/array_pipelining.py`): `C[i] = sum(abs(sin(A[:, i])))` over the columns
+of A. viproc runs it unchanged at 1.2x (200 x 200) to 3.1x, and also the variant whose
+iterations overwrite earlier results (`C[:i+1] = ...`), where the order matters. The manual
+way, a thread pool over the columns (`Parallel.For`), makes NumPy slower under the GIL.
+Free-threaded Python 3.13t (no GIL) makes the thread pool fast (1.1-2.8x vs. NumPy on that
+interpreter), but it has to be written by hand and gives wrong results for `C[:i+1] = ...`.
+
 ![Speedups of unchanged NumPy programs on 4 cores](docs/benchmarks/readme/programs.png)
 
-More programs: independent chains, an FFT pipeline, finance, a stencil and preprocessing gain
-1.8-7.5x; a strictly dependent chain (logistic regression) has nothing to overlap.
+**More programs:** independent chains, an FFT pipeline, finance, a stencil and
+preprocessing gain 1.8-7.5x; a strictly dependent chain (logistic regression) has nothing to
+overlap.
 
 Suite scores, all shape maps, other machines and how to measure:
 [docs/benchmarks.md](docs/benchmarks.md). Figure data and scripts: `docs/benchmarks/readme/`.

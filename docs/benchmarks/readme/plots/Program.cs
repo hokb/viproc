@@ -1,7 +1,7 @@
 // README figures of viproc, drawn with ILNumerics.Drawing.
 //   dotnet run -c Release -- <data dir> <output dir>
 // Input: CSV files written by ../make_charts.py (shape_map.csv, loop.csv,
-// kmeans.csv). Output: shape_map, loop, kmeans as .svg and .bmp (GDI).
+// kmeans.csv, programs.tsv). Output: shape_map, loop, kmeans, programs as .svg and .bmp (GDI).
 using System.Drawing;
 using System.Globalization;
 using ILNumerics;
@@ -49,7 +49,7 @@ void Style(PlotCube pc, string xlabel, string ylabel) {
     pc.Axes.YAxis.Ticks.DefaultLabel.Font = font;
 }
 
-// --- shape map: median speedup over rows x columns, two panels ---------------
+// --- shape map: median speedup of single operations over rows x columns ---------------
 // Diverging colormap over log2(speedup): red (slower) - gray (1x) - blue.
 Colormap SpeedupColormap() {
     // ILNumerics colormap data: one row per key, columns position, r, g, b, a
@@ -62,20 +62,18 @@ Colormap SpeedupColormap() {
 }
 
 void ShapeMap() {
-    var rows = ReadCsv("shape_map.csv");   // rows, cols, elements, all, single
+    var rows = ReadCsv("shape_map.csv");   // rows, cols, elements, all, single (median of the single-op cases)
     var grid = rows.Where(r => r[0] > 0).ToList();
     var rs = grid.Select(r => r[0]).Distinct().OrderBy(v => v).ToArray();
     var cs = grid.Select(r => r[1]).Distinct().OrderBy(v => v).ToArray();
     var scene = new Scene();
-    string[] titles = { "single operations: x = op(x)", "all 43 programs (median)" };
-    int[] column = { 4, 3 };
-    for (int panel = 0; panel < 2; panel++) {
+    {
         Array<float> z = zeros<float>(rs.Length, cs.Length);
         var pc = new PlotCube(twoDMode: true);
-        pc.ScreenRect = new RectangleF(0.02f + panel * 0.47f, 0.08f, 0.46f, 0.84f);
+        pc.ScreenRect = new RectangleF(0.02f, 0.08f, 0.96f, 0.84f);
         foreach (var r in grid) {
             int i = Array.IndexOf(rs, r[0]), j = Array.IndexOf(cs, r[1]);
-            var v = r[column[panel]];
+            var v = r[4];
             z[i, j] = (float)Math.Log2(v);
             var lab = new Label(v.ToString("0.00", CultureInfo.InvariantCulture) + "x") {
                 Position = new Vector3(j, i, 1), Font = small,
@@ -86,7 +84,7 @@ void ShapeMap() {
         var img = new ImageSCPlot(z, Colormaps.Custom, Tuple.Create(-2f, 2f));
         img.Colormap = SpeedupColormap();
         pc.Add(img);
-        Style(pc, "columns", panel == 0 ? "rows" : "");
+        Style(pc, "columns", "rows");
         pc.Axes.XAxis.Ticks.Mode = TickMode.Manual;
         pc.Axes.YAxis.Ticks.Mode = TickMode.Manual;
         pc.Axes.XAxis.Ticks.Clear();
@@ -102,19 +100,19 @@ void ShapeMap() {
         Array<float> lp3 = new float[,] { { lx.GetValue(0), ly.GetValue(0), 2 }, { lx.GetValue(1), ly.GetValue(1), 2 } };
         ten4.Line.Positions.Update(lp3.T);
         pc.Add(ten4);
-        pc.Add(new Title(titles[panel]));
+        pc.Add(new Title("toy programs without array ILP: one operation per step, x = op(x) (median)"));
         scene.Add(pc);
     }
     var note = new Label("speedup = NumPy time / viproc time (red: viproc slower, blue: faster); dashed: 10,000 elements") {
         Position = new Vector3(0.5, 0.97, 0), Anchor = new PointF(0.5f, 1f), Font = font };
     note.Color = ink2;
     scene.Screen.Add(note);
-    Save(scene, "shape_map", 1300, 640);
+    Save(scene, "shape_map", 1000, 640);
 }
 
 // --- Parallel.For: the column loop over matrix sizes ---------------------------
 void Loop() {
-    var rows = ReadCsv("loop.csv");   // n, threads, loop, loop_dep, vectorized (speedups)
+    var rows = ReadCsv("loop.csv");   // n, threads, loop, loop_dep, vectorized, ft threads (speedups)
     Array<float> x = rows.Select(r => (float)r[0]).ToArray();
     LinePlot Line(int col, string tag, Color c, DashStyle d, MarkerStyle m) {
         Array<float> y = rows.Select(r => (float)r[col]).ToArray();
@@ -127,7 +125,8 @@ void Loop() {
     var pc = new PlotCube(twoDMode: true) {
         Line(2, "viproc: C[i] = sum(abs(sin(A[:, i])))", viprocColor, DashStyle.Solid, MarkerStyle.Dot),
         Line(3, "viproc: C[:i+1] = ...  (order matters)", depColor, DashStyle.Solid, MarkerStyle.Diamond),
-        Line(1, "NumPy + thread pool (Parallel.For): C[i] = ...", numpyColor, DashStyle.Dashed, MarkerStyle.Square),
+        Line(5, "free-threaded Python 3.13t (no GIL) + thread pool, by hand: C[i] = ...", Hex("#a8a7a0"), DashStyle.Dashed, MarkerStyle.TriangleUp),
+        Line(1, "NumPy + thread pool (Parallel.For, with the GIL): C[i] = ...", numpyColor, DashStyle.Dashed, MarkerStyle.Square),
     };
     // 1x: plain NumPy
     Array<float> one = new float[] { (float)rows.Min(r => r[0]), (float)rows.Max(r => r[0]) };
@@ -136,10 +135,10 @@ void Loop() {
     pc.Axes.XAxis.Ticks.Mode = TickMode.Manual;
     pc.Axes.XAxis.Ticks.Clear();
     foreach (var r in rows) pc.Axes.XAxis.Ticks.Add((float)r[0], r[0].ToString("N0", CultureInfo.InvariantCulture));
-    pc.Add(new Legend { Location = new PointF(0.12f, 0.15f), Anchor = new PointF(0, 0) });
+    pc.Add(new Legend { Location = new PointF(0.115f, 0.19f), Anchor = new PointF(0, 0) });
     pc.Add(new Title("Python loop over the n columns of A, 4 cores"));
     pc.AutoScaleOnAdd = false;
-    pc.Limits.Set(new Vector3(150, 0, 0), new Vector3(3150, 4.2, 0));
+    pc.Limits.Set(new Vector3(150, 0, 0), new Vector3(3150, 5.3, 0));
     var scene = new Scene { pc };
     Save(scene, "loop", 1000, 560);
 }
@@ -164,7 +163,7 @@ void KMeans() {
         Line(4, "the same NumPy program on viproc", viprocColor, MarkerStyle.Dot),
     };
     Style(pc, "elapsed time [s]", "time per k-means run [ms]");
-    pc.Add(new Legend { Location = new PointF(0.97f, 0.47f), Anchor = new PointF(1, 0.5f) });
+    pc.Add(new Legend { Location = new PointF(0.88f, 0.47f), Anchor = new PointF(1, 0.5f) });
     pc.Add(new Title("k-means (ILNumerics' Part 3 program), 1203 x 1203, k = 50, 4 cores"));
     pc.AutoScaleOnAdd = false;
     pc.Limits.Set(new Vector3(0, 0, 0), new Vector3(22, 3300, 0));
@@ -172,7 +171,47 @@ void KMeans() {
     Save(scene, "kmeans", 1000, 560);
 }
 
+// --- more programs: horizontal bars (ILNumerics.Toolboxes.Drawing2) ------------
+void Programs() {
+    var rows = File.ReadLines(Path.Combine(dataDir, "programs.tsv")).Skip(1)
+        .Where(l => l.Trim().Length > 0).Select(l => l.Split('\t')).Reverse().ToList();
+    Array<float> y = rows.Select(r => float.Parse(r[1], CultureInfo.InvariantCulture)).ToArray();
+    // 1x: plain NumPy, drawn first (behind the bars)
+    Array<float> lx = ones<float>(2, 1);
+    Array<float> ly = new float[] { 0.4f, rows.Count + 0.6f };
+    var pc = new PlotCube(twoDMode: true) {
+        new LinePlot(lx, ly, lineColor: ink2, lineWidth: 1, lineStyle: DashStyle.Dashed) };
+    var bars = new BarPlot(y, borderColor: viprocColor, fillColor: viprocColor, barWidth: 0.42f,
+                           drawHorizontal: true) { UseLighting = false };
+    for (int i = 0; i < rows.Count; i++)
+        if (y.GetValue(i) < 1) bars.SetBarColor(i, Hex("#a8a7a0"), Hex("#a8a7a0"));
+    pc.Add(bars);
+    // program names above their bars (the bar plot's own axis ticks are hidden)
+    for (int i = 0; i < rows.Count; i++) {
+        var name = new Label(rows[i][0]) {
+            Position = new Vector3(0, i + 1 + 0.27f, 1), Anchor = new PointF(0, 1), Font = font };
+        name.Color = Color.Black;
+        pc.Add(name);
+        var lab = new Label(rows[i][2]) {
+            Position = new Vector3(y.GetValue(i) + 0.1f, i + 1, 1), Anchor = new PointF(0, 0.5f), Font = font };
+        lab.Color = ink2;
+        pc.Add(lab);
+    }
+    Style(pc, "speedup vs. NumPy, 4 cores (dashed: 1x)", "");
+    pc.Axes.YAxis.GridMajor.Visible = false;
+    pc.Add(new Title("unchanged NumPy programs, bit-identical results"));
+    pc.AutoScaleOnAdd = false;
+    pc.Limits.Set(new Vector3(0, 0.5, 0), new Vector3(8.6, rows.Count + 0.75, 0));
+    var scene = new Scene { pc };
+    scene.Configure();
+    bars.Axis.Ticks.DefaultLabel.Visible = false;   // names are labels above the bars
+    bars.Axis.Ticks.Visible = false;
+    bars.Axis.GridMajor.Visible = false;
+    Save(scene, "programs", 1000, 600);
+}
+
 var only = args.Length > 2 ? args[2] : "all";
 if (only is "all" or "shape_map") ShapeMap();
 if (only is "all" or "loop") Loop();
 if (only is "all" or "kmeans") KMeans();
+if (only is "all" or "programs") Programs();

@@ -9,7 +9,8 @@
     <Nullable>disable</Nullable>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="ILNumerics.Computing" Version="7.4.56" />
-    <PackageReference Include="ILNumerics.Drawing" Version="7.4.56" />
+    <PackageReference Include="ILNumerics.Computing" Version="7.4.77" />
+    <PackageReference Include="ILNumerics.Drawing" Version="7.4.77" />
+    <PackageReference Include="ILNumerics.Toolboxes.Drawing2" Version="7.4.77" />
   </ItemGroup>
 </Project>

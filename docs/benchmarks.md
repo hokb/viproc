@@ -908,7 +908,9 @@ sync per step: nothing to overlap.
 ### README figures (2026-10-30)
 
 The README's figures (`docs/benchmarks/readme/`: data in `data/`, drawn
-with ILNumerics by `plots/`, see `make_charts.py`). Code of `03c16cb`
+with ILNumerics by `plots/`, see `make_charts.py`; the README's shape map
+shows the single-op row's medians, the bars come from "Real-world
+programs", `strong_scaling.py` and the FFT numbers above). Code of `03c16cb`
 (`main` after #58), Release build `2026-10-30T20:57:09 #f92697ba`;
 Linux VM, Intel Xeon @ 2.10 GHz, 4 cores, 15.7 GiB, Python 3.13.17,
 NumPy 2.5.3. All results bit-identical.
@@ -936,6 +938,13 @@ speedup vs. NumPy (the figure shows w=3, the default: cores - 1):
 | 1,500 | 0.36x | 3.10x | 2.16x | 3.04x | 3.06x | 3.60x |
 | 2,000 | 0.41x | 1.97x | 2.80x | 2.73x | 3.09x | 3.25x |
 | 3,000 | 0.67x | 2.96x | 2.69x | 3.64x | 3.18x | 2.66x |
+
+The same loop with a thread pool on a **free-threaded CPython** (no GIL;
+`python/benchmarks/free_threaded_loop.py`, Python 3.13.14t, NumPy 2.5.4,
+4 threads, same VM; speedup vs. the plain loop on that interpreter, results
+identical): n = 200 1.11x, 500 1.55x, 1,000 2.30x, 1,500 2.84x, 2,000
+2.81x, 3,000 2.64x. About viproc's w=3 speed, but written by hand, on
+another interpreter, and only for `loop`: `loop_dep` needs its order.
 
 **k-means**, ILNumerics' Part 3 NumPy script (`Part3_noopt.py`, 1203 x
 1203, k = 50, 5 iterations) for 20 s each, median time per run: NumPy
