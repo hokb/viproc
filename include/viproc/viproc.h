@@ -49,11 +49,10 @@ const char* vp_version(void);
 
 /* --- Runtime ------------------------------------------------------------- */
 
-/* [GIL] Creates the runtime. workers == 0: one per physical core
- * (SMT siblings count once).
+/* [GIL] Creates the runtime with its fixed number of worker threads (2).
  * max_active_tasks == 0: default look-ahead limit (1000). NumPy must be
  * importable. Returns NULL on failure. */
-vp_runtime* vp_runtime_create(size_t workers, size_t max_active_tasks, char* err, size_t errlen);
+vp_runtime* vp_runtime_create(size_t max_active_tasks, char* err, size_t errlen);
 /* [no GIL] Waits until no task is active. */
 void vp_wait_all(vp_runtime* rt);
 /* [GIL] Waits for all tasks and destroys the runtime. Arrays still alive

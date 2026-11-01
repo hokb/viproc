@@ -31,7 +31,7 @@ inside its loops), for `loop` only: for `loop_dep` it would be wrong.
 Every result is checked bit for bit against NumPy.
 
     PYTHONPATH=build/python python3 python/benchmarks/array_pipelining.py
-    ... --sizes 200:500,1500:10 --workers 1,2,3,4 --samples 7
+    ... --sizes 200:500,1500:10 --samples 7
 """
 
 import argparse
@@ -111,7 +111,7 @@ def measure(n, reps, workers, samples, threads):
         rows["loop", "numpy_threads"] = (median(t), numpy.array_equal(C, expected["loop"]), 0)
 
     for w in workers:
-        viproc.init(workers=w)
+        viproc.init()  # its fixed 2 workers
         vA = counter(viproc, n)
         for name, prog in PROGRAMS.items():
             vC = viproc.zeros(n)
@@ -160,14 +160,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--sizes", default="200:500,1500:10",
                    help="n:reps,... (A is n x n; reps runs per sample, as ILNumerics)")
-    p.add_argument("--workers", default=None, help="viproc worker counts (default 1,2,..,cores)")
     p.add_argument("--threads", type=int, default=None,
                    help="threads of the NumPy Parallel.For (default: cores)")
     p.add_argument("--samples", type=int, default=7)
     args = p.parse_args()
     cores = viproc.physical_cores()
-    workers = ([int(w) for w in args.workers.split(",")] if args.workers
-               else sorted({1, 2, *range(4, cores + 1, 4), cores}))
+    workers = [2]  # viproc's fixed worker count
     threads = args.threads or cores
     viproc.init()
     budget = viproc._viproc.direct_budget_ns() / 1e3

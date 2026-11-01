@@ -1,17 +1,14 @@
 """viproc benchmark suite: many array programs, NumPy vs. viproc, one score.
 
 Runs every case of suite_cases.py in several sizes and layouts, plain NumPy
-against viproc with 1 worker and with one worker per core, checks that the
-results are identical, and condenses the speedups into the *parallel
-efficiency score* (0..100, 100 = ideal), normalized to the machine:
+against viproc (its fixed 2 workers), checks that the results are identical,
+and condenses the speedups into the *parallel efficiency score* (0..100,
+100 = ideal):
 
-- **Cores.** A case of parallel width P (independent instruction streams)
-  ideally runs min(cores, P) times faster than NumPy on medium and large
-  data. Cores are physical cores (SMT siblings count once, as viproc's
-  default worker count): a second hardware thread shares its core's
-  execution units, so it is no second core for the ideal. Tiny data cannot amortize a hand-off, so there the ideal is parity
-  with NumPy (1x). Efficiency = speedup / ideal; this divides out the core
-  count, so the score is comparable between a laptop and a server.
+- **Workers.** A case of parallel width P (independent instruction streams)
+  ideally runs min(2, P) times faster than NumPy on medium and large data,
+  2 being viproc's worker count. Tiny data cannot amortize a hand-off, so
+  there the ideal is parity with NumPy (1x). Efficiency = speedup / ideal.
 - **RAM.** The `large` size class is scaled to the memory per core
   (RAM / (512 x max(cores, 8)) elements, clamped to [500k, 10M]): large
   for the machine, never swapping.
@@ -326,13 +323,13 @@ def score(results, cores):
     }
 
 
-def measure_viproc(case, bases, lay, base_shape, reps, repeat, expected, workers):
-    """Best time of `case` on viproc with `workers` threads, whether its result
+def measure_viproc(case, bases, lay, base_shape, reps, repeat, expected):
+    """Best time of `case` on viproc (its 2 workers), whether its result
     equals NumPy's, and the eager fallbacks of one run. Every viproc array
     is gone when this returns (before the next init)."""
     import viproc
 
-    viproc.init(workers=workers)
+    viproc.init()
     unsupported = []
 
     def convert(a):
@@ -366,12 +363,10 @@ def run_suite(args):
 
     cores = args.cores or usable_cores()
     ram = physical_memory()
-    viproc.init()  # the runtime's default worker count (physical cores - 1)
+    viproc.init()  # the runtime's fixed worker count (2)
     default = viproc.workers()
     viproc.shutdown()
-    spec = (args.workers.replace("max", str(cores)).replace("default", str(default))
-            .replace("threads", str(usable_threads())))
-    workers = sorted({int(w) for w in spec.split(",")})
+    workers = [default]
     wmax = max(workers)
     target = 0.02 if args.quick else 0.04
     repeat = args.repeat or (3 if args.quick else 5)
@@ -413,7 +408,7 @@ def run_suite(args):
              "numpy_s": t_np, "viproc_s": {}, "fallbacks": None, "identical": True}
         for w in workers:
             t, same, fallbacks, unsupported = measure_viproc(
-                case, bases, lay, base_shape, reps, repeat, expected, w)
+                case, bases, lay, base_shape, reps, repeat, expected)
             r["viproc_s"][str(w)] = t
             r["identical"] = r["identical"] and same
             if w == wmax:
@@ -447,10 +442,6 @@ def main():
     p.add_argument("--out", default="reports", help="output directory (default: ./reports)")
     p.add_argument("--quick", action="store_true", help="shorter runs, fewer large cases")
     p.add_argument("--filter", help="regular expression on case/size/layout")
-    p.add_argument("--workers", default="1,max",
-                   help="viproc worker counts, 'max' = cores (physical), 'default' = viproc's "
-                        "default (physical cores - 1), 'threads' = hardware threads "
-                        "(default 1,max)")
     p.add_argument("--cores", type=int, help="override the detected physical core count")
     p.add_argument("--repeat", type=int, help="timed runs per measurement (best of)")
     p.add_argument("--merge", nargs="+", metavar="RESULTS_JSON",

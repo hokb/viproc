@@ -11,12 +11,11 @@ SIZE_ORDER = ["scalar", "tiny", "small", "medium", "large"]
 
 SCORE_EXPLAINED = """\
 **How the score works.** Each configuration runs as plain NumPy and on viproc
-(at `max` workers: one per physical core). *Speedup* = NumPy time / viproc time. Its
-*ideal* is min(cores, P) for medium and large data, where cores are physical
-cores (SMT siblings count once) and P is the program's parallel width
-(independent instruction streams), and 1x (parity with NumPy) for
-scalar, tiny and small data, where no hand-off can pay off. *Efficiency* =
-speedup / ideal: dividing by the cores makes it comparable across machines.
+(its fixed 2 workers). *Speedup* = NumPy time / viproc time. Its
+*ideal* is min(2, P) for medium and large data, where P is the program's
+parallel width (independent instruction streams), and 1x (parity with NumPy)
+for scalar, tiny and small data, where no hand-off can pay off.
+*Efficiency* = speedup / ideal.
 The `large` size class scales with RAM per core. **Score** = 100 x geometric
 mean over the categories of the geometric mean of their efficiencies
 (100 = ideal everywhere; above 100 is possible, e.g. through temporary

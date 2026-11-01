@@ -45,7 +45,6 @@ def main():
     p.add_argument("--chains", type=int, default=8)
     p.add_argument("--length", type=int, default=10)
     p.add_argument("--repeat", type=int, default=3)
-    p.add_argument("--workers", type=str, default="1,2,4")
     p.add_argument("--sync-below", type=int, default=None,
                    help="ops with ready inputs and fewer elements run inline (default: viproc's)")
     p.add_argument("--deterministic", action="store_true", help="disable the adaptive policy")
@@ -61,8 +60,8 @@ def main():
           f"{os.cpu_count()} CPUs")
     print(f"{'numpy':>12}: {t_np * 1e3:8.1f} ms")
 
-    for w in (int(s) for s in args.workers.split(",")):
-        viproc.init(workers=w, sync_below=args.sync_below,
+    for w in (2,):  # viproc's fixed worker count
+        viproc.init(sync_below=args.sync_below,
                     adaptive=False if args.deterministic else None)
         vdata = [viproc.asarray(d) for d in data]
         viproc.wait_all()

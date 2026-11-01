@@ -52,9 +52,8 @@ def _env_policy():
 
 def _ensure_runtime():
     if not _viproc.initialized():
-        workers = int(os.environ.get("VIPROC_WORKERS", "0"))
         sync_below, adaptive = _env_policy()
-        _viproc.init(workers, 0, sync_below, adaptive)
+        _viproc.init(0, sync_below, adaptive)
         _small_ops[0] = 2048 if sync_below < 0 else sync_below
         _scale_budget(adaptive)
 
@@ -1918,11 +1917,9 @@ def wait_all():
         _viproc.wait_all()
 
 
-def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
-    """(Re)starts the runtime.
+def init(max_active_tasks=0, sync_below=None, adaptive=None):
+    """(Re)starts the runtime (2 worker threads, fixed).
 
-    workers: worker threads (0: one per physical core but one, the main
-        thread's; at least 1).
     sync_below: ops whose inputs are ready and that produce fewer elements run
         inline on the calling thread (default 2048, env VIPROC_SYNC_BELOW).
     adaptive: let each issue site switch to inline execution while its results
@@ -1936,7 +1933,7 @@ def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
         shutdown()  # raises an error of the old runtime nothing reported yet
     finally:
         adaptive = env_adaptive if adaptive is None else adaptive
-        _viproc.init(workers, max_active_tasks, sync_below, adaptive)
+        _viproc.init(max_active_tasks, sync_below, adaptive)
         _small_ops[0] = 2048 if sync_below < 0 else sync_below
         _scale_budget(adaptive)
 

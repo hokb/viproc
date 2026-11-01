@@ -4,6 +4,7 @@
 #include "runtime/cpu.hpp"
 #include "runtime/element_pool.hpp"
 #include "runtime/runtime.hpp"
+#include "runtime/workers.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -49,9 +50,8 @@ class FnKernel : public Kernel {
 };
 
 // Plain asynchronous dispatch (no inline execution) for the scheduling tests.
-RuntimeOptions opts(std::size_t workers, std::size_t max_active = kDefaultMaxActiveTasks) {
+RuntimeOptions opts(std::size_t max_active = kDefaultMaxActiveTasks) {
     RuntimeOptions o;
-    o.workers = workers;
     o.max_active_tasks = max_active;
     o.offload.sync_below = 0;
     o.offload.adaptive = false;
@@ -138,7 +138,7 @@ void inplace_add(Runtime& rt, const ArrayPtr& target, const ArrayPtr& other) {
 }
 
 void test_chain() {
-    Runtime rt(opts(4));
+    Runtime rt(opts());
     ArrayPtr x = make_ready(rt, 16, 0.0);
     for (int i = 0; i < 500; ++i) {
         x = issue1(rt, add_const(1.0), {x}, 16);
@@ -147,7 +147,7 @@ void test_chain() {
 }
 
 void test_diamond() {
-    Runtime rt(opts(4));
+    Runtime rt(opts());
     ArrayPtr a = issue1(rt, add_const(1.0, 20ms), {make_ready(rt, 8, 1.0)}, 8); // 2
     ArrayPtr b = issue1(rt, add_const(10.0, 20ms), {a}, 8);                     // 12
     ArrayPtr c = issue1(rt, add_const(100.0), {a}, 8);                          // 102
@@ -156,7 +156,7 @@ void test_diamond() {
 }
 
 void test_main_thread_runs_ahead() {
-    Runtime rt(opts(2));
+    Runtime rt(opts());
     auto start = std::chrono::steady_clock::now();
     ArrayPtr x = make_ready(rt, 4, 0.0);
     for (int i = 0; i < 10; ++i) {
@@ -168,7 +168,7 @@ void test_main_thread_runs_ahead() {
 }
 
 void test_independent_ops_overlap() {
-    Runtime rt(opts(4));
+    Runtime rt(opts());
     auto start = std::chrono::steady_clock::now();
     std::vector<ArrayPtr> rs;
     for (int i = 0; i < 8; ++i) {
@@ -181,7 +181,7 @@ void test_independent_ops_overlap() {
 }
 
 void test_continuation_on_same_thread() {
-    Runtime rt(opts(4));
+    Runtime rt(opts());
     std::mutex m;
     std::vector<std::thread::id> ids;
     auto record = std::make_shared<FnKernel>([&](auto in, auto out) {
@@ -210,7 +210,7 @@ void test_fan_out_small_stay_large_spread() {
     // One completion makes four tasks runnable: three small ones stay with
     // the completing worker (RuntimeOptions::local_below), the large one
     // goes to another worker, so the small ones do not wait behind it.
-    Runtime rt(opts(4));
+    Runtime rt(opts());
     std::mutex m;
     std::map<std::string, std::thread::id> where;
     auto rec = [&](const char* name, std::chrono::milliseconds d) {
@@ -241,7 +241,7 @@ void test_fan_out_small_stay_large_spread() {
 }
 
 void test_deep_chain_no_stack_growth() {
-    Runtime rt(opts(2));
+    Runtime rt(opts());
     // Gate makes all 100000 tasks pending, so they run as continuations;
     // nested execution would overflow the stack.
     ArrayPtr x = issue1(rt, add_const(0.0, 20ms), {make_ready(rt, 1, 0.0)}, 1);
@@ -252,7 +252,7 @@ void test_deep_chain_no_stack_growth() {
 }
 
 void test_inout_in_place() {
-    Runtime rt(opts(2));
+    Runtime rt(opts());
     ArrayPtr a = make_ready(rt, 8, 1.0);
     ArrayPtr one = make_ready(rt, 8, 1.0);
     CountableArray* before = a->buffer().get();
@@ -266,7 +266,7 @@ void test_inout_in_place() {
 void test_inout_chain_stays_in_place() {
     // A pending in/out op reads the buffer it writes; later writers wait for
     // it anyway, so that read must not force them to copy-on-write.
-    Runtime rt(opts(2));
+    Runtime rt(opts());
     ArrayPtr gate = issue1(rt, add_const(0.0, 30ms), {make_ready(rt, 8, 0.0)}, 8);
     ArrayPtr a = make_ready(rt, 8, 1.0);
     CountableArray* before = a->buffer().get();
@@ -280,7 +280,7 @@ void test_inout_chain_stays_in_place() {
 }
 
 void test_prepare_host_write() {
-    Runtime rt(opts(2));
+    Runtime rt(opts());
     // Live NumPy views (host_views) are aliases, as NumPy's views: written in place.
     ArrayPtr a = make_ready(rt, 8, 3.0);
     std::shared_ptr<CountableArray> exported = a->buffer(); // held, as an export does
@@ -299,7 +299,7 @@ void test_prepare_host_write() {
 }
 
 void test_copy_on_write() {
-    Runtime rt(opts(2));
+    Runtime rt(opts());
     ArrayPtr a = make_ready(rt, 8, 1.0);
     ArrayPtr one = make_ready(rt, 8, 1.0);
     // Pending reader of `a`: waits on a slow gate, so it reads `a` later.
@@ -317,7 +317,7 @@ void test_copy_on_write() {
 }
 
 void test_view_write_visible_in_base() {
-    Runtime rt(opts(2));
+    Runtime rt(opts());
     ArrayPtr base = make_ready(rt, 8, 0.0);
     ArrayPtr even = slice(rt, base, 0, 2, 4); // base[0::2]
     CountableArray* before = base->buffer().get();
@@ -333,7 +333,7 @@ void test_view_write_visible_in_base() {
 }
 
 void test_view_write_waits_for_base_producer() {
-    Runtime rt(opts(2));
+    Runtime rt(opts());
     // base is pending (slow producer); a view of it is written in place.
     ArrayPtr base = issue1(rt, add_const(5.0, 30ms), {make_ready(rt, 8, 0.0)}, 8);
     ArrayPtr odd = slice(rt, base, 1, 2, 4);
@@ -343,7 +343,7 @@ void test_view_write_waits_for_base_producer() {
 }
 
 void test_view_copy_on_write() {
-    Runtime rt(opts(2));
+    Runtime rt(opts());
     ArrayPtr base = make_ready(rt, 8, 0.0);
     ArrayPtr even = slice(rt, base, 0, 2, 4);
     // Pending reader of the whole base.
@@ -362,7 +362,7 @@ void test_view_copy_on_write() {
 }
 
 void test_consolidated_copy_on_write_of_strided_array() {
-    Runtime rt(opts(2));
+    Runtime rt(opts());
     // A reversed array (stride -8) that alone covers its whole storage.
     Layout rev = vec(4);
     rev.strides[0] = -8;
@@ -385,7 +385,7 @@ void test_consolidated_copy_on_write_of_strided_array() {
 }
 
 void test_overlapping_inplace() {
-    Runtime rt(opts(2));
+    Runtime rt(opts());
     // a += a[::-1] must read all of `a` before writing (NumPy semantics).
     Layout l = vec(6);
     auto b = std::make_shared<CountableArray>(l.nbytes());
@@ -403,7 +403,7 @@ void test_overlapping_inplace() {
 }
 
 void test_error_propagation() {
-    Runtime rt(opts(2));
+    Runtime rt(opts());
     auto fail = std::make_shared<FnKernel>([](auto, auto) {
         std::this_thread::sleep_for(10ms);
         return KernelResult{1, "boom", 0};
@@ -423,7 +423,7 @@ void test_error_propagation() {
 }
 
 void test_error_reports() {
-    Runtime rt(opts(2));
+    Runtime rt(opts());
     auto fail = [](const char* msg) {
         return std::make_shared<FnKernel>([msg](auto, auto) { return KernelResult{1, msg, 0}; });
     };
@@ -555,7 +555,7 @@ void test_consumer_registration_races() {
 void test_active_limit() {
     std::atomic<int> running{0};
     std::atomic<int> max_seen{0};
-    Runtime rt(opts(4, 6));
+    Runtime rt(opts(6));
     std::size_t max_active = 0;
     auto k = std::make_shared<FnKernel>([&](auto in, auto out) {
         int r = ++running;
@@ -583,7 +583,7 @@ void test_random_programs(std::int64_t n, bool in_place) {
     // in_place the outputs may take dying inputs' memory.
     std::mt19937 rng(1);
     for (int round = 0; round < 20; ++round) {
-        Runtime rt(opts(4));
+        Runtime rt(opts());
         std::vector<ArrayPtr> arrays;
         std::vector<double> ref;
         for (int i = 0; i < 4; ++i) {
@@ -654,7 +654,7 @@ void test_random_view_programs() {
     };
     const Slice slices[] = {{0, 1, 6}, {0, 2, 3}, {1, 2, 3}, {5, -1, 6}, {4, -2, 3}, {2, 1, 3}};
     for (int round = 0; round < 20; ++round) {
-        Runtime rt(opts(4));
+        Runtime rt(opts());
         std::vector<ArrayPtr> bases;
         std::vector<std::vector<double>> ref;
         for (int i = 0; i < 4; ++i) {
@@ -722,7 +722,7 @@ std::shared_ptr<Kernel> add_one_where(std::thread::id main) {
 }
 
 void test_offload_small_ops_run_inline() {
-    RuntimeOptions o = opts(2);
+    RuntimeOptions o = opts();
     o.offload.sync_below = 1024;
     Runtime rt(o);
     const auto main = std::this_thread::get_id();
@@ -742,7 +742,7 @@ void test_offload_small_ops_run_inline() {
 }
 
 void test_offload_adaptive_per_site() {
-    RuntimeOptions o = opts(2);
+    RuntimeOptions o = opts();
     o.offload.sync_below = 0;
     o.offload.adaptive = true;
     Runtime rt(o);
@@ -797,7 +797,7 @@ void test_offload_adaptive_per_site() {
 } // namespace
 
 void test_deferred_allocation() {
-    Runtime rt(opts(2));
+    Runtime rt(opts());
     const std::int64_t n = 1000;
     std::atomic<bool> open{false};
     auto gate = std::make_shared<FnKernel>([&open](auto in, auto out) {
@@ -931,22 +931,19 @@ void test_element_pool() {
     pool.set_limit(saved_limit);
 }
 
-// The default worker count is one per physical core but one (the main
-// thread's): at least 1, at most one per hardware thread.
-void test_default_workers() {
+// The runtime has a fixed number of workers: 2.
+void test_worker_count() {
     const std::size_t cores = physical_core_count();
     const std::size_t logical = std::max(1u, std::thread::hardware_concurrency());
     std::printf("physical cores %zu, hardware threads %zu\n", cores, logical);
     check(cores >= 1 && cores <= logical, "physical cores within [1, hardware threads]");
     Runtime rt{RuntimeOptions{}};
-    check(default_worker_count() == (cores > 1 ? cores - 1 : 1),
-          "default worker count: physical cores - 1, at least 1");
-    check(rt.worker_count() == default_worker_count(),
-          "default runtime has one worker per physical core but one");
+    check(worker_threads() == 2, "worker threads: 2");
+    check(rt.worker_count() == 2, "the runtime has 2 workers");
 }
 
 int main() {
-    test_default_workers();
+    test_worker_count();
     test_element_pool();
     test_chain();
     test_diamond();

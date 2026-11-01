@@ -164,8 +164,7 @@ is a sync point, where the program waits for that result. Never measure times in
   `viproc.enable(False)` / `viproc.enable(True)` switch it for longer stretches.
 - **Timing:** read a value at the end of each measurement, e.g. `float(x.sum())` or `np.asarray(x)`.
   Otherwise you only measure how long it takes to issue the operations, not to compute them.
-- **Number of cores:** `VIPROC_WORKERS=4` (or 1, 2, 8, …) sets the number of workers, e.g. for scaling
-  tests.
+- **Number of cores:** viproc runs 2 worker threads besides the main thread; the number is fixed.
 - **Where it pays off:** many array operations on medium to large data that do not all depend on each
   other: iterative algorithms, simulations, image and signal processing. Loops over single scalar values
   gain little and may get slightly slower.

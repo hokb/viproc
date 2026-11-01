@@ -358,9 +358,9 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
   ref.hpp              Ref<T>: non-atomic intrusive refcount (Array, AliasGroup)
   pool.hpp             FixedPool / make_pooled: per-thread pools (Task, CountableArray, …)
   offload.*            OffloadPolicy: inline vs. worker for ready tasks
-  cpu.*                physical_core_count() (SMT siblings once, affinity),
-                       default_worker_count(): physical cores - 1 (the
-                       main thread keeps a core to issue on), at least 1
+  cpu.*                physical_core_count() (SMT siblings once, affinity)
+  workers.*            worker_threads(): the fixed worker count, 2 (no
+                       option, environment variable or API argument)
   element_pool.*       ElementPool: process-wide pool for element memory
                        (quantized bins, LIFO, bound, huge pages)
   countable_array.*    CountableArray: one data version, one handle per device

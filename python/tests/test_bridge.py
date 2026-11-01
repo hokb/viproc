@@ -280,7 +280,7 @@ def test_issue_site_names_the_user_code_line():
 
 def test_offload_policy_small_ops_inline_and_deterministic_mode():
     try:
-        viproc.init(workers=2, sync_below=1024)
+        viproc.init(sync_below=1024)
         small = viproc.asarray(np.arange(10.0))
         before = viproc.offload_stats()
         r = small * 2
@@ -288,7 +288,7 @@ def test_offload_policy_small_ops_inline_and_deterministic_mode():
         assert viproc.offload_stats()["direct"] == before["direct"] + 1  # without a task
         assert same(r, np.arange(10.0) * 2)
 
-        viproc.init(workers=2, sync_below=0, adaptive=False)  # deterministic: always async
+        viproc.init(sync_below=0, adaptive=False)  # deterministic: always async
         big = viproc.asarray(rng.standard_normal(1_000_000))
         for _ in range(50):
             (np.sin(big) + 1).wait()  # always waited on right away
@@ -299,7 +299,7 @@ def test_offload_policy_small_ops_inline_and_deterministic_mode():
 
 def test_adaptive_policy_switches_site_waited_on_right_away():
     try:
-        viproc.init(workers=2, sync_below=0, adaptive=True)
+        viproc.init(sync_below=0, adaptive=True)
         x = viproc.asarray(rng.standard_normal(4096))
         for _ in range(64):
             (x * 2).wait()  # same issue site, result needed immediately
@@ -650,11 +650,12 @@ def test_waits_inside_an_issue_release_the_gil():
         viproc.init()
 
 
-def test_default_worker_count_leaves_the_main_thread_a_core():
+def test_worker_count_is_fixed_at_two():
     viproc.init()
     try:
-        cores = viproc.physical_cores()
-        assert cores >= 1
-        assert viproc.workers() == max(1, cores - 1)
+        assert viproc.physical_cores() >= 1
+        assert viproc.workers() == 2
+        with pytest.raises(TypeError):
+            viproc.init(workers=4)
     finally:
         viproc.init()

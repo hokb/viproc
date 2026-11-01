@@ -129,9 +129,4 @@ std::size_t physical_core_count() {
     return cores == 0 ? logical : std::min(cores, logical);
 }
 
-std::size_t default_worker_count() {
-    const std::size_t cores = physical_core_count();
-    return cores > 1 ? cores - 1 : 1;
-}
-
 } // namespace viproc

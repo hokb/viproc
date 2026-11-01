@@ -12,7 +12,7 @@ SUITE = os.path.join(os.path.dirname(__file__), "..", "benchmarks", "suite.py")
 def test_suite_runs_and_writes_reports(tmp_path):
     out = tmp_path / "bench"
     proc = subprocess.run(
-        [sys.executable, SUITE, "--quick", "--repeat", "1", "--workers", "1,2",
+        [sys.executable, SUITE, "--quick", "--repeat", "1",
          "--filter", r"chain_serial/tiny|dtype_chains/small/vec/(int16|complex128)|"
                      r"gather/small|scalar_newton",
          "--out", str(out)],

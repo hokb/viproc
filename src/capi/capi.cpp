@@ -239,14 +239,13 @@ void reacquire_gil() {
 
 } // namespace
 
-vp_runtime* vp_runtime_create(size_t workers, size_t max_active_tasks, char* err, size_t errlen) {
+vp_runtime* vp_runtime_create(size_t max_active_tasks, char* err, size_t errlen) {
     if (!numpy::init()) {
         PyErr_Clear();
         set_error(err, errlen, "cannot import the NumPy C API");
         return nullptr;
     }
     RuntimeOptions options;
-    options.workers = workers;
     options.block_enter = release_gil;
     options.block_leave = reacquire_gil;
     if (max_active_tasks != 0) {

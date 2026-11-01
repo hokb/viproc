@@ -261,7 +261,6 @@ int main() {
 
     {
         RuntimeOptions o;
-        o.workers = 4;
         Runtime rt(o);
         test_broadcast_expression(rt);
         test_dtypes(rt);

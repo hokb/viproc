@@ -2460,10 +2460,10 @@ static PyObject* m_setup(PyObject* self, PyObject* args) {
 
 static PyObject* m_init(PyObject* self, PyObject* args) {
     (void)self;
-    Py_ssize_t workers = 0, max_active = 0;
+    Py_ssize_t max_active = 0;
     long long sync_below = -1; /* -1: runtime default */
     int adaptive = 1;
-    if (!PyArg_ParseTuple(args, "|nnLp", &workers, &max_active, &sync_below, &adaptive)) {
+    if (!PyArg_ParseTuple(args, "|nLp", &max_active, &sync_below, &adaptive)) {
         return NULL;
     }
     if (g_rt != NULL) {
@@ -2472,7 +2472,7 @@ static PyObject* m_init(PyObject* self, PyObject* args) {
     }
     char err[ERRLEN] = "";
     Py_CLEAR(g_extobj_last); /* the new runtime gets the errstate on the next call */
-    g_rt = vp_runtime_create((size_t)workers, (size_t)max_active, err, sizeof err);
+    g_rt = vp_runtime_create((size_t)max_active, err, sizeof err);
     if (g_rt == NULL) {
         PyErr_SetString(PyExc_RuntimeError, err);
         return NULL;
@@ -5070,7 +5070,7 @@ static PyMethodDef methods[] = {
     {"setup", m_setup, METH_VARARGS,
      "setup(cls, dtypes, fallback, asarray, internal_dirs, ops, ndarray, generic)"},
     {"init", m_init, METH_VARARGS,
-     "init(workers=0, max_active_tasks=0, sync_below=-1, adaptive=True)"},
+     "init(max_active_tasks=0, sync_below=-1, adaptive=True)"},
     {"shutdown", m_shutdown, METH_NOARGS, "Wait for all tasks and destroy the runtime."},
     {"initialized", m_initialized, METH_NOARGS, NULL},
     {"offload_counts", m_offload_counts, METH_NOARGS,

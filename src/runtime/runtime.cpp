@@ -1,6 +1,6 @@
 #include "runtime.hpp"
 
-#include "cpu.hpp"
+#include "workers.hpp"
 #include "pool.hpp"
 
 #include <algorithm>
@@ -57,10 +57,7 @@ template <class Done> bool spin_until(Done done) {
 } // namespace
 
 Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_(options_.offload) {
-    std::size_t n = options_.workers;
-    if (n == 0) {
-        n = default_worker_count();
-    }
+    const std::size_t n = worker_threads();
     if (options_.max_active_tasks == 0) {
         options_.max_active_tasks = 1;
     }

@@ -83,7 +83,7 @@ def measure(case, shape, cores, workers, target, repeat, seed, module=False):
     warm = time.perf_counter() - t0
     t_np, _ = best_of(lambda: case.run(data, reps), repeats_for(warm, repeat))
 
-    viproc.init(workers=workers)
+    viproc.init()  # its fixed 2 workers
     vdata = [viproc.asarray(a) for a in data]
     viproc.wait_all()
 
@@ -178,7 +178,7 @@ def summarize(results):
 def run_map(args):
     cores = args.cores or usable_cores()
     ram = physical_memory()
-    workers = args.workers or cores
+    workers = 2  # viproc's fixed worker count
     target = 0.02 if args.quick else 0.04
     repeat = args.repeat or 3
     cols = grid_axis(args.max_cols, args.quick)
@@ -670,7 +670,6 @@ def main():
     p.add_argument("--out", default="reports/shape_map", help="output directory")
     p.add_argument("--quick", action="store_true", help="whole decades, shorter runs")
     p.add_argument("--filter", help="regular expression on the case names")
-    p.add_argument("--workers", type=int, help="viproc workers (default: cores)")
     p.add_argument("--cores", type=int, help="override the detected core count")
     p.add_argument("--repeat", type=int, help="timed runs per measurement (best of, default 3)")
     p.add_argument("--max-cols", type=int, default=1_000)

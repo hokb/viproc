@@ -43,6 +43,7 @@ add_library(viproc
     src/runtime/layout.cpp
     src/runtime/countable_array.cpp
     src/runtime/cpu.cpp
+    src/runtime/workers.cpp
     src/runtime/element_pool.cpp
     src/runtime/task.cpp
     src/runtime/runtime.cpp
