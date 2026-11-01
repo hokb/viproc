@@ -1,5 +1,5 @@
 """np.where in C (select or NumPy's own where on borrowed views) and the
-module's ufunc proxies (viproc.add, ...: NumPy's ufunc without its override
+module's ufunc proxies (numpy2x.add, ...: NumPy's ufunc without its override
 dispatch): results, dtypes and errors as NumPy's."""
 
 import pickle
@@ -7,17 +7,17 @@ import pickle
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 
 DTYPES = ["?", "i4", "i8", "f4", "f8", "c8", "c16"]
 
 
 def _value(rng, kind, shape, dtype):
     data = (rng.standard_normal(shape) * 4).astype(dtype)
-    if kind == "viproc":
-        return viproc.asarray(data), data
+    if kind == "numpy2x":
+        return numpy2x.asarray(data), data
     if kind == "pending":
-        v = viproc.asarray(np.broadcast_to(data, (300, 30) if shape == (300, 30) else shape))
+        v = numpy2x.asarray(np.broadcast_to(data, (300, 30) if shape == (300, 30) else shape))
         return v.copy() if v.size > 4096 else v, data
     if kind == "numpy":
         return data, data
@@ -41,8 +41,8 @@ def _outcome(f, *args):
 def test_where_matches_numpy(big):
     rng = np.random.default_rng(11 + big)
     shapes = [(300, 30), (30,), (300, 1), ()] if big else [(4, 5), (5,), (4, 1), (), (3,)]
-    kinds = ["viproc", "pending", "numpy", "list", "npscalar", "scalar"] if big else [
-        "viproc", "numpy", "list", "npscalar", "scalar"]
+    kinds = ["numpy2x", "pending", "numpy", "list", "npscalar", "scalar"] if big else [
+        "numpy2x", "numpy", "list", "npscalar", "scalar"]
     for trial in range(400):
         args, ref = [], []
         for i in range(3):
@@ -53,24 +53,24 @@ def test_where_matches_numpy(big):
             args.append(v)
             ref.append(n)
         expected = _outcome(np.where, *ref)
-        for where in (np.where, viproc.where):
+        for where in (np.where, numpy2x.where):
             assert _outcome(where, *args) == expected, (trial, [type(a) for a in args])
 
 
 def test_where_small_ready_runs_without_tasks_or_fallbacks():
-    c = viproc.asarray(np.arange(20) % 3 == 0)
-    x = viproc.asarray(np.arange(20.0))
-    viproc.wait_all()
-    f0 = viproc._ndarray.fallback_calls
-    s0 = viproc.offload_stats()
-    for where in (np.where, viproc.where):
+    c = numpy2x.asarray(np.arange(20) % 3 == 0)
+    x = numpy2x.asarray(np.arange(20.0))
+    numpy2x.wait_all()
+    f0 = numpy2x._ndarray.fallback_calls
+    s0 = numpy2x.offload_stats()
+    for where in (np.where, numpy2x.where):
         r = where(c, x, -1.0)
-        assert isinstance(r, viproc.ndarray) and r.ready()
+        assert isinstance(r, numpy2x.ndarray) and r.ready()
         assert np.array_equal(np.asarray(r), np.where(np.arange(20) % 3 == 0, np.arange(20.0), -1.0))
         r = where(c, x, np.float32(2))  # a NumPy scalar: NumPy's where on borrowed views
-        assert isinstance(r, viproc.ndarray) and r.dtype == np.float64
-    s1 = viproc.offload_stats()
-    assert viproc._ndarray.fallback_calls == f0
+        assert isinstance(r, numpy2x.ndarray) and r.dtype == np.float64
+    s1 = numpy2x.offload_stats()
+    assert numpy2x._ndarray.fallback_calls == f0
     assert s1["offloaded"] == s0["offloaded"] and s1["inline"] == s0["inline"]
 
 
@@ -81,10 +81,10 @@ UFUNCS = ["add", "subtract", "multiply", "divide", "power", "maximum", "minimum"
 
 def test_ufunc_proxies_match_numpy():
     rng = np.random.default_rng(5)
-    kinds = ["viproc", "numpy", "scalar", "npscalar", "list"]
+    kinds = ["numpy2x", "numpy", "scalar", "npscalar", "list"]
     shapes = [(4, 5), (5,), ()]
     for name in UFUNCS:
-        uf, proxy = getattr(np, name), getattr(viproc, name)
+        uf, proxy = getattr(np, name), getattr(numpy2x, name)
         assert proxy == uf and isinstance(proxy, np.ufunc) and proxy.nin == uf.nin
         assert pickle.loads(pickle.dumps(proxy)) is uf
         for trial in range(60):
@@ -97,18 +97,18 @@ def test_ufunc_proxies_match_numpy():
             with np.errstate(all="ignore"):
                 expected = _outcome(uf, *ref)
                 got = _outcome(proxy, *args)
-                # viproc raises a failed op's error as a subclass of NumPy's
+                # numpy2x raises a failed op's error as a subclass of NumPy's
                 # (AsyncValueError for a negative integer exponent).
                 assert got == expected or (isinstance(expected, type) and isinstance(got, type)
                                            and issubclass(got, expected)), (name, trial)
-    x = viproc.asarray(np.arange(6.0))
-    out = viproc.asarray(np.zeros(6))
-    assert viproc.add(x, 1.0, out=out) is out
+    x = numpy2x.asarray(np.arange(6.0))
+    out = numpy2x.asarray(np.zeros(6))
+    assert numpy2x.add(x, 1.0, out=out) is out
     assert np.array_equal(np.asarray(out), np.arange(6.0) + 1)
-    assert float(viproc.add.reduce(x)) == 15.0
-    assert np.array_equal(np.asarray(viproc.multiply.outer(x, x)), np.multiply.outer(
+    assert float(numpy2x.add.reduce(x)) == 15.0
+    assert np.array_equal(np.asarray(numpy2x.multiply.outer(x, x)), np.multiply.outer(
         np.arange(6.0), np.arange(6.0)))
-    assert np.asarray(viproc.sqrt(x, dtype=np.float32)).dtype == np.float32
+    assert np.asarray(numpy2x.sqrt(x, dtype=np.float32)).dtype == np.float32
 
 
 REDUCTIONS = ["sum", "prod", "max", "min", "amax", "amin", "any", "all", "mean", "var", "std",
@@ -134,13 +134,13 @@ def _reduction_kwargs(rng, name, ndim):
 
 
 def test_reduction_proxies_match_numpy():
-    """viproc.sum, ... (module mode): NumPy's function without its
+    """numpy2x.sum, ... (module mode): NumPy's function without its
     __array_function__ dispatch; results, dtypes and errors as NumPy's."""
     rng = np.random.default_rng(9)
-    kinds = ["viproc", "pending", "numpy", "list", "scalar"]
+    kinds = ["numpy2x", "pending", "numpy", "list", "scalar"]
     shapes = [(4, 5), (5,), (), (300, 30)]
     for name in REDUCTIONS:
-        f, proxy = getattr(np, name), getattr(viproc, name)
+        f, proxy = getattr(np, name), getattr(numpy2x, name)
         assert proxy == f and isinstance(proxy, type(f)) and proxy.__name__ == f.__name__
         assert pickle.loads(pickle.dumps(proxy)) is f
         for trial in range(40):
@@ -164,13 +164,13 @@ def test_reduction_proxies_take_the_c_path():
 
     with deterministic():
         data = np.arange(SIZE, dtype=np.float64).reshape(50, -1)
-        x = viproc.asarray(data)
-        r = assert_async(viproc.sum, pending(x), axis=0)
+        x = numpy2x.asarray(data)
+        r = assert_async(numpy2x.sum, pending(x), axis=0)
         assert np.array_equal(np.asarray(r), data.sum(axis=0))
-        r = assert_async(viproc.max, pending(x))
+        r = assert_async(numpy2x.max, pending(x))
         assert float(r) == data.max()
-        small = viproc.asarray(np.arange(10.0))
-        viproc.wait_all()
-        f0 = viproc._ndarray.fallback_calls
-        assert viproc.sum(small) == 45.0 and viproc.mean(small, axis=0) == 4.5
-        assert viproc._ndarray.fallback_calls == f0
+        small = numpy2x.asarray(np.arange(10.0))
+        numpy2x.wait_all()
+        f0 = numpy2x._ndarray.fallback_calls
+        assert numpy2x.sum(small) == 45.0 and numpy2x.mean(small, axis=0) == 4.5
+        assert numpy2x._ndarray.fallback_calls == f0

@@ -1,12 +1,12 @@
 """np.sort, np.argsort, ndarray.sort and ndarray.argsort on NumPy's sort
-functions (hokb/viproc#25 step 7a): bit-identical to NumPy (values, the
+functions (hokb/numpy2x#25 step 7a): bit-identical to NumPy (values, the
 order of equal elements, NaNs and signed zeros, dtypes, layouts, errors) and
 on the asynchronous path."""
 
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 from async_path import assert_async, pending
 from test_compositions import DTYPES, check, det, same, sample  # noqa: F401 (det: fixture)
 from test_joining import path  # noqa: F401 (fixture)
@@ -62,7 +62,7 @@ def test_sort_in_place(dtype, path):
 def test_sort_in_place_export(path):
     """An export taken before a.sort() sees the sort, as NumPy's view."""
     x = ties((60, 50), np.float64)
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     e = np.asarray(v)
     v.sort()
     same(e, np.sort(x))
@@ -105,6 +105,6 @@ ASYNC = [  # name, call, shape, dtype, tasks
                          ids=[c[0] for c in ASYNC])
 def test_async(call, shape, dtype, ops, det):
     x = ties(shape, dtype)
-    v = pending(viproc.asarray(x))
+    v = pending(numpy2x.asarray(x))
     got = assert_async(call, v, ops=ops)
     same(got, call(x.copy()))

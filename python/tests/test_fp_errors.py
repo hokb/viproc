@@ -10,7 +10,7 @@ import warnings
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 
 N = 10_000  # above sync_below: the ops run as tasks
 a = np.resize(np.array([0.0, 1e308, -1.0, 1.0, 1e-300]), N)
@@ -22,7 +22,7 @@ def warnings_of(f, *args):
         r = f(*args)
         if not np.isscalar(r):
             np.asarray(r)  # sync
-        viproc.wait_all()  # reports what is still queued
+        numpy2x.wait_all()  # reports what is still queued
     return [(w_.category, str(w_.message)) for w_ in w]
 
 
@@ -53,7 +53,7 @@ def test_warnings_like_numpy(case, errstate):
     f = CASES[case]
     with np.errstate(**errstate):
         expected = warnings_of(f, a)
-        got = warnings_of(f, viproc.asarray(a))
+        got = warnings_of(f, numpy2x.asarray(a))
     assert got == expected
 
 
@@ -64,10 +64,10 @@ def test_raise_like_numpy(case):
         with pytest.raises(FloatingPointError) as expected:
             f(a)
         with pytest.raises(FloatingPointError) as got:
-            r = f(viproc.asarray(a))
+            r = f(numpy2x.asarray(a))
             np.asarray(r)
-            viproc.wait_all()
-    assert isinstance(got.value, viproc.AsyncFloatingPointError)
+            numpy2x.wait_all()
+    assert isinstance(got.value, numpy2x.AsyncFloatingPointError)
     assert str(got.value).startswith(str(expected.value))
 
 
@@ -76,18 +76,18 @@ def test_warn_before_raise_in_numpys_order():
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             with pytest.raises(FloatingPointError, match="invalid value encountered in divide"):
-                np.asarray(viproc.asarray(a) / 0)
+                np.asarray(numpy2x.asarray(a) / 0)
     assert [str(x.message) for x in w] == ["divide by zero encountered in divide"]
 
 
 def test_errstate_is_the_one_of_the_issue():
-    v = viproc.asarray(a)
+    v = numpy2x.asarray(a)
     with np.errstate(all="ignore"):
         r = v / 0  # issued here, completes later
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         np.asarray(r)
-        viproc.wait_all()
+        numpy2x.wait_all()
     assert w == []
 
 
@@ -101,36 +101,36 @@ def test_call_log_and_print_modes(capfd):
         def write(self, s):
             self.lines.append(s)
 
-    for x in (a, viproc.asarray(a)):
+    for x in (a, numpy2x.asarray(a)):
         with np.errstate(all="call", call=lambda *args: calls.append(args)):
             np.asarray(x / 0)
-            viproc.wait_all()
+            numpy2x.wait_all()
     assert calls[:2] == calls[2:] == [("divide by zero", 9), ("invalid value", 9)]
     logs = []
-    for x in (a, viproc.asarray(a)):
+    for x in (a, numpy2x.asarray(a)):
         log = Log()
         with np.errstate(all="log", call=log):
             np.asarray(x * 10)
-            viproc.wait_all()
+            numpy2x.wait_all()
         logs.append(log.lines)
     assert logs[0] == logs[1] == ["Warning: overflow encountered in multiply\n"]
     capfd.readouterr()
-    for x in (a, viproc.asarray(a)):
+    for x in (a, numpy2x.asarray(a)):
         with np.errstate(all="print"):
             np.asarray(x * 10)
-            viproc.wait_all()
+            numpy2x.wait_all()
     err = capfd.readouterr().err
     assert err == "Warning: overflow encountered in multiply\n" * 2
 
 
 def test_warnings_point_at_the_issuing_line_and_warn_once_there():
-    v = viproc.asarray(a)
+    v = numpy2x.asarray(a)
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("default")
         for _ in range(3):
             r = v / 0; line = __import__("sys")._getframe().f_lineno  # noqa: E702
             np.asarray(r)
-        viproc.wait_all()
+        numpy2x.wait_all()
     assert [str(x.message) for x in w] == ["divide by zero encountered in divide",
                                            "invalid value encountered in divide"]
     assert all(x.filename == __file__ and x.lineno == line for x in w)
@@ -140,5 +140,5 @@ def test_warning_filter_error_raises():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         with pytest.raises(RuntimeWarning, match="divide by zero encountered in divide"):
-            np.asarray(viproc.asarray(a) / 0)
-            viproc.wait_all()
+            np.asarray(numpy2x.asarray(a) / 0)
+            numpy2x.wait_all()

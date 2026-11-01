@@ -1,4 +1,4 @@
-"""Reports of the viproc benchmark suite (suite.py): Markdown and a
+"""Reports of the numpy2x benchmark suite (suite.py): Markdown and a
 self-contained HTML page (no scripts, no external resources), for one run
 or a comparison of several runs (machines, platforms)."""
 
@@ -10,8 +10,8 @@ CATEGORY_ORDER = ["chains", "indexing", "reductions", "algorithms", "dtypes", "s
 SIZE_ORDER = ["scalar", "tiny", "small", "medium", "large"]
 
 SCORE_EXPLAINED = """\
-**How the score works.** Each configuration runs as plain NumPy and on viproc
-(its fixed 2 workers). *Speedup* = NumPy time / viproc time. Its
+**How the score works.** Each configuration runs as plain NumPy and on numpy2x
+(its fixed 2 workers). *Speedup* = NumPy time / numpy2x time. Its
 *ideal* is min(2, P) for medium and large data, where P is the program's
 parallel width (independent instruction streams), and 1x (parity with NumPy)
 for scalar, tiny and small data, where no hand-off can pay off.
@@ -19,16 +19,16 @@ for scalar, tiny and small data, where no hand-off can pay off.
 The `large` size class scales with RAM per core. **Score** = 100 x geometric
 mean over the categories of the geometric mean of their efficiencies
 (100 = ideal everywhere; above 100 is possible, e.g. through temporary
-reuse). *Fallbacks* count operations viproc ran eagerly in NumPy (each one a
+reuse). *Fallbacks* count operations numpy2x ran eagerly in NumPy (each one a
 sync point); they show what still keeps a case from scaling. "NumPy only"
-marks inputs of a dtype viproc does not support yet (int16, float16): they
+marks inputs of a dtype numpy2x does not support yet (int16, float16): they
 stay NumPy arrays, and their ops run in plain NumPy."""
 
 
 def _fallbacks(r):
-    """Fallback count, or which input dtypes viproc left to plain NumPy."""
-    if r.get("not_in_viproc"):
-        return "NumPy only (" + ", ".join(r["not_in_viproc"]) + ")"
+    """Fallback count, or which input dtypes numpy2x left to plain NumPy."""
+    if r.get("not_in_numpy2x"):
+        return "NumPy only (" + ", ".join(r["not_in_numpy2x"]) + ")"
     return str(r["fallbacks"])
 
 
@@ -65,7 +65,7 @@ def summary_markdown(run):
         f"## Parallel efficiency score: **{_fmt_score(s['score'])}** / 100",
         "",
         f"{m['label']} · {m['cpu']} · {m['cores']} cores · {_gib(m['ram_bytes'])} RAM · "
-        f"Python {m['python']} · NumPy {m['numpy']} · viproc {m['viproc']}"
+        f"Python {m['python']} · NumPy {m['numpy']} · numpy2x {m['numpy2x']}"
         f"{' · build ' + m['build'] if m.get('build') else ''}",
         "",
         "| | |",
@@ -90,11 +90,11 @@ def summary_markdown(run):
 def report_markdown(run):
     m = run["machine"]
     wmax = max(m["workers"])
-    out = ["# viproc benchmark suite", "", summary_markdown(run), "", "## Machine", "",
+    out = ["# numpy2x benchmark suite", "", summary_markdown(run), "", "## Machine", "",
            "| | |", "|---|---|"]
     for k, label in [("os", "OS"), ("cpu", "CPU"), ("cores", "physical cores used"),
                      ("logical_cpus", "logical CPUs"), ("python", "Python"),
-                     ("numpy", "NumPy"), ("viproc", "viproc"), ("build_type", "build type"),
+                     ("numpy", "NumPy"), ("numpy2x", "numpy2x"), ("build_type", "build type"),
                      ("elision", "temporary elision"), ("blas_threads", "BLAS threads"),
                      ("date", "date")]:
         out.append(f"| {label} | {m.get(k, '')} |")
@@ -104,7 +104,7 @@ def report_markdown(run):
             "", "## Results", ""]
     workers = m["workers"]
     head = ["case", "size", "layout", "dtype", "P", "NumPy ms"]
-    head += [f"viproc w={w} ms" for w in workers]
+    head += [f"numpy2x w={w} ms" for w in workers]
     head += ["speedup", "ideal", "efficiency", "fallbacks", "identical"]
     out.append("| " + " | ".join(head) + " |")
     out.append("|" + "|".join(["---"] * 4 + ["---:"] * (len(head) - 5) + [":-:"]) + "|")
@@ -115,7 +115,7 @@ def report_markdown(run):
                 continue
             row = [r["case"], r["size"], r["layout"], r.get("dtype", ""), str(r["width"]),
                    _fmt_ms(r["numpy_s"])]
-            row += [_fmt_ms(r["viproc_s"][str(w)]) for w in workers]
+            row += [_fmt_ms(r["numpy2x_s"][str(w)]) for w in workers]
             row += [_fmt_x(r["speedup"]), _fmt_x(r["ideal"]), f"{r['efficiency']:.2f}",
                     _fallbacks(r), "yes" if r["identical"] else "**NO**"]
             out.append("| " + " | ".join(row) + " |")
@@ -126,7 +126,7 @@ def report_markdown(run):
             seen.add(r["case"])
             out.append(f"- `{r['case']}` ({r['category']}): {r['description']}")
     out.append("")
-    out.append(f"viproc ran with {wmax} workers for the score; speedups use that column.")
+    out.append(f"numpy2x ran with {wmax} workers for the score; speedups use that column.")
     return "\n".join(out) + "\n"
 
 
@@ -278,7 +278,7 @@ def report_html(run):
     head = ("<tr><th>case</th><th>size</th><th>layout</th><th>dtype</th>"
             "<th class='num'>P</th>"
             "<th class='num'>NumPy ms</th>"
-            + "".join(f"<th class='num'>viproc w={w}</th>" for w in workers)
+            + "".join(f"<th class='num'>numpy2x w={w}</th>" for w in workers)
             + "<th>speedup (w=" + str(wmax) + ")</th><th class='num'>speedup</th>"
             "<th class='num'>efficiency</th><th class='num'>fallbacks</th><th>identical</th></tr>")
     body = []
@@ -297,7 +297,7 @@ def report_html(run):
                 f"<td>{r['size']}</td><td>{r['layout']}</td><td>{r.get('dtype', '')}</td>"
                 f"<td class='num'>{r['width']}</td>"
                 f"<td class='num'>{_fmt_ms(r['numpy_s'])}</td>"
-                + "".join(f"<td class='num'>{_fmt_ms(r['viproc_s'][str(w)])}</td>"
+                + "".join(f"<td class='num'>{_fmt_ms(r['numpy2x_s'][str(w)])}</td>"
                           for w in workers)
                 + f"<td>{_bar(r['speedup'], r['ideal'], tip)}</td>"
                 f"<td class='num'>{_fmt_x(r['speedup'])}</td>"
@@ -310,7 +310,7 @@ def report_html(run):
             ("platform", m["label"]), ("OS", m["os"]), ("CPU", m["cpu"]),
             ("physical cores used", m["cores"]), ("logical CPUs", m["logical_cpus"]),
             ("RAM", _gib(m["ram_bytes"])), ("Python", m["python"]), ("NumPy", m["numpy"]),
-            ("viproc", m["viproc"]), ("build type", m.get("build_type") or "–"),
+            ("numpy2x", m["numpy2x"]), ("build type", m.get("build_type") or "–"),
             ("temporary elision", m["elision"]), ("BLAS threads", m["blas_threads"]),
             ("large size class", f"{m['large_elements']:,} elements"),
             ("timing", f"best of {m['repeat']}, ~{m['target_s'] * 1e3:.0f} ms per NumPy run"),
@@ -319,9 +319,9 @@ def report_html(run):
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>viproc benchmark</title><style>{CSS}</style></head>
+<title>numpy2x benchmark</title><style>{CSS}</style></head>
 <body><main>
-<h1>viproc benchmark suite</h1>
+<h1>numpy2x benchmark suite</h1>
 <p class="sub">{html.escape(m['label'])} · {html.escape(m['cpu'])} · {m['cores']} cores ·
 {_gib(m['ram_bytes'])} RAM · NumPy {m['numpy']} · {m['date']}{' · build ' + html.escape(m['build']) if m.get('build') else ''}</p>
 {_tiles(run)}
@@ -360,7 +360,7 @@ def _run_name(run, i):
 
 def comparison_markdown(runs):
     names = [_run_name(r, i) for i, r in enumerate(runs)]
-    out = ["# viproc benchmark suite: comparison", "",
+    out = ["# numpy2x benchmark suite: comparison", "",
            "| | " + " | ".join(names) + " |", "|---|" + "---:|" * len(runs)]
 
     def row(label, fn):
@@ -421,9 +421,9 @@ def write_comparison(runs, out_dir):
     page = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>viproc benchmark comparison</title><style>{CSS}</style></head>
+<title>numpy2x benchmark comparison</title><style>{CSS}</style></head>
 <body><main>
-<h1>viproc benchmark suite: comparison</h1>
+<h1>numpy2x benchmark suite: comparison</h1>
 <p class="sub">Parallel efficiency score per run (100 = ideal scaling on that machine).</p>
 {tiles}
 <h2>Speedup vs NumPy per configuration</h2>

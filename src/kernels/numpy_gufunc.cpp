@@ -5,7 +5,7 @@
 #include <cstring>
 #include <mutex>
 
-namespace viproc::numpy {
+namespace numpy2x::numpy {
 
 std::size_t GufuncCore::present(std::size_t i) const {
     std::size_t n = 0;
@@ -218,4 +218,4 @@ std::shared_ptr<Kernel> make_gufunc_kernel(const UfuncLoop* loop, GufuncCore cor
     return std::make_shared<GufuncKernel>(loop, std::move(core), std::move(invalid_error), options);
 }
 
-} // namespace viproc::numpy
+} // namespace numpy2x::numpy

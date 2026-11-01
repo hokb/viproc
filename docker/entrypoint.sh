@@ -1,9 +1,9 @@
 #!/bin/bash
-# Command line of the viproc Linux and Wine images (docker/README.md).
+# Command line of the numpy2x Linux and Wine images (docker/README.md).
 #
-# The image holds the sources in $VIPROC_SRC and a configured build in
-# $VIPROC_BUILD. Every command first brings the build up to date, so a
-# checkout mounted over $VIPROC_SRC (docker run -v "$PWD:/src" ...) is
+# The image holds the sources in $NUMPY2X_SRC and a configured build in
+# $NUMPY2X_BUILD. Every command first brings the build up to date, so a
+# checkout mounted over $NUMPY2X_SRC (docker run -v "$PWD:/src" ...) is
 # rebuilt incrementally before it runs.
 set -euo pipefail
 
@@ -14,27 +14,27 @@ usage: docker run [--rm -it] [-v DIR:/work -w /work] IMAGE [COMMAND [ARGS...]]
 commands:
   test [CTEST_ARGS...]     build, then run all test suites with ctest (default)
   pytest [PYTEST_ARGS...]  build, then run the Python bridge tests
-  python [ARGS...]         Python with viproc importable (interactive with -it)
+  python [ARGS...]         Python with numpy2x importable (interactive with -it)
   benchmark [NAME [ARGS]]  run python/benchmarks/NAME.py (default: suite, the full
                            benchmark suite; reports go to /work/reports/<platform>:
                            mount a directory on /work to keep them)
   build                    bring the build up to date
-  info                     platform, Python, NumPy and viproc configuration
+  info                     platform, Python, NumPy and numpy2x configuration
   help                     this text
   anything else            executed as a command (e.g. bash)
 
-image: $VIPROC_PLATFORM, build type $(build_type), sources $VIPROC_SRC, build $VIPROC_BUILD
+image: $NUMPY2X_PLATFORM, build type $(build_type), sources $NUMPY2X_SRC, build $NUMPY2X_BUILD
 EOF
 }
 
 build_type() {
-    sed -n 's/^CMAKE_BUILD_TYPE:STRING=//p' "$VIPROC_BUILD/CMakeCache.txt" 2>/dev/null || true
+    sed -n 's/^CMAKE_BUILD_TYPE:STRING=//p' "$NUMPY2X_BUILD/CMakeCache.txt" 2>/dev/null || true
 }
 
 build() {
     local log
     log=$(mktemp)
-    if ! cmake --build "$VIPROC_BUILD" >"$log" 2>&1; then
+    if ! cmake --build "$NUMPY2X_BUILD" >"$log" 2>&1; then
         cat "$log" >&2
         rm -f "$log"
         exit 1
@@ -49,14 +49,14 @@ case "$cmd" in
 test)
     build
     status=0
-    ctest --test-dir "$VIPROC_BUILD" --output-on-failure "$@" || status=$?
+    ctest --test-dir "$NUMPY2X_BUILD" --output-on-failure "$@" || status=$?
     echo "note: 'test' (the default command) runs the test suites only; the benchmark" \
          "suite is 'benchmark' (docker/benchmark.sh runs it and copies the reports out)" >&2
     exit $status
     ;;
 pytest)
     build
-    exec python -m pytest "$VIPROC_SRC/python/tests" "$@"
+    exec python -m pytest "$NUMPY2X_SRC/python/tests" "$@"
     ;;
 python)
     build
@@ -70,10 +70,10 @@ benchmark)
         shift
     fi
     if [[ $name == suite && " $* " != *" --out "* && " $* " != *" --merge "* ]]; then
-        set -- --out "/work/reports/$VIPROC_PLATFORM" "$@"
+        set -- --out "/work/reports/$NUMPY2X_PLATFORM" "$@"
     fi
-    python "$VIPROC_SRC/python/benchmarks/$name.py" "$@"
-    if [[ $name == suite && -z ${VIPROC_REPORTS_COPIED:-} ]] && ! mountpoint -q /work 2>/dev/null; then
+    python "$NUMPY2X_SRC/python/benchmarks/$name.py" "$@"
+    if [[ $name == suite && -z ${NUMPY2X_REPORTS_COPIED:-} ]] && ! mountpoint -q /work 2>/dev/null; then
         # The host name is the container's ID unless --hostname was given.
         cat >&2 <<NOTE
 note: /work is not mounted, the reports are only inside this container.
@@ -92,13 +92,13 @@ build)
     ;;
 info)
     build
-    echo "image: $VIPROC_PLATFORM, build type $(build_type)"
+    echo "image: $NUMPY2X_PLATFORM, build type $(build_type)"
     exec python -c '
 import platform, sys
-import numpy, viproc
+import numpy, numpy2x
 print("platform:", platform.platform())
 print("python:", sys.version.split()[0], "numpy:", numpy.__version__)
-print("temporary elision:", viproc._viproc.elision_mode())'
+print("temporary elision:", numpy2x._numpy2x.elision_mode())'
     ;;
 help | -h | --help)
     usage

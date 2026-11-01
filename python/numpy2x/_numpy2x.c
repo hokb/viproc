@@ -1,17 +1,17 @@
-/* CPython extension module `viproc._viproc`: binding of the C ABI in
- * include/viproc/viproc.h, plus the hot path of the Python bridge.
+/* CPython extension module `numpy2x._numpy2x`: binding of the C ABI in
+ * include/numpy2x/numpy2x.h, plus the hot path of the Python bridge.
  *
- * `_Array` is the base class of `viproc.ndarray` (defined in _ndarray.py). It
- * owns one vp_array* and implements, in C, everything that runs once per
+ * `_Array` is the base class of `numpy2x.ndarray` (defined in _ndarray.py). It
+ * owns one nx_array* and implements, in C, everything that runs once per
  * array op: `__array_ufunc__` for element-wise ufunc calls and the Python
  * operators (`+`, `*=`, `<`, ...). Dtype resolution is NumPy's own
  * (`ufunc.resolve_dtypes`), cached per (ufunc, input kinds). Anything the fast
  * path does not handle goes to the Python fallback registered by
  * _ndarray.py, which keeps NumPy semantics for all other cases. */
 
-#include "viproc_python.h"
+#include "numpy2x_python.h"
 
-#include "viproc/viproc.h"
+#include "numpy2x/numpy2x.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -27,15 +27,15 @@
  * C stack and the module each belongs to: backtrace() and dladdr() with
  * glibc, RtlCaptureStackBackTrace() and GetModuleHandleExW() on Windows. */
 #if PY_VERSION_HEX >= 0x030E0000
-#define VP_ELIDE_EXACT 1
+#define NX_ELIDE_EXACT 1
 #elif defined(_WIN32)
-#define VP_ELIDE_BACKTRACE 1
+#define NX_ELIDE_BACKTRACE 1
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #elif defined(__GLIBC__)
-#define VP_ELIDE_BACKTRACE 1
+#define NX_ELIDE_BACKTRACE 1
 #include <dlfcn.h>
 #include <execinfo.h>
 #endif
@@ -44,22 +44,22 @@
 #define MAXDIMS 64
 #define MAXIN 3 /* element-wise ufuncs have at most 3 inputs */
 
-static vp_runtime* g_rt = NULL;
+static nx_runtime* g_rt = NULL;
 static unsigned long g_main_thread = 0;
 static PyObject* AsyncError = NULL;
-static PyObject* AsyncIndexError = NULL;  /* AsyncError and IndexError */
-static PyObject* AsyncValueError = NULL;  /* AsyncError and ValueError */
-static PyObject* AsyncLinAlgError = NULL; /* AsyncError and numpy.linalg.LinAlgError */
+static PyObject* AsyncIndexError = NULL;         /* AsyncError and IndexError */
+static PyObject* AsyncValueError = NULL;         /* AsyncError and ValueError */
+static PyObject* AsyncLinAlgError = NULL;        /* AsyncError and numpy.linalg.LinAlgError */
 static PyObject* AsyncFloatingPointError = NULL; /* AsyncError and FloatingPointError */
 static long long g_small = 2048; /* the runtime's sync_below: ops this small run directly */
 
-/* Registered by _ndarray.py via _viproc.setup(). */
-static PyTypeObject* g_array_cls = NULL; /* viproc.ndarray */
-static PyObject* g_dtypes[7];            /* np.dtype per vp_dtype code */
-static int g_alignment[7];               /* np.dtype(...).alignment per vp_dtype code */
+/* Registered by _ndarray.py via _numpy2x.setup(). */
+static PyTypeObject* g_array_cls = NULL; /* numpy2x.ndarray */
+static PyObject* g_dtypes[7];            /* np.dtype per nx_dtype code */
+static int g_alignment[7];               /* np.dtype(...).alignment per nx_dtype code */
 static PyObject* g_matmul = NULL;        /* np.matmul */
 static PyObject* g_fallback = NULL;      /* fallback(ufunc, method, inputs, kwargs) */
-static PyObject* g_asarray = NULL;       /* asarray(ndarray) -> viproc.ndarray */
+static PyObject* g_asarray = NULL;       /* asarray(ndarray) -> numpy2x.ndarray */
 static PyObject* g_internal_dirs = NULL; /* tuple of path prefixes skipped for issue sites */
 static PyObject* g_np_ndarray = NULL;    /* numpy.ndarray */
 static PyObject* g_np_generic = NULL;    /* numpy.generic */
@@ -93,9 +93,9 @@ typedef struct {
     size_t n;
 } Table;
 
-static Table g_code_flags; /* (code, 0) -> v: frame is inside viproc/NumPy */
+static Table g_code_flags; /* (code, 0) -> v: frame is inside numpy2x/NumPy */
 static Table g_sites;      /* (code, lasti) -> p: interned site (per runtime) */
-static Table g_sigs;       /* (ufunc, nin|kinds) -> v: packed dtype codes or -1, p: vp_loop */
+static Table g_sigs;       /* (ufunc, nin|kinds) -> v: packed dtype codes or -1, p: nx_loop */
 
 static size_t t_slot(const Table* t, const void* a, long long b) {
     unsigned long long h = (unsigned long long)(uintptr_t)a * 0x9E3779B97F4A7C15ull ^
@@ -172,7 +172,7 @@ static void t_clear(Table* t) {
 typedef struct {
     PyObject* obj; /* NULL: empty */
     int code;
-    vp_array* a;
+    nx_array* a;
 } ScalarSlot;
 static ScalarSlot g_scalars[SCALAR_SLOTS];
 
@@ -180,7 +180,7 @@ static void scalars_clear(void) {
     for (size_t i = 0; i < SCALAR_SLOTS; ++i) {
         ScalarSlot* s = &g_scalars[i];
         if (s->obj != NULL) {
-            vp_array_release(s->a);
+            nx_array_release(s->a);
             Py_DECREF(s->obj);
             *s = (ScalarSlot){NULL, 0, NULL};
         }
@@ -192,7 +192,7 @@ static void scalars_clear(void) {
  * miss that replaces a slot hands its array over in *evicted (else NULL): an
  * earlier operand of the same op may still use it, so the caller releases it
  * after the op is issued. */
-static vp_array* scalar_operand(PyObject* x, int code, vp_array** evicted) {
+static nx_array* scalar_operand(PyObject* x, int code, nx_array** evicted) {
     *evicted = NULL;
     const unsigned long long h = (unsigned long long)(uintptr_t)x * 0x9E3779B97F4A7C15ull ^
                                  (unsigned long long)code * 0xC2B2AE3D27D4EB4Full;
@@ -200,8 +200,8 @@ static vp_array* scalar_operand(PyObject* x, int code, vp_array** evicted) {
     if (s->obj == x && s->code == code) {
         return s->a;
     }
-    vp_array* a = NULL;
-    if (vp_array_from_scalar(g_rt, x, (vp_dtype)code, &a) != VP_OK) {
+    nx_array* a = NULL;
+    if (nx_array_from_scalar(g_rt, x, (nx_dtype)code, &a) != NX_OK) {
         return NULL;
     }
     if (s->obj != NULL) {
@@ -215,10 +215,10 @@ static vp_array* scalar_operand(PyObject* x, int code, vp_array** evicted) {
 static PyObject* s_call = NULL; /* "__call__" */
 static PyObject* s_out = NULL;  /* "out" */
 
-/* --- _Array: base class of viproc.ndarray ---------------------------------- */
+/* --- _Array: base class of numpy2x.ndarray ---------------------------------- */
 
 typedef struct {
-    PyObject_HEAD vp_array* a;
+    PyObject_HEAD nx_array* a;
     int readonly;       /* writes take NumPy's path: WRITEABLE == False, or warn_on_write */
     int warn_on_write;  /* NumPy's WARN_ON_WRITE (broadcast_arrays): WRITEABLE, but NumPy warns
                            on the first write, so writes run eagerly in NumPy (readonly set) */
@@ -235,18 +235,18 @@ static void Array_dealloc(ArrayObject* self) {
         PyObject_ClearWeakRefs((PyObject*)self);
     }
     if (self->a != NULL) {
-        vp_array_release(self->a);
+        nx_array_release(self->a);
     }
     Py_XDECREF(self->base);
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
-/* New viproc.ndarray owning `a` (released on failure). */
-static PyObject* wrap_array(vp_array* a) {
+/* New numpy2x.ndarray owning `a` (released on failure). */
+static PyObject* wrap_array(nx_array* a) {
     PyTypeObject* cls = g_array_cls != NULL ? g_array_cls : &ArrayType;
     ArrayObject* o = (ArrayObject*)cls->tp_alloc(cls, 0);
     if (o == NULL) {
-        vp_array_release(a);
+        nx_array_release(a);
         return NULL;
     }
     o->a = a;
@@ -257,9 +257,9 @@ static int is_array(PyObject* o) {
     return Py_TYPE(o) == g_array_cls || PyObject_TypeCheck(o, &ArrayType);
 }
 
-static vp_array* array_of(PyObject* o) {
+static nx_array* array_of(PyObject* o) {
     if (!is_array(o)) {
-        PyErr_SetString(PyExc_TypeError, "expected a viproc array");
+        PyErr_SetString(PyExc_TypeError, "expected a numpy2x array");
         return NULL;
     }
     return ((ArrayObject*)o)->a;
@@ -275,24 +275,24 @@ static PyObject* dims_tuple(int n, const int64_t* d) {
 
 static PyObject* Array_get_shape(ArrayObject* self, void* c) {
     (void)c;
-    return dims_tuple(vp_array_ndim(self->a), vp_array_shape(self->a));
+    return dims_tuple(nx_array_ndim(self->a), nx_array_shape(self->a));
 }
 
 static PyObject* Array_get_strides(ArrayObject* self, void* c) {
     (void)c;
-    return dims_tuple(vp_array_ndim(self->a), vp_array_strides(self->a));
+    return dims_tuple(nx_array_ndim(self->a), nx_array_strides(self->a));
 }
 
 static PyObject* Array_get_ndim(ArrayObject* self, void* c) {
     (void)c;
-    return PyLong_FromLong(vp_array_ndim(self->a));
+    return PyLong_FromLong(nx_array_ndim(self->a));
 }
 
 static PyObject* Array_get_dtype(ArrayObject* self, void* c) {
     (void)c;
-    PyObject* d = g_dtypes[vp_array_dtype(self->a)];
+    PyObject* d = g_dtypes[nx_array_dtype(self->a)];
     if (d == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "viproc._viproc.setup() was not called");
+        PyErr_SetString(PyExc_RuntimeError, "numpy2x._numpy2x.setup() was not called");
         return NULL;
     }
     return Py_NewRef(d);
@@ -352,12 +352,12 @@ static int Array_set_warn_on_write(ArrayObject* self, PyObject* v, void* c) {
     return 0;
 }
 
-static int c_contiguous(const vp_array* a);
+static int c_contiguous(const nx_array* a);
 
 static PyObject* Array_get_size(ArrayObject* self, void* c) {
     (void)c;
-    const int nd = vp_array_ndim(self->a);
-    const int64_t* shape = vp_array_shape(self->a);
+    const int nd = nx_array_ndim(self->a);
+    const int64_t* shape = nx_array_shape(self->a);
     long long n = 1;
     for (int i = 0; i < nd; ++i) {
         n *= (long long)shape[i];
@@ -376,14 +376,14 @@ static PyObject* Array_get_base(ArrayObject* self, void* c) {
 }
 
 /* --- ndarray.flags --------------------------------------------------------
- * NumPy's flags object (flagsobject.c) ported, for a viproc array: the bits
+ * NumPy's flags object (flagsobject.c) ported, for a numpy2x array: the bits
  * are computed from the layout as NumPy computes them
  * (_UpdateContiguousFlags, IsAligned), no probe array. Like NumPy's, a new
  * object per access holding the flags of that moment; its setters call the
  * array's setflags(). */
 enum {
     FL_WARN_ON_WRITE = INT_MIN, /* NPY_ARRAY_WARN_ON_WRITE, bit 31 */
-    FL_C = 0x1, /* NumPy's NPY_ARRAY_* values: `num` is NumPy's */
+    FL_C = 0x1,                 /* NumPy's NPY_ARRAY_* values: `num` is NumPy's */
     FL_F = 0x2,
     FL_OWNDATA = 0x4,
     FL_ALIGNED = 0x100,
@@ -399,12 +399,12 @@ typedef struct {
 static PyTypeObject FlagsType; /* forward */
 
 /* F-contiguous (extent-1 dimensions may have any stride). */
-static int f_contiguous(const vp_array* a) {
-    const int nd = vp_array_ndim(a);
-    const int64_t* shape = vp_array_shape(a);
-    const int64_t* strides = vp_array_strides(a);
-    static const int64_t itemsizes[] = {1, 4, 8, 4, 8, 8, 16}; /* vp_dtype order */
-    int64_t step = itemsizes[vp_array_dtype(a)];
+static int f_contiguous(const nx_array* a) {
+    const int nd = nx_array_ndim(a);
+    const int64_t* shape = nx_array_shape(a);
+    const int64_t* strides = nx_array_strides(a);
+    static const int64_t itemsizes[] = {1, 4, 8, 4, 8, 8, 16}; /* nx_dtype order */
+    int64_t step = itemsizes[nx_array_dtype(a)];
     for (int i = 0; i < nd; ++i) {
         if (shape[i] == 0) {
             return 1;
@@ -421,15 +421,15 @@ static int f_contiguous(const vp_array* a) {
 
 /* NumPy's raw_array_is_aligned: the data address (storage aligned, plus the
  * offset) and the strides of extents > 1, as multiples of the alignment. */
-static int aligned(const vp_array* a) {
-    const int alignment = g_alignment[vp_array_dtype(a)];
+static int aligned(const nx_array* a) {
+    const int alignment = g_alignment[nx_array_dtype(a)];
     if (alignment <= 1) {
         return 1;
     }
-    const int nd = vp_array_ndim(a);
-    const int64_t* shape = vp_array_shape(a);
-    const int64_t* strides = vp_array_strides(a);
-    uint64_t check = (uint64_t)vp_array_offset(a);
+    const int nd = nx_array_ndim(a);
+    const int64_t* shape = nx_array_shape(a);
+    const int64_t* strides = nx_array_strides(a);
+    uint64_t check = (uint64_t)nx_array_offset(a);
     for (int i = 0; i < nd; ++i) {
         if (shape[i] > 1) {
             check |= (uint64_t)strides[i];
@@ -480,7 +480,7 @@ FLAGS_GET(writeable_no_warn, FL_WRITEABLE)
         if ((self->flags & FL_WARN_ON_WRITE) &&                                                    \
             PyErr_WarnEx(PyExc_FutureWarning,                                                      \
                          "future versions will not create a writeable array from "                 \
-                         "broadcast_array. Set the writable flag explicitly to avoid this "       \
+                         "broadcast_array. Set the writable flag explicitly to avoid this "        \
                          "warning.",                                                               \
                          1) < 0) {                                                                 \
             return NULL;                                                                           \
@@ -699,19 +699,19 @@ static PyMappingMethods Flags_as_mapping = {
 };
 
 static PyTypeObject FlagsType = {
-    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "viproc._viproc.flagsobj",
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "numpy2x._numpy2x.flagsobj",
     .tp_basicsize = sizeof(FlagsObject),
     .tp_dealloc = (destructor)Flags_dealloc,
     .tp_repr = (reprfunc)Flags_repr,
     .tp_str = (reprfunc)Flags_repr,
     .tp_as_mapping = &Flags_as_mapping,
     .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_doc = "ndarray.flags of a viproc array, as NumPy's flags object.",
+    .tp_doc = "ndarray.flags of a numpy2x array, as NumPy's flags object.",
     .tp_richcompare = Flags_richcompare,
     .tp_getset = Flags_getset,
 };
 
-/* a.setflags(write, align, uic): NumPy's array_setflags on the viproc
+/* a.setflags(write, align, uic): NumPy's array_setflags on the numpy2x
  * array's flags (readonly, unaligned), in NumPy's order and with its
  * messages; an error after a change restores the flags, as NumPy's does. */
 static PyObject* Array_setflags(ArrayObject* self, PyObject* args, PyObject* kwds) {
@@ -801,11 +801,11 @@ static int check_runtime(void);
 static int check_async_errors(void);
 static int code_is_internal(PyCodeObject* code);
 
-/* Arguments (viproc array, any object) of a METH_FASTCALL function; checks
+/* Arguments (numpy2x array, any object) of a METH_FASTCALL function; checks
  * the runtime too. 0 or -1 with an exception. */
 static int array_and_arg(PyObject* const* args, Py_ssize_t nargs) {
     if (nargs != 2 || !PyObject_TypeCheck(args[0], &ArrayType)) {
-        PyErr_SetString(PyExc_TypeError, "expected (viproc array, object)");
+        PyErr_SetString(PyExc_TypeError, "expected (numpy2x array, object)");
         return -1;
     }
     return check_runtime();
@@ -813,12 +813,12 @@ static int array_and_arg(PyObject* const* args, Py_ssize_t nargs) {
 
 static int check_runtime(void) {
     if (g_rt == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "viproc runtime is not initialized");
+        PyErr_SetString(PyExc_RuntimeError, "numpy2x runtime is not initialized");
         return -1;
     }
     if (PyThread_get_thread_ident() != g_main_thread) {
         PyErr_SetString(PyExc_RuntimeError,
-                        "viproc may only be used from the thread that initialized it");
+                        "numpy2x may only be used from the thread that initialized it");
         return -1;
     }
     return check_async_errors();
@@ -844,9 +844,9 @@ static void raise_async(const char* err) {
 
 /* --- floating-point errors (docs/design/error-handling.md, E8) -----------
  * NumPy's errstate lives in a context variable (numpy.ufunc.extobj, a new
- * capsule per errstate block). Every call into viproc compares it with the
+ * capsule per errstate block). Every call into numpy2x compares it with the
  * last one seen (one PyContextVar_Get); on a change its modes go to the
- * runtime (vp_set_fp_mode), which gives them to every op issued from then
+ * runtime (nx_set_fp_mode), which gives them to every op issued from then
  * on. Ops report FP errors under the mode of their issue: raise fails the
  * op (AsyncFloatingPointError), the other modes queue an event that the
  * Python reporter (_report_fp: NumPy's messages, warnings at the issue
@@ -880,7 +880,7 @@ static int fp_sync(void) {
         return -1;
     }
     Py_DECREF(mc);
-    vp_set_fp_mode(g_rt, mode, ctx);
+    nx_set_fp_mode(g_rt, mode, ctx);
     return 0;
 }
 
@@ -888,7 +888,7 @@ static int fp_sync(void) {
  * filter "error", an errcall raising). */
 static int report_fp_events(void) {
     PyObject* events = NULL;
-    const int n = vp_take_fp_events(g_rt, &events);
+    const int n = nx_take_fp_events(g_rt, &events);
     if (n < 0) {
         return -1;
     }
@@ -910,7 +910,7 @@ static int raise_pending_error(void) {
         return -1;
     }
     char err[ERRLEN] = "";
-    if (vp_take_error(g_rt, err, sizeof err) != VP_ERROR) {
+    if (nx_take_error(g_rt, err, sizeof err) != NX_ERROR) {
         return 0;
     }
     raise_async(err);
@@ -918,8 +918,8 @@ static int raise_pending_error(void) {
 }
 
 /* 1 if the running Python code is the user's: no frame, or the innermost one
- * outside viproc and NumPy. An asynchronous error is raised only there, never
- * inside viproc's or NumPy's own Python code, whose `except ValueError:`
+ * outside numpy2x and NumPy. An asynchronous error is raised only there, never
+ * inside numpy2x's or NumPy's own Python code, whose `except ValueError:`
  * blocks would swallow it. */
 static int in_user_code(void) {
     PyFrameObject* f = PyEval_GetFrame(); /* borrowed */
@@ -932,24 +932,24 @@ static int in_user_code(void) {
     return !internal;
 }
 
-/* At every call into viproc: one atomic load while no op failed. */
+/* At every call into numpy2x: one atomic load while no op failed. */
 static int check_async_errors(void) {
     if (fp_sync() < 0) {
         return -1;
     }
-    return vp_error_pending(g_rt) && in_user_code() ? raise_pending_error() : 0;
+    return nx_error_pending(g_rt) && in_user_code() ? raise_pending_error() : 0;
 }
 
 /* Raises a failed op's error in the main thread as soon as it is recorded,
  * wherever the program is (as Python raises KeyboardInterrupt): run by the
  * interpreter's eval loop (Py_AddPendingCall) in the main thread, with the
- * GIL. Inside viproc's or NumPy's own code it is scheduled again, so it
+ * GIL. Inside numpy2x's or NumPy's own code it is scheduled again, so it
  * surfaces in the user's code. Nothing is done if the error was raised
- * already (a sync point, wait_all, the next call into viproc). */
+ * already (a sync point, wait_all, the next call into numpy2x). */
 static int pending_raise(void* arg) {
     (void)arg;
-    if (g_rt == NULL || PyThread_get_thread_ident() != g_main_thread || !vp_error_pending(g_rt)) {
-        return 0; /* another thread uses viproc: the next call raises it */
+    if (g_rt == NULL || PyThread_get_thread_ident() != g_main_thread || !nx_error_pending(g_rt)) {
+        return 0; /* another thread uses numpy2x: the next call raises it */
     }
     if (!in_user_code()) {
         (void)Py_AddPendingCall(pending_raise, NULL); /* queue full: the next call */
@@ -958,7 +958,7 @@ static int pending_raise(void* arg) {
     return raise_pending_error();
 }
 
-/* vp_set_error_notify: on the failing thread, no GIL needed. */
+/* nx_set_error_notify: on the failing thread, no GIL needed. */
 static void error_recorded(void* arg) {
     (void)arg;
     (void)Py_AddPendingCall(pending_raise, NULL);
@@ -966,14 +966,14 @@ static void error_recorded(void* arg) {
 
 static int raise_status(int status, const char* err) {
     switch (status) {
-    case VP_OK:
+    case NX_OK:
         return 0;
-    case VP_PYERR:
+    case NX_PYERR:
         return -1;
-    case VP_UNSUPPORTED:
+    case NX_UNSUPPORTED:
         PyErr_SetString(PyExc_NotImplementedError, err);
         return -1;
-    case VP_INVALID:
+    case NX_INVALID:
         PyErr_SetString(PyExc_ValueError, err);
         return -1;
     default:
@@ -1005,7 +1005,7 @@ static int read_dims(PyObject* seq, int64_t* out) {
     return (int)n;
 }
 
-/* 1 if `code` belongs to viproc or NumPy (g_internal_dirs), cached per code
+/* 1 if `code` belongs to numpy2x or NumPy (g_internal_dirs), cached per code
  * object. */
 static int code_is_internal(PyCodeObject* code) {
     const Entry* flag = t_find(&g_code_flags, code, 0);
@@ -1029,8 +1029,8 @@ static int code_is_internal(PyCodeObject* code) {
     return is_internal;
 }
 
-/* Issue site: "file:line in function" of the first frame outside viproc and
- * NumPy, interned in the runtime (vp_intern) and cached per (code object,
+/* Issue site: "file:line in function" of the first frame outside numpy2x and
+ * NumPy, interned in the runtime (nx_intern) and cached per (code object,
  * bytecode offset). The offset, unlike the line number, is free to read: the
  * line is computed only on a cache miss. Never NULL. */
 static const char* issue_site(void) {
@@ -1052,7 +1052,7 @@ static const char* issue_site(void) {
                 Py_XDECREF(name);
                 Py_XDECREF(fn);
                 if (text != NULL) {
-                    site = vp_intern(g_rt, PyBytes_AS_STRING(text));
+                    site = nx_intern(g_rt, PyBytes_AS_STRING(text));
                     Py_DECREF(text);
                     if (t_put(&g_sites, code, lasti, 0, site, (PyObject*)code) < 0) {
                         PyErr_Clear();
@@ -1062,30 +1062,30 @@ static const char* issue_site(void) {
             }
             Py_DECREF(code);
             Py_DECREF(f);
-            return site != NULL ? site : vp_intern(g_rt, "<unknown>");
+            return site != NULL ? site : nx_intern(g_rt, "<unknown>");
         }
         Py_DECREF(code);
         PyFrameObject* back = PyFrame_GetBack(f); /* new ref */
         Py_DECREF(f);
         f = back;
     }
-    return vp_intern(g_rt, "<unknown>");
+    return nx_intern(g_rt, "<unknown>");
 }
 
 /* --- temporary elision (D5) ---------------------------------------------- */
 
 static unsigned long long g_elided = 0; /* ops that reused a temporary's buffer */
 
-#if defined(VP_ELIDE_BACKTRACE)
+#if defined(NX_ELIDE_BACKTRACE)
 /* Outputs smaller than this are not worth a backtrace (~1-2 us). NumPy uses
  * the same bound for its own elision. */
-#define VP_ELIDE_MIN_BYTES (256 * 1024)
+#define NX_ELIDE_MIN_BYTES (256 * 1024)
 
 enum { FRAME_OTHER = 0, FRAME_OURS, FRAME_PYTHON };
 
 /* Code address of a function (ISO C has no function -> object pointer cast). */
-typedef void (*vp_fn)(void);
-static void* code_address(vp_fn f) {
+typedef void (*nx_fn)(void);
+static void* code_address(nx_fn f) {
     void* p;
     memcpy(&p, &f, sizeof p);
     return p;
@@ -1126,8 +1126,8 @@ static int frame_class(void* addr) {
     static void* ours = NULL;
     static void* python = NULL;
     if (ours == NULL) {
-        ours = module_base(code_address((vp_fn)frame_class));
-        python = module_base(code_address((vp_fn)PyNumber_Add));
+        ours = module_base(code_address((nx_fn)frame_class));
+        python = module_base(code_address((nx_fn)PyNumber_Add));
     }
     const size_t slot = ((uintptr_t)addr >> 4) & 255;
     if (cache[slot].addr == addr) {
@@ -1224,7 +1224,7 @@ static PyNumberMethods probe_as_number = {
     .nb_matrix_multiply = probe_binary,
 };
 static PyTypeObject ProbeType = {
-    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "viproc._viproc._ElisionProbe",
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "numpy2x._numpy2x._ElisionProbe",
     .tp_basicsize = sizeof(PyObject),
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_as_number = &probe_as_number,
@@ -1383,11 +1383,11 @@ static PyObject* m_elision_chains(PyObject* self, PyObject* noargs) {
  * by the interpreter's value stack, so its buffer may take the result.
  * `nbytes` is the size of the buffer that would be reused. */
 static int is_temporary(PyObject* obj, size_t nbytes) {
-#if defined(VP_ELIDE_EXACT)
+#if defined(NX_ELIDE_EXACT)
     (void)nbytes;
     return PyUnstable_Object_IsUniqueReferencedTemporary(obj);
-#elif defined(VP_ELIDE_BACKTRACE)
-    return Py_REFCNT(obj) == 1 && nbytes >= VP_ELIDE_MIN_BYTES && called_from_interpreter();
+#elif defined(NX_ELIDE_BACKTRACE)
+    return Py_REFCNT(obj) == 1 && nbytes >= NX_ELIDE_MIN_BYTES && called_from_interpreter();
 #else
     (void)obj;
     (void)nbytes;
@@ -1396,12 +1396,12 @@ static int is_temporary(PyObject* obj, size_t nbytes) {
 }
 
 /* C-contiguous (extent-1 dimensions may have any stride). */
-static int c_contiguous(const vp_array* a) {
-    const int nd = vp_array_ndim(a);
-    const int64_t* shape = vp_array_shape(a);
-    const int64_t* strides = vp_array_strides(a);
-    static const int64_t itemsizes[] = {1, 4, 8, 4, 8, 8, 16}; /* vp_dtype order */
-    int64_t step = itemsizes[vp_array_dtype(a)];
+static int c_contiguous(const nx_array* a) {
+    const int nd = nx_array_ndim(a);
+    const int64_t* shape = nx_array_shape(a);
+    const int64_t* strides = nx_array_strides(a);
+    static const int64_t itemsizes[] = {1, 4, 8, 4, 8, 8, 16}; /* nx_dtype order */
+    int64_t step = itemsizes[nx_array_dtype(a)];
     for (int i = nd; i-- > 0;) {
         if (shape[i] == 0) {
             return 1;
@@ -1422,16 +1422,16 @@ static int c_contiguous(const vp_array* a) {
  * allocate its result in C order, the temporary's layout, and its iterator
  * calls the loop the same way with either output (strided or mixed-order
  * operands make the iteration depend on the output's layout). */
-static PyObject* elision_candidate(PyObject* const* inputs, vp_array* const* ins, Py_ssize_t n,
+static PyObject* elision_candidate(PyObject* const* inputs, nx_array* const* ins, Py_ssize_t n,
                                    int out_code, int ndim, const int64_t* shape) {
-#if defined(VP_ELIDE_BACKTRACE)
+#if defined(NX_ELIDE_BACKTRACE)
     /* Below the bound nothing is elided (is_temporary): skip the checks. */
-    static const int64_t itemsizes[] = {1, 4, 8, 4, 8, 8, 16}; /* vp_dtype order */
+    static const int64_t itemsizes[] = {1, 4, 8, 4, 8, 8, 16}; /* nx_dtype order */
     int64_t nbytes = itemsizes[out_code];
     for (int i = 0; i < ndim; ++i) {
         nbytes *= shape[i];
     }
-    if (nbytes < VP_ELIDE_MIN_BYTES) {
+    if (nbytes < NX_ELIDE_MIN_BYTES) {
         return NULL;
     }
 #endif
@@ -1442,11 +1442,11 @@ static PyObject* elision_candidate(PyObject* const* inputs, vp_array* const* ins
     }
     for (Py_ssize_t i = 0; i < n; ++i) {
         if (!is_array(inputs[i]) || ((ArrayObject*)inputs[i])->readonly ||
-            (int)vp_array_dtype(ins[i]) != out_code || vp_array_ndim(ins[i]) != ndim ||
-            memcmp(vp_array_shape(ins[i]), shape, (size_t)ndim * sizeof(int64_t)) != 0) {
+            (int)nx_array_dtype(ins[i]) != out_code || nx_array_ndim(ins[i]) != ndim ||
+            memcmp(nx_array_shape(ins[i]), shape, (size_t)ndim * sizeof(int64_t)) != 0) {
             continue;
         }
-        const size_t nbytes = vp_array_reusable_bytes(ins[i]);
+        const size_t nbytes = nx_array_reusable_bytes(ins[i]);
         if (nbytes != 0 && is_temporary(inputs[i], nbytes)) {
             return inputs[i];
         }
@@ -1456,7 +1456,7 @@ static PyObject* elision_candidate(PyObject* const* inputs, vp_array* const* ins
 
 /* --- scalar shortcut ------------------------------------------------------ */
 
-/* An op on scalars only (ready 0-d viproc arrays, Python and NumPy scalars)
+/* An op on scalars only (ready 0-d numpy2x arrays, Python and NumPy scalars)
  * has nothing to run asynchronously: NumPy computes it right here, on NumPy
  * scalars, as the NumPy program would (its 0-d values are NumPy scalars:
  * reductions and scalar indexing return them, and ufuncs on 0-d arrays do
@@ -1477,8 +1477,8 @@ static int scalars_of(PyObject* const* inputs, Py_ssize_t n, PyObject** out, Py_
     for (Py_ssize_t i = 0; i < n; ++i) {
         PyObject* x = inputs[i];
         if (is_array(x)) {
-            vp_array* a = ((ArrayObject*)x)->a;
-            if (vp_array_ndim(a) != 0 || !vp_array_ready(a)) {
+            nx_array* a = ((ArrayObject*)x)->a;
+            if (nx_array_ndim(a) != 0 || !nx_array_ready(a)) {
                 return 0;
             }
         } else if (!(PyFloat_CheckExact(x) || PyLong_CheckExact(x) || PyBool_Check(x) ||
@@ -1489,7 +1489,7 @@ static int scalars_of(PyObject* const* inputs, Py_ssize_t n, PyObject** out, Py_
     }
     for (Py_ssize_t i = 0; i < n; ++i) {
         PyObject* x = inputs[i];
-        out[i] = is_array(x) ? vp_array_scalar(((ArrayObject*)x)->a) : Py_NewRef(x);
+        out[i] = is_array(x) ? nx_array_scalar(((ArrayObject*)x)->a) : Py_NewRef(x);
         if (out[i] == NULL) {
             for (Py_ssize_t j = 0; j < i; ++j) {
                 Py_DECREF(out[j]);
@@ -1513,7 +1513,7 @@ static void release_all(PyObject** objs, Py_ssize_t n) {
 /* --- the ufunc fast path -------------------------------------------------- */
 
 /* Input kinds in the dtype-resolution cache key. Arrays and NumPy scalars use
- * their vp_dtype code (0..6): NumPy treats both as typed ("strong"). Python
+ * their nx_dtype code (0..6): NumPy treats both as typed ("strong"). Python
  * scalars are weak (NEP 50) and resolved by type, not value. */
 enum { K_PYBOOL = 10, K_PYINT = 11, K_PYFLOAT = 12, K_PYCOMPLEX = 13 };
 
@@ -1539,7 +1539,7 @@ static int dtype_code(PyObject* dtype) {
 /* Kind of an input, or -1 if the fast path cannot take it. */
 static int input_kind(PyObject* x) {
     if (is_array(x)) {
-        return (int)vp_array_dtype(((ArrayObject*)x)->a);
+        return (int)nx_array_dtype(((ArrayObject*)x)->a);
     }
     if (PyBool_Check(x)) {
         return K_PYBOOL;
@@ -1586,7 +1586,7 @@ static PyObject* kind_spec(int kind) {
  * (inputs, then the output; 8 bits each) or -1 if the fast path does not
  * handle the call, *loop NumPy's loop for them. Returns 0, or -1 on error. */
 static int resolve_slow(PyObject* ufunc, int nin, const int* kinds, long long* packed,
-                        const vp_loop** loop) {
+                        const nx_loop** loop) {
     *packed = -1;
     *loop = NULL;
     PyObject* a_nin = PyObject_GetAttrString(ufunc, "nin");
@@ -1622,7 +1622,7 @@ static int resolve_slow(PyObject* ufunc, int nin, const int* kinds, long long* p
     for (int i = 0; i <= nin && ok; ++i) {
         int c = dtype_code(PyTuple_GET_ITEM(res, i));
         /* Typed inputs of another dtype are cast as NumPy casts them
-         * (vp_ufunc_issue); every dtype must be a viproc dtype. */
+         * (nx_ufunc_issue); every dtype must be a numpy2x dtype. */
         ok = c >= 0;
         p |= (long long)c << (8 * i);
     }
@@ -1630,12 +1630,12 @@ static int resolve_slow(PyObject* ufunc, int nin, const int* kinds, long long* p
     if (!ok) {
         return 0;
     }
-    vp_dtype dts[MAXIN + 1];
+    nx_dtype dts[MAXIN + 1];
     for (int i = 0; i <= nin; ++i) {
-        dts[i] = (vp_dtype)((p >> (8 * i)) & 0xff);
+        dts[i] = (nx_dtype)((p >> (8 * i)) & 0xff);
     }
     char err[ERRLEN];
-    if (vp_ufunc_loop(g_rt, ufunc, nin, dts, loop, err, sizeof err) != VP_OK) {
+    if (nx_ufunc_loop(g_rt, ufunc, nin, dts, loop, err, sizeof err) != NX_OK) {
         *loop = NULL; /* no exact NumPy loop (or it needs the Python API) */
         return 0;
     }
@@ -1664,32 +1664,32 @@ static int broadcast_into(int64_t* shape, int* ndim, int nd, const int64_t* d) {
     return 0;
 }
 
-/* np.matmul(a, b) of two viproc arrays (vp_matmul). Returns 1 and sets
+/* np.matmul(a, b) of two numpy2x arrays (nx_matmul). Returns 1 and sets
  * *result (new reference), 0 if NumPy has to run it (fallback), -1 on a
  * Python error. A 0-d result (vector @ vector) is NumPy's scalar if it is
  * there already, else a pending 0-d array marked as a scalar. */
 static int fast_matmul(PyObject* ufunc, PyObject* a, PyObject* b, PyObject** result) {
-    vp_array* r = NULL;
+    nx_array* r = NULL;
     char err[ERRLEN] = "";
-    int st = vp_matmul(g_rt, ufunc, ((ArrayObject*)a)->a, ((ArrayObject*)b)->a, &r, issue_site(),
+    int st = nx_matmul(g_rt, ufunc, ((ArrayObject*)a)->a, ((ArrayObject*)b)->a, &r, issue_site(),
                        err, sizeof err);
-    if (st == VP_UNSUPPORTED) {
+    if (st == NX_UNSUPPORTED) {
         return 0;
     }
     if (raise_status(st, err) < 0) {
         return -1;
     }
-    if (vp_array_ndim(r) == 0 && vp_array_ready(r) &&
-        vp_array_wait(g_rt, r, err, sizeof err) == VP_OK) {
-        *result = vp_array_scalar(r);
-        vp_array_release(r);
+    if (nx_array_ndim(r) == 0 && nx_array_ready(r) &&
+        nx_array_wait(g_rt, r, err, sizeof err) == NX_OK) {
+        *result = nx_array_scalar(r);
+        nx_array_release(r);
         return *result != NULL ? 1 : -1;
     }
     *result = wrap_array(r);
     if (*result == NULL) {
         return -1;
     }
-    if (vp_array_ndim(r) == 0) {
+    if (nx_array_ndim(r) == 0) {
         ((ArrayObject*)*result)->scalar = 1;
     }
     return 1;
@@ -1697,7 +1697,7 @@ static int fast_matmul(PyObject* ufunc, PyObject* a, PyObject* b, PyObject** res
 
 /* Issues ufunc(*inputs, out=out) asynchronously. Returns 1 and sets *result
  * (new reference), 0 if the fast path does not handle the call, -1 on a
- * Python error. `out` is NULL or a viproc array. */
+ * Python error. `out` is NULL or a numpy2x array. */
 static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, PyObject* out,
                       int elide, PyObject** result) {
     if (g_rt == NULL || g_array_cls == NULL || n > MAXIN ||
@@ -1721,11 +1721,11 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
         key |= (long long)kinds[i] << (8 * i);
     }
     long long packed;
-    const vp_loop* loop = NULL;
+    const nx_loop* loop = NULL;
     const Entry* hit = t_find(&g_sigs, ufunc, key);
     if (hit != NULL) {
         packed = hit->v;
-        loop = (const vp_loop*)hit->p;
+        loop = (const nx_loop*)hit->p;
     } else {
         int r = resolve_slow(ufunc, (int)n, kinds, &packed, &loop);
         if (r < 0 || t_put(&g_sigs, ufunc, key, packed, loop, ufunc) < 0) {
@@ -1742,8 +1742,8 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
 
     /* Inputs as runtime arrays; scalars (cached) and NumPy arrays are
      * converted. */
-    vp_array* ins[MAXIN];
-    vp_array* evicted[MAXIN];
+    nx_array* ins[MAXIN];
+    nx_array* evicted[MAXIN];
     PyObject* keep[MAXIN];
     int nevicted = 0, nkeep = 0, status = 0;
     int64_t shape[MAXDIMS];
@@ -1769,14 +1769,14 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
         }
         /* Folds input i into the broadcast shape of inputs 0..i-1: after the
          * loop, shape/ndim is the output shape. */
-        if (broadcast_into(shape, &ndim, vp_array_ndim(ins[i]), vp_array_shape(ins[i])) < 0) {
+        if (broadcast_into(shape, &ndim, nx_array_ndim(ins[i]), nx_array_shape(ins[i])) < 0) {
             status = 1; /* not broadcastable: the fallback raises NumPy's error */
         }
     }
     if (status == 0 && out != NULL) {
-        vp_array* o = ((ArrayObject*)out)->a;
-        int same = vp_array_ndim(o) == ndim && (int)vp_array_dtype(o) == codes[n] &&
-                   memcmp(vp_array_shape(o), shape, (size_t)ndim * sizeof(int64_t)) == 0;
+        nx_array* o = ((ArrayObject*)out)->a;
+        int same = nx_array_ndim(o) == ndim && (int)nx_array_dtype(o) == codes[n] &&
+                   memcmp(nx_array_shape(o), shape, (size_t)ndim * sizeof(int64_t)) == 0;
         if (!same || ((ArrayObject*)out)->readonly) {
             status = 1; /* casting/broadcasting into out=, or read-only: NumPy decides */
         }
@@ -1791,23 +1791,23 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
     int handled = 0;
     if (status == 0) {
         char err[ERRLEN] = "";
-        vp_array* res = NULL;
-        int st = vp_ufunc_issue(g_rt, loop, ins, ndim, shape,
+        nx_array* res = NULL;
+        int st = nx_ufunc_issue(g_rt, loop, ins, ndim, shape,
                                 out != NULL ? ((ArrayObject*)out)->a : NULL, &res, issue_site(),
                                 err, sizeof err);
-        if (st == VP_OK) {
+        if (st == NX_OK) {
             *result = out != NULL ? Py_NewRef(out) : wrap_array(res);
             if (out == NULL && *result != NULL && ndim == 0) {
                 ((ArrayObject*)*result)->scalar = 1; /* NumPy returns a scalar */
             }
             handled = *result != NULL ? 1 : -1;
-        } else if (st != VP_UNSUPPORTED) {
+        } else if (st != NX_UNSUPPORTED) {
             raise_status(st, err);
             handled = -1;
         }
     }
     for (int i = 0; i < nevicted; ++i) {
-        vp_array_release(evicted[i]); /* an issued task keeps its data alive */
+        nx_array_release(evicted[i]); /* an issued task keeps its data alive */
     }
     for (int i = 0; i < nkeep; ++i) {
         Py_DECREF(keep[i]);
@@ -1895,7 +1895,7 @@ static PyObject* op_ufunc(const char* name) {
     }
     PyObject* u = g_ops != NULL ? PyDict_GetItemString(g_ops, name) : NULL;
     if (u == NULL) {
-        PyErr_Format(PyExc_RuntimeError, "viproc: ufunc for %s not registered", name);
+        PyErr_Format(PyExc_RuntimeError, "numpy2x: ufunc for %s not registered", name);
         return NULL;
     }
     if (g_op_cache_n < MAX_OPS) {
@@ -2153,9 +2153,9 @@ static PyMethodDef Array_methods[] = {
     {"swapaxes", (PyCFunction)(void (*)(void))Array_swapaxes, METH_FASTCALL | METH_KEYWORDS,
      "As NumPy's ndarray.swapaxes()."},
     {"sort", (PyCFunction)(void (*)(void))Array_sort, METH_FASTCALL | METH_KEYWORDS,
-     "As NumPy's ndarray.sort(): a task in C (vp_sort), else _sort_py."},
+     "As NumPy's ndarray.sort(): a task in C (nx_sort), else _sort_py."},
     {"argsort", (PyCFunction)(void (*)(void))Array_argsort, METH_FASTCALL | METH_KEYWORDS,
-     "As NumPy's ndarray.argsort(): a task in C (vp_sort), else np.argsort."},
+     "As NumPy's ndarray.argsort(): a task in C (nx_sort), else np.argsort."},
     {"setflags", (PyCFunction)(void (*)(void))Array_setflags, METH_VARARGS | METH_KEYWORDS,
      "As NumPy's ndarray.setflags() (no sync)."},
     {"resize", (PyCFunction)(void (*)(void))Array_resize, METH_VARARGS | METH_KEYWORDS,
@@ -2166,7 +2166,7 @@ static PyMethodDef Array_methods[] = {
 
 static PyObject* m_item(PyObject* self, PyObject* const* args, Py_ssize_t nargs);
 static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t nargs);
-static int basic_layout(vp_array* x, PyObject* key, int* out_nd, int64_t* nshape, int64_t* nstrides,
+static int basic_layout(nx_array* x, PyObject* key, int* out_nd, int64_t* nshape, int64_t* nstrides,
                         int64_t* out_offset);
 
 /* a[key]. In C for what runs once per op, without a Python frame: an
@@ -2185,7 +2185,7 @@ static PyObject* Array_subscript(PyObject* self, PyObject* key) {
         return NULL;
     }
     if (r != Py_None) {
-        if (vp_array_ndim(((ArrayObject*)r)->a) > 0) {
+        if (nx_array_ndim(((ArrayObject*)r)->a) > 0) {
             return r;
         }
         Py_ssize_t n = PyTuple_Check(key) ? PyTuple_GET_SIZE(key) : 1;
@@ -2198,15 +2198,15 @@ static PyObject* Array_subscript(PyObject* self, PyObject* key) {
     }
     Py_DECREF(r);
     if (g_getitem == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "viproc: setup() was not called");
+        PyErr_SetString(PyExc_RuntimeError, "numpy2x: setup() was not called");
         return NULL;
     }
     return PyObject_CallFunctionObjArgs(g_getitem, self, key, NULL);
 }
 
-static int64_t array_size(vp_array* a);
+static int64_t array_size(nx_array* a);
 
-/* Viproc arrays in an index key (the key or the items of a key tuple):
+/* Numpy2x arrays in an index key (the key or the items of a key tuple):
  * *found counts them, *pending those not ready. */
 static void key_arrays(PyObject* key, int* found, int* pending) {
     PyObject* const* items = PyTuple_Check(key) ? &PyTuple_GET_ITEM(key, 0) : &key;
@@ -2215,27 +2215,27 @@ static void key_arrays(PyObject* key, int* found, int* pending) {
     for (Py_ssize_t i = 0; i < n; ++i) {
         if (is_array(items[i])) {
             ++*found;
-            *pending += !vp_array_ready(((ArrayObject*)items[i])->a);
+            *pending += !nx_array_ready(((ArrayObject*)items[i])->a);
         }
     }
 }
 
-/* Ends a borrow (vp_array_borrow): a view NumPy kept a reference to becomes a
+/* Ends a borrow (nx_array_borrow): a view NumPy kept a reference to becomes a
  * read-only export. */
-static int end_borrow(vp_array* a, PyObject* view) {
+static int end_borrow(nx_array* a, PyObject* view) {
     int r = 0;
-    if (Py_REFCNT(view) > 1 && vp_array_pin(a, view) != VP_OK) {
+    if (Py_REFCNT(view) > 1 && nx_array_pin(a, view) != NX_OK) {
         r = -1;
     }
     Py_DECREF(view);
     return r;
 }
 
-/* The key with its (ready) viproc arrays replaced by borrowed NumPy views;
+/* The key with its (ready) numpy2x arrays replaced by borrowed NumPy views;
  * the views are appended to `borrowed` (pairs of array object and view). */
 static PyObject* borrow_key(PyObject* key, PyObject* borrowed) {
     if (is_array(key)) {
-        PyObject* v = vp_array_borrow(((ArrayObject*)key)->a);
+        PyObject* v = nx_array_borrow(((ArrayObject*)key)->a);
         if (v == NULL || PyList_Append(borrowed, key) < 0 || PyList_Append(borrowed, v) < 0) {
             Py_XDECREF(v);
             return NULL;
@@ -2259,19 +2259,19 @@ static PyObject* borrow_key(PyObject* key, PyObject* borrowed) {
 }
 
 /* a[key] = value by NumPy itself: its mapping slot (array_assign_subscript)
- * called on a borrowed, writable view of a's buffer, viproc arrays in the key
+ * called on a borrowed, writable view of a's buffer, numpy2x arrays in the key
  * and the value as borrowed views too. Only when NumPy may write the buffer
- * right now (vp_array_host_writable) and every viproc array involved is
+ * right now (nx_array_host_writable) and every numpy2x array involved is
  * ready: then no task touches the memory during the call, and the view never
  * reaches user code (design doc D7). Values, casts, errors: NumPy's. */
 static int numpy_setitem(PyObject* self, PyObject* key, PyObject* value, int nkey) {
-    vp_array* x = ((ArrayObject*)self)->a;
+    nx_array* x = ((ArrayObject*)self)->a;
     PyObject* borrowed = PyList_New(0);
-    PyObject* view = borrowed != NULL ? vp_array_borrow(x) : NULL;
+    PyObject* view = borrowed != NULL ? nx_array_borrow(x) : NULL;
     PyObject* k = view == NULL ? NULL : nkey ? borrow_key(key, borrowed) : Py_NewRef(key);
     PyObject* v = NULL;
     if (k != NULL) {
-        v = is_array(value) ? vp_array_borrow(((ArrayObject*)value)->a) : Py_NewRef(value);
+        v = is_array(value) ? nx_array_borrow(((ArrayObject*)value)->a) : Py_NewRef(value);
     }
     int r = -1;
     if (v != NULL) {
@@ -2286,7 +2286,7 @@ static int numpy_setitem(PyObject* self, PyObject* key, PyObject* value, int nke
     for (Py_ssize_t i = 0; borrowed != NULL && i + 1 < PyList_GET_SIZE(borrowed); i += 2) {
         PyObject* bv = PyList_GET_ITEM(borrowed, i + 1); /* the list's reference only */
         if (Py_REFCNT(bv) > 1 &&
-            vp_array_pin(((ArrayObject*)PyList_GET_ITEM(borrowed, i))->a, bv) != VP_OK) {
+            nx_array_pin(((ArrayObject*)PyList_GET_ITEM(borrowed, i))->a, bv) != NX_OK) {
             r = -1;
         }
     }
@@ -2306,7 +2306,7 @@ static int is_scalar_value(PyObject* v) {
 
 static int call_setitem_hook(PyObject* self, PyObject* key, PyObject* value) {
     if (g_setitem == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "viproc: setup() was not called");
+        PyErr_SetString(PyExc_RuntimeError, "numpy2x: setup() was not called");
         return -1;
     }
     PyObject* r = PyObject_CallFunctionObjArgs(g_setitem, self, key, value, NULL);
@@ -2336,12 +2336,12 @@ static int Array_ass_subscript(PyObject* self, PyObject* key, PyObject* value) {
         PyErr_SetString(PyExc_ValueError, "assignment destination is read-only");
         return -1;
     }
-    vp_array* x = ((ArrayObject*)self)->a;
+    nx_array* x = ((ArrayObject*)self)->a;
     int nkey, kpending;
     key_arrays(key, &nkey, &kpending);
     const int val_array = is_array(value);
-    const int all_ready = !kpending && (!val_array || vp_array_ready(((ArrayObject*)value)->a));
-    const int writable = all_ready && vp_array_host_writable(x);
+    const int all_ready = !kpending && (!val_array || nx_array_ready(((ArrayObject*)value)->a));
+    const int writable = all_ready && nx_array_host_writable(x);
     if (writable && array_size(x) <= g_small) {
         return numpy_setitem(self, key, value, nkey);
     }
@@ -2362,10 +2362,10 @@ static int Array_ass_subscript(PyObject* self, PyObject* key, PyObject* value) {
     }
     PyObject* src = NULL;
     if (val_array) {
-        src = Py_NewRef(value); /* another dtype: vp_assign casts */
+        src = Py_NewRef(value); /* another dtype: nx_assign casts */
     } else if (is_scalar_value(value)) {
-        vp_array* s = NULL;
-        if (vp_array_from_item(g_rt, value, vp_array_dtype(x), &s) != VP_OK) {
+        nx_array* s = NULL;
+        if (nx_array_from_item(g_rt, value, nx_array_dtype(x), &s) != NX_OK) {
             return -1; /* NumPy's conversion error, as a[i] = value raises it */
         }
         src = wrap_array(s);
@@ -2373,15 +2373,15 @@ static int Array_ass_subscript(PyObject* self, PyObject* key, PyObject* value) {
     if (src == NULL) {
         return PyErr_Occurred() ? -1 : call_setitem_hook(self, key, value);
     }
-    vp_array* t = vp_array_view(g_rt, x, vp_array_dtype(x), vnd, vshape, vstrides, voffset);
+    nx_array* t = nx_array_view(g_rt, x, nx_array_dtype(x), vnd, vshape, vstrides, voffset);
     char err[ERRLEN] = "";
-    const int status = vp_assign(g_rt, t, ((ArrayObject*)src)->a, issue_site(), err, sizeof err);
-    vp_array_release(t);
+    const int status = nx_assign(g_rt, t, ((ArrayObject*)src)->a, issue_site(), err, sizeof err);
+    nx_array_release(t);
     Py_DECREF(src);
-    if (status == VP_OK) {
+    if (status == NX_OK) {
         return 0;
     }
-    if (status == VP_INVALID || status == VP_UNSUPPORTED) {
+    if (status == NX_INVALID || status == NX_UNSUPPORTED) {
         return call_setitem_hook(self, key, value); /* NumPy's error or cast */
     }
     return raise_status(status, err);
@@ -2393,7 +2393,7 @@ static PyMappingMethods Array_as_mapping = {
 };
 
 static PyTypeObject ArrayType = {
-    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "viproc._viproc._Array",
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "numpy2x._numpy2x._Array",
     .tp_basicsize = sizeof(ArrayObject),
     .tp_dealloc = (destructor)Array_dealloc,
     .tp_as_number = &Array_as_number,
@@ -2401,7 +2401,7 @@ static PyTypeObject ArrayType = {
     .tp_richcompare = Array_richcompare,
     .tp_weaklistoffset = offsetof(ArrayObject, weakrefs),
     .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
-    .tp_doc = "Base class of viproc.ndarray: owns one runtime array.",
+    .tp_doc = "Base class of numpy2x.ndarray: owns one runtime array.",
     .tp_methods = Array_methods,
     .tp_getset = Array_getset,
     /* no tp_new: instances are only created by this module */
@@ -2467,21 +2467,21 @@ static PyObject* m_init(PyObject* self, PyObject* args) {
         return NULL;
     }
     if (g_rt != NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "viproc runtime already initialized");
+        PyErr_SetString(PyExc_RuntimeError, "numpy2x runtime already initialized");
         return NULL;
     }
     char err[ERRLEN] = "";
     Py_CLEAR(g_extobj_last); /* the new runtime gets the errstate on the next call */
-    g_rt = vp_runtime_create((size_t)max_active, err, sizeof err);
+    g_rt = nx_runtime_create((size_t)max_active, err, sizeof err);
     if (g_rt == NULL) {
         PyErr_SetString(PyExc_RuntimeError, err);
         return NULL;
     }
     g_main_thread = PyThread_get_thread_ident();
-    vp_set_error_notify(g_rt, error_recorded, NULL);
+    nx_set_error_notify(g_rt, error_recorded, NULL);
     g_small = sync_below >= 0 ? sync_below : 2048;
     if (sync_below >= 0 || !adaptive) {
-        vp_set_offload_policy(g_rt, sync_below >= 0 ? sync_below : 2048, adaptive);
+        nx_set_offload_policy(g_rt, sync_below >= 0 ? sync_below : 2048, adaptive);
     }
     Py_RETURN_NONE;
 }
@@ -2493,19 +2493,19 @@ static PyObject* m_offload_counts(PyObject* self, PyObject* noargs) {
         return NULL;
     }
     uint64_t inl = 0, off = 0;
-    vp_offload_counts(g_rt, &inl, &off);
+    nx_offload_counts(g_rt, &inl, &off);
     return Py_BuildValue(
         "{s:K,s:K,s:K,s:K,s:K,s:K}", "inline", (unsigned long long)inl, "offloaded",
-        (unsigned long long)off, "direct", (unsigned long long)vp_direct_count(g_rt), "tasks",
-        (unsigned long long)vp_task_count(g_rt), "syncs", (unsigned long long)vp_sync_count(g_rt),
-        "wakes", (unsigned long long)vp_wake_count(g_rt));
+        (unsigned long long)off, "direct", (unsigned long long)nx_direct_count(g_rt), "tasks",
+        (unsigned long long)nx_task_count(g_rt), "syncs", (unsigned long long)nx_sync_count(g_rt),
+        "wakes", (unsigned long long)nx_wake_count(g_rt));
 }
 
 static PyObject* m_pool_stats(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
-    vp_pool_stats s;
-    vp_pool_get_stats(&s);
+    nx_pool_stats s;
+    nx_pool_get_stats(&s);
     return Py_BuildValue("{s:K,s:K,s:K,s:K,s:K}", "hits", (unsigned long long)s.hits, "misses",
                          (unsigned long long)s.misses, "cached", (unsigned long long)s.cached,
                          "dropped", (unsigned long long)s.dropped, "limit",
@@ -2515,7 +2515,7 @@ static PyObject* m_pool_stats(PyObject* self, PyObject* noargs) {
 static PyObject* m_pool_trim(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
-    vp_pool_trim();
+    nx_pool_trim();
     Py_RETURN_NONE;
 }
 
@@ -2525,16 +2525,16 @@ static PyObject* m_pool_set_limit(PyObject* self, PyObject* arg) {
     if (v == (unsigned long long)-1 && PyErr_Occurred()) {
         return NULL;
     }
-    vp_pool_set_limit(v);
+    nx_pool_set_limit(v);
     Py_RETURN_NONE;
 }
 
 static PyObject* m_elision_mode(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
-#if defined(VP_ELIDE_EXACT)
+#if defined(NX_ELIDE_EXACT)
     return PyUnicode_FromString("exact");
-#elif defined(VP_ELIDE_BACKTRACE)
+#elif defined(NX_ELIDE_BACKTRACE)
     return PyUnicode_FromString("backtrace");
 #else
     return PyUnicode_FromString("off");
@@ -2554,16 +2554,16 @@ static PyObject* m_shutdown(PyObject* self, PyObject* noargs) {
         /* An error nothing reported yet is raised here, after the runtime is
          * gone (at exit, Python prints it: "Exception ignored in atexit"). */
         Py_BEGIN_ALLOW_THREADS;
-        vp_wait_all(g_rt);
+        nx_wait_all(g_rt);
         Py_END_ALLOW_THREADS;
         char err[ERRLEN] = "";
-        const int failed = vp_take_error(g_rt, err, sizeof err) == VP_ERROR;
-        vp_runtime* rt = g_rt;
+        const int failed = nx_take_error(g_rt, err, sizeof err) == NX_ERROR;
+        nx_runtime* rt = g_rt;
         g_rt = NULL;
         t_clear(&g_sites); /* interned in the runtime being destroyed */
         t_clear(&g_sigs);  /* holds its loop handles */
         scalars_clear();   /* arrays of the runtime being destroyed */
-        vp_runtime_destroy(rt);
+        nx_runtime_destroy(rt);
         if (failed) {
             raise_async(err);
             return NULL;
@@ -2584,13 +2584,13 @@ static PyObject* m_workers(PyObject* self, PyObject* noargs) {
     if (check_runtime() < 0) {
         return NULL;
     }
-    return PyLong_FromSize_t(vp_worker_count(g_rt));
+    return PyLong_FromSize_t(nx_worker_count(g_rt));
 }
 
 static PyObject* m_physical_cores(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
-    return PyLong_FromSize_t(vp_physical_core_count());
+    return PyLong_FromSize_t(nx_physical_core_count());
 }
 
 static PyObject* m_direct_budget_ns(PyObject* self, PyObject* noargs) {
@@ -2599,7 +2599,7 @@ static PyObject* m_direct_budget_ns(PyObject* self, PyObject* noargs) {
     if (check_runtime() < 0) {
         return NULL;
     }
-    return PyFloat_FromDouble(vp_direct_budget_ns(g_rt));
+    return PyFloat_FromDouble(nx_direct_budget_ns(g_rt));
 }
 
 static PyObject* m_set_offload_policy(PyObject* self, PyObject* args) {
@@ -2612,7 +2612,7 @@ static PyObject* m_set_offload_policy(PyObject* self, PyObject* args) {
     if (check_runtime() < 0) {
         return NULL;
     }
-    vp_set_offload_policy(g_rt, sync_below, adaptive);
+    nx_set_offload_policy(g_rt, sync_below, adaptive);
     Py_RETURN_NONE;
 }
 
@@ -2625,7 +2625,7 @@ static PyObject* m_set_direct_budget_ns(PyObject* self, PyObject* arg) {
     if (check_runtime() < 0) {
         return NULL;
     }
-    vp_set_direct_budget_ns(g_rt, ns);
+    nx_set_direct_budget_ns(g_rt, ns);
     Py_RETURN_NONE;
 }
 
@@ -2638,7 +2638,7 @@ static PyObject* m_set_chain_ns(PyObject* self, PyObject* arg) {
     if (check_runtime() < 0) {
         return NULL;
     }
-    vp_set_chain_ns(g_rt, ns);
+    nx_set_chain_ns(g_rt, ns);
     Py_RETURN_NONE;
 }
 
@@ -2648,7 +2648,7 @@ static PyObject* m_active_tasks(PyObject* self, PyObject* noargs) {
     if (check_runtime() < 0) {
         return NULL;
     }
-    return PyLong_FromSize_t(vp_active_tasks(g_rt));
+    return PyLong_FromSize_t(nx_active_tasks(g_rt));
 }
 
 static PyObject* m_wait_all(PyObject* self, PyObject* noargs) {
@@ -2658,7 +2658,7 @@ static PyObject* m_wait_all(PyObject* self, PyObject* noargs) {
         return NULL;
     }
     Py_BEGIN_ALLOW_THREADS;
-    vp_wait_all(g_rt);
+    nx_wait_all(g_rt);
     Py_END_ALLOW_THREADS;
     if (raise_pending_error() < 0) {
         return NULL;
@@ -2672,8 +2672,8 @@ static PyObject* m_from_ndarray(PyObject* self, PyObject* arr) {
         return NULL;
     }
     char err[ERRLEN] = "";
-    vp_array* a = NULL;
-    if (raise_status(vp_array_from_ndarray(g_rt, arr, &a, err, sizeof err), err) < 0) {
+    nx_array* a = NULL;
+    if (raise_status(nx_array_from_ndarray(g_rt, arr, &a, err, sizeof err), err) < 0) {
         return NULL;
     }
     return wrap_array(a);
@@ -2697,9 +2697,9 @@ static PyObject* set_base(PyObject* v, PyObject* a) {
 
 /* A view of `a` with this layout (offset relative to a's first element),
  * read-only if `a` is; new reference or NULL. */
-static PyObject* make_view(PyObject* a, vp_dtype dtype, int nd, const int64_t* shape,
+static PyObject* make_view(PyObject* a, nx_dtype dtype, int nd, const int64_t* shape,
                            const int64_t* strides, int64_t offset, int readonly) {
-    PyObject* v = wrap_array(vp_array_view(g_rt, array_of(a), dtype, nd, shape, strides, offset));
+    PyObject* v = wrap_array(nx_array_view(g_rt, array_of(a), dtype, nd, shape, strides, offset));
     if (v != NULL) {
         ((ArrayObject*)v)->readonly = ((ArrayObject*)a)->readonly || readonly;
         ((ArrayObject*)v)->warn_on_write = !readonly && ((ArrayObject*)a)->warn_on_write;
@@ -2714,11 +2714,11 @@ static PyObject* make_view(PyObject* a, vp_dtype dtype, int nd, const int64_t* s
  * first element): 1, or 0 for any other key and for errors, which the
  * caller leaves to NumPy's messages (no Python error set). An all-int key
  * gives a 0-d view. */
-static int basic_layout(vp_array* x, PyObject* key, int* out_nd, int64_t* nshape, int64_t* nstrides,
+static int basic_layout(nx_array* x, PyObject* key, int* out_nd, int64_t* nshape, int64_t* nstrides,
                         int64_t* out_offset) {
-    const int nd = vp_array_ndim(x);
-    const int64_t* shape = vp_array_shape(x);
-    const int64_t* strides = vp_array_strides(x);
+    const int nd = nx_array_ndim(x);
+    const int64_t* shape = nx_array_shape(x);
+    const int64_t* strides = nx_array_strides(x);
     PyObject* const* items = PyTuple_Check(key) ? &PyTuple_GET_ITEM(key, 0) : &key;
     const Py_ssize_t n = PyTuple_Check(key) ? PyTuple_GET_SIZE(key) : 1;
     /* Count the dimensions the key consumes. */
@@ -2807,13 +2807,13 @@ static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t 
         return NULL;
     }
     PyObject *a = args[0], *key = args[1];
-    vp_array* x = array_of(a);
+    nx_array* x = array_of(a);
     int64_t nshape[MAXDIMS], nstrides[MAXDIMS], offset = 0;
     int newnd = 0;
     if (!basic_layout(x, key, &newnd, nshape, nstrides, &offset)) {
         Py_RETURN_NONE;
     }
-    return make_view(a, vp_array_dtype(x), newnd, nshape, nstrides, offset, 0);
+    return make_view(a, nx_array_dtype(x), newnd, nshape, nstrides, offset, 0);
 }
 
 /* a.transpose(axes) (axes: None or a permutation, negative axes allowed) as
@@ -2824,10 +2824,10 @@ static PyObject* m_transpose(PyObject* self, PyObject* const* args, Py_ssize_t n
         return NULL;
     }
     PyObject *a = args[0], *axes = args[1];
-    vp_array* x = array_of(a);
-    const int nd = vp_array_ndim(x);
-    const int64_t* shape = vp_array_shape(x);
-    const int64_t* strides = vp_array_strides(x);
+    nx_array* x = array_of(a);
+    const int nd = nx_array_ndim(x);
+    const int64_t* shape = nx_array_shape(x);
+    const int64_t* strides = nx_array_strides(x);
     int64_t perm[MAXDIMS];
     if (axes == Py_None) {
         for (int i = 0; i < nd; ++i) {
@@ -2857,17 +2857,17 @@ static PyObject* m_transpose(PyObject* self, PyObject* const* args, Py_ssize_t n
         nshape[i] = shape[perm[i]];
         nstrides[i] = strides[perm[i]];
     }
-    return make_view(a, vp_array_dtype(x), nd, nshape, nstrides, 0, 0);
+    return make_view(a, nx_array_dtype(x), nd, nshape, nstrides, 0, 0);
 }
 
 /* reshape(a, shape, order): NumPy's a.reshape(shape, order=order) ('C',
  * 'F' or 'A') as a view, None if NumPy would copy. One -1 is resolved and
  * size mismatches raise as in NumPy (_fix_unknown_dimension). */
 static PyObject* reshape_view(PyObject* a, int64_t* dims, int nd, int order) {
-    vp_array* x = array_of(a);
+    nx_array* x = array_of(a);
     int64_t size = 1;
-    for (int i = 0; i < vp_array_ndim(x); ++i) {
-        size *= vp_array_shape(x)[i];
+    for (int i = 0; i < nx_array_ndim(x); ++i) {
+        size *= nx_array_shape(x)[i];
     }
     int unknown = -1;
     int64_t known = 1;
@@ -2912,11 +2912,11 @@ static PyObject* reshape_view(PyObject* a, int64_t* dims, int nd, int order) {
         return NULL;
     }
     if (order == 'A') { /* F if the array is F- and not C-contiguous */
-        const int64_t* shape = vp_array_shape(x);
-        const int64_t* strides = vp_array_strides(x);
-        const int n = vp_array_ndim(x);
-        static const int64_t itemsizes[] = {1, 4, 8, 4, 8, 8, 16}; /* vp_dtype order */
-        int64_t step = itemsizes[vp_array_dtype(x)];
+        const int64_t* shape = nx_array_shape(x);
+        const int64_t* strides = nx_array_strides(x);
+        const int n = nx_array_ndim(x);
+        static const int64_t itemsizes[] = {1, 4, 8, 4, 8, 8, 16}; /* nx_dtype order */
+        int64_t step = itemsizes[nx_array_dtype(x)];
         int f = 1;
         for (int i = 0; i < n && f; ++i) {
             if (shape[i] == 0) {
@@ -2932,7 +2932,7 @@ static PyObject* reshape_view(PyObject* a, int64_t* dims, int nd, int order) {
     if (order != 'C' && order != 'F') {
         Py_RETURN_NONE;
     }
-    vp_array* r = vp_array_reshape(g_rt, x, nd, dims, (char)order);
+    nx_array* r = nx_array_reshape(g_rt, x, nd, dims, (char)order);
     if (r == NULL) {
         Py_RETURN_NONE;
     }
@@ -2946,7 +2946,7 @@ static PyObject* reshape_view(PyObject* a, int64_t* dims, int nd, int order) {
 
 /* own(v): v with its base cleared, for a view of a copy only v references.
  * NumPy's ravel/flatten copy straight into a new array owning its data
- * (base None, OWNDATA). viproc has no copy into another shape, so it copies
+ * (base None, OWNDATA). numpy2x has no copy into another shape, so it copies
  * first (astype, order C) and views the copy (reshape(-1)), which gives the
  * view base = the temporary copy; own() makes it the owner NumPy returns.
  * Safe: the view holds its memory through its alias group in the runtime,
@@ -2985,10 +2985,10 @@ static PyObject* Array_resize(PyObject* self, PyObject* args, PyObject* kwds) {
     }
     if (!is_array(r)) {
         Py_DECREF(r);
-        PyErr_SetString(PyExc_SystemError, "_resize_py must return a viproc array or None");
+        PyErr_SetString(PyExc_SystemError, "_resize_py must return a numpy2x array or None");
         return NULL;
     }
-    vp_array* old = ((ArrayObject*)self)->a;
+    nx_array* old = ((ArrayObject*)self)->a;
     ((ArrayObject*)self)->a = ((ArrayObject*)r)->a;
     ((ArrayObject*)r)->a = old; /* released with r */
     Py_DECREF(r);
@@ -3070,20 +3070,20 @@ static PyObject* Array_swapaxes(PyObject* self, PyObject* const* args, Py_ssize_
     int64_t ij[2];
     if (Py_TYPE(self) == g_array_cls && kwnames == NULL && nargs == 2 && exact_dims(args, 2, ij) &&
         check_runtime() == 0) {
-        vp_array* x = array_of(self);
-        const int nd = vp_array_ndim(x);
+        nx_array* x = array_of(self);
+        const int nd = nx_array_ndim(x);
         int64_t i = ij[0] < 0 ? ij[0] + nd : ij[0], j = ij[1] < 0 ? ij[1] + nd : ij[1];
         if (i >= 0 && i < nd && j >= 0 && j < nd) {
             int64_t shape[MAXDIMS], strides[MAXDIMS];
-            memcpy(shape, vp_array_shape(x), (size_t)nd * sizeof(int64_t));
-            memcpy(strides, vp_array_strides(x), (size_t)nd * sizeof(int64_t));
+            memcpy(shape, nx_array_shape(x), (size_t)nd * sizeof(int64_t));
+            memcpy(strides, nx_array_strides(x), (size_t)nd * sizeof(int64_t));
             int64_t t = shape[i];
             shape[i] = shape[j];
             shape[j] = t;
             t = strides[i];
             strides[i] = strides[j];
             strides[j] = t;
-            return make_view(self, vp_array_dtype(x), nd, shape, strides, 0, 0);
+            return make_view(self, nx_array_dtype(x), nd, shape, strides, 0, 0);
         }
     } else if (PyErr_Occurred()) {
         return NULL;
@@ -3111,10 +3111,10 @@ static PyObject* m_broadcast_to(PyObject* self, PyObject* args) {
     if (!PyArg_ParseTuple(args, "O!O", &ArrayType, &a, &shape_o) || check_runtime() < 0) {
         return NULL;
     }
-    vp_array* x = array_of(a);
+    nx_array* x = array_of(a);
     int64_t dims[MAXDIMS], st[MAXDIMS];
     const int nd = read_dims(shape_o, dims);
-    const int ond = vp_array_ndim(x);
+    const int ond = nx_array_ndim(x);
     if (nd < 0) {
         PyErr_Clear();
         Py_RETURN_NONE;
@@ -3129,15 +3129,15 @@ static PyObject* m_broadcast_to(PyObject* self, PyObject* args) {
         }
         if (j < 0) {
             st[i] = 0;
-        } else if (vp_array_shape(x)[j] == dims[i]) {
-            st[i] = dims[i] == 1 ? 0 : vp_array_strides(x)[j]; /* nditer: 0 for extent 1 */
-        } else if (vp_array_shape(x)[j] == 1) {
+        } else if (nx_array_shape(x)[j] == dims[i]) {
+            st[i] = dims[i] == 1 ? 0 : nx_array_strides(x)[j]; /* nditer: 0 for extent 1 */
+        } else if (nx_array_shape(x)[j] == 1) {
             st[i] = 0;
         } else {
             Py_RETURN_NONE;
         }
     }
-    return make_view(a, vp_array_dtype(x), nd, dims, st, 0, 1);
+    return make_view(a, nx_array_dtype(x), nd, dims, st, 0, 1);
 }
 
 static PyObject* m_view(PyObject* self, PyObject* args) {
@@ -3151,7 +3151,7 @@ static PyObject* m_view(PyObject* self, PyObject* args) {
         return NULL;
     }
     if (code < 0) {
-        code = (int)vp_array_dtype(array_of(base));
+        code = (int)nx_array_dtype(array_of(base));
     }
     int64_t shape[MAXDIMS], strides[MAXDIMS];
     int nd = read_dims(shape_o, shape);
@@ -3162,7 +3162,7 @@ static PyObject* m_view(PyObject* self, PyObject* args) {
         return NULL;
     }
     PyObject* v =
-        wrap_array(vp_array_view(g_rt, array_of(base), (vp_dtype)code, nd, shape, strides, offset));
+        wrap_array(nx_array_view(g_rt, array_of(base), (nx_dtype)code, nd, shape, strides, offset));
     if (v != NULL) {
         ((ArrayObject*)v)->readonly = ((ArrayObject*)base)->readonly; /* as NumPy views */
         ((ArrayObject*)v)->warn_on_write = ((ArrayObject*)base)->warn_on_write;
@@ -3174,19 +3174,19 @@ static PyObject* m_scalar(PyObject* self, PyObject* a) {
     (void)self;
     if (!PyObject_TypeCheck(a, &ArrayType) || check_runtime() < 0) {
         if (!PyErr_Occurred()) {
-            PyErr_SetString(PyExc_TypeError, "scalar: a viproc array expected");
+            PyErr_SetString(PyExc_TypeError, "scalar: a numpy2x array expected");
         }
         return NULL;
     }
-    vp_array* x = array_of(a);
-    if (!vp_array_ready(x)) {
+    nx_array* x = array_of(a);
+    if (!nx_array_ready(x)) {
         Py_RETURN_NONE;
     }
     char err[ERRLEN] = "";
-    if (raise_status(vp_array_wait(g_rt, x, err, sizeof err), err) < 0) {
+    if (raise_status(nx_array_wait(g_rt, x, err, sizeof err), err) < 0) {
         return NULL; /* the producer failed */
     }
-    return vp_array_scalar(x);
+    return nx_array_scalar(x);
 }
 
 /* item(a, key): for an integer key (an int, or a tuple of one int per
@@ -3198,14 +3198,14 @@ static PyObject* m_item(PyObject* self, PyObject* const* args, Py_ssize_t nargs)
         return NULL;
     }
     PyObject *a = args[0], *key = args[1];
-    vp_array* x = array_of(a);
-    const int nd = vp_array_ndim(x);
+    nx_array* x = array_of(a);
+    const int nd = nx_array_ndim(x);
     const Py_ssize_t nk = PyTuple_Check(key) ? PyTuple_GET_SIZE(key) : 1;
-    if (nk != nd || nd == 0 || !vp_array_ready(x)) {
+    if (nk != nd || nd == 0 || !nx_array_ready(x)) {
         Py_RETURN_NONE;
     }
-    const int64_t* shape = vp_array_shape(x);
-    const int64_t* strides = vp_array_strides(x);
+    const int64_t* shape = nx_array_shape(x);
+    const int64_t* strides = nx_array_strides(x);
     int64_t offset = 0;
     for (int i = 0; i < nd; ++i) {
         PyObject* k = PyTuple_Check(key) ? PyTuple_GET_ITEM(key, i) : key;
@@ -3226,19 +3226,19 @@ static PyObject* m_item(PyObject* self, PyObject* const* args, Py_ssize_t nargs)
         offset += (v < 0 ? v + shape[i] : v) * strides[i];
     }
     int64_t zero = 0;
-    vp_array* e = vp_array_view(g_rt, x, vp_array_dtype(x), 0, &zero, &zero, offset);
-    PyObject* r = vp_array_scalar(e);
-    vp_array_release(e);
+    nx_array* e = nx_array_view(g_rt, x, nx_array_dtype(x), 0, &zero, &zero, offset);
+    PyObject* r = nx_array_scalar(e);
+    nx_array_release(e);
     return r;
 }
 
 static PyObject* m_ready(PyObject* self, PyObject* o) {
     (void)self;
-    vp_array* a = array_of(o);
+    nx_array* a = array_of(o);
     if (a == NULL || check_runtime() < 0) {
         return NULL;
     }
-    return PyBool_FromLong(vp_array_ready(a));
+    return PyBool_FromLong(nx_array_ready(a));
 }
 
 static PyObject* m_same_storage(PyObject* self, PyObject* args) {
@@ -3247,21 +3247,21 @@ static PyObject* m_same_storage(PyObject* self, PyObject* args) {
     if (!PyArg_ParseTuple(args, "O!O!", &ArrayType, &x, &ArrayType, &y)) {
         return NULL;
     }
-    return PyBool_FromLong(vp_array_same_storage(array_of(x), array_of(y)));
+    return PyBool_FromLong(nx_array_same_storage(array_of(x), array_of(y)));
 }
 
-static int wait_array(vp_array* a) {
+static int wait_array(nx_array* a) {
     char err[ERRLEN] = "";
     int status;
     Py_BEGIN_ALLOW_THREADS;
-    status = vp_array_wait(g_rt, a, err, sizeof err);
+    status = nx_array_wait(g_rt, a, err, sizeof err);
     Py_END_ALLOW_THREADS;
     return raise_status(status, err);
 }
 
 static PyObject* m_wait(PyObject* self, PyObject* o) {
     (void)self;
-    vp_array* a = array_of(o);
+    nx_array* a = array_of(o);
     if (a == NULL || check_runtime() < 0 || wait_array(a) < 0) {
         return NULL;
     }
@@ -3269,7 +3269,7 @@ static PyObject* m_wait(PyObject* self, PyObject* o) {
 }
 
 /* export(a, writable=False): NumPy view of a's data, no copy (D7). A writable
- * export first makes the buffer exclusive (vp_array_prepare_write); it is for
+ * export first makes the buffer exclusive (nx_array_prepare_write); it is for
  * NumPy code the bridge runs synchronously, never handed to user code. */
 static PyObject* m_export(PyObject* self, PyObject* args) {
     (void)self;
@@ -3278,14 +3278,14 @@ static PyObject* m_export(PyObject* self, PyObject* args) {
     if (!PyArg_ParseTuple(args, "O!|p", &ArrayType, &o, &writable) || check_runtime() < 0) {
         return NULL;
     }
-    vp_array* a = array_of(o);
+    nx_array* a = array_of(o);
     const int warn = ((ArrayObject*)o)->warn_on_write;
     writable = writable && (!((ArrayObject*)o)->readonly || warn);
     if (writable) {
         char err[ERRLEN] = "";
         int status;
         Py_BEGIN_ALLOW_THREADS;
-        status = vp_array_prepare_write(g_rt, a, err, sizeof err);
+        status = nx_array_prepare_write(g_rt, a, err, sizeof err);
         Py_END_ALLOW_THREADS;
         if (raise_status(status, err) < 0) {
             return NULL;
@@ -3293,7 +3293,7 @@ static PyObject* m_export(PyObject* self, PyObject* args) {
     } else if (wait_array(a) < 0) {
         return NULL;
     }
-    PyObject* e = vp_array_export(a, writable);
+    PyObject* e = nx_array_export(a, writable);
     if (e != NULL && writable && warn) { /* NumPy warns on the first write */
         PyObject* flags = PyObject_GetAttrString(e, "flags");
         if (flags == NULL || PyObject_SetAttrString(flags, "_warn_on_write", Py_True) < 0) {
@@ -3316,7 +3316,7 @@ static PyObject* m_assign(PyObject* self, PyObject* args) {
         return NULL;
     }
     char err[ERRLEN] = "";
-    int status = vp_assign(g_rt, array_of(dst), array_of(src), issue_site(), err, sizeof err);
+    int status = nx_assign(g_rt, array_of(dst), array_of(src), issue_site(), err, sizeof err);
     if (raise_status(status, err) < 0) {
         return NULL;
     }
@@ -3324,10 +3324,10 @@ static PyObject* m_assign(PyObject* self, PyObject* args) {
 }
 
 /* reduce(ufunc, a, axes, keepdims, dtype, initial): async reduction with
- * NumPy's reduction loop (vp_reduce). `axes`: a sequence of bools, one per
+ * NumPy's reduction loop (nx_reduce). `axes`: a sequence of bools, one per
  * dimension of `a`; `dtype`: dtype= or None; `initial`: start value or None
  * (start at the first elements). Returns the (pending) result, or None if
- * viproc cannot run it (the caller falls back to NumPy). */
+ * numpy2x cannot run it (the caller falls back to NumPy). */
 static PyObject* m_reduce(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *ufunc, *a, *axes, *dtype, *identity, *out = Py_None;
@@ -3340,8 +3340,8 @@ static PyObject* m_reduce(PyObject* self, PyObject* args) {
     if (out != Py_None && (!is_array(out) || ((ArrayObject*)out)->readonly)) {
         Py_RETURN_NONE;
     }
-    vp_array* in = array_of(a);
-    const int nd = vp_array_ndim(in);
+    nx_array* in = array_of(a);
+    const int nd = nx_array_ndim(in);
     PyObject* fast = PySequence_Fast(axes, "axes must be a sequence");
     if (fast == NULL) {
         return NULL;
@@ -3361,12 +3361,12 @@ static PyObject* m_reduce(PyObject* self, PyObject* args) {
         flags[i] = (unsigned char)t;
     }
     Py_DECREF(fast);
-    vp_array* res = NULL;
+    nx_array* res = NULL;
     char err[ERRLEN] = "";
     const int status =
-        vp_reduce_out(g_rt, ufunc, in, flags, keepdims, dtype, identity,
+        nx_reduce_out(g_rt, ufunc, in, flags, keepdims, dtype, identity,
                       out != Py_None ? array_of(out) : NULL, &res, issue_site(), err, sizeof err);
-    if (status == VP_UNSUPPORTED) {
+    if (status == NX_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
     if (raise_status(status, err) < 0) {
@@ -3391,8 +3391,8 @@ static PyObject* m_ufunc_typed(PyObject* self, PyObject* args) {
         (out != Py_None && !is_array(out))) {
         Py_RETURN_NONE;
     }
-    vp_array* in[MAXIN];
-    vp_dtype dts[MAXIN + 1];
+    nx_array* in[MAXIN];
+    nx_dtype dts[MAXIN + 1];
     int64_t shape[MAXDIMS];
     int ndim = 0;
     for (Py_ssize_t i = 0; i <= nin; ++i) {
@@ -3403,7 +3403,7 @@ static PyObject* m_ufunc_typed(PyObject* self, PyObject* args) {
             }
             Py_RETURN_NONE;
         }
-        dts[i] = (vp_dtype)c;
+        dts[i] = (nx_dtype)c;
     }
     for (Py_ssize_t i = 0; i < nin; ++i) {
         PyObject* x = PyTuple_GET_ITEM(ins, i);
@@ -3411,40 +3411,40 @@ static PyObject* m_ufunc_typed(PyObject* self, PyObject* args) {
             Py_RETURN_NONE;
         }
         in[i] = array_of(x);
-        const int nd = vp_array_ndim(in[i]);
-        if (nd > MAXDIMS || broadcast_into(shape, &ndim, nd, vp_array_shape(in[i])) < 0) {
+        const int nd = nx_array_ndim(in[i]);
+        if (nd > MAXDIMS || broadcast_into(shape, &ndim, nd, nx_array_shape(in[i])) < 0) {
             Py_RETURN_NONE; /* NumPy raises its error in the fallback */
         }
     }
-    vp_array* mask = where != Py_None ? array_of(where) : NULL;
+    nx_array* mask = where != Py_None ? array_of(where) : NULL;
     if (mask != NULL &&
-        (vp_array_ndim(mask) > MAXDIMS ||
-         broadcast_into(shape, &ndim, vp_array_ndim(mask), vp_array_shape(mask)) < 0)) {
+        (nx_array_ndim(mask) > MAXDIMS ||
+         broadcast_into(shape, &ndim, nx_array_ndim(mask), nx_array_shape(mask)) < 0)) {
         Py_RETURN_NONE;
     }
-    vp_array* o = NULL;
+    nx_array* o = NULL;
     if (out != Py_None) {
         /* the inputs broadcast to out's shape, which must not change */
         o = array_of(out);
-        const int nd = vp_array_ndim(o);
-        const int64_t* os = vp_array_shape(o);
+        const int nd = nx_array_ndim(o);
+        const int64_t* os = nx_array_shape(o);
         if (((ArrayObject*)out)->readonly || nd > MAXDIMS ||
             broadcast_into(shape, &ndim, nd, os) < 0 || ndim != nd ||
             memcmp(shape, os, (size_t)nd * sizeof(int64_t)) != 0) {
             Py_RETURN_NONE;
         }
     }
-    const vp_loop* loop = NULL;
+    const nx_loop* loop = NULL;
     char err[ERRLEN] = "";
-    int status = vp_ufunc_loop(g_rt, ufunc, (int)nin, dts, &loop, err, sizeof err);
-    vp_array* res = NULL;
-    if (status == VP_OK) {
-        status = mask != NULL ? vp_ufunc_issue_masked(g_rt, loop, in, mask, ndim, shape, o, &res,
+    int status = nx_ufunc_loop(g_rt, ufunc, (int)nin, dts, &loop, err, sizeof err);
+    nx_array* res = NULL;
+    if (status == NX_OK) {
+        status = mask != NULL ? nx_ufunc_issue_masked(g_rt, loop, in, mask, ndim, shape, o, &res,
                                                       issue_site(), err, sizeof err)
-                              : vp_ufunc_issue(g_rt, loop, in, ndim, shape, o, &res, issue_site(),
+                              : nx_ufunc_issue(g_rt, loop, in, ndim, shape, o, &res, issue_site(),
                                                err, sizeof err);
     }
-    if (status == VP_UNSUPPORTED) {
+    if (status == NX_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
     if (raise_status(status, err) < 0) {
@@ -3465,8 +3465,8 @@ static PyObject* m_ufunc_multi(PyObject* self, PyObject* args) {
     if (nin < 1 || nop <= nin || nop > 8) {
         Py_RETURN_NONE;
     }
-    vp_array* in[8];
-    vp_dtype dts[8];
+    nx_array* in[8];
+    nx_dtype dts[8];
     int64_t shape[MAXDIMS];
     int ndim = 0;
     for (Py_ssize_t i = 0; i < nin; ++i) {
@@ -3475,8 +3475,8 @@ static PyObject* m_ufunc_multi(PyObject* self, PyObject* args) {
             Py_RETURN_NONE;
         }
         in[i] = array_of(x);
-        const int nd = vp_array_ndim(in[i]);
-        if (nd > MAXDIMS || broadcast_into(shape, &ndim, nd, vp_array_shape(in[i])) < 0) {
+        const int nd = nx_array_ndim(in[i]);
+        if (nd > MAXDIMS || broadcast_into(shape, &ndim, nd, nx_array_shape(in[i])) < 0) {
             Py_RETURN_NONE; /* NumPy raises its error in the fallback */
         }
     }
@@ -3488,13 +3488,13 @@ static PyObject* m_ufunc_multi(PyObject* self, PyObject* args) {
             }
             Py_RETURN_NONE;
         }
-        dts[i] = (vp_dtype)c;
+        dts[i] = (nx_dtype)c;
     }
-    vp_array* res[8] = {NULL};
+    nx_array* res[8] = {NULL};
     char err[ERRLEN] = "";
-    const int status = vp_ufunc_multi(g_rt, ufunc, (int)nin, in, (int)(nop - nin), dts, ndim, shape,
+    const int status = nx_ufunc_multi(g_rt, ufunc, (int)nin, in, (int)(nop - nin), dts, ndim, shape,
                                       res, issue_site(), err, sizeof err);
-    if (status == VP_UNSUPPORTED) {
+    if (status == NX_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
     if (raise_status(status, err) < 0) {
@@ -3506,11 +3506,11 @@ static PyObject* m_ufunc_multi(PyObject* self, PyObject* args) {
         if (t != NULL) {
             w = wrap_array(res[j]); /* releases res[j] on failure */
         } else {
-            vp_array_release(res[j]);
+            nx_array_release(res[j]);
         }
         if (w == NULL) {
             for (Py_ssize_t k = j + 1; k < nop - nin; ++k) {
-                vp_array_release(res[k]);
+                nx_array_release(res[k]);
             }
             Py_XDECREF(t);
             return NULL;
@@ -3557,9 +3557,9 @@ static PyObject* m_gufunc(PyObject* self, PyObject* args) {
         (invalid != Py_None && !PyUnicode_Check(invalid))) {
         Py_RETURN_NONE;
     }
-    vp_array* in[MAXOP];
-    vp_array* out[MAXOP];
-    vp_dtype dts[MAXOP];
+    nx_array* in[MAXOP];
+    nx_array* out[MAXOP];
+    nx_dtype dts[MAXOP];
     int core_n[MAXOP], core_axes[MAXCORE], codes_i[MAXOP];
     int64_t sizes[MAXCORE];
     int labels[MAXCORE];
@@ -3580,7 +3580,7 @@ static PyObject* m_gufunc(PyObject* self, PyObject* args) {
         if (codes_i[i] < 0 || codes_i[i] > 6) {
             Py_RETURN_NONE;
         }
-        dts[i] = (vp_dtype)codes_i[i];
+        dts[i] = (nx_dtype)codes_i[i];
     }
     for (Py_ssize_t i = 0; i < nin; ++i) {
         PyObject* x = PyTuple_GET_ITEM(ins, i);
@@ -3600,12 +3600,12 @@ static PyObject* m_gufunc(PyObject* self, PyObject* args) {
     if (invalid != Py_None && inv == NULL) {
         return NULL;
     }
-    vp_array* res[MAXOP] = {NULL};
+    nx_array* res[MAXOP] = {NULL};
     char err[ERRLEN] = "";
-    const int status = vp_gufunc(g_rt, ufunc, (int)nin, in, (int)nout, outs != Py_None ? out : NULL,
+    const int status = nx_gufunc(g_rt, ufunc, (int)nin, in, (int)nout, outs != Py_None ? out : NULL,
                                  dts, core_n, core_axes, nlabels, sizes, flags, order_n, order, inv,
                                  (int64_t)work, res, issue_site(), err, sizeof err);
-    if (status == VP_UNSUPPORTED) {
+    if (status == NX_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
     if (raise_status(status, err) < 0) {
@@ -3620,11 +3620,11 @@ static PyObject* m_gufunc(PyObject* self, PyObject* args) {
         if (t != NULL) {
             w = wrap_array(res[j]); /* releases res[j] on failure */
         } else {
-            vp_array_release(res[j]);
+            nx_array_release(res[j]);
         }
         if (w == NULL) {
             for (Py_ssize_t k = j + 1; k < nout; ++k) {
-                vp_array_release(res[k]);
+                nx_array_release(res[k]);
             }
             Py_XDECREF(t);
             return NULL;
@@ -3643,7 +3643,7 @@ static PyObject* m_reduceat(PyObject* self, PyObject* args) {
         return NULL;
     }
     int64_t st[MAXDIMS];
-    const int nd = vp_array_ndim(array_of(a));
+    const int nd = nx_array_ndim(array_of(a));
     if (strides != Py_None) {
         PyObject* sf = PySequence_Fast(strides, "strides must be a sequence");
         if (sf == NULL) {
@@ -3677,14 +3677,14 @@ static PyObject* m_reduceat(PyObject* self, PyObject* args) {
         memcpy(ind, view.buf, (size_t)n * sizeof(int64_t));
     }
     PyBuffer_Release(&view);
-    vp_array* res = NULL;
+    nx_array* res = NULL;
     char err[ERRLEN] = "";
-    const int status = n > INT_MAX ? VP_UNSUPPORTED
-                                   : vp_reduceat(g_rt, ufunc, array_of(a), axis, ind, (int)n,
+    const int status = n > INT_MAX ? NX_UNSUPPORTED
+                                   : nx_reduceat(g_rt, ufunc, array_of(a), axis, ind, (int)n,
                                                  strides != Py_None ? st : NULL, &res, issue_site(),
                                                  err, sizeof err);
     PyMem_Free(ind);
-    if (status == VP_UNSUPPORTED) {
+    if (status == NX_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
     if (raise_status(status, err) < 0) {
@@ -3704,19 +3704,19 @@ static PyObject* m_ufunc_at(PyObject* self, PyObject* args) {
         Py_RETURN_NONE;
     }
     const int nin = values != Py_None ? 2 : 1;
-    vp_dtype dts[3];
+    nx_dtype dts[3];
     for (int i = 0; i <= nin; ++i) {
-        dts[i] = vp_array_dtype(array_of(a));
+        dts[i] = nx_array_dtype(array_of(a));
     }
-    const vp_loop* loop = NULL;
+    const nx_loop* loop = NULL;
     char err[ERRLEN] = "";
-    int status = vp_ufunc_loop(g_rt, ufunc, nin, dts, &loop, err, sizeof err);
-    if (status == VP_OK) {
+    int status = nx_ufunc_loop(g_rt, ufunc, nin, dts, &loop, err, sizeof err);
+    if (status == NX_OK) {
         status =
-            vp_ufunc_at(g_rt, loop, array_of(a), array_of(idx),
+            nx_ufunc_at(g_rt, loop, array_of(a), array_of(idx),
                         values != Py_None ? array_of(values) : NULL, issue_site(), err, sizeof err);
     }
-    if (status == VP_UNSUPPORTED) {
+    if (status == NX_UNSUPPORTED) {
         Py_RETURN_FALSE;
     }
     if (raise_status(status, err) < 0) {
@@ -3732,11 +3732,11 @@ static PyObject* m_accumulate(PyObject* self, PyObject* args) {
     if (!PyArg_ParseTuple(args, "OO!i", &ufunc, &ArrayType, &a, &axis) || check_runtime() < 0) {
         return NULL;
     }
-    vp_array* res = NULL;
+    nx_array* res = NULL;
     char err[ERRLEN] = "";
     const int status =
-        vp_accumulate(g_rt, ufunc, array_of(a), axis, &res, issue_site(), err, sizeof err);
-    if (status == VP_UNSUPPORTED) {
+        nx_accumulate(g_rt, ufunc, array_of(a), axis, &res, issue_site(), err, sizeof err);
+    if (status == NX_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
     if (raise_status(status, err) < 0) {
@@ -3750,12 +3750,12 @@ static PyObject* m_accumulate(PyObject* self, PyObject* args) {
  * Python frame:
  *  - Small ready data (at most g_small elements, the direct path's bound):
  *    NumPy itself computes it, with the caller's arguments, on a borrowed
- *    read-only view of the buffer (vp_array_borrow): NumPy's result, errors
+ *    read-only view of the buffer (nx_array_borrow): NumPy's result, errors
  *    and warnings by construction, at NumPy's cost. There is nothing to run
  *    asynchronously, as for the direct path. An ndarray result is fresh
  *    memory and adopted.
  *  - Otherwise sum/prod/max/min/any/all with axis and keepdims only:
- *    vp_reduce, asynchronously.
+ *    nx_reduce, asynchronously.
  *  - Everything else: the Python handlers (_ndarray.py). */
 
 enum { RK_SUM = 0, RK_MINMAX = 1, RK_ANYALL = 2, RK_OTHER = 3 };
@@ -3776,7 +3776,7 @@ static RedSpec g_red[MAX_RED];
 static int g_nred = 0;
 static PyObject* g_array_function = NULL; /* array_function(self, func, types, args, kwargs) */
 static PyObject* g_novalue = NULL;        /* np._NoValue */
-static int g_red_async = 0;               /* NumPy >= 2.3: vp_reduce's blocks are NumPy's */
+static int g_red_async = 0;               /* NumPy >= 2.3: nx_reduce's blocks are NumPy's */
 
 /* Positional parameters per kind, in NumPy's order (any/all: `where` is
  * keyword-only). */
@@ -3857,9 +3857,9 @@ static int red_axes(PyObject* axis, int nd, unsigned char* flags) {
     return 1;
 }
 
-static int64_t array_size(vp_array* a) {
-    const int nd = vp_array_ndim(a);
-    const int64_t* shape = vp_array_shape(a);
+static int64_t array_size(nx_array* a) {
+    const int nd = nx_array_ndim(a);
+    const int64_t* shape = nx_array_shape(a);
     int64_t n = 1;
     for (int i = 0; i < nd; ++i) {
         n *= shape[i];
@@ -3868,64 +3868,64 @@ static int64_t array_size(vp_array* a) {
 }
 
 /* 1 if NumPy computes the call right away on `self`'s data (small, ready,
- * no other viproc array among the arguments). */
+ * no other numpy2x array among the arguments). */
 static int red_delegates(PyObject* self, PyObject* const* v, Py_ssize_t n) {
-    if (Py_TYPE(self) != g_array_cls || !vp_array_ready(((ArrayObject*)self)->a) ||
+    if (Py_TYPE(self) != g_array_cls || !nx_array_ready(((ArrayObject*)self)->a) ||
         array_size(((ArrayObject*)self)->a) > g_small) {
         return 0;
     }
     for (Py_ssize_t i = 0; i < n; ++i) {
         if (is_array(v[i])) {
-            return 0; /* out=, where= of viproc arrays: the Python handlers */
+            return 0; /* out=, where= of numpy2x arrays: the Python handlers */
         }
     }
     return 1;
 }
 
 /* NumPy's read-only view of a ready array's data, borrowed for one call. */
-static PyObject* red_borrow(vp_array* a) {
+static PyObject* red_borrow(nx_array* a) {
     char err[ERRLEN] = "";
-    if (raise_status(vp_array_wait(g_rt, a, err, sizeof err), err) < 0) {
+    if (raise_status(nx_array_wait(g_rt, a, err, sizeof err), err) < 0) {
         return NULL; /* the producer failed */
     }
-    return vp_array_borrow(a);
+    return nx_array_borrow(a);
 }
 
 /* Ends the borrow: a view NumPy kept a reference to becomes an export. Then
  * maps the result: an ndarray (fresh memory) is adopted. */
 static PyObject* red_return(PyObject* self, PyObject* view, PyObject* r) {
-    vp_array* a = ((ArrayObject*)self)->a;
+    nx_array* a = ((ArrayObject*)self)->a;
     if (r == view) { /* e.g. astype(copy=False) of the same dtype: NumPy's `a` itself */
         Py_DECREF(r);
         Py_DECREF(view);
         return Py_NewRef(self);
     }
-    if (Py_REFCNT(view) > 1 && vp_array_pin(a, view) != VP_OK) {
+    if (Py_REFCNT(view) > 1 && nx_array_pin(a, view) != NX_OK) {
         Py_DECREF(view);
         Py_XDECREF(r);
         return NULL;
     }
     Py_DECREF(view);
     if (r != NULL && Py_TYPE(r) == (PyTypeObject*)g_np_ndarray) {
-        vp_array* x = NULL;
+        nx_array* x = NULL;
         char err[ERRLEN] = "";
-        if (vp_array_from_ndarray(g_rt, r, &x, err, sizeof err) == VP_OK) {
+        if (nx_array_from_ndarray(g_rt, r, &x, err, sizeof err) == NX_OK) {
             Py_DECREF(r);
             return wrap_array(x);
         }
-        /* a dtype viproc does not support: NumPy's array, as the fallback */
+        /* a dtype numpy2x does not support: NumPy's array, as the fallback */
     }
     return r;
 }
 
-/* 1 if the call gives an array (an axis or keepdims): vp_reduce, run
+/* 1 if the call gives an array (an axis or keepdims): nx_reduce, run
  * directly for small ready data, makes it cheaper than NumPy's call on a
  * borrowed view plus adopting NumPy's result. */
 static int red_array_result(PyObject* const* v) {
     return !(red_absent(v[RA_AXIS]) || v[RA_AXIS] == Py_None) || v[RA_KEEPDIMS] == Py_True;
 }
 
-/* sum/prod/max/min/any/all asynchronously (vp_reduce). 1 with *result, 0 if
+/* sum/prod/max/min/any/all asynchronously (nx_reduce). 1 with *result, 0 if
  * the Python handlers decide, -1 on error. */
 static int red_async(const RedSpec* sp, PyObject* self, PyObject* const* v, PyObject** result) {
     if (!g_red_async || sp->kind == RK_OTHER || Py_TYPE(self) != g_array_cls) {
@@ -3943,35 +3943,35 @@ static int red_async(const RedSpec* sp, PyObject* self, PyObject* const* v, PyOb
         }
         keepdims = v[RA_KEEPDIMS] == Py_True;
     }
-    vp_array* a = ((ArrayObject*)self)->a;
-    if (sp->kind == RK_ANYALL && vp_array_dtype(a) != VP_BOOL) {
+    nx_array* a = ((ArrayObject*)self)->a;
+    if (sp->kind == RK_ANYALL && nx_array_dtype(a) != NX_BOOL) {
         return 0; /* `a != 0` first: the Python handler */
     }
     unsigned char flags[MAXDIMS];
-    if (!red_axes(v[RA_AXIS], vp_array_ndim(a), flags)) {
+    if (!red_axes(v[RA_AXIS], nx_array_ndim(a), flags)) {
         return 0;
     }
-    vp_array* r = NULL;
+    nx_array* r = NULL;
     char err[ERRLEN] = "";
-    const int st = vp_reduce(g_rt, sp->ufunc, a, flags, keepdims, Py_None, sp->identity, &r,
+    const int st = nx_reduce(g_rt, sp->ufunc, a, flags, keepdims, Py_None, sp->identity, &r,
                              issue_site(), err, sizeof err);
-    if (st == VP_UNSUPPORTED) {
+    if (st == NX_UNSUPPORTED) {
         return 0;
     }
     if (raise_status(st, err) < 0) {
         return -1;
     }
-    if (vp_array_ndim(r) == 0 && vp_array_ready(r) &&
-        vp_array_wait(g_rt, r, err, sizeof err) == VP_OK) {
-        *result = vp_array_scalar(r); /* NumPy's scalar: the data is there */
-        vp_array_release(r);
+    if (nx_array_ndim(r) == 0 && nx_array_ready(r) &&
+        nx_array_wait(g_rt, r, err, sizeof err) == NX_OK) {
+        *result = nx_array_scalar(r); /* NumPy's scalar: the data is there */
+        nx_array_release(r);
         return *result != NULL ? 1 : -1;
     }
     *result = wrap_array(r);
     if (*result == NULL) {
         return -1;
     }
-    if (vp_array_ndim(r) == 0) {
+    if (nx_array_ndim(r) == 0) {
         ((ArrayObject*)*result)->scalar = 1;
     }
     return 1;
@@ -3979,7 +3979,7 @@ static int red_async(const RedSpec* sp, PyObject* self, PyObject* const* v, PyOb
 
 static int red_ready(void) {
     if (g_array_function == NULL || g_array_cls == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "viproc: setup_reductions() was not called");
+        PyErr_SetString(PyExc_RuntimeError, "numpy2x: setup_reductions() was not called");
         return -1;
     }
     return check_runtime();
@@ -4022,7 +4022,7 @@ static PyObject* red_method(const char* name, int* cache, PyObject* self, PyObje
     if (*cache < 0 || *cache >= g_nred) {
         const RedSpec* found = red_spec_of_method(name);
         if (found == NULL) {
-            PyErr_Format(PyExc_RuntimeError, "viproc: %s not registered", name);
+            PyErr_Format(PyExc_RuntimeError, "numpy2x: %s not registered", name);
             return NULL;
         }
         *cache = (int)(found - g_red);
@@ -4041,7 +4041,7 @@ static PyObject* red_method(const char* name, int* cache, PyObject* self, PyObje
         }
     }
     if (nargs + nkw <= RA_N + 4 && red_delegates(self, args, nargs + nkw)) {
-        vp_array* a = ((ArrayObject*)self)->a;
+        nx_array* a = ((ArrayObject*)self)->a;
         PyObject* view = red_borrow(a);
         if (view == NULL) {
             return NULL;
@@ -4072,17 +4072,17 @@ RED_METHODS(X)
 #undef X
 
 /* Number of elements of a where() operand for the delegate's size check:
- * viproc arrays (ready only), ndarrays and scalars; -1 for anything else
+ * numpy2x arrays (ready only), ndarrays and scalars; -1 for anything else
  * (lists, pending arrays): the Python handler decides. *nd/shape get its
  * shape (at most MAXDIMS dimensions). */
 static int where_operand(PyObject* x, int* nd, int64_t* shape) {
     if (is_array(x)) {
-        vp_array* a = ((ArrayObject*)x)->a;
-        if (!vp_array_ready(a) || vp_array_ndim(a) > MAXDIMS) {
+        nx_array* a = ((ArrayObject*)x)->a;
+        if (!nx_array_ready(a) || nx_array_ndim(a) > MAXDIMS) {
             return -1;
         }
-        *nd = vp_array_ndim(a);
-        memcpy(shape, vp_array_shape(a), sizeof(int64_t) * (size_t)*nd);
+        *nd = nx_array_ndim(a);
+        memcpy(shape, nx_array_shape(a), sizeof(int64_t) * (size_t)*nd);
         return 0;
     }
     if (PyFloat_Check(x) || PyLong_Check(x) || PyComplex_Check(x) ||
@@ -4109,8 +4109,8 @@ static int where_operand(PyObject* x, int* nd, int64_t* shape) {
 
 /* Kind of a dtype or Python scalar for NEP 50's weak promotion: bool 0,
  * integer 1, floating 2, complex 3. */
-static int dtype_kind(vp_dtype d) {
-    return d == VP_BOOL ? 0 : d <= VP_INT64 ? 1 : d <= VP_FLOAT64 ? 2 : 3;
+static int dtype_kind(nx_dtype d) {
+    return d == NX_BOOL ? 0 : d <= NX_INT64 ? 1 : d <= NX_FLOAT64 ? 2 : 3;
 }
 static int scalar_kind(PyObject* v) {
     return PyBool_Check(v)           ? 0
@@ -4120,9 +4120,9 @@ static int scalar_kind(PyObject* v) {
                                      : -1;
 }
 
-/* np.where(cond, x, y) as a select (vp_select: run directly for small ready
+/* np.where(cond, x, y) as a select (nx_select: run directly for small ready
  * data, asynchronously otherwise) when NumPy's result dtype needs no cast:
- * a bool viproc condition, x and y viproc arrays of one dtype, or one of
+ * a bool numpy2x condition, x and y numpy2x arrays of one dtype, or one of
  * them a Python scalar that NEP 50 promotes weakly to the other's dtype
  * (converted now, as NumPy converts it). NULL without an error otherwise. */
 static PyObject* where_select(PyObject* fargs, PyObject* fkw) {
@@ -4131,18 +4131,18 @@ static PyObject* where_select(PyObject* fargs, PyObject* fkw) {
     }
     PyObject *c = PyTuple_GET_ITEM(fargs, 0), *x = PyTuple_GET_ITEM(fargs, 1),
              *y = PyTuple_GET_ITEM(fargs, 2);
-    if (!is_array(c) || vp_array_dtype(((ArrayObject*)c)->a) != VP_BOOL) {
+    if (!is_array(c) || nx_array_dtype(((ArrayObject*)c)->a) != NX_BOOL) {
         return NULL;
     }
     const int xa = is_array(x), ya = is_array(y);
-    vp_dtype d;
+    nx_dtype d;
     if (xa && ya) {
-        d = vp_array_dtype(((ArrayObject*)x)->a);
-        if (vp_array_dtype(((ArrayObject*)y)->a) != d) {
+        d = nx_array_dtype(((ArrayObject*)x)->a);
+        if (nx_array_dtype(((ArrayObject*)y)->a) != d) {
             return NULL;
         }
     } else if (xa || ya) {
-        d = vp_array_dtype(((ArrayObject*)(xa ? x : y))->a);
+        d = nx_array_dtype(((ArrayObject*)(xa ? x : y))->a);
         const int k = scalar_kind(xa ? y : x);
         if (k < 0 || k > dtype_kind(d)) {
             return NULL;
@@ -4150,20 +4150,20 @@ static PyObject* where_select(PyObject* fargs, PyObject* fkw) {
     } else {
         return NULL;
     }
-    vp_array* conv = NULL;
-    if (!(xa && ya) && vp_array_from_item(g_rt, xa ? y : x, d, &conv) != VP_OK) {
+    nx_array* conv = NULL;
+    if (!(xa && ya) && nx_array_from_item(g_rt, xa ? y : x, d, &conv) != NX_OK) {
         PyErr_Clear(); /* NumPy raises its own error */
         return NULL;
     }
-    vp_array* r = NULL;
+    nx_array* r = NULL;
     char err[ERRLEN] = "";
     const int status =
-        vp_select(g_rt, ((ArrayObject*)c)->a, xa ? ((ArrayObject*)x)->a : conv,
+        nx_select(g_rt, ((ArrayObject*)c)->a, xa ? ((ArrayObject*)x)->a : conv,
                   ya ? ((ArrayObject*)y)->a : conv, &r, issue_site(), err, sizeof err);
     if (conv != NULL) {
-        vp_array_release(conv);
+        nx_array_release(conv);
     }
-    if (status == VP_INVALID || status == VP_UNSUPPORTED) {
+    if (status == NX_INVALID || status == NX_UNSUPPORTED) {
         return NULL; /* broadcasting errors: NumPy's, from the handlers */
     }
     if (raise_status(status, err) < 0) {
@@ -4173,7 +4173,7 @@ static PyObject* where_select(PyObject* fargs, PyObject* fkw) {
 }
 
 /* np.where(cond, x, y) of small ready data: NumPy's own where on borrowed
- * views of the viproc operands (design doc D7), its fresh result adopted.
+ * views of the numpy2x operands (design doc D7), its fresh result adopted.
  * Values, dtype, broadcasting and errors are NumPy's. NULL without an error
  * when the call is not small and ready: the Python handler (a select task). */
 static PyObject* where_delegate(PyObject* fargs, PyObject* fkw) {
@@ -4223,16 +4223,16 @@ static PyObject* where_delegate(PyObject* fargs, PyObject* fkw) {
         }
     }
     if (r != NULL && Py_TYPE(r) == (PyTypeObject*)g_np_ndarray) {
-        vp_array* a = NULL;
+        nx_array* a = NULL;
         char err[ERRLEN] = "";
-        if (vp_array_from_ndarray(g_rt, r, &a, err, sizeof err) == VP_OK) {
+        if (nx_array_from_ndarray(g_rt, r, &a, err, sizeof err) == NX_OK) {
             Py_DECREF(r);
             return wrap_array(a);
         }
-        /* a dtype viproc does not support: NumPy's array, as the fallback */
+        /* a dtype numpy2x does not support: NumPy's array, as the fallback */
     }
     if (r == NULL && !PyErr_Occurred()) {
-        PyErr_SetString(PyExc_RuntimeError, "viproc: where failed");
+        PyErr_SetString(PyExc_RuntimeError, "numpy2x: where failed");
     }
     return r;
 }
@@ -4262,7 +4262,7 @@ static int sort_kind(PyObject* kind, PyObject* stable) {
 }
 
 /* np.sort / np.argsort (a, axis=-1, kind=None, order=None, *, stable=None)
- * and a.sort(...) (`in_place`) with an int axis and order None as vp_sort:
+ * and a.sort(...) (`in_place`) with an int axis and order None as nx_sort:
  * the result (None for a.sort), or NULL without an error for every other
  * call (the handlers in _sort.py: axis=None, conversions, NumPy's errors).
  * pos[0] is `a`; nkw keywords kwn/kwv. */
@@ -4293,20 +4293,20 @@ static PyObject* sort_issue(PyObject* const* pos, Py_ssize_t npos, PyObject* con
     if (kind < 0 || (v[3] != NULL && v[3] != Py_None) || (in_place && ao->readonly)) {
         return NULL;
     }
-    vp_array* a = ao->a;
-    vp_array* flat = NULL; /* axis=None: NumPy's flatten(), here a view where it is one */
+    nx_array* a = ao->a;
+    nx_array* flat = NULL; /* axis=None: NumPy's flatten(), here a view where it is one */
     if (v[1] == Py_None && !in_place) {
         int64_t size = 1;
-        for (int i = 0; i < vp_array_ndim(a); ++i) {
-            size *= vp_array_shape(a)[i];
+        for (int i = 0; i < nx_array_ndim(a); ++i) {
+            size *= nx_array_shape(a)[i];
         }
-        if ((flat = vp_array_reshape(g_rt, a, 1, &size, 'C')) == NULL) {
+        if ((flat = nx_array_reshape(g_rt, a, 1, &size, 'C')) == NULL) {
             return NULL; /* the copy in _sort.py */
         }
         a = flat;
         v[1] = NULL;
     }
-    const int nd = vp_array_ndim(a);
+    const int nd = nx_array_ndim(a);
     long axis = -1;
     if (v[1] != NULL) {
         if (!PyLong_CheckExact(v[1])) {
@@ -4321,14 +4321,14 @@ static PyObject* sort_issue(PyObject* const* pos, Py_ssize_t npos, PyObject* con
     if (nd == 0 || axis < -nd || axis >= nd) {
         return NULL; /* NumPy's AxisError */
     }
-    vp_array* r = NULL;
+    nx_array* r = NULL;
     char err[ERRLEN] = "";
-    const int status = vp_sort(g_rt, a, axis < 0 ? (int)axis + nd : (int)axis, kind, arg, in_place,
+    const int status = nx_sort(g_rt, a, axis < 0 ? (int)axis + nd : (int)axis, kind, arg, in_place,
                                0, NULL, &r, issue_site(), err, sizeof err);
     if (flat != NULL) {
-        vp_array_release(flat);
+        nx_array_release(flat);
     }
-    if (status != VP_OK) {
+    if (status != NX_OK) {
         return NULL;
     }
     return in_place ? Py_NewRef(Py_None) : wrap_array(r);
@@ -4446,7 +4446,7 @@ static PyObject* Array_array_function(PyObject* self, PyObject* const* args, Py_
     int delegate =
         sp->impl != NULL && red_delegates(target, pos, npos - 1) && red_delegates(target, kwv, nkw);
     if (delegate) {
-        vp_array* a = ((ArrayObject*)target)->a;
+        nx_array* a = ((ArrayObject*)target)->a;
         PyObject* view = red_borrow(a);
         if (view == NULL) {
             return NULL;
@@ -4545,11 +4545,11 @@ static PyObject* m_astype(PyObject* self, PyObject* args) {
     if (!PyArg_ParseTuple(args, "O!iC", &ArrayType, &a, &code, &order) || check_runtime() < 0) {
         return NULL;
     }
-    vp_array* res = NULL;
+    nx_array* res = NULL;
     char err[ERRLEN] = "";
-    const int status = vp_astype(g_rt, array_of(a), (vp_dtype)code, (char)order, &res, issue_site(),
+    const int status = nx_astype(g_rt, array_of(a), (nx_dtype)code, (char)order, &res, issue_site(),
                                  err, sizeof err);
-    if (status == VP_UNSUPPORTED) {
+    if (status == NX_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
     if (raise_status(status, err) < 0) {
@@ -4572,11 +4572,11 @@ static PyObject* m_sort(PyObject* self, PyObject* args) {
     if (order_n < 0 || (in_place && ((ArrayObject*)a)->readonly)) {
         Py_RETURN_NONE;
     }
-    vp_array* res = NULL;
+    nx_array* res = NULL;
     char err[ERRLEN] = "";
-    const int status = vp_sort(g_rt, array_of(a), axis, kind, arg, in_place, order_n, order, &res,
+    const int status = nx_sort(g_rt, array_of(a), axis, kind, arg, in_place, order_n, order, &res,
                                issue_site(), err, sizeof err);
-    if (status == VP_UNSUPPORTED) {
+    if (status == NX_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
     if (raise_status(status, err) < 0) {
@@ -4600,11 +4600,11 @@ static PyObject* m_arg_reduce(PyObject* self, PyObject* args) {
     if (nd < 0) {
         return NULL;
     }
-    vp_array* res = NULL;
+    nx_array* res = NULL;
     char err[ERRLEN] = "";
     const int status =
-        vp_arg_reduce(g_rt, argmax, array_of(a), nd, shape, &res, issue_site(), err, sizeof err);
-    if (status == VP_UNSUPPORTED) {
+        nx_arg_reduce(g_rt, argmax, array_of(a), nd, shape, &res, issue_site(), err, sizeof err);
+    if (status == NX_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
     if (raise_status(status, err) < 0) {
@@ -4614,7 +4614,7 @@ static PyObject* m_arg_reduce(PyObject* self, PyObject* args) {
 }
 
 /* Reads (index arrays, their axes, result axes) for gather/scatter. */
-static int read_index_args(PyObject* idx_o, PyObject* axes_o, PyObject* res_o, vp_array** idx,
+static int read_index_args(PyObject* idx_o, PyObject* axes_o, PyObject* res_o, nx_array** idx,
                            int* axes, int* nidx, int* res, int* nres) {
     PyObject* fi = PySequence_Fast(idx_o, "index arrays: a sequence expected");
     if (fi == NULL) {
@@ -4633,7 +4633,7 @@ static int read_index_args(PyObject* idx_o, PyObject* axes_o, PyObject* res_o, v
         PyObject* x = PySequence_Fast_GET_ITEM(fi, j);
         if (!PyObject_TypeCheck(x, &ArrayType)) {
             Py_DECREF(fi);
-            PyErr_SetString(PyExc_TypeError, "index arrays must be viproc arrays");
+            PyErr_SetString(PyExc_TypeError, "index arrays must be numpy2x arrays");
             return -1;
         }
         idx[j] = array_of(x);
@@ -4655,13 +4655,13 @@ static int read_index_args(PyObject* idx_o, PyObject* axes_o, PyObject* res_o, v
 static PyObject* m_gather(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *a, *idx_o, *axes_o, *res_o, *strides_o;
-    int mode = VP_INDEX_RAISE;
+    int mode = NX_INDEX_RAISE;
     if (!PyArg_ParseTuple(args, "O!OOOO|i", &ArrayType, &a, &idx_o, &axes_o, &res_o, &strides_o,
                           &mode) ||
         check_runtime() < 0) {
         return NULL;
     }
-    vp_array* idx[MAXDIMS];
+    nx_array* idx[MAXDIMS];
     int axes[MAXDIMS], res[MAXDIMS], nidx, nres;
     if (read_index_args(idx_o, axes_o, res_o, idx, axes, &nidx, res, &nres) < 0) {
         return NULL;
@@ -4674,10 +4674,10 @@ static PyObject* m_gather(PyObject* self, PyObject* args) {
         }
         return NULL;
     }
-    vp_array* r = NULL;
+    nx_array* r = NULL;
     char err[ERRLEN] = "";
     const int status =
-        vp_gather(g_rt, array_of(a), nidx, idx, axes, nres, res,
+        nx_gather(g_rt, array_of(a), nidx, idx, axes, nres, res,
                   strides_o == Py_None ? NULL : strides, mode, &r, issue_site(), err, sizeof err);
     if (raise_status(status, err) < 0) {
         return NULL;
@@ -4688,19 +4688,19 @@ static PyObject* m_gather(PyObject* self, PyObject* args) {
 static PyObject* m_scatter(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *a, *idx_o, *axes_o, *res_o, *values;
-    int mode = VP_INDEX_RAISE;
+    int mode = NX_INDEX_RAISE;
     if (!PyArg_ParseTuple(args, "O!OOOO!|i", &ArrayType, &a, &idx_o, &axes_o, &res_o, &ArrayType,
                           &values, &mode) ||
         check_runtime() < 0) {
         return NULL;
     }
-    vp_array* idx[MAXDIMS];
+    nx_array* idx[MAXDIMS];
     int axes[MAXDIMS], res[MAXDIMS], nidx, nres;
     if (read_index_args(idx_o, axes_o, res_o, idx, axes, &nidx, res, &nres) < 0) {
         return NULL;
     }
     char err[ERRLEN] = "";
-    const int status = vp_scatter(g_rt, array_of(a), nidx, idx, axes, nres, res, array_of(values),
+    const int status = nx_scatter(g_rt, array_of(a), nidx, idx, axes, nres, res, array_of(values),
                                   mode, issue_site(), err, sizeof err);
     if (raise_status(status, err) < 0) {
         return NULL;
@@ -4711,7 +4711,7 @@ static PyObject* m_scatter(PyObject* self, PyObject* args) {
 /* place(dtype, shape, strides, parts): a new array of `dtype` and `shape`
  * with the dense byte `strides` (None: C order), assembled from `parts`, a
  * sequence of (src, shape, strides, offset): src copied into the result's
- * view with that shape, byte strides and byte offset (vp_place). */
+ * view with that shape, byte strides and byte offset (nx_place). */
 static PyObject* m_place(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *dtype, *shape_o, *strides_o, *parts_o;
@@ -4733,7 +4733,7 @@ static PyObject* m_place(PyObject* self, PyObject* args) {
         return NULL;
     }
     const Py_ssize_t n = PySequence_Fast_GET_SIZE(parts);
-    vp_array** srcs = PyMem_Malloc((size_t)(n + 1) * sizeof(vp_array*));
+    nx_array** srcs = PyMem_Malloc((size_t)(n + 1) * sizeof(nx_array*));
     int* pnd = PyMem_Malloc((size_t)(n + 1) * sizeof(int));
     int64_t* pshapes = PyMem_Malloc((size_t)(n * MAXDIMS + 1) * sizeof(int64_t));
     int64_t* pstrides = PyMem_Malloc((size_t)(n * MAXDIMS + 1) * sizeof(int64_t));
@@ -4765,10 +4765,10 @@ static PyObject* m_place(PyObject* self, PyObject* args) {
         poffsets[i] = off;
         at += k;
     }
-    vp_array* r = NULL;
+    nx_array* r = NULL;
     char err[ERRLEN] = "";
     const int status =
-        vp_place(g_rt, (vp_dtype)code, nd, shape, strides_o == Py_None ? NULL : strides, (int)n,
+        nx_place(g_rt, (nx_dtype)code, nd, shape, strides_o == Py_None ? NULL : strides, (int)n,
                  srcs, pnd, pshapes, pstrides, poffsets, &r, issue_site(), err, sizeof err);
     if (raise_status(status, err) == 0) {
         result = wrap_array(r);
@@ -4783,7 +4783,7 @@ done:
     return result;
 }
 
-/* matmul(a, b): np.matmul of two viproc arrays, or None if NumPy has to run
+/* matmul(a, b): np.matmul of two numpy2x arrays, or None if NumPy has to run
  * it. */
 static PyObject* m_matmul(PyObject* self, PyObject* args) {
     (void)self;
@@ -4809,15 +4809,15 @@ static PyObject* m_select(PyObject* self, PyObject* args) {
         check_runtime() < 0) {
         return NULL;
     }
-    vp_array* r = NULL;
+    nx_array* r = NULL;
     char err[ERRLEN] = "";
     const int status =
-        vp_select(g_rt, array_of(c), array_of(x), array_of(y), &r, issue_site(), err, sizeof err);
+        nx_select(g_rt, array_of(c), array_of(x), array_of(y), &r, issue_site(), err, sizeof err);
     if (raise_status(status, err) < 0) {
         return NULL;
     }
     PyObject* w = wrap_array(r);
-    if (w != NULL && vp_array_ndim(r) == 0) {
+    if (w != NULL && nx_array_ndim(r) == 0) {
         ((ArrayObject*)w)->scalar = 1;
     }
     return w;
@@ -4831,7 +4831,7 @@ static PyObject* m_mask_assign(PyObject* self, PyObject* args) {
         return NULL;
     }
     char err[ERRLEN] = "";
-    const int status = vp_mask_assign(g_rt, array_of(a), array_of(mask), array_of(value),
+    const int status = nx_mask_assign(g_rt, array_of(a), array_of(mask), array_of(value),
                                       issue_site(), err, sizeof err);
     if (raise_status(status, err) < 0) {
         return NULL;
@@ -4850,13 +4850,13 @@ static PyObject* m_issue_site(PyObject* self, PyObject* noargs) {
 
 /* ---- Module-level ufuncs and np.where without NumPy's dispatch -------- */
 
-/* viproc.<ufunc> (module mode: `import viproc as np`, python -m viproc): a
+/* numpy2x.<ufunc> (module mode: `import numpy2x as np`, python -m numpy2x): a
  * proxy of an element-wise NumPy ufunc whose call takes the C hot path
- * (fast_ufunc) right away when an argument is a viproc array, instead of
+ * (fast_ufunc) right away when an argument is a numpy2x array, instead of
  * NumPy's override dispatch (PyUFunc_CheckOverride: argument tuple, kwargs
  * dict, __array_ufunc__ call; ~2,000 instructions). Every other call and
  * every attribute (reduce, outer, at, nin, types, ...) goes to the ufunc
- * itself; __class__ is numpy.ufunc, so isinstance(viproc.add, np.ufunc)
+ * itself; __class__ is numpy.ufunc, so isinstance(numpy2x.add, np.ufunc)
  * holds. */
 typedef struct {
     PyObject_HEAD PyObject* ufunc; /* the ufunc, or the reduction function (np.sum, ...) */
@@ -4896,13 +4896,13 @@ static PyObject* UfuncProxy_vectorcall(PyObject* self, PyObject* const* args, si
     return PyObject_Vectorcall(uf, args, nargsf, kwnames);
 }
 
-/* viproc.sum, prod, min, max, amin, amax, any, all, mean, var, std, argmin,
- * argmax (module mode): np.<reduction>(a, ...) of a viproc array `a` without
+/* numpy2x.sum, prod, min, max, amin, amax, any, all, mean, var, std, argmin,
+ * argmax (module mode): np.<reduction>(a, ...) of a numpy2x array `a` without
  * NumPy's __array_function__ dispatch (dispatcher call, relevant-argument
  * tuple, types tuple, kwargs dict: ~8,000 instructions, more than the
  * reduction's issue). The same steps as Array_array_function, in the same
- * order: vp_reduce for an array result, NumPy's implementation on a borrowed
- * view for small ready data, vp_reduce for a full reduction; every other
+ * order: nx_reduce for an array result, NumPy's implementation on a borrowed
+ * view for small ready data, nx_reduce for a full reduction; every other
  * call is NumPy's function itself, which dispatches as usual. */
 static PyObject* ReduceProxy_vectorcall(PyObject* self, PyObject* const* args, size_t nargsf,
                                         PyObject* kwnames) {
@@ -5017,7 +5017,7 @@ static PyObject* UfuncProxy_repr(PyObject* self) {
 }
 
 static PyTypeObject UfuncProxyType = {
-    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "viproc._viproc.ufunc_proxy",
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "numpy2x._numpy2x.ufunc_proxy",
     .tp_basicsize = sizeof(UfuncProxy),
     .tp_dealloc = UfuncProxy_dealloc,
     .tp_vectorcall_offset = offsetof(UfuncProxy, vectorcall),
@@ -5030,8 +5030,8 @@ static PyTypeObject UfuncProxyType = {
     .tp_new = UfuncProxy_new,
 };
 
-/* viproc.where (module mode): np.where(cond, x, y) without NumPy's
- * __array_function__ dispatch when a viproc array is among the arguments;
+/* numpy2x.where (module mode): np.where(cond, x, y) without NumPy's
+ * __array_function__ dispatch when a numpy2x array is among the arguments;
  * everything else is numpy.where itself. */
 static PyObject* m_where(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
                          PyObject* kwnames) {
@@ -5057,7 +5057,7 @@ static PyObject* m_where(PyObject* self, PyObject* const* args, Py_ssize_t nargs
         }
     }
     if (g_where_func == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "viproc: setup() was not called");
+        PyErr_SetString(PyExc_RuntimeError, "numpy2x: setup() was not called");
         return NULL;
     }
     return PyObject_Vectorcall(g_where_func, args, (size_t)nargs, kwnames);
@@ -5069,8 +5069,7 @@ static PyMethodDef methods[] = {
      "set_fp_reporting(extobj_contextvar, get_extobj_dict, mode_of, reporter)"},
     {"setup", m_setup, METH_VARARGS,
      "setup(cls, dtypes, fallback, asarray, internal_dirs, ops, ndarray, generic)"},
-    {"init", m_init, METH_VARARGS,
-     "init(max_active_tasks=0, sync_below=-1, adaptive=True)"},
+    {"init", m_init, METH_VARARGS, "init(max_active_tasks=0, sync_below=-1, adaptive=True)"},
     {"shutdown", m_shutdown, METH_NOARGS, "Wait for all tasks and destroy the runtime."},
     {"initialized", m_initialized, METH_NOARGS, NULL},
     {"offload_counts", m_offload_counts, METH_NOARGS,
@@ -5079,7 +5078,7 @@ static PyMethodDef methods[] = {
     {"elided", m_elided, METH_NOARGS, "Ops that wrote into a temporary operand's buffer."},
     {"elision_mode", m_elision_mode, METH_NOARGS,
      "How temporaries are recognized: 'exact', 'backtrace' or 'off'."},
-#if defined(VP_ELIDE_BACKTRACE)
+#if defined(NX_ELIDE_BACKTRACE)
     {"elision_chains", m_elision_chains, METH_NOARGS,
      "Frames per calibrated operator call chain (backtrace mode; one per operator)."},
 #endif
@@ -5115,17 +5114,17 @@ static PyMethodDef methods[] = {
     {"broadcast_to", m_broadcast_to, METH_VARARGS,
      "broadcast_to(a, shape): read-only broadcast view, None if not broadcastable"},
     {"gather", m_gather, METH_VARARGS,
-     "gather(a, idx, idx_axes, result_axes, result_strides[, mode]): a[idx...] (vp_gather)"},
+     "gather(a, idx, idx_axes, result_axes, result_strides[, mode]): a[idx...] (nx_gather)"},
     {"scatter", m_scatter, METH_VARARGS,
-     "scatter(a, idx, idx_axes, result_axes, values): a[idx...] = values (vp_scatter)"},
+     "scatter(a, idx, idx_axes, result_axes, values): a[idx...] = values (nx_scatter)"},
     {"where", (PyCFunction)(void (*)(void))m_where, METH_FASTCALL | METH_KEYWORDS,
-     "where(condition, [x, y]): numpy.where without NumPy's dispatch for viproc arrays"},
+     "where(condition, [x, y]): numpy.where without NumPy's dispatch for numpy2x arrays"},
     {"place", m_place, METH_VARARGS,
-     "place(dtype, shape, strides, parts): an array assembled from copies (vp_place)"},
-    {"select", m_select, METH_VARARGS, "select(cond, x, y): np.where(cond, x, y) (vp_select)"},
+     "place(dtype, shape, strides, parts): an array assembled from copies (nx_place)"},
+    {"select", m_select, METH_VARARGS, "select(cond, x, y): np.where(cond, x, y) (nx_select)"},
     {"mask_assign", m_mask_assign, METH_VARARGS, "mask_assign(a, mask, value): a[mask] = value"},
     {"matmul", m_matmul, METH_VARARGS,
-     "matmul(a, b): np.matmul of two viproc arrays asynchronously, or None"},
+     "matmul(a, b): np.matmul of two numpy2x arrays asynchronously, or None"},
     {"arg_reduce", m_arg_reduce, METH_VARARGS,
      "arg_reduce(argmax, a, out_shape): argmin/argmax along a's last axis (C-contiguous)"},
     {"astype", m_astype, METH_VARARGS,
@@ -5138,12 +5137,12 @@ static PyMethodDef methods[] = {
     {"ufunc_multi", m_ufunc_multi, METH_VARARGS,
      "ufunc_multi(ufunc, inputs, dtype codes): async ufunc with several outputs, or None"},
     {"sort", m_sort, METH_VARARGS,
-     "sort(a, axis, kind, arg, in_place, out_order): async sort/argsort along axis (vp_sort): "
+     "sort(a, axis, kind, arg, in_place, out_order): async sort/argsort along axis (nx_sort): "
      "the result, True (in place) or None if unsupported"},
     {"gufunc", m_gufunc, METH_VARARGS,
      "gufunc(ufunc, inputs, outs|None, dtype codes, core_n, core_axes, label sizes, flags, "
      "out_order, "
-     "invalid_error|None, work): async generalized ufunc (vp_gufunc): the outputs (a tuple) "
+     "invalid_error|None, work): async generalized ufunc (nx_gufunc): the outputs (a tuple) "
      "or None"},
     {"reduceat", m_reduceat, METH_VARARGS,
      "reduceat(ufunc, a, axis, indices (int64 bytes), strides|None): async ufunc.reduceat "
@@ -5160,8 +5159,8 @@ static PyMethodDef methods[] = {
 
 static struct PyModuleDef module = {
     PyModuleDef_HEAD_INIT,
-    "_viproc",
-    "viproc runtime binding.",
+    "_numpy2x",
+    "numpy2x runtime binding.",
     -1,
     methods,
     NULL,
@@ -5170,7 +5169,7 @@ static struct PyModuleDef module = {
     NULL,
 };
 
-PyMODINIT_FUNC PyInit__viproc(void) {
+PyMODINIT_FUNC PyInit__numpy2x(void) {
     if (PyType_Ready(&ArrayType) < 0 || PyType_Ready(&UfuncProxyType) < 0 ||
         PyType_Ready(&FlagsType) < 0) {
         return NULL;
@@ -5182,15 +5181,15 @@ PyMODINIT_FUNC PyInit__viproc(void) {
     s_call = PyUnicode_InternFromString("__call__");
     s_out = PyUnicode_InternFromString("out");
     AsyncError = PyErr_NewExceptionWithDoc(
-        "viproc._viproc.AsyncError",
+        "numpy2x._numpy2x.AsyncError",
         "An array op that ran asynchronously failed. Raised at the next call into "
-        "viproc after the failure and at every sync point touching its results; "
+        "numpy2x after the failure and at every sync point touching its results; "
         "the message names the op and where it was issued.",
         PyExc_RuntimeError, NULL);
     PyObject* bases = AsyncError != NULL ? PyTuple_Pack(2, AsyncError, PyExc_IndexError) : NULL;
     AsyncIndexError =
         bases != NULL
-            ? PyErr_NewExceptionWithDoc("viproc._viproc.AsyncIndexError",
+            ? PyErr_NewExceptionWithDoc("numpy2x._numpy2x.AsyncIndexError",
                                         "An index out of bounds in an asynchronous indexing op.",
                                         bases, NULL)
             : NULL;
@@ -5198,7 +5197,7 @@ PyMODINIT_FUNC PyInit__viproc(void) {
     bases = AsyncError != NULL ? PyTuple_Pack(2, AsyncError, PyExc_ValueError) : NULL;
     AsyncValueError =
         bases != NULL
-            ? PyErr_NewExceptionWithDoc("viproc._viproc.AsyncValueError",
+            ? PyErr_NewExceptionWithDoc("numpy2x._numpy2x.AsyncValueError",
                                         "An invalid element value in an asynchronous op (as "
                                         "NumPy's ValueError: integer power with a negative "
                                         "exponent).",
@@ -5212,7 +5211,7 @@ PyMODINIT_FUNC PyInit__viproc(void) {
     Py_XDECREF(lin_err);
     AsyncLinAlgError =
         bases != NULL
-            ? PyErr_NewExceptionWithDoc("viproc._viproc.AsyncLinAlgError",
+            ? PyErr_NewExceptionWithDoc("numpy2x._numpy2x.AsyncLinAlgError",
                                         "A numpy.linalg op that ran asynchronously failed (as "
                                         "NumPy's LinAlgError: singular matrix, no convergence).",
                                         bases, NULL)
@@ -5221,7 +5220,7 @@ PyMODINIT_FUNC PyInit__viproc(void) {
     bases = AsyncError != NULL ? PyTuple_Pack(2, AsyncError, PyExc_FloatingPointError) : NULL;
     AsyncFloatingPointError =
         bases != NULL
-            ? PyErr_NewExceptionWithDoc("viproc._viproc.AsyncFloatingPointError",
+            ? PyErr_NewExceptionWithDoc("numpy2x._numpy2x.AsyncFloatingPointError",
                                         "A floating-point error of an asynchronous op under "
                                         "np.errstate(...='raise') (as NumPy's "
                                         "FloatingPointError).",
@@ -5237,7 +5236,7 @@ PyMODINIT_FUNC PyInit__viproc(void) {
         PyModule_AddObjectRef(m, "AsyncValueError", AsyncValueError) < 0 ||
         PyModule_AddObjectRef(m, "_Array", (PyObject*)&ArrayType) < 0 ||
         PyModule_AddObjectRef(m, "ufunc_proxy", (PyObject*)&UfuncProxyType) < 0 ||
-        PyModule_AddStringConstant(m, "version", vp_version()) < 0) {
+        PyModule_AddStringConstant(m, "version", nx_version()) < 0) {
         Py_DECREF(m);
         return NULL;
     }

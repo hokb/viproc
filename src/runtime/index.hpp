@@ -9,7 +9,7 @@
 #include <memory>
 #include <vector>
 
-namespace viproc {
+namespace numpy2x {
 
 // Integer array indices into some axes of a source (or destination) view.
 // The index arrays (int32 or int64) broadcast to `bshape`. Each axis of the
@@ -47,4 +47,4 @@ std::shared_ptr<Kernel> make_mask_assign_kernel();
 // {cond, x, y}, outputs = {out}.
 std::shared_ptr<Kernel> make_select_kernel();
 
-} // namespace viproc
+} // namespace numpy2x

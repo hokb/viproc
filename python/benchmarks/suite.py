@@ -1,13 +1,13 @@
-"""viproc benchmark suite: many array programs, NumPy vs. viproc, one score.
+"""numpy2x benchmark suite: many array programs, NumPy vs. numpy2x, one score.
 
 Runs every case of suite_cases.py in several sizes and layouts, plain NumPy
-against viproc (its fixed 2 workers), checks that the results are identical,
+against numpy2x (its fixed 2 workers), checks that the results are identical,
 and condenses the speedups into the *parallel efficiency score* (0..100,
 100 = ideal):
 
 - **Workers.** A case of parallel width P (independent instruction streams)
   ideally runs min(2, P) times faster than NumPy on medium and large data,
-  2 being viproc's worker count. Tiny data cannot amortize a hand-off, so
+  2 being numpy2x's worker count. Tiny data cannot amortize a hand-off, so
   there the ideal is parity with NumPy (1x). Efficiency = speedup / ideal.
 - **RAM.** The `large` size class is scaled to the memory per core
   (RAM / (512 x max(cores, 8)) elements, clamped to [500k, 10M]): large
@@ -19,7 +19,7 @@ efficiencies in that category (each category weighs the same).
 Usage:
     PYTHONPATH=build/python python3 python/benchmarks/suite.py [--quick] [--out DIR]
     python3 python/benchmarks/suite.py --merge a/results.json b/results.json --out DIR
-    docker run --rm -v "$PWD:/work" viproc:linux benchmark suite
+    docker run --rm -v "$PWD:/work" numpy2x:linux benchmark suite
 
 Writes DIR/results.json, DIR/report.md and DIR/report.html.
 """
@@ -51,9 +51,9 @@ def usable_cores():
     """Physical cores this process may use (affinity counts, SMT siblings
     once), at most the hardware threads it may use (a cgroup CPU quota
     counts)."""
-    import viproc
+    import numpy2x
 
-    return min(viproc.physical_cores(), usable_threads())
+    return min(numpy2x.physical_cores(), usable_threads())
 
 
 def usable_threads():
@@ -132,9 +132,9 @@ def build_stamp():
     (Python sources and extension), so a report shows which build it ran."""
     import hashlib
 
-    import viproc
+    import numpy2x
 
-    pkg = os.path.dirname(viproc.__file__)
+    pkg = os.path.dirname(numpy2x.__file__)
     h, newest = hashlib.sha256(), 0.0
     for name in sorted(os.listdir(pkg)):
         if name.endswith((".py", ".so", ".pyd")):
@@ -168,10 +168,10 @@ def check_out_dir(out, reference):
 
 
 def machine_info(cores, ram):
-    import viproc
+    import numpy2x
 
     return {
-        "label": os.environ.get("VIPROC_PLATFORM") or f"{platform.system().lower()}",
+        "label": os.environ.get("NUMPY2X_PLATFORM") or f"{platform.system().lower()}",
         "os": platform.platform(),
         "cpu": cpu_model(),
         "cores": cores,
@@ -180,10 +180,10 @@ def machine_info(cores, ram):
         "ram_bytes": ram,
         "python": sys.version.split()[0],
         "numpy": np.__version__,
-        "viproc": viproc.__version__,
+        "numpy2x": numpy2x.__version__,
         "build": build_stamp(),
-        "build_type": os.environ.get("VIPROC_BUILD_TYPE", ""),
-        "elision": viproc._viproc.elision_mode(),
+        "build_type": os.environ.get("NUMPY2X_BUILD_TYPE", ""),
+        "elision": numpy2x._numpy2x.elision_mode(),
         "blas_threads": os.environ.get("OPENBLAS_NUM_THREADS", "default"),
         "date": datetime.datetime.now().isoformat(timespec="seconds"),
     }
@@ -238,7 +238,7 @@ def apply_layout(bases, lay, base_shape, convert):
 
 
 def materialize(result):
-    """NumPy copy of a result (sync point for viproc results)."""
+    """NumPy copy of a result (sync point for numpy2x results)."""
     def one(x):
         if hasattr(x, "shape"):
             return np.array(np.asarray(x))
@@ -323,49 +323,49 @@ def score(results, cores):
     }
 
 
-def measure_viproc(case, bases, lay, base_shape, reps, repeat, expected):
-    """Best time of `case` on viproc (its 2 workers), whether its result
-    equals NumPy's, and the eager fallbacks of one run. Every viproc array
+def measure_numpy2x(case, bases, lay, base_shape, reps, repeat, expected):
+    """Best time of `case` on numpy2x (its 2 workers), whether its result
+    equals NumPy's, and the eager fallbacks of one run. Every numpy2x array
     is gone when this returns (before the next init)."""
-    import viproc
+    import numpy2x
 
-    viproc.init()
+    numpy2x.init()
     unsupported = []
 
     def convert(a):
-        # A dtype viproc does not support (int16, float16) stays a NumPy
-        # array, as in a viproc program: those ops run in plain NumPy.
-        v = viproc.asarray(a)
-        if not isinstance(v, viproc.ndarray):
+        # A dtype numpy2x does not support (int16, float16) stays a NumPy
+        # array, as in a numpy2x program: those ops run in plain NumPy.
+        v = numpy2x.asarray(a)
+        if not isinstance(v, numpy2x.ndarray):
             unsupported.append(str(a.dtype))
             return a
         return v
 
     vdata = apply_layout(bases, lay, base_shape, convert)
-    viproc.wait_all()
+    numpy2x.wait_all()
 
     def run():
         out = case.run(vdata, reps)
-        viproc.wait_all()
+        numpy2x.wait_all()
         return out
 
-    f0 = viproc._ndarray.fallback_calls
+    f0 = numpy2x._ndarray.fallback_calls
     t0 = time.perf_counter()
     same = identical(materialize(run()), expected)  # also the warm-up
     warm = time.perf_counter() - t0
-    fallbacks = viproc._ndarray.fallback_calls - f0
+    fallbacks = numpy2x._ndarray.fallback_calls - f0
     t, _ = best_of(run, repeats_for(warm, repeat))
     return t, same, fallbacks, sorted(set(unsupported))
 
 
 def run_suite(args):
-    import viproc
+    import numpy2x
 
     cores = args.cores or usable_cores()
     ram = physical_memory()
-    viproc.init()  # the runtime's fixed worker count (2)
-    default = viproc.workers()
-    viproc.shutdown()
+    numpy2x.init()  # the runtime's fixed worker count (2)
+    default = numpy2x.workers()
+    numpy2x.shutdown()
     workers = [default]
     wmax = max(workers)
     target = 0.02 if args.quick else 0.04
@@ -387,7 +387,7 @@ def run_suite(args):
                 continue
             configs.append((case, size, layout, dtype))
 
-    print(f"viproc benchmark suite: {len(configs)} configurations, {cores} cores, "
+    print(f"numpy2x benchmark suite: {len(configs)} configurations, {cores} cores, "
           f"{ram / 2**30:.1f} GiB RAM, workers {workers}, large = "
           f"{info['large_elements']:,} elements, build {info['build']}", flush=True)
 
@@ -405,28 +405,28 @@ def run_suite(args):
              "size": size, "layout": layout, "dtype": dtype or default_dtype(bases),
              "width": width, "reps": reps,
              "elements": int(np.prod(base_shape)) if base_shape else 1,
-             "numpy_s": t_np, "viproc_s": {}, "fallbacks": None, "identical": True}
+             "numpy_s": t_np, "numpy2x_s": {}, "fallbacks": None, "identical": True}
         for w in workers:
-            t, same, fallbacks, unsupported = measure_viproc(
+            t, same, fallbacks, unsupported = measure_numpy2x(
                 case, bases, lay, base_shape, reps, repeat, expected)
-            r["viproc_s"][str(w)] = t
+            r["numpy2x_s"][str(w)] = t
             r["identical"] = r["identical"] and same
             if w == wmax:
                 r["fallbacks"] = fallbacks
-                r["not_in_viproc"] = unsupported
-        viproc.shutdown()
-        r["speedup"] = t_np / r["viproc_s"][str(wmax)]
-        r["speedup_w1"] = t_np / r["viproc_s"]["1"] if "1" in r["viproc_s"] else None
+                r["not_in_numpy2x"] = unsupported
+        numpy2x.shutdown()
+        r["speedup"] = t_np / r["numpy2x_s"][str(wmax)]
+        r["speedup_w1"] = t_np / r["numpy2x_s"]["1"] if "1" in r["numpy2x_s"] else None
         r["ideal"] = ideal_speedup(size, width, wmax)
         r["efficiency"] = r["speedup"] / r["ideal"]
         results.append(r)
         mark = "" if r["identical"] else "  RESULT DIFFERS"
         print(f"[{i + 1:3}/{len(configs)}] {case.name:18} {size:6} {layout:7} "
               f"{r['dtype']:18} P={width:<3} "
-              f"numpy {t_np * 1e3:8.2f} ms  viproc {r['viproc_s'][str(wmax)] * 1e3:8.2f} ms  "
+              f"numpy {t_np * 1e3:8.2f} ms  numpy2x {r['numpy2x_s'][str(wmax)] * 1e3:8.2f} ms  "
               f"speedup {r['speedup']:5.2f}x  eff {r['efficiency']:4.2f}  "
               f"fallbacks {r['fallbacks']}"
-              + (f"  stays NumPy: {','.join(r['not_in_viproc'])}" if r["not_in_viproc"] else "")
+              + (f"  stays NumPy: {','.join(r['not_in_numpy2x'])}" if r["not_in_numpy2x"] else "")
               + mark, flush=True)
 
     return {"machine": info, "results": results, "summary": score(results, wmax)}
@@ -434,7 +434,7 @@ def run_suite(args):
 
 def main():
     # Some programs overflow or divide by zero on purpose (float16, int
-    # wrap-around); NumPy and viproc then agree on inf/nan, the warnings are
+    # wrap-around); NumPy and numpy2x then agree on inf/nan, the warnings are
     # noise here.
     warnings.simplefilter("ignore", RuntimeWarning)
     np.seterr(all="ignore")

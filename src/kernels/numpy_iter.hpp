@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace viproc::numpy {
+namespace numpy2x::numpy {
 
 // The pending Python error as a string (cleared). GIL held.
 std::string fetch_python_error();
@@ -154,4 +154,4 @@ PyArrayObject* template_array(const Layout& l, char* data, bool writable);
 // written through it.
 char* template_address();
 
-} // namespace viproc::numpy
+} // namespace numpy2x::numpy

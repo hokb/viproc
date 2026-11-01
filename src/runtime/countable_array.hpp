@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <memory>
 
-namespace viproc {
+namespace numpy2x {
 
 // One version of an array's data (docs/design/array-data-model.md, A1). Its memory is up
 // to kInlineBytes inside the object, larger blocks come from the element pool
@@ -116,4 +116,4 @@ class CountableArray {
     std::shared_ptr<void> owner_;
 };
 
-} // namespace viproc
+} // namespace numpy2x

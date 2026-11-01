@@ -1,7 +1,7 @@
-# Memory management in viproc
+# Memory management in numpy2x
 
-This document collects the design decisions about memory in viproc: who owns
-what, when memory is released, how it is reused, and how viproc memory is
+This document collects the design decisions about memory in numpy2x: who owns
+what, when memory is released, how it is reused, and how numpy2x memory is
 shared with NumPy. CLAUDE.md summarizes the execution model; this document
 is the reference for everything memory-related and records *why* each
 decision was taken.
@@ -21,15 +21,15 @@ current data version, last writer); a data version is a `CountableArray`
 
 | # | Decision | Status |
 |---|----------|--------|
-| D1 | No dedicated (temporary) array types; one `viproc.ndarray` type | Decided |
+| D1 | No dedicated (temporary) array types; one `numpy2x.ndarray` type | Decided |
 | D2 | Deterministic memory management through reference counting | Decided; implemented for objects |
-| D3 | Own memory pool for element memory in the viproc layer | Implemented |
+| D3 | Own memory pool for element memory in the numpy2x layer | Implemented |
 | D4 | Pools for the per-op runtime objects (Task, Metadata, CountableArray, ArrayBlock) | Implemented |
 | D5 | Reuse the buffer of a temporary input for the output | Implemented |
 | D6 | Ownership: Python owns objects, the runtime owns element memory | Implemented |
-| D7 | Array conversions viproc ↔ ndarray: copy-free aliasing export, copy-free import of fresh memory, eager fallbacks with NumPy's semantics | Implemented |
+| D7 | Array conversions numpy2x ↔ ndarray: copy-free aliasing export, copy-free import of fresh memory, eager fallbacks with NumPy's semantics | Implemented |
 | D8 | Write-after-read safety by copy-on-write, not by locking | Implemented |
-| D9 | `viproc.ndarray` is a wrapper, not a subclass of `numpy.ndarray` | Decided, implemented |
+| D9 | `numpy2x.ndarray` is a wrapper, not a subclass of `numpy.ndarray` | Decided, implemented |
 | D10 | Access model: pool allocations on the main thread only, releases from any thread | Superseded by D11 for element memory; holds for D4 |
 | D11 | Element memory as late as possible: the task producing a buffer takes its block when it runs, from a dying input or the pool | Implemented |
 
@@ -58,7 +58,7 @@ reused.
 
 ## D1 — No dedicated (temporary) array types
 
-**Decision.** viproc has one array type, `viproc.ndarray`. There is no
+**Decision.** numpy2x has one array type, `numpy2x.ndarray`. There is no
 temporary/return type, no input/output parameter type and no scope API.
 
 **Why.**
@@ -69,7 +69,7 @@ temporary/return type, no input/output parameter type and no scope API.
   returns. That is exactly what `RetArray` and `Scope` provide on .NET,
   without any type or scope in user code.
 - Dedicated types would rule out running unchanged NumPy programs
-  (`python -m viproc script.py`), a goal of the Python bridge.
+  (`python -m numpy2x script.py`), a goal of the Python bridge.
 - What the type system tells ILNumerics ("this value is used once") can be
   read from the reference count at runtime where it matters (D5).
 
@@ -85,7 +85,7 @@ reference goes, never by a collector or at an unknown later time.
 
 | Object | Counted by | Released |
 |--------|-----------|----------|
-| `viproc.ndarray` (Python object) | CPython refcount | when the program drops it |
+| `numpy2x.ndarray` (Python object) | CPython refcount | when the program drops it |
 | `Array`, `AliasGroup` (runtime, main thread only) | `Ref<T>`, plain int (`src/runtime/ref.hpp`) | with the last Python object / view referring to them |
 | `Metadata` (size descriptor) | `MetadataPtr`, intrusive atomic | when no array and no issued task (operand) refers to it |
 | `Task` | `std::shared_ptr` (atomic) | after completion, when no array names it as producer |
@@ -104,7 +104,7 @@ parks them in a graveyard drained at the next C ABI call
 
 ## D3 — Own memory pool for element memory
 
-**Decision.** Element memory comes from a pool in the viproc layer. Buffers
+**Decision.** Element memory comes from a pool in the numpy2x layer. Buffers
 released by D2 go back to the pool and are reused by later ops instead of
 being returned to the system allocator. A request is served by a cached
 block of **equal or larger** size, as long as the excess stays below a
@@ -126,7 +126,7 @@ single-op loop shows no difference. With several live temporaries it trims
 and re-faults memory on every iteration (Python, `((x + 1) * 2) + 3`,
 float64):
 
-| Elements | NumPy, temporaries | NumPy, `out=` reuse | viproc, no pool |
+| Elements | NumPy, temporaries | NumPy, `out=` reuse | numpy2x, no pool |
 |---------:|-------------------:|--------------------:|----------------:|
 | 1e5 | 0.61 ms (358 faults)   | 0.08 ms (0) | 0.75 ms (554)    |
 | 1e6 | 3.8 ms (1,319 faults)  | 1.3 ms (0)  | 8.3 ms (5,827)   |
@@ -167,7 +167,7 @@ advantage.)
 - **Large blocks.** `MADV_HUGEPAGE` from 2 MiB (Linux; a hint). Windows:
   blocks from 2 MiB come from `VirtualAlloc` (page-aligned, lazily
   committed like on Linux). Large pages (`MEM_LARGE_PAGES`) are opt-in,
-  `VIPROC_LARGE_PAGES=1`: used when the process holds the "Lock pages in
+  `NUMPY2X_LARGE_PAGES=1`: used when the process holds the "Lock pages in
   memory" privilege (`SeLockMemoryPrivilege`, enabled once at first use)
   and the block is a whole number of large pages (always from 16 MiB on).
   Not by default: Windows commits and zeroes a large-page block inside
@@ -177,11 +177,11 @@ advantage.)
   instead of < 1 ms, 3 misses). Linux's huge pages fault in on the
   worker that first writes the block instead.
 - **Bound.** At most a configured number of cached bytes (counted in
-  capacity; default: half the physical memory, as ONAL; `VIPROC_POOL_LIMIT`
-  — bytes, `K`/`M`/`G` suffix — to override; `viproc.set_pool_limit()`).
+  capacity; default: half the physical memory, as ONAL; `NUMPY2X_POOL_LIMIT`
+  — bytes, `K`/`M`/`G` suffix — to override; `numpy2x.set_pool_limit()`).
   A release that would exceed the bound returns its block to the system
   (the simplest policy; evicting older cached blocks instead is an open
-  question). `viproc.trim()` and runtime shutdown empty the pool.
+  question). `numpy2x.trim()` and runtime shutdown empty the pool.
 - **Process-wide.** One pool per process (`ElementPool::instance()`, never
   destroyed: blocks may be released at exit). It is trimmed when a runtime
   shuts down.
@@ -189,12 +189,12 @@ advantage.)
   itself and retries once, then `std::bad_alloc` propagates. Not done yet:
   waiting for issued tasks (their completion releases buffers) before
   giving up, and raising `MemoryError` at the issuing op.
-- **Statistics.** `viproc.pool_stats()`: hits, misses, cached bytes,
-  releases dropped by the bound, limit (C ABI: `vp_pool_get_stats`).
+- **Statistics.** `numpy2x.pool_stats()`: hits, misses, cached bytes,
+  releases dropped by the bound, limit (C ABI: `nx_pool_get_stats`).
 - **Determinism is kept.** Release into the pool happens at the same moment
   as before; only *where* the memory goes changes. Peak memory: live data +
   outputs of running tasks (D11) + the pool bound.
-- **Debugging.** `-DVIPROC_ELEMENT_POOL=OFF` sets the default bound to 0
+- **Debugging.** `-DNUMPY2X_ELEMENT_POOL=OFF` sets the default bound to 0
   (no caching), so AddressSanitizer keeps catching use-after-free in
   element memory.
 
@@ -210,13 +210,13 @@ per bin, rounding up on allocation, a byte bound of half the available
 memory, page-aligned native blocks, optional clearing on request, and OOM
 recovery by emptying the pool and retrying. **Not taken:** its growth of
 the bound by 10 % on every overflowing release (the bound drifts upward;
-viproc keeps a fixed bound) and its eviction order (alternately smallest
-and largest bins; viproc prefers the least recently released blocks, which
+numpy2x keeps a fixed bound) and its eviction order (alternately smallest
+and largest bins; numpy2x prefers the least recently released blocks, which
 are least likely to be reused soon). ONAL also contains a disabled attempt
 to block the issuing thread when allocated bytes exceed the bound; the
 comment notes it failed for memory-heavy algorithms whose pressure does not
 come from pending work, and leaves memory pressure to OOM handling. A
-memory-based look-ahead limit in viproc (below) must avoid that trap.
+memory-based look-ahead limit in numpy2x (below) must avoid that trap.
 
 **Relation to the look-ahead limit.** The limit of 1000 active tasks also
 bounds the memory pending ops hold. A memory-based limit (bytes reserved by
@@ -241,8 +241,8 @@ bridge").
 
 ## D5 — Reuse the buffer of a temporary input
 
-**Implemented** (`python/viproc/_viproc.c`: `elision_candidate`,
-`is_temporary`; C ABI `vp_array_reusable_bytes`). The runtime counterpart
+**Implemented** (`python/numpy2x/_numpy2x.c`: `elision_candidate`,
+`is_temporary`; C ABI `nx_array_reusable_bytes`). The runtime counterpart
 of ILNumerics' persistence cast, without a type: when an operand of an
 element-wise **operator** (`+ - * / // % << >> & | ^ @`, unary `- + ~`) is
 a temporary, the op writes its result into that operand's buffer instead of
@@ -254,7 +254,7 @@ An operand qualifies when, at issue time on the main thread:
 1. **dtype and shape equal the output's** (no broadcasting into it; element
    -wise loops read and write the same element in one call, as NumPy does
    in place);
-2. **the runtime may reuse its buffer** (`vp_array_reusable_bytes`): the
+2. **the runtime may reuse its buffer** (`nx_array_reusable_bytes`): the
    `Array` has no other reference and its `AliasGroup` no other array (no
    views), the buffer is pool memory (so never memory shared with NumPy),
    no issued task still reads it (`async_reads == 0`; a pending *producer*
@@ -268,7 +268,7 @@ An operand qualifies when, at issue time on the main thread:
    - CPython 3.12/3.13 on glibc and on Windows: reference count 1 **and**
      the operator was applied by the bytecode interpreter itself, not by C
      code that may hold a borrowed reference to an object owned elsewhere
-     (mode `"backtrace"`). The return addresses after viproc's frames
+     (mode `"backtrace"`). The return addresses after numpy2x's frames
      (`backtrace()` / `RtlCaptureStackBackTrace()`; module of an address
      via `dladdr()` / `GetModuleHandleExW()`) must start with a chain
      recorded once by running every operator on a probe object, entered
@@ -293,11 +293,11 @@ An operand qualifies when, at issue time on the main thread:
      runtime's dispatch (`binary_op1`), and a PGO build (e.g. GitHub's
      `actions/setup-python` CPython, `--enable-optimizations`) gives
      each path its own call site; calibrated with `p + p` only, `x + 1.0`
-     never elided there. `_viproc.elision_chains()` lists the calibrated
+     never elided there. `_numpy2x.elision_chains()` lists the calibrated
      chain lengths (39: 12 binary operators x 3 forms, 3 unary).
    - Otherwise (other C libraries, macOS with CPython < 3.14): off (mode
      `"off"`).
-   `viproc._viproc.elision_mode()` reports the mode, `_viproc.elided()`
+   `numpy2x._numpy2x.elision_mode()` reports the mode, `_numpy2x.elided()`
    counts elided ops.
 
 **Views.** Rule 2 works on the alias group, not on the Python object, so views
@@ -307,7 +307,7 @@ still has another view (e.g. one kept in a list). A view that is the only
 array left on its alias group and covers its buffer contiguously from offset 0
 (`(x * 2)[:] + 1`) is reused, correctly: nothing else can see that buffer.
 Offset or strided views are not reused (conservative). Buffers exported to
-NumPy (D7) fail rule 2: a live export counts as a reader. Read-only viproc
+NumPy (D7) fail rule 2: a live export counts as a reader. Read-only numpy2x
 arrays (D7, "Eager fallbacks") are never reused either.
 
 Then the op is issued with the operand as its `out=` array: an in/out op
@@ -322,40 +322,40 @@ the same array copy-on-write, and blocked the next elision.
 3.6 / 60 ms); pool memory held after the loop 1e7: 266 → 88 MiB.
 `strong_scaling.py` 1e7 (4 workers, 8 chains of length 5): 2.96 → 1.98 s,
 7.5x NumPy (above 4x because NumPy pays page faults for its temporaries
-and viproc writes in place, saving memory bandwidth).
+and numpy2x writes in place, saving memory bandwidth).
 
 ## D6 — Ownership
 
 **Implemented.**
 
-- **Python objects** (`viproc.ndarray`, `numpy.ndarray`) are owned by
+- **Python objects** (`numpy2x.ndarray`, `numpy.ndarray`) are owned by
   Python and its reference counting.
-- **Element memory** is owned by the runtime (`CountableArray`), whether viproc
+- **Element memory** is owned by the runtime (`CountableArray`), whether numpy2x
   allocated it or adopted it from a NumPy array. Adopted memory stays
   alive through a reference to its ndarray held by the `CountableArray`.
 - **`Array` / `AliasGroup`** are runtime objects reachable only from the
   main thread; workers see `Task`s, `Metadata` objects and `CountableArray`s only.
-- **The C ABI** hands out `Array*` as `vp_array*`, one reference each;
+- **The C ABI** hands out `Array*` as `nx_array*`, one reference each;
   bridges never see C++ ownership types.
 
-## D7 — Array conversions: viproc ↔ ndarray
+## D7 — Array conversions: numpy2x ↔ ndarray
 
 **Implemented** (`numpy::export_ndarray`, `Runtime::prepare_host_write`,
-C ABI `vp_array_export`, `vp_array_prepare_write`, `vp_array_view`;
-`python/viproc/_ndarray.py`: `_Host`). Exports to NumPy copy no element data;
+C ABI `nx_array_export`, `nx_array_prepare_write`, `nx_array_view`;
+`python/numpy2x/_ndarray.py`: `_Host`). Exports to NumPy copy no element data;
 imports copy no element data where the memory is provably nobody else's.
 Values stay identical to NumPy in every case.
 
-### Is NumPy only ever called by viproc?
+### Is NumPy only ever called by numpy2x?
 
-No, and that decides the design. viproc controls every access to a viproc
+No, and that decides the design. numpy2x controls every access to a numpy2x
 array: NumPy loops run only inside tasks (inputs completed, outputs
 allocated, writes in place only without pending readers, D8), or eagerly on
 the main thread after a sync. But once a plain `numpy.ndarray` exists on
 the same memory, anyone can call NumPy on it directly: user code
 (`b[0] = 5`, `np.add(b, 1, out=b)`), libraries, C extensions. Those calls
-do not pass through viproc (`numpy.ndarray` is NumPy's own type), and they
-run on the main thread *while viproc's workers may still read or write the
+do not pass through numpy2x (`numpy.ndarray` is NumPy's own type), and they
+run on the main thread *while numpy2x's workers may still read or write the
 same buffer*. Synchronous with respect to the main thread is not
 synchronous with respect to the workers. So a copy-free conversion needs a
 rule for that outside access.
@@ -364,7 +364,7 @@ rule for that outside access.
 
 `np.asarray(v)`, `v.__array__()` and `v.numpy()` give what `np.asarray`
 gives for a NumPy array: **the same memory**, no copy. The export is
-writable (read-only only for read-only viproc arrays, as NumPy keeps the
+writable (read-only only for read-only numpy2x arrays, as NumPy keeps the
 flag), and writes through either side show in the other, as with NumPy's
 own views. Before it is made, `v`'s producer and every issued task still
 reading the buffer are waited for (`Runtime::prepare_host_write`; no
@@ -404,7 +404,7 @@ Measured (1e7 float64): `np.asarray(v)` 18.8 ms (copy) → 0.001 ms;
 Reductions, `mean`/`var`/`std`, `argmax`/`argmin`, `copy` and `astype` of
 **small ready** data (at most `sync_below` elements, the direct path's
 bound) have nothing to run asynchronously. `_Array`'s C methods and its
-`__array_function__` hand them to NumPy itself: `vp_array_borrow(a)` is an
+`__array_function__` hand them to NumPy itself: `nx_array_borrow(a)` is an
 ndarray over the buffer with `a`'s layout and **no owner and no export
 bookkeeping**, and NumPy's own method (`view.sum(...)`) or NumPy's
 implementation of the function (`np.sum._implementation`) runs on it with
@@ -416,41 +416,41 @@ construction, at NumPy's cost plus the borrow.
   (thread rules: ready stays ready until the main thread issues a writer).
 - The view is flagged writable, as NumPy's own arrays are: NumPy copies
   read-only inputs in some calls (`argmax` through `PyArray_FromArray`).
-  The callee only reads; calls with an `out=` or `where=` of viproc arrays
+  The callee only reads; calls with an `out=` or `where=` of numpy2x arrays
   are not delegated.
 - After the call: a view NumPy still references (refcount > 1, e.g. kept
-  in a result's base) is **pinned** (`vp_array_pin`): made read-only and
+  in a result's base) is **pinned** (`nx_array_pin`): made read-only and
   turned into a regular export (`host_views`). A result that is the view
   itself (`astype(copy=False)` of the same dtype) maps to `a`; an ndarray
   result is fresh memory and adopted (Import).
 - **Index assignment** (`a[key] = value`, small ready target) writes
   through the borrow: NumPy's mapping slot runs on the borrowed view. This
   needs more than readiness: no task may still read the buffer and no
-  export may be alive (`vp_array_host_writable`: ready, no stored error,
+  export may be alive (`nx_array_host_writable`: ready, no stored error,
   no `async_reads`, no `host_views`), else a reader would see the new
   values. Key arrays and the value are borrowed in the same
   call and pinned afterwards if NumPy kept them. Otherwise the assignment
   is a task (copy-on-write as for any in/out op).
-- Not delegated: reductions with an axis or keepdims that `vp_reduce`
+- Not delegated: reductions with an axis or keepdims that `nx_reduce`
   covers (its direct path is cheaper than NumPy's call plus adopting the
-  result array), and larger or pending inputs (`vp_reduce`
+  result array), and larger or pending inputs (`nx_reduce`
   asynchronously, else the Python handlers).
 
-### Eager fallbacks: NumPy code on viproc memory, NumPy's semantics
+### Eager fallbacks: NumPy code on numpy2x memory, NumPy's semantics
 
-Everything viproc does not run asynchronously (reductions, `np.*`
+Everything numpy2x does not run asynchronously (reductions, `np.*`
 functions, advanced indexing, `ufunc.at`, mutating functions such as
 `np.put`, …) runs eagerly in NumPy on the main thread (`_Host` in
 `_ndarray.py`). The goal is NumPy's semantics exactly, including identity,
 aliasing, writability and in-place writes, so the fallback hands NumPy the
-viproc memory itself, not copies:
+numpy2x memory itself, not copies:
 
-1. **Exclusive, writable export per viproc argument**
-   (`vp_array_export(a, writable=1)` → `Runtime::prepare_host_write`): wait
+1. **Exclusive, writable export per numpy2x argument**
+   (`nx_array_export(a, writable=1)` → `Runtime::prepare_host_write`): wait
    for the array's producer, then until no issued task still reads the
    buffer (live exports are aliases and see the writes, as NumPy's views) (`CountableArray::wait_task_readers`). From then on no
    worker touches the buffer: the main thread issues nothing while NumPy
-   runs. A writable export is not counted as a reader. Read-only viproc
+   runs. A writable export is not counted as a reader. Read-only numpy2x
    arrays get a read-only export (NumPy then raises its own error).
 2. **NumPy runs** on these views: `out=`, in-place functions (`np.put`,
    `np.place`, `np.putmask`, `np.fill_diagonal`, `np.copyto(where=)`,
@@ -459,13 +459,13 @@ viproc memory itself, not copies:
    they are NumPy's.
 3. **Results are mapped back** to what NumPy would have returned:
 
-   | NumPy result | viproc result |
+   | NumPy result | numpy2x result |
    |--------------|---------------|
-   | a viproc argument's export itself (`np.atleast_1d(x)`, `out=`) | that viproc array (`r is x`, as in NumPy) |
-   | shares memory with an export (`reshape`, `.T`, `ravel`, `split`, `diagonal`, `broadcast_to`, `sliding_window_view`, `real`/`imag`, …) | a viproc **view** of the same storage (`vp_array_view`, dtype views included), read-only if NumPy made it read-only |
+   | a numpy2x argument's export itself (`np.atleast_1d(x)`, `out=`) | that numpy2x array (`r is x`, as in NumPy) |
+   | shares memory with an export (`reshape`, `.T`, `ravel`, `split`, `diagonal`, `broadcast_to`, `sliding_window_view`, `real`/`imag`, …) | a numpy2x **view** of the same storage (`nx_array_view`, dtype views included), read-only if NumPy made it read-only |
    | a NumPy argument or a view of one | returned unchanged (a plain ndarray, as NumPy returns it) |
    | fresh memory (owns its data, no base) | adopted without a copy |
-   | anything else (view viproc cannot express: unaligned, non-native byte order, unsupported dtype) | copied |
+   | anything else (view numpy2x cannot express: unaligned, non-native byte order, unsupported dtype) | copied |
 
    Views are recognized by memory overlap (`np.may_share_memory`), not by
    the base chain: NumPy code builds views through other objects
@@ -474,16 +474,16 @@ viproc memory itself, not copies:
    aliases, counted as host views: ops on that memory run synchronously
    while they live (Export, above).
 
-**Read-only viproc arrays** (`_readonly`): views that NumPy returns
+**Read-only numpy2x arrays** (`_readonly`): views that NumPy returns
 read-only (`broadcast_to`, `sliding_window_view`, …) stay read-only in
-viproc. Writes raise NumPy's `ValueError("assignment destination is
+numpy2x. Writes raise NumPy's `ValueError("assignment destination is
 read-only")` / `output array is read-only`; operators fall back to NumPy
 for them, which raises the same error.
 
 Remaining differences to NumPy:
 
 - `np.broadcast_arrays` results: NumPy warns (`DeprecationWarning`) on the
-  first write and then writes; viproc maps them as writable views without
+  first write and then writes; numpy2x maps them as writable views without
   that warning.
 - An export that NumPy code keeps beyond the call is read-only afterwards,
   where NumPy's would stay writable (step 4).
@@ -499,15 +499,15 @@ provably have no other user:
 
 | Path | Conversion |
 |------|-----------|
-| Creation functions (`viproc.zeros`, `ones`, `arange`, …) | NumPy creates, viproc adopts (no copy) |
-| Results of eager fallbacks | mapped as above: viproc argument, viproc view, NumPy argument unchanged, fresh memory adopted, otherwise copied |
-| `viproc.asarray(nd)`, NumPy operand in a viproc op (`v + nd`) | copy: the caller still holds `nd` and may write it |
-| `viproc.asarray(nd, dtype=other)` | one copy (the cast) |
+| Creation functions (`numpy2x.zeros`, `ones`, `arange`, …) | NumPy creates, numpy2x adopts (no copy) |
+| Results of eager fallbacks | mapped as above: numpy2x argument, numpy2x view, NumPy argument unchanged, fresh memory adopted, otherwise copied |
+| `numpy2x.asarray(nd)`, NumPy operand in a numpy2x op (`v + nd`) | copy: the caller still holds `nd` and may write it |
+| `numpy2x.asarray(nd, dtype=other)` | one copy (the cast) |
 | Unsupported dtypes / layouts | stay NumPy arrays (eager NumPy) |
 
 **Considered, not taken:** sharing a user-held ndarray and running every
 op on that alias group synchronously while the ndarray is referenced outside
-viproc (refcount check per op). Correct, but `x = viproc.asarray(a)` with
+numpy2x (refcount check per op). Correct, but `x = numpy2x.asarray(a)` with
 `a` still in scope (the common case) would lose all asynchrony for `x`;
 one copy at import is cheaper than that. Writable exports *to the user*
 with the same rule were rejected for the same reason and because
@@ -567,8 +567,8 @@ order of a pairwise sum follows the layout).
 
 ## D9 — A wrapper, not a subclass of `numpy.ndarray`
 
-**Decided and implemented** (`python/viproc/_viproc.c`, `_ndarray.py`).
-`viproc.ndarray` is its own type implementing NumPy's array protocols
+**Decided and implemented** (`python/numpy2x/_numpy2x.c`, `_ndarray.py`).
+`numpy2x.ndarray` is its own type implementing NumPy's array protocols
 (`__array_ufunc__`, NEP 13; `__array_function__`, NEP 18; `__array__`)
 plus all Python operators. It does not derive from `numpy.ndarray`.
 
@@ -582,14 +582,14 @@ directly, bypassing every sync point:
    issued readers.
 2. **Memory protection does not fit.** Bohrium's npbackend subclasses
    `ndarray` and protects memory (mprotect + signal handler) until a flush.
-   In viproc, workers write the memory while the main thread must not read
+   In numpy2x, workers write the memory while the main thread must not read
    it; `mprotect` applies to the whole process, not per thread. It would
    need two mappings of every buffer (protected for the ndarray, writable
    for workers), syscalls per array and state change, page granularity and
    TLB shootdowns on all worker cores, which defeats small and medium
    arrays.
 3. **Copy-on-write would break.** An ndarray has a fixed data pointer that
-   C code may keep; viproc switches an alias group to a new buffer when an
+   C code may keep; numpy2x switches an alias group to a new buffer when an
    in-place write meets pending readers (D8), and consolidates layouts.
 4. **Unsafe by default.** A subclass inherits hundreds of C methods that
    work on the memory directly (`.sum`, `.copy`, `.tobytes`, `.fill`,
@@ -597,7 +597,7 @@ directly, bypassing every sync point:
    returns wrong values silently. With a wrapper, anything not implemented
    raises or goes through `__array__`, a clean sync point.
 5. **Views created in C.** NumPy creates subclass views itself (slicing,
-   `reshape`, `.T`) without telling viproc, which would lose the mapping
+   `reshape`, `.T`) without telling numpy2x, which would lose the mapping
    onto shared alias groups.
 
 **Consequences.**
@@ -605,9 +605,9 @@ directly, bypassing every sync point:
 - Library code that requires a real `numpy.ndarray` calls `__array__`
   (directly or through `np.asarray`): one sync point, and with D7 no copy.
 - `isinstance(x, np.ndarray)` is false outside code that runs with
-  `numpy` mapped to `viproc` (`python -m viproc`, planned), where
-  `np.ndarray` is `viproc.ndarray`.
-- Pure-Python NumPy code in libraries still runs asynchronously on viproc
+  `numpy` mapped to `numpy2x` (`python -m numpy2x`, planned), where
+  `np.ndarray` is `numpy2x.ndarray`.
+- Pure-Python NumPy code in libraries still runs asynchronously on numpy2x
   arrays passed to it: their `np.sin(x)` and `x * 2` dispatch through the
   protocols.
 
@@ -616,7 +616,7 @@ directly, bypassing every sync point:
 **Superseded by D11 for element memory** (the object pools of D4 keep this
 model). Kept for the record: buffers took their block
 when they are created, and only the main thread creates buffers (at
-issue); tasks reach `allocated` at issue. viproc enforces one access model
+issue); tasks reach `allocated` at issue. numpy2x enforces one access model
 for all its pools (element
 memory, D3; runtime objects, D4):
 

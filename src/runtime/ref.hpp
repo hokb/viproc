@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <utility>
 
-namespace viproc {
+namespace numpy2x {
 
 // Base of objects counted by Ref<T>. T provides
 // `static void last_ref_dropped(T*)`, called when the count drops to 0.
@@ -71,4 +71,4 @@ template <class T> class Ref {
     T* p_ = nullptr;
 };
 
-} // namespace viproc
+} // namespace numpy2x

@@ -1,6 +1,6 @@
-// Implementation of the public C ABI (include/viproc/viproc.h).
+// Implementation of the public C ABI (include/numpy2x/numpy2x.h).
 
-#include "viproc/viproc.h"
+#include "numpy2x/numpy2x.h"
 
 #include "kernels/numpy_gufunc.hpp"
 #include "kernels/numpy_matmul.hpp"
@@ -27,7 +27,7 @@
 #include <unordered_set>
 #include <vector>
 
-using namespace viproc;
+using namespace numpy2x;
 
 namespace {
 
@@ -90,14 +90,14 @@ void set_error(char* err, std::size_t errlen, const std::string& msg) {
     }
 }
 
-static_assert(static_cast<int>(DType::Bool) == VP_BOOL &&
-                  static_cast<int>(DType::Int32) == VP_INT32 &&
-                  static_cast<int>(DType::Int64) == VP_INT64 &&
-                  static_cast<int>(DType::Float32) == VP_FLOAT32 &&
-                  static_cast<int>(DType::Float64) == VP_FLOAT64 &&
-                  static_cast<int>(DType::Complex64) == VP_COMPLEX64 &&
-                  static_cast<int>(DType::Complex128) == VP_COMPLEX128,
-              "vp_dtype and DType must match");
+static_assert(static_cast<int>(DType::Bool) == NX_BOOL &&
+                  static_cast<int>(DType::Int32) == NX_INT32 &&
+                  static_cast<int>(DType::Int64) == NX_INT64 &&
+                  static_cast<int>(DType::Float32) == NX_FLOAT32 &&
+                  static_cast<int>(DType::Float64) == NX_FLOAT64 &&
+                  static_cast<int>(DType::Complex64) == NX_COMPLEX64 &&
+                  static_cast<int>(DType::Complex128) == NX_COMPLEX128,
+              "nx_dtype and DType must match");
 
 // "<message> (in <op>, issued at <site>)": the message keeps a leading
 // "TypeName: " for the bridge to raise that exception type.
@@ -106,13 +106,13 @@ std::string describe(const TaskError& e) {
            e.issue_site + ")";
 }
 
-DType to_dtype(vp_dtype d) { return static_cast<DType>(d); }
-vp_dtype to_vp(DType d) { return static_cast<vp_dtype>(d); }
+DType to_dtype(nx_dtype d) { return static_cast<DType>(d); }
+nx_dtype to_vp(DType d) { return static_cast<nx_dtype>(d); }
 
 } // namespace
 
-struct vp_loop {
-    const numpy::UfuncLoop* loop; // owned by vp_runtime::loops
+struct nx_loop {
+    const numpy::UfuncLoop* loop; // owned by nx_runtime::loops
     std::vector<DType> dtypes;    // inputs, then the output
 };
 
@@ -187,7 +187,7 @@ struct ReduceKeyHash {
 
 } // namespace
 
-struct vp_runtime {
+struct nx_runtime {
     std::unique_ptr<Runtime> rt;
     // Issue sites, interned: tasks keep a `const char*` to them. Grows with
     // the number of distinct source locations only.
@@ -195,7 +195,7 @@ struct vp_runtime {
     const char* intern(const char* site) { return sites.emplace(site).first->c_str(); }
     std::unique_ptr<numpy::LoopCache> loops;
     // One handle per resolved loop (node-based: stable addresses).
-    std::unordered_map<const numpy::UfuncLoop*, vp_loop> handles;
+    std::unordered_map<const numpy::UfuncLoop*, nx_loop> handles;
     std::shared_ptr<Graveyard> graveyard = std::make_shared<Graveyard>();
     // One matmul kernel per resolved loop.
     std::unordered_map<const numpy::UfuncLoop*, std::shared_ptr<Kernel>> matmul_kernels;
@@ -209,11 +209,11 @@ struct vp_runtime {
     std::unordered_map<ReduceKey, std::shared_ptr<Kernel>, ReduceKeyHash> reduce_kernels;
 };
 
-// A vp_array* is an Array* holding one reference (no wrapper allocation).
+// A nx_array* is an Array* holding one reference (no wrapper allocation).
 namespace {
-Array& arr(const vp_array* a) { return *reinterpret_cast<Array*>(const_cast<vp_array*>(a)); }
-ArrayPtr ref(const vp_array* a) { return ArrayPtr(&arr(a)); } // a new reference
-vp_array* hand_out(ArrayPtr a) { return reinterpret_cast<vp_array*>(a.release()); }
+Array& arr(const nx_array* a) { return *reinterpret_cast<Array*>(const_cast<nx_array*>(a)); }
+ArrayPtr ref(const nx_array* a) { return ArrayPtr(&arr(a)); } // a new reference
+nx_array* hand_out(ArrayPtr a) { return reinterpret_cast<nx_array*>(a.release()); }
 } // namespace
 
 extern "C" {
@@ -239,7 +239,7 @@ void reacquire_gil() {
 
 } // namespace
 
-vp_runtime* vp_runtime_create(size_t max_active_tasks, char* err, size_t errlen) {
+nx_runtime* nx_runtime_create(size_t max_active_tasks, char* err, size_t errlen) {
     if (!numpy::init()) {
         PyErr_Clear();
         set_error(err, errlen, "cannot import the NumPy C API");
@@ -251,16 +251,16 @@ vp_runtime* vp_runtime_create(size_t max_active_tasks, char* err, size_t errlen)
     if (max_active_tasks != 0) {
         options.max_active_tasks = max_active_tasks;
     }
-    auto* r = new vp_runtime();
+    auto* r = new nx_runtime();
     r->rt = std::make_unique<Runtime>(options);
     r->loops = std::make_unique<numpy::LoopCache>();
     numpy::set_kernel_threads(r->rt->worker_count() + 1);
     return r;
 }
 
-void vp_wait_all(vp_runtime* rt) { rt->rt->wait_all(); }
+void nx_wait_all(nx_runtime* rt) { rt->rt->wait_all(); }
 
-void vp_runtime_destroy(vp_runtime* rt) {
+void nx_runtime_destroy(nx_runtime* rt) {
     Py_BEGIN_ALLOW_THREADS;
     rt->rt.reset(); // waits for all tasks, stops the workers
     Py_END_ALLOW_THREADS;
@@ -270,17 +270,17 @@ void vp_runtime_destroy(vp_runtime* rt) {
     ElementPool::instance().trim(); // cached blocks are not kept across runtimes
 }
 
-void vp_set_error_notify(vp_runtime* rt, void (*fn)(void*), void* arg) {
+void nx_set_error_notify(nx_runtime* rt, void (*fn)(void*), void* arg) {
     rt->rt->errors().set_notify(fn, arg);
 }
 
-int vp_error_pending(const vp_runtime* rt) { return rt->rt->errors().pending() ? 1 : 0; }
+int nx_error_pending(const nx_runtime* rt) { return rt->rt->errors().pending() ? 1 : 0; }
 
-int vp_take_error(vp_runtime* rt, char* err, size_t errlen) {
+int nx_take_error(nx_runtime* rt, char* err, size_t errlen) {
     std::size_t more = 0;
     std::optional<TaskError> e = rt->rt->errors().take(&more);
     if (!e) {
-        return VP_OK;
+        return NX_OK;
     }
     std::string msg = describe(*e);
     if (more > 0) {
@@ -288,14 +288,14 @@ int vp_take_error(vp_runtime* rt, char* err, size_t errlen) {
                " not reported]";
     }
     set_error(err, errlen, msg);
-    return VP_ERROR;
+    return NX_ERROR;
 }
 
-void vp_set_fp_mode(vp_runtime* rt, int mode, int ctx) {
+void nx_set_fp_mode(nx_runtime* rt, int mode, int ctx) {
     rt->rt->set_fp_mode(FpMode{static_cast<std::uint16_t>(mode), static_cast<std::uint16_t>(ctx)});
 }
 
-int vp_take_fp_events(vp_runtime* rt, PyObject** out) {
+int nx_take_fp_events(nx_runtime* rt, PyObject** out) {
     std::vector<FpEvent> events = rt->rt->errors().take_fp();
     PyObject* list = PyList_New(static_cast<Py_ssize_t>(events.size()));
     if (list == nullptr) {
@@ -315,63 +315,63 @@ int vp_take_fp_events(vp_runtime* rt, PyObject** out) {
     return static_cast<int>(events.size());
 }
 
-size_t vp_worker_count(const vp_runtime* rt) { return rt->rt->worker_count(); }
+size_t nx_worker_count(const nx_runtime* rt) { return rt->rt->worker_count(); }
 
-size_t vp_physical_core_count(void) { return physical_core_count(); }
+size_t nx_physical_core_count(void) { return physical_core_count(); }
 
-double vp_direct_budget_ns(const vp_runtime* rt) {
+double nx_direct_budget_ns(const nx_runtime* rt) {
     return rt->rt->offload_policy().options().direct_budget_ns;
 }
 
-void vp_set_direct_budget_ns(vp_runtime* rt, double ns) {
+void nx_set_direct_budget_ns(nx_runtime* rt, double ns) {
     OffloadOptions o = rt->rt->offload_policy().options();
     o.direct_budget_ns = ns;
     rt->rt->set_offload_options(o);
 }
-void vp_set_chain_ns(vp_runtime* rt, double ns) {
+void nx_set_chain_ns(nx_runtime* rt, double ns) {
     OffloadOptions o = rt->rt->offload_policy().options();
     o.chain_ns = ns;
     rt->rt->set_offload_options(o);
 }
-size_t vp_active_tasks(const vp_runtime* rt) { return rt->rt->active_tasks(); }
+size_t nx_active_tasks(const nx_runtime* rt) { return rt->rt->active_tasks(); }
 
-void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive) {
+void nx_set_offload_policy(nx_runtime* rt, int64_t sync_below, int adaptive) {
     OffloadOptions o = rt->rt->offload_policy().options();
     o.sync_below = sync_below;
     o.adaptive = adaptive != 0;
     rt->rt->set_offload_options(o);
 }
 
-uint64_t vp_direct_count(const vp_runtime* rt) { return rt->rt->direct_count(); }
+uint64_t nx_direct_count(const nx_runtime* rt) { return rt->rt->direct_count(); }
 
-uint64_t vp_task_count(const vp_runtime* rt) { return rt->rt->task_count(); }
+uint64_t nx_task_count(const nx_runtime* rt) { return rt->rt->task_count(); }
 
-uint64_t vp_sync_count(const vp_runtime* rt) { return rt->rt->sync_count(); }
+uint64_t nx_sync_count(const nx_runtime* rt) { return rt->rt->sync_count(); }
 
-uint64_t vp_wake_count(const vp_runtime* rt) { return rt->rt->wake_count(); }
+uint64_t nx_wake_count(const nx_runtime* rt) { return rt->rt->wake_count(); }
 
-void vp_offload_counts(const vp_runtime* rt, uint64_t* inline_ops, uint64_t* offloaded_ops) {
+void nx_offload_counts(const nx_runtime* rt, uint64_t* inline_ops, uint64_t* offloaded_ops) {
     *inline_ops = rt->rt->offload_policy().inline_count();
     *offloaded_ops = rt->rt->offload_policy().offload_count();
 }
 
-void vp_pool_get_stats(vp_pool_stats* out) {
+void nx_pool_get_stats(nx_pool_stats* out) {
     const ElementPool::Stats s = ElementPool::instance().stats();
     *out = {s.hits, s.misses, s.cached, s.dropped, ElementPool::instance().limit()};
 }
 
-void vp_pool_trim(void) { ElementPool::instance().trim(); }
+void nx_pool_trim(void) { ElementPool::instance().trim(); }
 
-void vp_pool_set_limit(uint64_t bytes) {
+void nx_pool_set_limit(uint64_t bytes) {
     ElementPool::instance().set_limit(static_cast<std::size_t>(bytes));
 }
 
-int vp_array_from_ndarray(vp_runtime* rt, PyObject* ndarray, vp_array** out, char* err,
+int nx_array_from_ndarray(nx_runtime* rt, PyObject* ndarray, nx_array** out, char* err,
                           size_t errlen) {
     rt->graveyard->drain();
     if (!numpy::supported_ndarray(ndarray)) {
         set_error(err, errlen, "unsupported dtype or memory layout");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     Py_INCREF(ndarray);
     std::shared_ptr<void> owner = python_owner(rt->graveyard, ndarray);
@@ -379,38 +379,38 @@ int vp_array_from_ndarray(vp_runtime* rt, PyObject* ndarray, vp_array** out, cha
     ArrayPtr a = numpy::wrap_ndarray(*rt->rt, ndarray, e, std::move(owner));
     if (!a) {
         set_error(err, errlen, e);
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     *out = hand_out(std::move(a));
-    return VP_OK;
+    return NX_OK;
 }
 
-const char* vp_intern(vp_runtime* rt, const char* site) { return rt->intern(site); }
+const char* nx_intern(nx_runtime* rt, const char* site) { return rt->intern(site); }
 
-int vp_array_from_scalar(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array** out) {
+int nx_array_from_scalar(nx_runtime* rt, PyObject* value, nx_dtype dtype, nx_array** out) {
     ArrayPtr a = numpy::scalar_array(*rt->rt, value, to_dtype(dtype));
     if (!a) {
-        return VP_PYERR;
+        return NX_PYERR;
     }
     *out = hand_out(std::move(a));
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_array_from_item(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array** out) {
+int nx_array_from_item(nx_runtime* rt, PyObject* value, nx_dtype dtype, nx_array** out) {
     ArrayPtr a = numpy::item_array(*rt->rt, value, to_dtype(dtype));
     if (!a) {
-        return VP_PYERR;
+        return NX_PYERR;
     }
     *out = hand_out(std::move(a));
-    return VP_OK;
+    return NX_OK;
 }
 
-PyObject* vp_array_scalar(const vp_array* a) {
+PyObject* nx_array_scalar(const nx_array* a) {
     const Array& x = arr(a);
     return numpy::scalar_object(x.layout().dtype, x.buffer()->data() + x.layout().offset);
 }
 
-vp_array* vp_array_reshape(vp_runtime* rt, const vp_array* a, int ndim, const int64_t* shape,
+nx_array* nx_array_reshape(nx_runtime* rt, const nx_array* a, int ndim, const int64_t* shape,
                            char order) {
     const Layout& l = arr(a).layout();
     Layout out;
@@ -420,7 +420,7 @@ vp_array* vp_array_reshape(vp_runtime* rt, const vp_array* a, int ndim, const in
     return hand_out(rt->rt->view(ref(a), std::move(out)));
 }
 
-vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, vp_dtype dtype, int ndim,
+nx_array* nx_array_view(nx_runtime* rt, const nx_array* base, nx_dtype dtype, int ndim,
                         const int64_t* shape, const int64_t* strides, int64_t offset) {
     Layout l;
     l.dtype = to_dtype(dtype);
@@ -430,19 +430,19 @@ vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, vp_dtype dtype, in
     return hand_out(rt->rt->view(ref(base), std::move(l)));
 }
 
-void vp_array_release(vp_array* a) { ArrayPtr::adopt(&arr(a)).reset(); }
+void nx_array_release(nx_array* a) { ArrayPtr::adopt(&arr(a)).reset(); }
 
-int vp_array_ndim(const vp_array* a) { return static_cast<int>(arr(a).layout().shape.size()); }
-const int64_t* vp_array_shape(const vp_array* a) { return arr(a).layout().shape.data(); }
-const int64_t* vp_array_strides(const vp_array* a) { return arr(a).layout().strides.data(); }
-vp_dtype vp_array_dtype(const vp_array* a) { return to_vp(arr(a).layout().dtype); }
-int64_t vp_array_offset(const vp_array* a) { return arr(a).layout().offset; }
-int vp_array_ready(vp_array* a) { return arr(a).ready() ? 1 : 0; }
-int vp_array_same_storage(const vp_array* a, const vp_array* b) {
+int nx_array_ndim(const nx_array* a) { return static_cast<int>(arr(a).layout().shape.size()); }
+const int64_t* nx_array_shape(const nx_array* a) { return arr(a).layout().shape.data(); }
+const int64_t* nx_array_strides(const nx_array* a) { return arr(a).layout().strides.data(); }
+nx_dtype nx_array_dtype(const nx_array* a) { return to_vp(arr(a).layout().dtype); }
+int64_t nx_array_offset(const nx_array* a) { return arr(a).layout().offset; }
+int nx_array_ready(nx_array* a) { return arr(a).ready() ? 1 : 0; }
+int nx_array_same_storage(const nx_array* a, const nx_array* b) {
     return arr(a).group() == arr(b).group() ? 1 : 0;
 }
 
-size_t vp_array_reusable_bytes(const vp_array* a) {
+size_t nx_array_reusable_bytes(const nx_array* a) {
     const Array& x = arr(a);
     const CountableArray& b = *x.buffer();
     const Layout& l = x.layout();
@@ -452,41 +452,41 @@ size_t vp_array_reusable_bytes(const vp_array* a) {
     return ok ? b.nbytes() : 0;
 }
 
-int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
+int nx_array_wait(nx_runtime* rt, nx_array* a, char* err, size_t errlen) {
     ErrorRef e = rt->rt->wait(arr(a));
     if (e) {
         set_error(err, errlen, describe(rt->rt->errors().raise_at_sync_point(e)));
-        return VP_ERROR;
+        return NX_ERROR;
     }
-    return VP_OK;
+    return NX_OK;
 }
 
-PyObject* vp_array_export(const vp_array* a, int writable) {
+PyObject* nx_array_export(const nx_array* a, int writable) {
     return numpy::export_ndarray(arr(a), writable != 0);
 }
 
-int vp_array_host_writable(vp_array* a) {
+int nx_array_host_writable(nx_array* a) {
     Array& x = arr(a);
     return x.ready() && !x.group()->last_error() && !x.buffer()->has_readers() ? 1 : 0;
 }
 
-PyObject* vp_array_borrow(const vp_array* a) { return numpy::borrow_ndarray(arr(a)); }
+PyObject* nx_array_borrow(const nx_array* a) { return numpy::borrow_ndarray(arr(a)); }
 
-int vp_array_pin(const vp_array* a, PyObject* view) {
-    return numpy::pin_borrowed(arr(a), view) ? VP_OK : VP_PYERR;
+int nx_array_pin(const nx_array* a, PyObject* view) {
+    return numpy::pin_borrowed(arr(a), view) ? NX_OK : NX_PYERR;
 }
 
-int vp_array_prepare_write(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
+int nx_array_prepare_write(nx_runtime* rt, nx_array* a, char* err, size_t errlen) {
     ErrorRef e = rt->rt->prepare_host_write(arr(a));
     if (e) {
         set_error(err, errlen, describe(rt->rt->errors().raise_at_sync_point(e)));
-        return VP_ERROR;
+        return NX_ERROR;
     }
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_ufunc_loop(vp_runtime* rt, PyObject* ufunc, int nin, const vp_dtype* dtypes,
-                  const vp_loop** out, char* err, size_t errlen) {
+int nx_ufunc_loop(nx_runtime* rt, PyObject* ufunc, int nin, const nx_dtype* dtypes,
+                  const nx_loop** out, char* err, size_t errlen) {
     std::vector<DType> d;
     for (int i = 0; i <= nin; ++i) {
         d.push_back(to_dtype(dtypes[i]));
@@ -496,14 +496,14 @@ int vp_ufunc_loop(vp_runtime* rt, PyObject* ufunc, int nin, const vp_dtype* dtyp
     if (loop == nullptr) {
         PyErr_Clear();
         set_error(err, errlen, e);
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     if (loop->nin() != nin || loop->nout() != 1) {
         set_error(err, errlen, "only ufuncs with one output are supported");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
-    *out = &rt->handles.try_emplace(loop, vp_loop{loop, std::move(d)}).first->second;
-    return VP_OK;
+    *out = &rt->handles.try_emplace(loop, nx_loop{loop, std::move(d)}).first->second;
+    return NX_OK;
 }
 
 } // extern "C"
@@ -531,7 +531,7 @@ bool f_contiguous(const Layout& l) {
 // calls the loop once over all elements, else one driven by NumPy's iterator
 // (LoopCache::iter_elementwise), which also casts inputs of another dtype.
 // nullptr if NumPy cannot run it so.
-std::shared_ptr<Kernel> elementwise_kernel(vp_runtime* rt, const vp_loop& loop,
+std::shared_ptr<Kernel> elementwise_kernel(nx_runtime* rt, const nx_loop& loop,
                                            std::span<const ArrayPtr> ins, const Layout& out,
                                            bool out_given, char* err, size_t errlen) {
     const Layout* ptrs[3];
@@ -568,7 +568,7 @@ std::shared_ptr<Kernel> elementwise_kernel(vp_runtime* rt, const vp_loop& loop,
 // single loop call (check_for_trivial_loop); longer and n-d ones are cast
 // in the iterator's buffers (elementwise_kernel). Replaces the first kind by
 // the result of an issued cast task. False if NumPy cannot cast.
-bool cast_small_inputs(vp_runtime* rt, const vp_loop& loop, std::span<ArrayPtr> ins,
+bool cast_small_inputs(nx_runtime* rt, const nx_loop& loop, std::span<ArrayPtr> ins,
                        const char* site, char* err, size_t errlen) {
     long bufsize = -1;
     for (std::size_t i = 0; i < ins.size(); ++i) {
@@ -604,22 +604,22 @@ bool cast_small_inputs(vp_runtime* rt, const vp_loop& loop, std::span<ArrayPtr> 
 
 extern "C" {
 
-int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs, int out_ndim,
-                   const int64_t* out_shape, vp_array* out, vp_array** result, const char* site,
+int nx_ufunc_issue(nx_runtime* rt, const nx_loop* loop, nx_array* const* inputs, int out_ndim,
+                   const int64_t* out_shape, nx_array* out, nx_array** result, const char* site,
                    char* err, size_t errlen) {
     rt->graveyard->drain();
     const int nin = loop->loop->nin();
     ArrayPtr ins[3];
     if (nin > 3) {
         set_error(err, errlen, "too many inputs");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     for (int i = 0; i < nin; ++i) {
         ins[i] = ref(inputs[i]);
     }
     if (!cast_small_inputs(rt, *loop, std::span(ins, static_cast<std::size_t>(nin)), site, err,
                            errlen)) {
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     const DType out_dtype = loop->dtypes[static_cast<std::size_t>(nin)];
     Shape shape(out_shape, out_shape + out_ndim);
@@ -628,16 +628,16 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
         const Layout& ol = arr(out).layout();
         if (ol.shape != shape) {
             set_error(err, errlen, "out= array has the wrong shape");
-            return VP_INVALID;
+            return NX_INVALID;
         }
         const ArrayPtr o = ref(out);
         std::shared_ptr<Kernel> k = elementwise_kernel(rt, *loop, in_span, ol, true, err, errlen);
         if (!k) {
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
         rt->rt->issue(k, in_span, std::span(&o, 1), {}, site);
         *result = nullptr;
-        return VP_OK;
+        return NX_OK;
     }
     // NumPy's result layout (order='K'); C order unless an input is not.
     bool all_c = true;
@@ -676,22 +676,22 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
     }
     std::shared_ptr<Kernel> k = elementwise_kernel(rt, *loop, in_span, l, false, err, errlen);
     if (!k) {
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     ArrayPtr res;
     rt->rt->issue(k, in_span, {}, std::span(&l, 1), site, std::span(&res, 1));
     *result = hand_out(std::move(res));
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_ufunc_issue_masked(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
-                          vp_array* mask, int out_ndim, const int64_t* out_shape, vp_array* out,
-                          vp_array** result, const char* site, char* err, size_t errlen) {
+int nx_ufunc_issue_masked(nx_runtime* rt, const nx_loop* loop, nx_array* const* inputs,
+                          nx_array* mask, int out_ndim, const int64_t* out_shape, nx_array* out,
+                          nx_array** result, const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     const int nin = loop->loop->nin();
     if (nin > 3 || loop->loop->nout() != 1 || arr(mask).layout().dtype != DType::Bool) {
         set_error(err, errlen, "unsupported masked ufunc");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     // no copies of small inputs: NumPy's masked execution skips
     // check_for_trivial_loop
@@ -711,7 +711,7 @@ int vp_ufunc_issue_masked(vp_runtime* rt, const vp_loop* loop, vp_array* const* 
         ol = arr(out).layout();
         if (ol.shape != shape) {
             set_error(err, errlen, "out= array has the wrong shape");
-            return VP_INVALID;
+            return NX_INVALID;
         }
     } else {
         // the iterator allocates the output in order K over every operand,
@@ -730,29 +730,29 @@ int vp_ufunc_issue_masked(vp_runtime* rt, const vp_loop* loop, vp_array* const* 
     if (!k) {
         PyErr_Clear();
         set_error(err, errlen, e);
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     const std::span<const ArrayPtr> in_span(ins, ni + 1);
     if (out != nullptr) {
         const ArrayPtr o = ref(out);
         rt->rt->issue(k, in_span, std::span(&o, 1), {}, site);
         *result = nullptr;
-        return VP_OK;
+        return NX_OK;
     }
     ArrayPtr res;
     rt->rt->issue(k, in_span, {}, std::span(&ol, 1), site, std::span(&res, 1));
     *result = hand_out(std::move(res));
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_ufunc_multi(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, int nout,
-                   const vp_dtype* dtypes, int out_ndim, const int64_t* out_shape,
-                   vp_array** results, const char* site, char* err, size_t errlen) {
+int nx_ufunc_multi(nx_runtime* rt, PyObject* ufunc, int nin, nx_array* const* inputs, int nout,
+                   const nx_dtype* dtypes, int out_ndim, const int64_t* out_shape,
+                   nx_array** results, const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     constexpr int kMax = 8;
     if (nin < 1 || nout < 1 || nin + nout > kMax) {
         set_error(err, errlen, "unsupported number of operands");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     std::vector<DType> d;
     for (int i = 0; i < nin + nout; ++i) {
@@ -763,7 +763,7 @@ int vp_ufunc_multi(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* in
     if (loop == nullptr || loop->nin() != nin || loop->nout() != nout) {
         PyErr_Clear();
         set_error(err, errlen, loop == nullptr ? e : "wrong number of operands");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     ArrayPtr ins[kMax];
     for (int i = 0; i < nin; ++i) {
@@ -771,10 +771,10 @@ int vp_ufunc_multi(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* in
     }
     // check_for_trivial_loop runs for every ufunc: small inputs of another
     // dtype are cast into copies first here too
-    const vp_loop handle{loop, d};
+    const nx_loop handle{loop, d};
     if (!cast_small_inputs(rt, handle, std::span(ins, static_cast<std::size_t>(nin)), site, err,
                            errlen)) {
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     Layout in_layouts[kMax];
     bool all_c = true;
@@ -798,33 +798,33 @@ int vp_ufunc_multi(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* in
     if (!k) {
         PyErr_Clear();
         set_error(err, errlen, e);
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     ArrayPtr res[kMax];
     rt->rt->issue(k, std::span(ins, ni), {}, std::span(outs, no), site, std::span(res, no));
     for (std::size_t j = 0; j < no; ++j) {
         results[j] = hand_out(std::move(res[j]));
     }
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, vp_dtype out_dtype,
-             int out_ndim, const int64_t* out_shape, vp_array* out, vp_array** result,
+int nx_ufunc(nx_runtime* rt, PyObject* ufunc, int nin, nx_array* const* inputs, nx_dtype out_dtype,
+             int out_ndim, const int64_t* out_shape, nx_array* out, nx_array** result,
              const char* site, char* err, size_t errlen) {
-    std::vector<vp_dtype> dtypes;
+    std::vector<nx_dtype> dtypes;
     for (int i = 0; i < nin; ++i) {
         dtypes.push_back(to_vp(arr(inputs[i]).layout().dtype));
     }
     dtypes.push_back(out_dtype);
-    const vp_loop* loop = nullptr;
-    const int st = vp_ufunc_loop(rt, ufunc, nin, dtypes.data(), &loop, err, errlen);
-    if (st != VP_OK) {
+    const nx_loop* loop = nullptr;
+    const int st = nx_ufunc_loop(rt, ufunc, nin, dtypes.data(), &loop, err, errlen);
+    if (st != NX_OK) {
         return st;
     }
-    return vp_ufunc_issue(rt, loop, inputs, out_ndim, out_shape, out, result, site, err, errlen);
+    return nx_ufunc_issue(rt, loop, inputs, out_ndim, out_shape, out, result, site, err, errlen);
 }
 
-int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array** result,
+int nx_astype(nx_runtime* rt, nx_array* in, nx_dtype dtype, char order, nx_array** result,
               const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout& l = arr(in).layout();
@@ -867,11 +867,11 @@ int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array
         }
     } else {
         set_error(err, errlen, "unsupported order");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     if (l.size() == 0) {
         set_error(err, errlen, "empty");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     std::string e;
     std::shared_ptr<Kernel> k =
@@ -879,13 +879,13 @@ int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array
     if (!k) {
         PyErr_Clear(); // e.g. a ComplexWarning raised as an error: NumPy raises it again
         set_error(err, errlen, e);
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     const ArrayPtr ins[] = {ref(in)};
     ArrayPtr res;
     rt->rt->issue(k, ins, {}, std::span(&out, 1), site, std::span(&res, 1));
     *result = hand_out(std::move(res));
-    return VP_OK;
+    return NX_OK;
 }
 
 } // extern "C"
@@ -893,7 +893,7 @@ int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array
 namespace {
 
 // The IndexSpec of an indexing call and the shape of its result.
-bool index_spec(const Layout& view, int nidx, vp_array* const* idx, const int* idx_axes, int nres,
+bool index_spec(const Layout& view, int nidx, nx_array* const* idx, const int* idx_axes, int nres,
                 const int* result_axes, IndexSpec& spec, Shape& shape, char* err, size_t errlen) {
     const int nd = static_cast<int>(view.shape.size());
     for (int j = 0; j < nidx; ++j) {
@@ -924,19 +924,19 @@ bool index_spec(const Layout& view, int nidx, vp_array* const* idx, const int* i
 
 extern "C" {
 
-int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, const int* idx_axes,
+int nx_gather(nx_runtime* rt, nx_array* src, int nidx, nx_array* const* idx, const int* idx_axes,
               int nres, const int* result_axes, const int64_t* result_strides, int mode,
-              vp_array** result, const char* site, char* err, size_t errlen) {
+              nx_array** result, const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout& v = arr(src).layout();
     IndexSpec spec;
     Shape shape;
     if (!index_spec(v, nidx, idx, idx_axes, nres, result_axes, spec, shape, err, errlen)) {
-        return VP_INVALID;
+        return NX_INVALID;
     }
-    if (mode < VP_INDEX_RAISE || mode > VP_INDEX_CLIP) {
+    if (mode < NX_INDEX_RAISE || mode > NX_INDEX_CLIP) {
         set_error(err, errlen, "indexing: unknown index mode");
-        return VP_INVALID;
+        return NX_INVALID;
     }
     spec.mode = static_cast<IndexMode>(mode);
     Layout out = Layout::contiguous(v.dtype, std::move(shape));
@@ -944,7 +944,7 @@ int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, con
         out.strides.assign(result_strides, result_strides + nres);
         if (!out.dense() && out.size() != 0) {
             set_error(err, errlen, "gather: result strides are not dense");
-            return VP_INVALID;
+            return NX_INVALID;
         }
     }
     std::vector<ArrayPtr> ins{ref(src)};
@@ -955,29 +955,29 @@ int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, con
     rt->rt->issue(make_gather_kernel(std::move(spec)), ins, {}, std::span(&out, 1), site,
                   std::span(&res, 1));
     *result = hand_out(std::move(res));
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_scatter(vp_runtime* rt, vp_array* dst, int nidx, vp_array* const* idx, const int* idx_axes,
-               int nres, const int* result_axes, vp_array* values, int mode, const char* site,
+int nx_scatter(nx_runtime* rt, nx_array* dst, int nidx, nx_array* const* idx, const int* idx_axes,
+               int nres, const int* result_axes, nx_array* values, int mode, const char* site,
                char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout& v = arr(dst).layout();
     IndexSpec spec;
     Shape shape;
     if (!index_spec(v, nidx, idx, idx_axes, nres, result_axes, spec, shape, err, errlen)) {
-        return VP_INVALID;
+        return NX_INVALID;
     }
-    if (mode < VP_INDEX_RAISE || mode > VP_INDEX_CLIP) {
+    if (mode < NX_INDEX_RAISE || mode > NX_INDEX_CLIP) {
         set_error(err, errlen, "indexing: unknown index mode");
-        return VP_INVALID;
+        return NX_INVALID;
     }
     spec.mode = static_cast<IndexMode>(mode);
     const Layout& vl = arr(values).layout();
     Shape b;
     if (vl.dtype != v.dtype || !broadcast_shapes(shape, vl.shape, b) || b != shape) {
         set_error(err, errlen, "scatter: values have the wrong dtype or shape");
-        return VP_INVALID;
+        return NX_INVALID;
     }
     std::vector<ArrayPtr> ins{ref(values)};
     for (int j = 0; j < nidx; ++j) {
@@ -985,10 +985,10 @@ int vp_scatter(vp_runtime* rt, vp_array* dst, int nidx, vp_array* const* idx, co
     }
     const ArrayPtr io[] = {ref(dst)};
     rt->rt->issue(make_scatter_kernel(std::move(spec)), ins, io, {}, site);
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_select(vp_runtime* rt, vp_array* cond, vp_array* x, vp_array* y, vp_array** result,
+int nx_select(nx_runtime* rt, nx_array* cond, nx_array* x, nx_array* y, nx_array** result,
               const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout ls[] = {arr(cond).layout(), arr(x).layout(), arr(y).layout()};
@@ -996,7 +996,7 @@ int vp_select(vp_runtime* rt, vp_array* cond, vp_array* x, vp_array* y, vp_array
     if (ls[0].dtype != DType::Bool || ls[1].dtype != ls[2].dtype ||
         !broadcast_shapes(ls[0].shape, ls[1].shape, a) || !broadcast_shapes(a, ls[2].shape, b)) {
         set_error(err, errlen, "where: wrong dtypes or shapes");
-        return VP_INVALID;
+        return NX_INVALID;
     }
     Layout out = Layout::keep_order(ls[1].dtype, std::move(b), ls);
     const ArrayPtr ins[] = {ref(cond), ref(x), ref(y)};
@@ -1004,10 +1004,10 @@ int vp_select(vp_runtime* rt, vp_array* cond, vp_array* x, vp_array* y, vp_array
     static const std::shared_ptr<Kernel> kernel = make_select_kernel();
     rt->rt->issue(kernel, ins, {}, std::span(&out, 1), site, std::span(&res, 1));
     *result = hand_out(std::move(res));
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* value, const char* site,
+int nx_mask_assign(nx_runtime* rt, nx_array* dst, nx_array* mask, nx_array* value, const char* site,
                    char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout& d = arr(dst).layout();
@@ -1016,18 +1016,18 @@ int vp_mask_assign(vp_runtime* rt, vp_array* dst, vp_array* mask, vp_array* valu
     if (m.dtype != DType::Bool || arr(value).layout().dtype != d.dtype ||
         arr(value).layout().size() != 1 || !broadcast_shapes(d.shape, m.shape, b) || b != d.shape) {
         set_error(err, errlen, "mask assignment: wrong dtypes or shapes");
-        return VP_INVALID;
+        return NX_INVALID;
     }
     const ArrayPtr ins[] = {ref(value), ref(mask)};
     const ArrayPtr io[] = {ref(dst)};
     static const std::shared_ptr<Kernel> kernel = make_mask_assign_kernel();
     rt->rt->issue(kernel, ins, io, {}, site);
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_place(vp_runtime* rt, vp_dtype dtype, int ndim, const int64_t* shape, const int64_t* strides,
-             int nparts, vp_array* const* srcs, const int* part_ndim, const int64_t* part_shapes,
-             const int64_t* part_strides, const int64_t* part_offsets, vp_array** result,
+int nx_place(nx_runtime* rt, nx_dtype dtype, int ndim, const int64_t* shape, const int64_t* strides,
+             int nparts, nx_array* const* srcs, const int* part_ndim, const int64_t* part_shapes,
+             const int64_t* part_strides, const int64_t* part_offsets, nx_array** result,
              const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     Shape dims;
@@ -1037,7 +1037,7 @@ int vp_place(vp_runtime* rt, vp_dtype dtype, int ndim, const int64_t* shape, con
         out.strides.assign(strides, strides + ndim);
         if (!out.dense() && out.size() != 0) {
             set_error(err, errlen, "place: result strides are not dense");
-            return VP_INVALID;
+            return NX_INVALID;
         }
     }
     const std::int64_t item = static_cast<std::int64_t>(itemsize(out.dtype));
@@ -1064,7 +1064,7 @@ int vp_place(vp_runtime* rt, vp_dtype dtype, int ndim, const int64_t* shape, con
         if (s.dtype != out.dtype || !broadcast_shapes(p.shape, s.shape, b) || b != p.shape ||
             (size != 0 && (lo < 0 || hi + item > nbytes))) {
             set_error(err, errlen, "place: a part has the wrong dtype, shape or position");
-            return VP_INVALID;
+            return NX_INVALID;
         }
         ins.push_back(ref(srcs[i]));
     }
@@ -1072,7 +1072,7 @@ int vp_place(vp_runtime* rt, vp_dtype dtype, int ndim, const int64_t* shape, con
     rt->rt->issue(make_place_kernel(std::move(parts)), ins, {}, std::span(&out, 1), site,
                   std::span(&res, 1));
     *result = hand_out(std::move(res));
-    return VP_OK;
+    return NX_OK;
 }
 
 namespace {
@@ -1098,7 +1098,7 @@ bool numpy_aligned(const Array& a) {
 }
 } // namespace
 
-int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_array** result,
+int nx_matmul(nx_runtime* rt, PyObject* ufunc, nx_array* a, nx_array* b, nx_array** result,
               const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout& la = arr(a).layout();
@@ -1107,11 +1107,11 @@ int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_arra
     std::int64_t work = 0;
     if (!numpy::matmul_layout(la, lb, out, work)) {
         set_error(err, errlen, "matmul: dtypes or shapes NumPy does not take as they are");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     if (!numpy_aligned(arr(a)) || !numpy_aligned(arr(b))) {
         set_error(err, errlen, "matmul: misaligned operand (NumPy copies it)");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     std::string e;
     const DType d[] = {la.dtype, la.dtype, la.dtype};
@@ -1119,7 +1119,7 @@ int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_arra
     if (loop == nullptr) {
         PyErr_Clear();
         set_error(err, errlen, e);
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     std::shared_ptr<Kernel>& kernel = rt->matmul_kernels[loop];
     if (!kernel) {
@@ -1129,19 +1129,19 @@ int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_arra
     ArrayPtr res;
     rt->rt->issue(kernel, ins, {}, std::span(&out, 1), site, std::span(&res, 1), work);
     *result = hand_out(std::move(res));
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, int nout,
-              vp_array* const* outs, const vp_dtype* dtypes, const int* core_n,
+int nx_gufunc(nx_runtime* rt, PyObject* ufunc, int nin, nx_array* const* inputs, int nout,
+              nx_array* const* outs, const nx_dtype* dtypes, const int* core_n,
               const int* core_axes, int nlabels, int64_t* sizes, int flags, int order_n,
-              const int* out_order, const char* invalid_error, int64_t work, vp_array** results,
+              const int* out_order, const char* invalid_error, int64_t work, nx_array** results,
               const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     constexpr int kMax = 8;
     if (nin < 1 || nout < 1 || nin + nout > kMax || nlabels < 0) {
         set_error(err, errlen, "unsupported number of operands");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     if (order_n > 0) { // a permutation of the outputs' axes
         std::vector<bool> seen(static_cast<std::size_t>(order_n), false);
@@ -1149,7 +1149,7 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
             if (out_order[k] < 0 || out_order[k] >= order_n ||
                 seen[static_cast<std::size_t>(out_order[k])]) {
                 set_error(err, errlen, "gufunc: out_order is no permutation");
-                return VP_UNSUPPORTED;
+                return NX_UNSUPPORTED;
             }
             seen[static_cast<std::size_t>(out_order[k])] = true;
         }
@@ -1166,7 +1166,7 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
     if (loop == nullptr || loop->nin() != nin || loop->nout() != nout) {
         PyErr_Clear();
         set_error(err, errlen, loop == nullptr ? e : "wrong number of operands");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     numpy::GufuncCore core;
     core.nlabels = nlabels;
@@ -1185,16 +1185,16 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
         ls[i] = &a.layout();
         if (!numpy_aligned(a)) {
             set_error(err, errlen, "gufunc: misaligned operand (NumPy copies it)");
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
         if (i >= ni && ls[i]->dtype != d[i]) {
             set_error(err, errlen, "gufunc: out= of another dtype");
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
         for (std::size_t j = 0; i >= ni && j < ni; ++j) {
             if (arr(inputs[j]).group() == a.group()) {
                 set_error(err, errlen, "gufunc: out= overlaps an input (NumPy copies it)");
-                return VP_UNSUPPORTED;
+                return NX_UNSUPPORTED;
             }
         }
     }
@@ -1209,7 +1209,7 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
         const std::size_t nc = core.present(i);
         if (l.shape.size() < nc) {
             set_error(err, errlen, "gufunc: operand has too few dimensions");
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
         std::size_t ax = l.shape.size() - nc;
         for (int label : core.axes[i]) {
@@ -1219,21 +1219,21 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
             int64_t& size = sizes[label];
             if (size >= 0 && size != l.shape[ax]) {
                 set_error(err, errlen, "gufunc: core dimension mismatch");
-                return VP_UNSUPPORTED;
+                return NX_UNSUPPORTED;
             }
             size = l.shape[ax++];
         }
         Shape b;
         if (!broadcast_shapes(batch, Shape(l.shape.begin(), l.shape.end() - nc), b)) {
             set_error(err, errlen, "gufunc: batch shapes do not broadcast");
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
         batch = std::move(b);
     }
     for (int i = 0; i < nlabels; ++i) {
         if (sizes[i] < 0) {
             set_error(err, errlen, "gufunc: output core dimension of unknown size");
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
     }
     const std::size_t nb = batch.size();
@@ -1274,7 +1274,7 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
         }
         if (i >= ni && Shape(l.shape.begin(), l.shape.begin() + lb) != batch) {
             set_error(err, errlen, "gufunc: out= does not have the batch shape");
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
         iter_ops.push_back(std::move(it));
     }
@@ -1319,23 +1319,23 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
         }
         if (l.size() == 0) {
             set_error(err, errlen, "gufunc: empty cast");
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
         std::shared_ptr<Kernel> k = numpy::make_cast_kernel(l, dst, rt->loops->buffersize(),
                                                             defer_release(rt->graveyard), e);
         if (!k) {
             PyErr_Clear();
             set_error(err, errlen, e);
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
         ArrayPtr res;
         const ArrayPtr in[] = {ins[i]};
         rt->rt->issue(k, in, {}, std::span(&dst, 1), site, std::span(&res, 1));
         ins[i] = std::move(res);
     }
-    const int options = flags & (VP_GUFUNC_CHECK_FINITE | VP_GUFUNC_SERIAL);
-    static_assert(int{VP_GUFUNC_CHECK_FINITE} == int{numpy::kGufuncCheckFinite} &&
-                  int{VP_GUFUNC_SERIAL} == int{numpy::kGufuncSerial});
+    const int options = flags & (NX_GUFUNC_CHECK_FINITE | NX_GUFUNC_SERIAL);
+    static_assert(int{NX_GUFUNC_CHECK_FINITE} == int{numpy::kGufuncCheckFinite} &&
+                  int{NX_GUFUNC_SERIAL} == int{numpy::kGufuncSerial});
     std::shared_ptr<Kernel>& kernel = rt->gufunc_kernels[{
         loop, core.axes, invalid_error != nullptr ? invalid_error : "", options}];
     if (!kernel) {
@@ -1348,7 +1348,7 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
             results[j] = nullptr;
         }
         rt->rt->issue(kernel, std::span(ins, ni), std::span(io, no), {}, site, {}, work);
-        return VP_OK;
+        return NX_OK;
     }
     // New outputs: NumPy's iterator allocates each over the batch axes and
     // its own core axes in the iteration order (or in out_order).
@@ -1363,7 +1363,7 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
         if (order_n > 0) {
             if (static_cast<std::size_t>(order_n) != shape.size()) {
                 set_error(err, errlen, "gufunc: out_order does not match the outputs");
-                return VP_UNSUPPORTED;
+                return NX_UNSUPPORTED;
             }
             Layout l;
             l.dtype = d[ni + j];
@@ -1403,11 +1403,11 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
     for (std::size_t j = 0; j < no; ++j) {
         results[j] = hand_out(std::move(res[j]));
     }
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_sort(vp_runtime* rt, vp_array* in, int axis, int kind, int arg, int in_place, int order_n,
-            const int* out_order, vp_array** result, const char* site, char* err, size_t errlen) {
+int nx_sort(nx_runtime* rt, nx_array* in, int axis, int kind, int arg, int in_place, int order_n,
+            const int* out_order, nx_array** result, const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     *result = nullptr;
     const Layout& l = arr(in).layout();
@@ -1415,7 +1415,7 @@ int vp_sort(vp_runtime* rt, vp_array* in, int axis, int kind, int arg, int in_pl
     if (axis < 0 || axis >= nd || (in_place != 0 && arg != 0) ||
         (in_place == 0 && arg == 0 && order_n != nd && order_n != 0)) {
         set_error(err, errlen, "sort: unsupported arguments");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     std::shared_ptr<Kernel>& k = rt->sort_kernels[{l.dtype, kind, arg != 0, axis}];
     if (!k) {
@@ -1423,13 +1423,13 @@ int vp_sort(vp_runtime* rt, vp_array* in, int axis, int kind, int arg, int in_pl
         k = numpy::make_sort_kernel(l.dtype, kind, arg != 0, axis, e);
         if (!k) {
             set_error(err, errlen, e);
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
     }
     if (in_place != 0) {
         const ArrayPtr io[] = {ref(in)};
         rt->rt->issue(k, {}, io, {}, site, {});
-        return VP_OK;
+        return NX_OK;
     }
     Layout out;
     if (arg != 0) {
@@ -1460,7 +1460,7 @@ int vp_sort(vp_runtime* rt, vp_array* in, int axis, int kind, int arg, int in_pl
             const int a = out_order[i];
             if (a < 0 || a >= nd || seen[static_cast<std::size_t>(a)]) {
                 set_error(err, errlen, "sort: out_order is no permutation");
-                return VP_UNSUPPORTED;
+                return NX_UNSUPPORTED;
             }
             seen[static_cast<std::size_t>(a)] = true;
             out.strides[static_cast<std::size_t>(a)] = step;
@@ -1472,36 +1472,36 @@ int vp_sort(vp_runtime* rt, vp_array* in, int axis, int kind, int arg, int in_pl
     rt->rt->issue(k, ins, {}, std::span(&out, 1), site, std::span(&res, 1),
                   static_cast<std::int64_t>(l.size()) * 4);
     *result = hand_out(std::move(res));
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_arg_reduce(vp_runtime* rt, int argmax, vp_array* in, int out_ndim, const int64_t* out_shape,
-                  vp_array** result, const char* site, char* err, size_t errlen) {
+int nx_arg_reduce(nx_runtime* rt, int argmax, nx_array* in, int out_ndim, const int64_t* out_shape,
+                  nx_array** result, const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout& l = arr(in).layout();
     Layout out = Layout::contiguous(DType::Int64, Shape(out_shape, out_shape + out_ndim));
     if (l.shape.empty() || !l.c_contiguous() || l.shape.back() == 0 ||
         out.size() * l.shape.back() != l.size() || sizeof(void*) != 8) {
         set_error(err, errlen, "argmin/argmax: unsupported input");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     std::string e;
     std::shared_ptr<Kernel> k = numpy::make_arg_reduce_kernel(l.dtype, argmax != 0, e);
     if (!k) {
         set_error(err, errlen, e);
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     const ArrayPtr ins[] = {ref(in)};
     ArrayPtr res;
     rt->rt->issue(k, ins, {}, std::span(&out, 1), site, std::span(&res, 1));
     *result = hand_out(std::move(res));
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
-              int keepdims, PyObject* dtype, PyObject* identity, vp_array** result,
+int nx_reduce(nx_runtime* rt, PyObject* ufunc, nx_array* in, const unsigned char* axes,
+              int keepdims, PyObject* dtype, PyObject* identity, nx_array** result,
               const char* site, char* err, size_t errlen) {
-    return vp_reduce_out(rt, ufunc, in, axes, keepdims, dtype, identity, nullptr, result, site, err,
+    return nx_reduce_out(rt, ufunc, in, axes, keepdims, dtype, identity, nullptr, result, site, err,
                          errlen);
 }
 
@@ -1529,7 +1529,7 @@ namespace {
 // strided inputs even without a cast, and a loop called on a buffer can
 // round differently than on strided data (complex multiply has a SIMD path
 // for contiguous operands only).
-std::shared_ptr<Kernel> make_fast_reduce_kernel(vp_runtime* rt, PyObject* ufunc, const Layout& l,
+std::shared_ptr<Kernel> make_fast_reduce_kernel(nx_runtime* rt, PyObject* ufunc, const Layout& l,
                                                 std::span<const bool> reduced,
                                                 const Layout& out_layout, PyObject* dtype,
                                                 PyObject* identity) {
@@ -1558,14 +1558,14 @@ std::shared_ptr<Kernel> make_fast_reduce_kernel(vp_runtime* rt, PyObject* ufunc,
 
 } // namespace
 
-int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
-                  int keepdims, PyObject* dtype, PyObject* identity, vp_array* out,
-                  vp_array** result, const char* site, char* err, size_t errlen) {
+int nx_reduce_out(nx_runtime* rt, PyObject* ufunc, nx_array* in, const unsigned char* axes,
+                  int keepdims, PyObject* dtype, PyObject* identity, nx_array* out,
+                  nx_array** result, const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout& l = arr(in).layout();
     if (l.size() == 0) {
         set_error(err, errlen, "empty reduction"); // NumPy's identity / error handling
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     const std::size_t nd = l.shape.size();
     SmallVector<char, kInlineRank> flags(nd, 0); // no std::vector<bool>: data()
@@ -1603,7 +1603,7 @@ int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned 
     if (!kernel) {
         kernel = make_fast_reduce_kernel(rt, ufunc, l, reduced, out_layout, dtype, identity);
         if (!kernel && PyErr_Occurred()) {
-            return VP_PYERR;
+            return NX_PYERR;
         }
         if (kernel && cacheable) {
             if (rt->reduce_kernels.size() >= 4096) {
@@ -1620,49 +1620,49 @@ int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned 
         if (!k) {
             PyErr_Clear();
             set_error(err, errlen, e);
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
         const ArrayPtr ins[] = {ref(in)};
         if (out != nullptr) {
             if (!same_result_layout(arr(out).layout(), rl)) {
                 set_error(err, errlen, "reduce: out= has another layout or dtype");
-                return VP_UNSUPPORTED;
+                return NX_UNSUPPORTED;
             }
             const ArrayPtr io[] = {ref(out)};
             rt->rt->issue(k, ins, io, {}, site, {}, l.size());
             *result = nullptr;
-            return VP_OK;
+            return NX_OK;
         }
         ArrayPtr res;
         rt->rt->issue(k, ins, {}, std::span(&rl, 1), site, std::span(&res, 1), l.size());
         *result = hand_out(std::move(res));
-        return VP_OK;
+        return NX_OK;
     }
     const ArrayPtr ins[] = {ref(in)};
     if (out != nullptr) {
         if (!same_result_layout(arr(out).layout(), out_layout)) {
             set_error(err, errlen, "reduce: out= has another layout or dtype");
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
         const ArrayPtr io[] = {ref(out)};
         rt->rt->issue(kernel, ins, io, {}, site, {}, l.size());
         *result = nullptr;
-        return VP_OK;
+        return NX_OK;
     }
     ArrayPtr res;
     rt->rt->issue(kernel, ins, {}, std::span(&out_layout, 1), site, std::span(&res, 1), l.size());
     *result = hand_out(std::move(res));
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_accumulate(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, vp_array** result,
+int nx_accumulate(nx_runtime* rt, PyObject* ufunc, nx_array* in, int axis, nx_array** result,
                   const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout& l = arr(in).layout();
     const auto nd = static_cast<int>(l.shape.size());
     if (nd == 0 || axis < 0 || axis >= nd || l.size() == 0) {
         set_error(err, errlen, "accumulate: empty or 0-d input");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     // NumPy allocates a 1-d result C-contiguous, an n-d one through its
     // iterator in order K
@@ -1676,32 +1676,32 @@ int vp_accumulate(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, vp_ar
     if (loop == nullptr) {
         PyErr_Clear();
         set_error(err, errlen, e);
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     const ArrayPtr ins[] = {ref(in)};
     ArrayPtr res;
     rt->rt->issue(numpy::make_accumulate_kernel(loop, axis), ins, {}, std::span(&out, 1), site,
                   std::span(&res, 1), l.size());
     *result = hand_out(std::move(res));
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_reduceat(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, const int64_t* indices,
-                int nindices, const int64_t* out_strides, vp_array** result, const char* site,
+int nx_reduceat(nx_runtime* rt, PyObject* ufunc, nx_array* in, int axis, const int64_t* indices,
+                int nindices, const int64_t* out_strides, nx_array** result, const char* site,
                 char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout& l = arr(in).layout();
     const auto nd = static_cast<int>(l.shape.size());
     if (nd == 0 || axis < 0 || axis >= nd || nindices <= 0) {
         set_error(err, errlen, "reduceat: 0-d input or no indices");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     const auto ax = static_cast<std::size_t>(axis);
     std::vector<std::int64_t> ind(indices, indices + nindices);
     for (const std::int64_t i : ind) {
         if (i < 0 || i >= l.shape[ax]) {
             set_error(err, errlen, "reduceat: index out of range"); // NumPy raises it
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
     }
     Shape shape = l.shape;
@@ -1713,12 +1713,12 @@ int vp_reduceat(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, const i
         }
         if (!out.dense()) {
             set_error(err, errlen, "reduceat: result strides not dense");
-            return VP_INVALID;
+            return NX_INVALID;
         }
     }
     if (out.size() == 0) {
         set_error(err, errlen, "reduceat: empty result");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     std::string e;
     const numpy::UfuncLoop* loop = rt->loops->get_reduction(
@@ -1726,18 +1726,18 @@ int vp_reduceat(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, const i
     if (loop == nullptr) {
         PyErr_Clear();
         set_error(err, errlen, e);
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     const ArrayPtr ins[] = {ref(in)};
     ArrayPtr res;
     rt->rt->issue(numpy::make_reduceat_kernel(loop, axis, std::move(ind)), ins, {},
                   std::span(&out, 1), site, std::span(&res, 1), l.size());
     *result = hand_out(std::move(res));
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_ufunc_at(vp_runtime* rt, const vp_loop* loop, vp_array* a, vp_array* indices,
-                vp_array* values, const char* site, char* err, size_t errlen) {
+int nx_ufunc_at(nx_runtime* rt, const nx_loop* loop, nx_array* a, nx_array* indices,
+                nx_array* values, const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
     const Layout& al = arr(a).layout();
     const Layout& xl = arr(indices).layout();
@@ -1750,7 +1750,7 @@ int vp_ufunc_at(vp_runtime* rt, const vp_loop* loop, vp_array* a, vp_array* indi
     if (!same || al.shape.empty() || xl.shape.size() != 1 ||
         (xl.dtype != DType::Int32 && xl.dtype != DType::Int64)) {
         set_error(err, errlen, "ufunc.at: unsupported operands");
-        return VP_UNSUPPORTED;
+        return NX_UNSUPPORTED;
     }
     if (values != nullptr) {
         Shape full = al.shape;
@@ -1759,7 +1759,7 @@ int vp_ufunc_at(vp_runtime* rt, const vp_loop* loop, vp_array* a, vp_array* indi
         const Layout& vl = arr(values).layout();
         if (vl.dtype != al.dtype || !broadcast_shapes(vl.shape, full, b) || b != full) {
             set_error(err, errlen, "ufunc.at: values do not broadcast");
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
     }
     std::int64_t work = xl.shape[0];
@@ -1773,10 +1773,10 @@ int vp_ufunc_at(vp_runtime* rt, const vp_loop* loop, vp_array* a, vp_array* indi
     }
     const ArrayPtr io[] = {ref(a)};
     rt->rt->issue(numpy::make_at_kernel(loop->loop), std::span(ins, nins), io, {}, site, {}, work);
-    return VP_OK;
+    return NX_OK;
 }
 
-int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, char* err,
+int nx_assign(nx_runtime* rt, nx_array* dst, nx_array* src, const char* site, char* err,
               size_t errlen) {
     rt->graveyard->drain();
     const Layout& d = arr(dst).layout();
@@ -1784,7 +1784,7 @@ int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, ch
     Shape b;
     if (!broadcast_shapes(d.shape, s.shape, b) || b != d.shape) {
         set_error(err, errlen, "assign: shapes do not broadcast");
-        return VP_INVALID;
+        return NX_INVALID;
     }
     const ArrayPtr ins[] = {ref(src)};
     const ArrayPtr io[] = {ref(dst)};
@@ -1792,7 +1792,7 @@ int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, ch
         // NumPy casts the values in its assignment (unsafe casting): the cast
         // kernel writes them straight into dst.
         if (d.size() == 0) {
-            return VP_OK;
+            return NX_OK;
         }
         std::string e;
         std::shared_ptr<Kernel> k = numpy::make_cast_kernel(
@@ -1800,14 +1800,14 @@ int vp_assign(vp_runtime* rt, vp_array* dst, vp_array* src, const char* site, ch
         if (!k) {
             PyErr_Clear();
             set_error(err, errlen, e);
-            return VP_UNSUPPORTED;
+            return NX_UNSUPPORTED;
         }
         rt->rt->issue(k, ins, io, {}, site);
-        return VP_OK;
+        return NX_OK;
     }
     static const std::shared_ptr<Kernel> assign = make_assign_kernel();
     rt->rt->issue(assign, ins, io, {}, site);
-    return VP_OK;
+    return NX_OK;
 }
 
 } // extern "C"

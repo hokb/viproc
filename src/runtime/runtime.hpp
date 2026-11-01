@@ -22,7 +22,7 @@
 #include <thread>
 #include <vector>
 
-namespace viproc {
+namespace numpy2x {
 
 // Look-ahead limit: maximum number of issued, not yet completed tasks.
 inline constexpr std::size_t kDefaultMaxActiveTasks = 1000;
@@ -36,7 +36,7 @@ struct ArrayBlock;
 // (`current`, a CountableArray) and the last task writing it (`last_writer`):
 // a write through one view makes the base and all other views pending, and
 // copy-on-write switches all of them to the new version together, without
-// viproc knowing the views.
+// numpy2x knowing the views.
 //
 // State: `pending` while `last_writer` is set and not completed, `ready`
 // otherwise. Only the main thread sets `last_writer` (ready -> pending); the
@@ -325,4 +325,4 @@ class Runtime {
     std::vector<std::thread> workers_;
 };
 
-} // namespace viproc
+} // namespace numpy2x

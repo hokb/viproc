@@ -1,12 +1,12 @@
-"""The viproc array type and its NumPy integration.
+"""The numpy2x array type and its NumPy integration.
 
-viproc arrays intercept NumPy through the array protocols (NEP 13
+numpy2x arrays intercept NumPy through the array protocols (NEP 13
 ``__array_ufunc__``, NEP 18 ``__array_function__``). Supported ops are issued
 asynchronously to the runtime; everything else syncs, runs eagerly in NumPy and
 wraps the result again (fallback).
 
 The per-op hot path (``__array_ufunc__`` for element-wise ufuncs and all
-operators) is implemented in C by the base class ``_viproc._Array``; this
+operators) is implemented in C by the base class ``_numpy2x._Array``; this
 module adds everything else and the fallbacks the C code calls.
 """
 
@@ -17,18 +17,18 @@ import sys
 import warnings
 import weakref
 
-import numpy as np  # imports the real NumPy, not viproc
+import numpy as np  # imports the real NumPy, not numpy2x
 from numpy.lib.array_utils import normalize_axis_index, normalize_axis_tuple
 
-from . import _viproc
+from . import _numpy2x
 
-AsyncError = _viproc.AsyncError
-AsyncIndexError = _viproc.AsyncIndexError
-AsyncValueError = _viproc.AsyncValueError
-AsyncLinAlgError = _viproc.AsyncLinAlgError
-AsyncFloatingPointError = _viproc.AsyncFloatingPointError
+AsyncError = _numpy2x.AsyncError
+AsyncIndexError = _numpy2x.AsyncIndexError
+AsyncValueError = _numpy2x.AsyncValueError
+AsyncLinAlgError = _numpy2x.AsyncLinAlgError
+AsyncFloatingPointError = _numpy2x.AsyncFloatingPointError
 
-# dtype <-> runtime dtype code (vp_dtype in viproc.h)
+# dtype <-> runtime dtype code (nx_dtype in numpy2x.h)
 _CODES = {
     np.dtype(np.bool_): 0,
     np.dtype(np.int32): 1,
@@ -45,15 +45,15 @@ _NUMPY_DIR = os.path.dirname(os.path.abspath(np.__file__))
 
 
 def _env_policy():
-    sync_below = int(os.environ.get("VIPROC_SYNC_BELOW", "-1"))
-    adaptive = os.environ.get("VIPROC_DETERMINISTIC", "0") in ("", "0")
+    sync_below = int(os.environ.get("NUMPY2X_SYNC_BELOW", "-1"))
+    adaptive = os.environ.get("NUMPY2X_DETERMINISTIC", "0") in ("", "0")
     return sync_below, adaptive
 
 
 def _ensure_runtime():
-    if not _viproc.initialized():
+    if not _numpy2x.initialized():
         sync_below, adaptive = _env_policy()
-        _viproc.init(0, sync_below, adaptive)
+        _numpy2x.init(0, sync_below, adaptive)
         _small_ops[0] = 2048 if sync_below < 0 else sync_below
         _scale_budget(adaptive)
 
@@ -70,7 +70,7 @@ def _ensure_runtime():
 # Before, the budget was 9 times d: 3.3 us on a 12700K, above a sin of 200
 # doubles (~0.8 us), so a loop over 200 x 200 columns
 # (`array_pipelining.py`) ran every op on the main thread.
-# VIPROC_DIRECT_BUDGET_NS sets the budget instead (ns; chain_ns 0).
+# NUMPY2X_DIRECT_BUDGET_NS sets the budget instead (ns; chain_ns 0).
 _op_ns = []  # [d, t, c]
 _CAL_OPS = 64
 
@@ -94,11 +94,11 @@ def _calibrate():
     # Interleaved rounds: a noisy phase of the machine hits all three alike.
     for _ in range(6):
         run(0, a)
-        _viproc.set_offload_policy(0, False)  # every op a task
+        _numpy2x.set_offload_policy(0, False)  # every op a task
         try:
             run(1, a)
         finally:
-            _viproc.set_offload_policy(_small_ops[0], True)
+            _numpy2x.set_offload_policy(_small_ops[0], True)
         # a view of a pending result (a sin of 16k doubles, ~0.05-0.2 ms on a
         # worker, longer than the 25 ops take to issue)
         run(2, np.sin(big)[:8])
@@ -106,40 +106,40 @@ def _calibrate():
 
 
 def _scale_budget(adaptive):
-    env = os.environ.get("VIPROC_DIRECT_BUDGET_NS")
+    env = os.environ.get("NUMPY2X_DIRECT_BUDGET_NS")
     if env:  # an explicit budget for this machine (experiments)
-        _viproc.set_direct_budget_ns(float(env))
+        _numpy2x.set_direct_budget_ns(float(env))
         return
     if not _op_ns:
         if not 8 < _small_ops[0] or not adaptive:
             return  # `a * b` would be a task / deterministic: no promotion
         _calibrate()
     d, t, c = _op_ns
-    _viproc.set_direct_budget_ns(min(max(t - d, 300.0), 50000.0))
-    _viproc.set_chain_ns(min(max(c - d, 0.0), 50000.0))
+    _numpy2x.set_direct_budget_ns(min(max(t - d, 300.0), 50000.0))
+    _numpy2x.set_chain_ns(min(max(c - d, 0.0), 50000.0))
 
 
 def _wrap_numpy(arr):
-    """viproc array over a NumPy array's memory. The caller gives up `arr`."""
+    """numpy2x array over a NumPy array's memory. The caller gives up `arr`."""
     _ensure_runtime()
     if arr.dtype not in _CODES or not arr.flags.aligned or not arr.dtype.isnative:
         return None
-    return _viproc.from_ndarray(arr)
+    return _numpy2x.from_ndarray(arr)
 
 
-# viproc on/off for code that creates arrays (viproc.enable, viproc.disabled):
+# numpy2x on/off for code that creates arrays (numpy2x.enable, numpy2x.disabled):
 # off, the creation functions return NumPy's own arrays, so the same program
 # runs as plain NumPy (benchmarking, debugging).
 _enabled = [True]
 
 
 def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0, like=None):
-    """Like numpy.array, returning a viproc array.
+    """Like numpy.array, returning a numpy2x array.
 
     NumPy data is always copied (the caller keeps its ndarray and may write
-    it later; design doc D7), also with copy=False. Dtypes viproc does not
+    it later; design doc D7), also with copy=False. Dtypes numpy2x does not
     support (object, str, float16, ...) give NumPy's array, as do all calls
-    while viproc is disabled."""
+    while numpy2x is disabled."""
     if not _enabled[0] or like is not None:
         return np.array(obj, dtype, copy=copy, order=order, subok=subok, ndmin=ndmin, like=like)
     if isinstance(obj, ndarray) and order in ("K", "A"):
@@ -156,7 +156,7 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0, like=N
 
 
 def asarray(obj, dtype=None, order=None, *, copy=None, like=None, **kwargs):
-    """Like numpy.asarray, returning a viproc array (viproc arrays of the
+    """Like numpy.asarray, returning a numpy2x array (numpy2x arrays of the
     requested dtype pass through; NumPy data is copied, see array())."""
     if not _enabled[0] or like is not None or kwargs:
         return np.asarray(obj, dtype, order, copy=copy, like=like, **kwargs)
@@ -166,10 +166,10 @@ def asarray(obj, dtype=None, order=None, *, copy=None, like=None, **kwargs):
 
 
 def fresh(r, args=(), kwargs=None):
-    """Result `r` of a NumPy function as viproc array: fresh memory is adopted
+    """Result `r` of a NumPy function as numpy2x array: fresh memory is adopted
     without a copy, a view of other memory is copied first. Returned as is:
     anything but a plain ndarray, an argument of the call (out=), dtypes
-    viproc does not support, and everything while viproc is disabled."""
+    numpy2x does not support, and everything while numpy2x is disabled."""
     if not _enabled[0] or type(r) is not np.ndarray:
         return r
     if any(r is a for a in args) or (kwargs and any(r is v for v in kwargs.values())):
@@ -182,7 +182,7 @@ def fresh(r, args=(), kwargs=None):
 
 
 def _to_numpy(x):
-    """NumPy input from a viproc array: a read-only view, no copy."""
+    """NumPy input from a numpy2x array: a read-only view, no copy."""
     return np.asarray(x) if isinstance(x, ndarray) else x
 
 
@@ -202,28 +202,28 @@ def _tree(x, fn):
 
 
 def _adopt(arr):
-    """viproc array over fresh NumPy memory (no copy); unsupported: as is."""
+    """numpy2x array over fresh NumPy memory (no copy); unsupported: as is."""
     w = _wrap_numpy(arr)
     return w if w is not None else arr
 
 
 class _Host:
-    """Runs NumPy code eagerly on viproc arrays with NumPy's semantics
+    """Runs NumPy code eagerly on numpy2x arrays with NumPy's semantics
     (design doc D7, "Eager fallbacks").
 
-    Each viproc argument becomes a *writable* NumPy view of its buffer, made
+    Each numpy2x argument becomes a *writable* NumPy view of its buffer, made
     exclusive first (export(a, True): waits for pending writers and readers;
     live exports are aliases and see the writes, as NumPy's views). NumPy code then
-    reads and writes viproc memory as it would an ndarray's: in-place
+    reads and writes numpy2x memory as it would an ndarray's: in-place
     functions, ``out=`` and overlap handling are NumPy's own. Results are
-    mapped back: an argument returned as is -> that viproc array; a view of
-    an argument -> a viproc view of the same storage (writable as NumPy made
+    mapped back: an argument returned as is -> that numpy2x array; a view of
+    an argument -> a numpy2x view of the same storage (writable as NumPy made
     it); a view of a NumPy argument -> returned unchanged; fresh memory ->
     adopted; anything else -> copied.
     """
 
     def __init__(self):
-        self.exports = {}  # id(export) -> (export, viproc array)
+        self.exports = {}  # id(export) -> (export, numpy2x array)
         self.plain = {}  # id(x) -> NumPy arguments
 
     def numpy(self, tree):
@@ -231,7 +231,7 @@ class _Host:
 
     def _convert(self, x):
         if isinstance(x, ndarray):
-            e = _viproc.export(x, True)  # read-only for read-only viproc arrays
+            e = _numpy2x.export(x, True)  # read-only for read-only numpy2x arrays
             self.exports[id(e)] = (e, x)
             return e
         if isinstance(x, np.ndarray):
@@ -263,9 +263,9 @@ class _Host:
             if np.may_share_memory(r, e):
                 code = _CODES.get(r.dtype)
                 if code is None or not r.flags.aligned or not r.dtype.isnative:
-                    return _adopt(r.copy())  # a view viproc cannot express
+                    return _adopt(r.copy())  # a view numpy2x cannot express
                 offset = r.__array_interface__["data"][0] - e.__array_interface__["data"][0]
-                w = _viproc.view(v, r.shape, r.strides, offset, code)
+                w = _numpy2x.view(v, r.shape, r.strides, offset, code)
                 if r.flags.num & _WARN_ON_WRITE:  # writable, warns on the first write
                     w._warn_on_write = True
                 else:
@@ -296,7 +296,7 @@ def _host_call(fn, args, kwargs):
 
 
 # --- reductions -----------------------------------------------------------------
-# Asynchronous with NumPy's own reduction loops (vp_reduce): viproc calls the
+# Asynchronous with NumPy's own reduction loops (nx_reduce): numpy2x calls the
 # loop in the blocks NumPy's reduction would, so results are bit-identical.
 # That calling pattern is the one of NumPy >= 2.3 (earlier versions split
 # loops at the buffer size); older NumPy keeps reductions eager.
@@ -311,14 +311,14 @@ _REDUCE_UFUNCS = frozenset((
 _MISS = object()
 _NV = np._NoValue
 # (ufunc, dtype, ndim, axis, keepdims, requested dtype) -> (axis flags,
-# keepdims, identity), or None if viproc cannot run that reduction. Per-call
+# keepdims, identity), or None if numpy2x cannot run that reduction. Per-call
 # work is then one lookup (normalizing axes and probing NumPy's result dtype
 # cost more than the reduction of 1,000 elements).
 _reduce_plans = {}
 
 
 def _plan_reduce(ufunc, dtype, ndim, axis, keepdims, requested):
-    try:  # NumPy's result dtype (int32 sums accumulate in int64); a viproc dtype?
+    try:  # NumPy's result dtype (int32 sums accumulate in int64); a numpy2x dtype?
         with warnings.catch_warnings():  # the probe only: the call itself warns
             warnings.simplefilter("ignore")
             if ufunc.reduce(np.zeros(1, dtype), dtype=requested).dtype not in _CODES:
@@ -338,11 +338,11 @@ def _plan_reduce(ufunc, dtype, ndim, axis, keepdims, requested):
 
 def _reduce(ufunc, a, axis=None, keepdims=False, dtype=None, initial=_NV, out=None):
     """ufunc.reduce(a, axis, dtype=..., keepdims=..., initial=..., out=...)
-    issued asynchronously, or None if viproc cannot run it (the caller falls
-    back to NumPy; empty inputs too, vp_reduce refuses them). Casting
+    issued asynchronously, or None if numpy2x cannot run it (the caller falls
+    back to NumPy; empty inputs too, nx_reduce refuses them). Casting
     reductions and strided ones NumPy buffers run on NumPy's own iterator
-    (vp_reduce). out=: a viproc array with the dtype and layout of the
-    result NumPy would allocate (vp_reduce_out), returned as NumPy returns
+    (nx_reduce). out=: a numpy2x array with the dtype and layout of the
+    result NumPy would allocate (nx_reduce_out), returned as NumPy returns
     it."""
     if not _REDUCE_ASYNC or type(a) is not ndarray or ufunc not in _REDUCE_UFUNCS:
         return None
@@ -364,8 +364,8 @@ def _reduce(ufunc, a, axis=None, keepdims=False, dtype=None, initial=_NV, out=No
     flags, keep, requested = plan
     start = ufunc.identity if initial is _NV else initial
     if out is not None:
-        return _viproc.reduce(ufunc, a, flags, keep, requested, start, out)
-    r = _viproc.reduce(ufunc, a, flags, keep, requested, start)
+        return _numpy2x.reduce(ufunc, a, flags, keep, requested, start, out)
+    r = _numpy2x.reduce(ufunc, a, flags, keep, requested, start)
     return _scalar_result(r) if r is not None and r.ndim == 0 else r
 
 
@@ -373,7 +373,7 @@ def _scalar_result(r):
     """A 0-d result NumPy returns as a scalar: NumPy's scalar if the data is
     there already (it ran directly), else the pending 0-d array, marked so
     that in-place operators rebind it as they rebind NumPy's scalars."""
-    s = _viproc.scalar(r)
+    s = _numpy2x.scalar(r)
     if s is not None:
         return s
     r._scalar = True
@@ -521,7 +521,7 @@ def _r_arg(argmax):
                 shape = shape[:ax] + (1,) + shape[ax:]
         if not src._c_contiguous:
             src = src.astype(src.dtype, order="C")
-        r = _viproc.arg_reduce(argmax, src, shape)
+        r = _numpy2x.arg_reduce(argmax, src, shape)
         if r is None:
             return _NOPE
         return _scalar_result(r) if r.ndim == 0 else r
@@ -551,7 +551,7 @@ _REDUCTIONS = {
 
 
 # --- views (metadata only, no sync) --------------------------------------------
-# Views are computed here and in C (_viproc.basic_view, transpose, reshape,
+# Views are computed here and in C (_numpy2x.basic_view, transpose, reshape,
 # broadcast_to) with NumPy's own rules (get_view_from_index, PyArray_Transpose,
 # PyArray_Newshape / _attempt_nocopy_reshape, PyArray_Diagonal, ...); no
 # ndarray is created for them. Invalid arguments: NumPy raises its own error
@@ -570,7 +570,7 @@ def _numpy_error(fn, a, *args, **kwargs):
 def _transpose(a, axes=None):
     if type(a) is not ndarray:
         return _NOPE
-    r = _viproc.transpose(a, axes)
+    r = _numpy2x.transpose(a, axes)
     return _numpy_error(np.transpose, a, axes) if r is None else r
 
 
@@ -581,7 +581,7 @@ def _swapaxes(a, axis1, axis2):
     j = normalize_axis_index(axis2, a.ndim, "axis2")
     perm = list(range(a.ndim))
     perm[i], perm[j] = perm[j], perm[i]
-    return _viproc.transpose(a, perm)
+    return _numpy2x.transpose(a, perm)
 
 
 def _moveaxis(a, source, destination):
@@ -596,7 +596,7 @@ def _moveaxis(a, source, destination):
     order = [n for n in range(a.ndim) if n not in source]
     for dest, src in sorted(zip(destination, source)):
         order.insert(dest, src)
-    return _viproc.transpose(a, order)
+    return _numpy2x.transpose(a, order)
 
 
 def _matrix_transpose(x):
@@ -606,12 +606,12 @@ def _matrix_transpose(x):
         return _numpy_error(np.matrix_transpose, x)
     perm = list(range(x.ndim))
     perm[-2], perm[-1] = perm[-1], perm[-2]
-    return _viproc.transpose(x, perm)
+    return _numpy2x.transpose(x, perm)
 
 
 def _basic(a, key):
     """a[key] for a basic key as a view (also for an all-int key: 0-d)."""
-    r = _viproc.basic_view(a, key)
+    r = _numpy2x.basic_view(a, key)
     if r is None:
         probe = np.broadcast_to(np.empty((), a.dtype), a.shape)
         probe[key]  # NumPy's IndexError
@@ -630,8 +630,8 @@ def _squeeze(a, axis=None):
             raise ValueError("cannot select an axis to squeeze out which has size not "
                              "equal to one")
     if not axes:
-        return _viproc.basic_view(a, ())
-    return _viproc.basic_view(a, tuple(0 if i in axes else slice(None)
+        return _numpy2x.basic_view(a, ())
+    return _numpy2x.basic_view(a, tuple(0 if i in axes else slice(None)
                                        for i in range(a.ndim)))
 
 
@@ -657,7 +657,7 @@ def _flip(m, axis=None):
         axes = normalize_axis_tuple(axis, m.ndim)
         key = tuple(slice(None, None, -1) if i in axes else slice(None)
                     for i in range(m.ndim))
-    return _viproc.basic_view(m, key)
+    return _numpy2x.basic_view(m, key)
 
 
 def _fliplr(m):
@@ -665,7 +665,7 @@ def _fliplr(m):
         return _NOPE
     if m.ndim < 2:
         raise ValueError("Input must be >= 2-d.")
-    return _viproc.basic_view(m, (slice(None), slice(None, None, -1)))
+    return _numpy2x.basic_view(m, (slice(None), slice(None, None, -1)))
 
 
 def _flipud(m):
@@ -673,7 +673,7 @@ def _flipud(m):
         return _NOPE
     if m.ndim < 1:
         raise ValueError("Input must be >= 1-d.")
-    return _viproc.basic_view(m, (slice(None, None, -1),))
+    return _numpy2x.basic_view(m, (slice(None, None, -1),))
 
 
 def _rot90(m, k=1, axes=(0, 1)):
@@ -689,14 +689,14 @@ def _rot90(m, k=1, axes=(0, 1)):
         raise ValueError(f"Axes={axes} out of range for array of ndim={m.ndim}.")
     k %= 4
     if k == 0:
-        return _viproc.basic_view(m, ())
+        return _numpy2x.basic_view(m, ())
     if k == 2:
         return _flip(_flip(m, axes[0]), axes[1])
     axes_list = list(range(m.ndim))
     (axes_list[axes[0]], axes_list[axes[1]]) = (axes_list[axes[1]], axes_list[axes[0]])
     if k == 1:
-        return _viproc.transpose(_flip(m, axes[1]), axes_list)
-    return _flip(_viproc.transpose(m, axes_list), axes[1])
+        return _numpy2x.transpose(_flip(m, axes[1]), axes_list)
+    return _flip(_numpy2x.transpose(m, axes_list), axes[1])
 
 
 def _atleast(n):
@@ -707,10 +707,10 @@ def _atleast(n):
         if n == 1 or a.ndim == 0:
             return _reshape(a, (1,) * n)
         if n == 2:
-            return _viproc.basic_view(a, (None, slice(None)))
+            return _numpy2x.basic_view(a, (None, slice(None)))
         if a.ndim == 1:
-            return _viproc.basic_view(a, (None, slice(None), None))
-        return _viproc.basic_view(a, (slice(None), slice(None), None))
+            return _numpy2x.basic_view(a, (None, slice(None), None))
+        return _numpy2x.basic_view(a, (slice(None), slice(None), None))
 
     def handler(*arys):
         if not arys or any(type(a) is not ndarray for a in arys):
@@ -725,7 +725,7 @@ def _broadcast_to(array, shape, subok=False):
     if type(array) is not ndarray:
         return _NOPE
     shape = (shape,) if isinstance(shape, (int, np.integer)) else tuple(shape)
-    r = _viproc.broadcast_to(array, shape)
+    r = _numpy2x.broadcast_to(array, shape)
     return _numpy_error(np.broadcast_to, array, shape) if r is None else r
 
 
@@ -753,7 +753,7 @@ def _diagonal(a, offset=0, axis1=0, axis2=1):
     else:
         start = offset * step
     keep = [i for i in range(a.ndim) if i not in (axis1, axis2)]
-    v = _viproc.view(a, [shape[i] for i in keep] + [size],
+    v = _numpy2x.view(a, [shape[i] for i in keep] + [size],
                      [strides[i] for i in keep] + [strides[axis1] + strides[axis2]], start)
     v._readonly = True
     return v
@@ -764,7 +764,7 @@ def _real(val):
         return _NOPE
     if val.dtype.kind != "c":
         return val  # NumPy: the array itself
-    return _viproc.view(val, val.shape, val.strides, 0, _CODES[_REAL_OF[val.dtype]])
+    return _numpy2x.view(val, val.shape, val.strides, 0, _CODES[_REAL_OF[val.dtype]])
 
 
 _REAL_OF = {np.dtype(np.complex64): np.dtype(np.float32),
@@ -788,14 +788,14 @@ def _dtype_view(a, dtype):
         for n in reversed(sub):
             inner.insert(0, step)
             step *= n
-        return _viproc.view(a, a.shape + tuple(sub), tuple(strides) + tuple(inner), 0,
+        return _numpy2x.view(a, a.shape + tuple(sub), tuple(strides) + tuple(inner), 0,
                             _CODES[base])
     if dtype.itemsize == a.itemsize:
-        return _viproc.view(a, a.shape, a.strides, 0, code)
+        return _numpy2x.view(a, a.shape, a.strides, 0, code)
     if a.ndim == 0 or a.strides[-1] != a.itemsize or (a.shape[-1] * a.itemsize) % dtype.itemsize:
         return _NOPE
     shape = a.shape[:-1] + (a.shape[-1] * a.itemsize // dtype.itemsize,)
-    return _viproc.view(a, shape, a.strides[:-1] + (dtype.itemsize,), 0, code)
+    return _numpy2x.view(a, shape, a.strides[:-1] + (dtype.itemsize,), 0, code)
 
 
 def _reshape(a, shape=None, order="C", *, newshape=None, copy=None):
@@ -812,15 +812,15 @@ def _reshape(a, shape=None, order="C", *, newshape=None, copy=None):
     shape = (shape,) if isinstance(shape, (int, np.integer)) else tuple(shape)
     if copy:
         src = a.astype(a.dtype, order="F" if order == "F" else "C")
-        return _viproc.reshape(src, shape, order)
-    r = _viproc.reshape(a, shape, order)
+        return _numpy2x.reshape(src, shape, order)
+    r = _numpy2x.reshape(a, shape, order)
     if r is not None:
         return r
     if copy is False:
         raise ValueError("Unable to avoid creating a copy while reshaping.")
     if order == "A":
         order = "C"  # A on an array that is not F-contiguous
-    r = _viproc.reshape(a.astype(a.dtype, order=order), shape, order)
+    r = _numpy2x.reshape(a.astype(a.dtype, order=order), shape, order)
     return _NOPE if r is None else r
 
 
@@ -841,10 +841,10 @@ def _ravel(a, order="C"):
         order = "F" if f else "C"  # 1-d strided: the K copy is the C copy
     # copies own their data (PyArray_Flatten), as NumPy's: base None
     if order == "C":
-        return _viproc.own(a.astype(a.dtype, order="C").reshape(-1))
+        return _numpy2x.own(a.astype(a.dtype, order="C").reshape(-1))
     if f:
         return _reshape(a, -1, "F")
-    return _viproc.own(_reshape(a.astype(a.dtype, order="F"), -1, "F"))
+    return _numpy2x.own(_reshape(a.astype(a.dtype, order="F"), -1, "F"))
 
 
 _VIEW_HANDLERS = {
@@ -876,7 +876,7 @@ def _where(condition, *xy):
             ops.append(a if a.dtype == want else a.astype(want))
         else:
             ops.append(asarray(np.asarray(a).astype(want)))
-    r = _viproc.select(*ops)
+    r = _numpy2x.select(*ops)
     return _scalar_result(r) if r.ndim == 0 else r
 
 
@@ -1088,7 +1088,7 @@ def _gather_fast(a, key):
     nb = idx.ndim
     res = list(range(p)) + [-1 - d for d in range(nb)] + list(range(p + 1, a.ndim))
     if p == 0:
-        return _viproc.gather(a, (idx,), (0,), res, None)
+        return _numpy2x.gather(a, (idx,), (0,), res, None)
     shape = a.shape[:p] + idx.shape + a.shape[p + 1:]
     strides = [0] * len(shape)
     step = a.itemsize
@@ -1098,7 +1098,7 @@ def _gather_fast(a, key):
     for k in reversed(range(p, p + nb)):
         strides[k] = step
         step *= shape[k]
-    return _viproc.gather(a, (idx,), (p,), res, strides)
+    return _numpy2x.gather(a, (idx,), (p,), res, strides)
 
 
 def _gather(a, key):
@@ -1107,11 +1107,11 @@ def _gather(a, key):
         return _NOPE
     v, arrays, axes, res, bshape, pattern = parsed
     strides = _result_strides(v, arrays, axes, res, bshape, pattern)
-    return _viproc.gather(v, arrays, axes, res, strides)
+    return _numpy2x.gather(v, arrays, axes, res, strides)
 
 
 def _as_values(value, dtype):
-    """`value` as a viproc array of `dtype` (NumPy's setitem conversion)."""
+    """`value` as a numpy2x array of `dtype` (NumPy's setitem conversion)."""
     if isinstance(value, ndarray):
         return value if value.dtype == dtype else value.astype(dtype)
     if np.ndim(value) == 0 and not isinstance(value, np.ndarray):
@@ -1129,7 +1129,7 @@ def _scatter(a, key, value):
         # over the remaining axes)
         m = key if isinstance(key, ndarray) else asarray(key)
         m = m[(Ellipsis,) + (None,) * (a.ndim - key.ndim)]
-        _viproc.mask_assign(a, m, _as_values(value, a.dtype))
+        _numpy2x.mask_assign(a, m, _as_values(value, a.dtype))
         return True
     parsed = _parse_index(a, key)
     if parsed is None:
@@ -1142,7 +1142,7 @@ def _scatter(a, key, value):
             return False
     except ValueError:
         return False  # NumPy raises
-    _viproc.scatter(v, arrays, axes, res, vals)
+    _numpy2x.scatter(v, arrays, axes, res, vals)
     return True
 
 
@@ -1153,7 +1153,7 @@ _small_ops = [2048]
 
 def _ready_key(key):
     keys = key if isinstance(key, tuple) else (key,)
-    return all(not isinstance(k, ndarray) or _viproc.ready(k) for k in keys)
+    return all(not isinstance(k, ndarray) or _numpy2x.ready(k) for k in keys)
 
 
 def _numpy_key(key):
@@ -1210,8 +1210,8 @@ def _fill_strides(shape, itemsize, fortran):
     return tuple(strides)
 
 
-class ndarray(_viproc._Array):
-    """Array whose ops run asynchronously in the viproc runtime.
+class ndarray(_numpy2x._Array):
+    """Array whose ops run asynchronously in the numpy2x runtime.
 
     Supported ops return immediately with a pending result; reading data
     (printing, ``np.asarray``, ``float()``, unsupported functions) is a sync
@@ -1243,26 +1243,26 @@ class ndarray(_viproc._Array):
         writes through either show in the other (read-only only for
         read-only arrays). While it lives, ops on this array's memory run
         synchronously (memory-management.md, D7)."""
-        return _viproc.export(self, True)
+        return _numpy2x.export(self, True)
 
     def __array__(self, dtype=None, copy=None):
         arr = self.numpy()
         if dtype is not None and np.dtype(dtype) != arr.dtype:
             if copy is False:
-                raise ValueError("viproc: converting the dtype needs a copy")
+                raise ValueError("numpy2x: converting the dtype needs a copy")
             return arr.astype(dtype)
         return arr.copy() if copy else arr
 
     def wait(self):
         """Sync point: wait until the data is computed (raises AsyncError)."""
-        _viproc.wait(self)
+        _numpy2x.wait(self)
         return self
 
     def ready(self):
-        return _viproc.ready(self)
+        return _numpy2x.ready(self)
 
     def __repr__(self):
-        return "viproc." + repr(self.numpy())
+        return "numpy2x." + repr(self.numpy())
 
     def __str__(self):
         return str(self.numpy())
@@ -1337,7 +1337,7 @@ class ndarray(_viproc._Array):
         code = _CODES.get(dtype)
         if (code is not None and order in ("K", "C", "F") and casting == "unsafe"
                 and self.size and type(self) is ndarray):
-            r = _viproc.astype(self, code, order)  # NumPy's casts, asynchronously
+            r = _numpy2x.astype(self, code, order)  # NumPy's casts, asynchronously
             if r is not None:
                 return r
         return _host_call(lambda a: a.astype(dtype, order, casting, subok, copy), (self,), {})
@@ -1346,7 +1346,7 @@ class ndarray(_viproc._Array):
         if order != "C":
             return _host_call(lambda a: a.copy(order), (self,), {})
         out = _wrap_numpy(np.empty(self.shape, self.dtype))
-        _viproc.assign(out, self)
+        _numpy2x.assign(out, self)
         return out
 
     def _reshape_py(self, *shape, **kwargs):  # behind _Array.reshape (C)
@@ -1359,12 +1359,12 @@ class ndarray(_viproc._Array):
 
     def flatten(self, order="C"):
         if order == "C" and type(self) is ndarray:
-            return _viproc.own(self.astype(self.dtype, order="C").reshape(-1))  # a copy
+            return _numpy2x.own(self.astype(self.dtype, order="C").reshape(-1))  # a copy
         return _host_call(lambda a: a.flatten(order), (self,), {})
 
     @property
     def T(self):
-        return _viproc.transpose(self, None)
+        return _numpy2x.transpose(self, None)
 
     @property
     def mT(self):
@@ -1391,7 +1391,7 @@ class ndarray(_viproc._Array):
     @property
     def imag(self):
         if self.dtype.kind == "c":  # the second half of each element
-            return _viproc.view(self, self.shape, self.strides, self.itemsize // 2,
+            return _numpy2x.view(self, self.shape, self.strides, self.itemsize // 2,
                                 _CODES[_REAL_OF[self.dtype]])
         return _host_call(lambda a: a.imag, (self,), {})  # NumPy: read-only zeros
 
@@ -1412,10 +1412,10 @@ class ndarray(_viproc._Array):
 
     # --- the other ndarray methods ---------------------------------------------
     # Delegates to NumPy's function forms, so they take whatever path the
-    # function takes (asynchronous where viproc supports it, else the eager
+    # function takes (asynchronous where numpy2x supports it, else the eager
     # fallback) and get faster with it. In-place methods without a function
     # form run NumPy's method in the fallback, on the writable view it makes
-    # after waiting for readers (vp_array_prepare_write).
+    # after waiting for readers (nx_array_prepare_write).
     def conj(self):
         # PyArray_Conjugate: a real array is returned as is (no copy).
         return np.conjugate(self) if self.dtype.kind == "c" else self
@@ -1463,7 +1463,7 @@ class ndarray(_viproc._Array):
     def repeat(self, repeats, axis=None):
         return np.repeat(self, repeats, axis)
 
-    # sort and argsort are _Array's C methods (vp_sort); this is the Python
+    # sort and argsort are _Array's C methods (nx_sort); this is the Python
     # path behind sort.
     def _sort_py(self, *args, **kwargs):
         if _sort.sort_in_place(self, *args, **kwargs):
@@ -1474,7 +1474,7 @@ class ndarray(_viproc._Array):
         _host_call(lambda a, *ar, **kw: a.partition(*ar, **kw), (self,) + args, kwargs)
 
     def _resize_py(self, args, kwargs, refs):  # behind _Array.resize (C)
-        # NumPy's array_resize and PyArray_Resize, on viproc data. NumPy
+        # NumPy's array_resize and PyArray_Resize, on numpy2x data. NumPy
         # parses the arguments and raises its errors on tiny NumPy probes in
         # the same state (contiguity, sizes, OWNDATA, weak references,
         # reference count), so they are NumPy's in every version; the data
@@ -1511,11 +1511,11 @@ class ndarray(_viproc._Array):
             np.empty(1, dt).resize(shape)  # MemoryError
         if any(n < 0 for n in shape):
             # NumPy accepts a negative extent after a zero one (its size loop
-            # stops at the zero); viproc's layouts cannot hold it.
+            # stops at the zero); numpy2x's layouts cannot hold it.
             raise ValueError(_RESIZE_NEGATIVE)
         strides = _fill_strides(shape, itemsize, f and not c)
         if size == self.size:  # same bytes: only shape and strides change
-            return _viproc.view(self, shape, strides, 0)
+            return _numpy2x.view(self, shape, strides, 0)
         if self.base is not None:  # not OWNDATA
             raise ValueError(_RESIZE_NOT_OWNER)
         if weakref.getweakrefcount(self):
@@ -1524,13 +1524,13 @@ class ndarray(_viproc._Array):
             raise ValueError(_RESIZE_REFS)
         # PyDataMem_UserRENEW and zeros: the old bytes in memory order first.
         m = min(size, self.size)
-        flat = _viproc.view(self, (self.size,), (itemsize,), 0)
+        flat = _numpy2x.view(self, (self.size,), (itemsize,), 0)
         out = _wrap_numpy(np.empty(size, dt))
         if m:
             out[:m] = flat[:m]
         if size > m:
             out[m:] = 0
-        return _viproc.view(out, shape, strides, 0)
+        return _numpy2x.view(out, shape, strides, 0)
 
     def byteswap(self, inplace=False):
         return _host_call(lambda a: a.byteswap(inplace), (self,), {})
@@ -1545,7 +1545,7 @@ class ndarray(_viproc._Array):
         if (value.ndim if isinstance(value, ndarray) else np.ndim(value)) != 0:  # NumPy's error
             _host_call(lambda a: a.fill(value), (self,), {})
             return
-        self[...] = value  # an assignment task (vp_assign), as NumPy casts
+        self[...] = value  # an assignment task (nx_assign), as NumPy casts
 
     # Sync points: they read the data.
     @property
@@ -1582,7 +1582,7 @@ class ndarray(_viproc._Array):
 
 
 class _FlatIter:
-    """a.flat of a viproc array: reading syncs (NumPy's flatiter on the
+    """a.flat of a numpy2x array: reading syncs (NumPy's flatiter on the
     read-only export), assigning runs NumPy's in the eager fallback."""
 
     __slots__ = ("base",)
@@ -1625,7 +1625,7 @@ def _ufunc_reduce(ufunc, a, axis=0, dtype=None, out=None, keepdims=False, initia
 
 
 def _product_operands(inputs):
-    """Both operands of a matrix product as viproc arrays (NumPy arrays are
+    """Both operands of a matrix product as numpy2x arrays (NumPy arrays are
     imported), or None if NumPy has to run it."""
     if len(inputs) != 2 or not all(isinstance(x, (ndarray, np.ndarray)) for x in inputs):
         return None
@@ -1637,7 +1637,7 @@ def _product_operands(inputs):
 
 def _matmul(a, b):
     ops = _product_operands((a, b))
-    return _viproc.matmul(*ops) if ops is not None else None
+    return _numpy2x.matmul(*ops) if ops is not None else None
 
 
 def _dot_operand(x):
@@ -1668,7 +1668,7 @@ def _dot(a, b, out=None):
         if any(e < 2 for x in ops for e in x.shape):
             return _NOPE  # dot's scalar/row/column special cases
         ops = tuple(_dot_operand(x) for x in ops)
-    r = _viproc.matmul(*ops)
+    r = _numpy2x.matmul(*ops)
     return _NOPE if r is None else r
 
 
@@ -1701,7 +1701,7 @@ def _fallback_ufunc(ufunc, method, inputs, kwargs):
     return _host_call(getattr(ufunc, method), inputs, kwargs)
 
 
-# Hooks for the C fast path (see _viproc.c).
+# Hooks for the C fast path (see _numpy2x.c).
 _OPS = {
     name: getattr(np, name)
     for name in (
@@ -1713,7 +1713,7 @@ _OPS = {
 }
 def _setitem(self, key, value):
     """a[key] = value beyond _Array's C slot (which hands small work on ready
-    data to NumPy and issues basic-key assignments of scalars and viproc
+    data to NumPy and issues basic-key assignments of scalars and numpy2x
     arrays): advanced keys, sequences as values, NumPy's errors."""
     if not _is_basic_index(key):  # NumPy assigns in place, overlap included
         if not self._readonly and type(self) is ndarray:
@@ -1742,13 +1742,13 @@ def _setitem(self, key, value):
         return
     target = self._view(key)
     if isinstance(value, ndarray):
-        src = value  # another dtype: cast in the assignment (vp_assign)
+        src = value  # another dtype: cast in the assignment (nx_assign)
     else:
         src = asarray(np.asarray(value).astype(self.dtype, copy=False))
     try:
-        _viproc.assign(target, src)
+        _numpy2x.assign(target, src)
     except NotImplementedError:  # a cast NumPy refused (warning turned into an error)
-        _viproc.assign(target, asarray(np.asarray(src).astype(self.dtype, copy=False)))
+        _numpy2x.assign(target, asarray(np.asarray(src).astype(self.dtype, copy=False)))
 
 
 def _getitem(self, key):
@@ -1760,14 +1760,14 @@ def _getitem(self, key):
         if v.ndim == 0:
             # NumPy returns a scalar: free if the data is there, else a
             # 0-d copy (a snapshot, as NumPy's scalar) instead of a sync
-            return _scalar_result(v.copy()) if not _viproc.ready(v) else _viproc.scalar(v)
+            return _scalar_result(v.copy()) if not _numpy2x.ready(v) else _numpy2x.scalar(v)
         return v
     if type(self) is ndarray:
         if type(key) in (ndarray, tuple, np.ndarray):  # a[idx], a[:, idx]: fast path
             r = _gather_fast(self, key)
             if r is not None:
                 return r
-        if self.size <= _small_ops[0] and _viproc.ready(self) and _ready_key(key):
+        if self.size <= _small_ops[0] and _numpy2x.ready(self) and _ready_key(key):
             # Small and ready: nothing to overlap, NumPy indexes right away
             # (advanced indexing always copies: the result is fresh).
             return _adopt(np.asarray(self.numpy()[_numpy_key(key)]))
@@ -1793,7 +1793,7 @@ def _reduction_fallback(func, args, kwargs):
     return _host_call(func, args, kwargs) if r is _NOPE else r
 
 
-_viproc.setup_reductions(
+_numpy2x.setup_reductions(
     tuple(
         (f, m, k, u, lambda args, kwargs, f=f: _reduction_fallback(f, args, kwargs))
         for f, m, k, u in (
@@ -1821,7 +1821,7 @@ _viproc.setup_reductions(
     _REDUCE_ASYNC,
 )
 
-_viproc.setup(
+_numpy2x.setup(
     ndarray,
     tuple(_DTYPES[c] for c in range(7)),
     _fallback_ufunc,
@@ -1907,24 +1907,24 @@ def _report_fp(events):
                 print(f"Warning: {msg}", file=sys.stderr)
 
 
-_viproc.set_fp_reporting(np._core._multiarray_umath._extobj_contextvar,
+_numpy2x.set_fp_reporting(np._core._multiarray_umath._extobj_contextvar,
                          np._core._multiarray_umath._get_extobj_dict, _fp_mode, _report_fp)
 
 
 def wait_all():
     """Sync point: wait until all issued ops have completed."""
-    if _viproc.initialized():
-        _viproc.wait_all()
+    if _numpy2x.initialized():
+        _numpy2x.wait_all()
 
 
 def init(max_active_tasks=0, sync_below=None, adaptive=None):
     """(Re)starts the runtime (2 worker threads, fixed).
 
     sync_below: ops whose inputs are ready and that produce fewer elements run
-        inline on the calling thread (default 2048, env VIPROC_SYNC_BELOW).
+        inline on the calling thread (default 2048, env NUMPY2X_SYNC_BELOW).
     adaptive: let each issue site switch to inline execution while its results
         are usually needed right after issuing (default True; False, or env
-        VIPROC_DETERMINISTIC=1, gives a deterministic schedule). Results are
+        NUMPY2X_DETERMINISTIC=1, gives a deterministic schedule). Results are
         identical either way; only where ops run changes.
     """
     env_sync, env_adaptive = _env_policy()
@@ -1933,7 +1933,7 @@ def init(max_active_tasks=0, sync_below=None, adaptive=None):
         shutdown()  # raises an error of the old runtime nothing reported yet
     finally:
         adaptive = env_adaptive if adaptive is None else adaptive
-        _viproc.init(max_active_tasks, sync_below, adaptive)
+        _numpy2x.init(max_active_tasks, sync_below, adaptive)
         _small_ops[0] = 2048 if sync_below < 0 else sync_below
         _scale_budget(adaptive)
 
@@ -1948,7 +1948,7 @@ def offload_stats():
     thread blocked; wait_all() not counted); w counts sleeping workers woken
     by the thread queuing a task (mostly the issuing main thread)."""
     _ensure_runtime()
-    return _viproc.offload_counts()
+    return _numpy2x.offload_counts()
 
 
 def pool_stats():
@@ -1957,36 +1957,36 @@ def pool_stats():
     hits/misses count requests served from the pool / from the system,
     cached is the number of bytes the pool holds, dropped the releases that
     went back to the system because of the bound (limit, bytes)."""
-    return _viproc.pool_stats()
+    return _numpy2x.pool_stats()
 
 
 def trim():
     """Return all element memory cached by the pool to the system."""
-    _viproc.pool_trim()
+    _numpy2x.pool_trim()
 
 
 def set_pool_limit(nbytes):
     """Bound for the bytes the element pool may cache (0: no caching)."""
-    _viproc.pool_set_limit(int(nbytes))
+    _numpy2x.pool_set_limit(int(nbytes))
 
 
 def shutdown():
     """Waits for all ops and stops the runtime. Raises the error of a failed op
     that was not reported yet (at exit Python prints it)."""
-    if _viproc.initialized():
-        _viproc.shutdown()
+    if _numpy2x.initialized():
+        _numpy2x.shutdown()
 
 
 def workers():
     _ensure_runtime()
-    return _viproc.workers()
+    return _numpy2x.workers()
 
 
 def physical_cores():
     """Physical cores this process may run on (SMT siblings once, affinity).
     The default worker count is one less (the main thread issues on its own
     core), at least 1."""
-    return _viproc.physical_cores()
+    return _numpy2x.physical_cores()
 
 
 from ._compose import COMPOSITIONS as _COMPOSITIONS  # noqa: E402 (uses this module)

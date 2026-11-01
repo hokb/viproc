@@ -1,5 +1,5 @@
-"""NumPy functions viproc composes of its asynchronous ops (_compose.py,
-hokb/viproc#25 step 2): bit-identical to NumPy (values, dtype, shape and
+"""NumPy functions numpy2x composes of its asynchronous ops (_compose.py,
+hokb/numpy2x#25 step 2): bit-identical to NumPy (values, dtype, shape and
 layout) over dtypes, layouts and sizes, and on the asynchronous path."""
 
 import warnings
@@ -7,7 +7,7 @@ import warnings
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 from async_path import SIZE, assert_async, deterministic, pending
 
 rng = np.random.default_rng(2)
@@ -31,8 +31,8 @@ def sample(shape, dtype, special=True):
 
 
 def layouts(x):
-    """(name, NumPy array, viproc array) for several layouts of x."""
-    v = viproc.asarray(x)
+    """(name, NumPy array, numpy2x array) for several layouts of x."""
+    v = numpy2x.asarray(x)
     yield "c", x, v
     if x.ndim >= 2:
         yield "t", x.T, v.T
@@ -59,11 +59,11 @@ def same(r, expected):
 
 
 def check(fn, *arrays, **kwargs):
-    """fn on NumPy arrays and on viproc arrays (all layouts of the first one)
+    """fn on NumPy arrays and on numpy2x arrays (all layouts of the first one)
     give the same result or raise the same error type, and the same warnings."""
     first, rest = arrays[0], arrays[1:]
     for _, x, v in layouts(first):
-        vr = [viproc.asarray(a) if isinstance(a, np.ndarray) else a for a in rest]
+        vr = [numpy2x.asarray(a) if isinstance(a, np.ndarray) else a for a in rest]
         with warnings.catch_warnings(record=True) as want_w:
             warnings.simplefilter("always")
             try:
@@ -81,7 +81,7 @@ def check(fn, *arrays, **kwargs):
 
 def messages(caught):
     # NumPy's floating-point warnings ("invalid value encountered in ...") are
-    # not reported by viproc yet (CLAUDE.md, FP flags); the others are code's.
+    # not reported by numpy2x yet (CLAUDE.md, FP flags); the others are code's.
     return sorted({str(w.message) for w in caught if "encountered in" not in str(w.message)})
 
 
@@ -212,13 +212,13 @@ def test_copies_views_and_new_arrays(dtype):
 
 
 def test_diag_result_is_writable_and_views_follow_numpy():
-    v = viproc.asarray(np.arange(4.0))
+    v = numpy2x.asarray(np.arange(4.0))
     d = np.diag(v)
     d[0, 1] = 5.0
     e = np.diag(np.arange(4.0))
     e[0, 1] = 5.0
     same(d, e)
-    m = viproc.asarray(np.arange(12.0).reshape(3, 4))
+    m = numpy2x.asarray(np.arange(12.0).reshape(3, 4))
     assert not np.diag(m).flags.writeable  # NumPy: a read-only view
 
 
@@ -233,7 +233,7 @@ def det():
 
 def big(shape=(SIZE,), dtype=np.float64, special=False):
     x = sample(shape, dtype, special)
-    return x, pending(viproc.asarray(x))
+    return x, pending(numpy2x.asarray(x))
 
 
 ASYNC = [  # name, call, inputs (shape, dtype), ops, small_steps, syncs[, min_tasks]
@@ -348,4 +348,4 @@ def test_broadcast_arrays_warn_on_write(case):
                    np.array(a).tolist(), np.array(b).tolist()]
         return out, [(x.category, str(x.message)) for x in w]
 
-    assert run(viproc) == run(np)
+    assert run(numpy2x) == run(np)

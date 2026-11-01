@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace viproc {
+namespace numpy2x {
 
 // Stages of a task, in order. Each stage is reached exactly once, in
 // increasing order.
@@ -254,7 +254,7 @@ class ErrorRef {
 // are reference counted by ErrorRefs (the failed task, its outputs, consumers
 // that inherit it) and outlive the runtime only while an array still refers to
 // one. The thread that runs a failing op records it before the op completes;
-// the main thread checks pending() at every call into viproc (one atomic load)
+// the main thread checks pending() at every call into numpy2x (one atomic load)
 // and takes the earliest unreported one. Only an op's own error is a record;
 // consumers refer to the same record (same id). All methods lock the table
 // (failed ops only), except pending().
@@ -477,4 +477,4 @@ class Task {
     bool blocked_ = false;
 };
 
-} // namespace viproc
+} // namespace numpy2x

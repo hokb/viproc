@@ -1,4 +1,4 @@
-"""ufunc calls the C fast path leaves to _ufuncs.call (hokb/viproc#25 step
+"""ufunc calls the C fast path leaves to _ufuncs.call (hokb/numpy2x#25 step
 5b): ufuncs with several outputs (divmod, modf, frexp), dtype=, signature=,
 casting= and out= arrays of another dtype. Bit-identical to NumPy (values,
 dtypes, layouts, errors) and on the asynchronous path."""
@@ -8,7 +8,7 @@ import warnings
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 from async_path import SIZE, assert_async
 from test_compositions import DTYPES, big, check, det, same, sample  # noqa: F401 (det: fixture)
 from test_joining import path  # noqa: F401 (fixture)
@@ -48,7 +48,7 @@ def test_dtype_signature_casting(dtype, path):
     check(lambda a, b: np.add(a, b, casting="equiv"), x, y)
     check(lambda a, b: np.true_divide(a, b, casting="safe", dtype=np.int64), x, y)
     check(lambda a, b: np.add(a, b, dtype=np.float32, signature=(None, None, None)), x, y)
-    check(lambda a: np.add(a, 300, dtype=np.int8), x)  # int8: not a viproc dtype
+    check(lambda a: np.add(a, 300, dtype=np.int8), x)  # int8: not a numpy2x dtype
     check(lambda a: np.add(a, 2**40, dtype=np.int32), x)  # NumPy's OverflowError
 
 
@@ -60,7 +60,7 @@ def test_out_of_another_dtype(dtype, path):
             for layout in ("c", "f", "step"):
                 out = np.zeros((4, 5) if layout != "step" else (8, 5), od)
                 out = np.asfortranarray(out) if layout == "f" else out
-                vout = viproc.asarray(out)
+                vout = numpy2x.asarray(out)
                 if layout == "step":
                     out, vout = out[::2], vout[::2]
                 try:
@@ -69,27 +69,27 @@ def test_out_of_another_dtype(dtype, path):
                         np.add(x, y, out=out, casting=casting)
                 except TypeError:
                     with pytest.raises(TypeError):
-                        np.add(viproc.asarray(x), viproc.asarray(y), out=vout, casting=casting)
+                        np.add(numpy2x.asarray(x), numpy2x.asarray(y), out=vout, casting=casting)
                     continue
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    r = np.add(viproc.asarray(x), viproc.asarray(y), out=vout, casting=casting)
+                    r = np.add(numpy2x.asarray(x), numpy2x.asarray(y), out=vout, casting=casting)
                     assert r is vout
                     same(vout, out)
                     np.absolute(x, out=out, casting=casting)
-                    np.absolute(viproc.asarray(x), out=(vout,), casting=casting)
+                    np.absolute(numpy2x.asarray(x), out=(vout,), casting=casting)
                     same(vout, out)
     # inputs broadcast to out's shape
     out = np.zeros((3, 4, 5), np.float32)
-    vout = viproc.asarray(out)
+    vout = numpy2x.asarray(out)
     np.add(x, 1, out=out, casting="unsafe")
-    np.add(viproc.asarray(x), 1, out=vout, casting="unsafe")
+    np.add(numpy2x.asarray(x), 1, out=vout, casting="unsafe")
     same(vout, out)
 
 
 def test_in_place_with_cast():
     x = sample((60, 50), np.int64)
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     np.multiply(x, 1.5, out=x, casting="unsafe")
     np.multiply(v, 1.5, out=v, casting="unsafe")
     same(v, x)
@@ -132,8 +132,8 @@ def test_async_path(det, call, inputs, tasks):
 def test_cast_into_out_takes_async_path(det):
     x, v = big((SIZE,), np.float64)
     out = np.zeros(SIZE, np.float32)
-    vout = viproc.asarray(out)
-    viproc.wait_all()
+    vout = numpy2x.asarray(out)
+    numpy2x.wait_all()
     np.add(x, 1, out=out)
     assert assert_async(lambda a: np.add(a, 1, out=vout), v) is vout
     same(vout, out)
@@ -142,7 +142,7 @@ def test_cast_into_out_takes_async_path(det):
 def test_complex_warnings_every_call():
     """NumPy warns once per complex-to-real cast it sets up, on every call."""
     x = sample((40, 50), np.complex128)
-    for v, o in [(x, np.zeros((40, 50))), (viproc.asarray(x), viproc.asarray(np.zeros((40, 50))))]:
+    for v, o in [(x, np.zeros((40, 50))), (numpy2x.asarray(x), numpy2x.asarray(np.zeros((40, 50))))]:
         for _ in range(3):
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")

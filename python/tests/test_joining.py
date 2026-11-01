@@ -1,5 +1,5 @@
-"""Joining and copying functions viproc runs as one placement task (_join.py,
-hokb/viproc#25 step 3): bit-identical to NumPy (values, dtype, shape and
+"""Joining and copying functions numpy2x runs as one placement task (_join.py,
+hokb/numpy2x#25 step 3): bit-identical to NumPy (values, dtype, shape and
 layout) over dtypes, layouts and arguments, and on the asynchronous path."""
 
 import warnings
@@ -7,7 +7,7 @@ import warnings
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 from async_path import SIZE, assert_async, counters
 from test_compositions import DTYPES, big, check, det, sample, same  # noqa: F401 (det: fixture)
 
@@ -26,11 +26,11 @@ def path(request):
     if request.param == "numpy":
         yield
         return
-    viproc.init(sync_below=0, adaptive=False)
+    numpy2x.init(sync_below=0, adaptive=False)
     try:
         yield
     finally:
-        viproc.init()
+        numpy2x.init()
 
 
 @pytest.mark.parametrize("shape", SHAPES)
@@ -47,7 +47,7 @@ def test_concatenate_and_stacking(shape, dtype, path):
     check(lambda a, b: np.dstack([a, b]), x, y)
     check(lambda a, b: np.append(a, b), x, y)
     check(lambda a, b: np.append(a, b, axis=0), x, y)
-    if len(shape) >= 2:  # 1-d: NumPy's dispatch iterates over it (elements, no viproc array)
+    if len(shape) >= 2:  # 1-d: NumPy's dispatch iterates over it (elements, no numpy2x array)
         check(lambda a: np.concatenate(a), x)  # the rows of a
     if len(shape) <= 2:
         check(lambda a, b: np.column_stack([a, b]), x, y)
@@ -58,7 +58,7 @@ def test_concatenate_mixed(shape, path):
     x = pair(shape, np.float64)
     i32 = pair(shape, np.int32)
     f32 = pair(shape, np.float32)
-    # promotion, casts, NumPy and Python inputs next to viproc arrays
+    # promotion, casts, NumPy and Python inputs next to numpy2x arrays
     check(lambda a, b: np.concatenate([a, b]), x, i32)
     check(lambda a, b: np.concatenate([a, b]), f32, i32)
     check(lambda a, b: np.concatenate([a, b]), i32, x)
@@ -172,12 +172,12 @@ ASYNC = [  # name, call, inputs (shape, dtype), tasks
 def test_small_ready_inputs_run_in_numpy(det):
     """Small ready inputs: NumPy's function right away, no task, no fallback."""
     x = sample((100,), np.float64, special=False)
-    v = viproc.asarray(x)
-    viproc.wait_all()
+    v = numpy2x.asarray(x)
+    numpy2x.wait_all()
     before = counters()
     r = np.concatenate([v, v])
     after = counters()
-    assert type(r) is viproc.ndarray
+    assert type(r) is numpy2x.ndarray
     assert after["tasks"] == before["tasks"] and after["fallbacks"] == before["fallbacks"]
     same(r, np.concatenate([x, x]))
 
@@ -195,7 +195,7 @@ def test_async_path(det, call, inputs, tasks):
 @pytest.mark.parametrize("vshape", [(1, 1, 3), (1, 1, 1, 1), (2, 1, 3), (1, 2, 3), (1, 1, 2)])
 def test_insert_values_with_extra_axes(vshape):
     """NumPy's assignment drops a value's leading length-1 axes and raises its
-    broadcast error otherwise (hokb/viproc#29 review)."""
+    broadcast error otherwise (hokb/numpy2x#29 review)."""
     x = np.arange(3000.0).reshape(1000, 3)
     v = np.arange(np.prod(vshape), dtype=float).reshape(vshape) + 0.5
 
@@ -205,7 +205,7 @@ def test_insert_values_with_extra_axes(vshape):
         except Exception as e:
             return type(e), str(e)
 
-    expected, got = run(np, x), run(viproc, viproc.asarray(x))
+    expected, got = run(np, x), run(numpy2x, numpy2x.asarray(x))
     if isinstance(expected, tuple):
         assert got == expected
     else:

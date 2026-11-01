@@ -5,7 +5,7 @@
 #include <cstring>
 #include <string>
 
-namespace viproc {
+namespace numpy2x {
 
 namespace {
 
@@ -348,4 +348,4 @@ std::shared_ptr<Kernel> make_scatter_kernel(IndexSpec spec) {
 
 std::shared_ptr<Kernel> make_mask_assign_kernel() { return std::make_shared<MaskAssignKernel>(); }
 
-} // namespace viproc
+} // namespace numpy2x

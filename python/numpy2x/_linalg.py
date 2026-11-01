@@ -1,4 +1,4 @@
-"""numpy.linalg on NumPy's _umath_linalg gufuncs (hokb/viproc#25, step 6b):
+"""numpy.linalg on NumPy's _umath_linalg gufuncs (hokb/numpy2x#25, step 6b):
 det, slogdet, inv, solve, cholesky, eig, eigh, eigvals, eigvalsh, svd,
 svdvals.
 
@@ -6,13 +6,13 @@ The code follows NumPy's numpy/linalg/_linalg.py (BSD-3-Clause): the same
 argument checks (LinAlgError for shapes, raised at the call), the same
 computation dtype (_commonType: double or cdouble, the result cast back to
 single precision where the inputs were), the same gufunc and signature.
-The gufunc runs as a task (_ufuncs.gufunc, vp_gufunc); NumPy's wrappers
+The gufunc runs as a task (_ufuncs.gufunc, nx_gufunc); NumPy's wrappers
 turn the loops' FP invalid flag into LinAlgError with
-errstate(invalid='call'); viproc's kernel checks the flag after each loop
+errstate(invalid='call'); numpy2x's kernel checks the flag after each loop
 call and fails the op with the same message, raised as AsyncLinAlgError (a
-LinAlgError) at the next call into viproc and at the result's sync points
+LinAlgError) at the next call into numpy2x and at the result's sync points
 (error-handling.md). eig's and eigvals' _assert_finite runs in the kernel
-too (VP_GUFUNC_CHECK_FINITE), before the loop. A handler returns _NOPE for
+too (NX_GUFUNC_CHECK_FINITE), before the loop. A handler returns _NOPE for
 arguments it does not cover: NumPy then runs the call in the eager
 fallback.
 """
@@ -24,7 +24,7 @@ from numpy.linalg import LinAlgError, _umath_linalg
 from numpy.linalg._linalg import EighResult, EigResult, SlogdetResult, SVDResult
 
 from . import _ndarray as _nd
-from . import _ufuncs, _viproc
+from . import _ufuncs, _numpy2x
 
 _NOPE = _nd._NOPE
 ndarray = _nd.ndarray
@@ -43,7 +43,7 @@ _SVD = "LinAlgError: SVD did not converge"
 
 
 def _arrays(*xs):
-    """The arguments as viproc arrays (NumPy arrays and sequences imported as
+    """The arguments as numpy2x arrays (NumPy arrays and sequences imported as
     asarray imports them), or None if one is not covered."""
     out = []
     for x in xs:
@@ -84,11 +84,11 @@ def _assert_stacked_square(a):
         raise LinAlgError("Last 2 dimensions of the array must be square")
 
 
-_CHECK_FINITE = 2  # VP_GUFUNC_CHECK_FINITE
-_SERIAL = 4  # VP_GUFUNC_SERIAL
+_CHECK_FINITE = 2  # NX_GUFUNC_CHECK_FINITE
+_SERIAL = 4  # NX_GUFUNC_SERIAL
 # Matrices of at least this many elements run one LAPACK call at a time:
 # OpenBLAS threads them itself, and several threaded calls at once
-# oversubscribe its threads (vp_gufunc, VP_GUFUNC_SERIAL).
+# oversubscribe its threads (nx_gufunc, NX_GUFUNC_SERIAL).
 SERIAL_FROM = 64 * 64
 
 
@@ -278,13 +278,13 @@ def _small_ready(func, handler):
     """Small ready inputs (at most sync_below elements together): nothing to
     overlap, NumPy's own function runs right away on read-only exports (its
     results are fresh memory, adopted); else the handler's task. Not with a
-    viproc array beyond the first two arguments (out=)."""
+    numpy2x array beyond the first two arguments (out=)."""
     def h(*args, **kwargs):
         arrays = [x for x in args[:2] if type(x) is ndarray]
         if (arrays and sum(x.size for x in arrays) <= _nd._small_ops[0]
                 and not any(type(x) is ndarray for x in args[2:])
                 and not any(type(x) is ndarray for x in kwargs.values())
-                and all(_viproc.ready(x) for x in arrays)):
+                and all(_numpy2x.ready(x) for x in arrays)):
             r = func(*[np.asarray(x) if type(x) is ndarray else x for x in args], **kwargs)
             if isinstance(r, tuple):
                 return type(r)(*[_nd.fresh(x) for x in r])

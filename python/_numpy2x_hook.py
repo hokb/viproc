@@ -1,14 +1,14 @@
-"""Makes ``import numpy`` in user code import viproc.
+"""Makes ``import numpy`` in user code import numpy2x.
 
-Used by ``python -m viproc prog.py`` and, when viproc is pip-installed, by
-``viproc.pth`` at every interpreter start if the environment variable
-``VIPROC=1`` is set. Only the user's own code gets viproc: modules of the
+Used by ``python -m numpy2x prog.py`` and, when numpy2x is pip-installed, by
+``numpy2x.pth`` at every interpreter start if the environment variable
+``NUMPY2X=1`` is set. Only the user's own code gets numpy2x: modules of the
 standard library and of installed packages (site-packages, dist-packages),
-NumPy and viproc themselves keep the real NumPy, so libraries that use NumPy's
-internals keep working; viproc arrays they receive go through NumPy's array
+NumPy and numpy2x themselves keep the real NumPy, so libraries that use NumPy's
+internals keep working; numpy2x arrays they receive go through NumPy's array
 protocols.
 
-Light on purpose (site imports it at every start): NumPy and viproc are
+Light on purpose (site imports it at every start): NumPy and numpy2x are
 imported only on the first ``import numpy`` of user code.
 """
 
@@ -50,7 +50,7 @@ def is_user_code(globals_):
     if not globals_:
         return False
     name = globals_.get("__name__") or ""
-    if name.partition(".")[0] in ("numpy", "viproc", "_viproc_hook"):
+    if name.partition(".")[0] in ("numpy", "numpy2x", "_numpy2x_hook"):
         return False
     path = globals_.get("__file__")
     if not path:
@@ -63,11 +63,11 @@ def is_user_code(globals_):
     return user
 
 
-def _viproc_counterpart(name):
-    """viproc's object for ``numpy`` or ``numpy.<sub>``: the viproc module,
-    its own submodule replacement (viproc.random) or NumPy's submodule."""
-    viproc = _original_import("viproc")
-    obj = viproc
+def _numpy2x_counterpart(name):
+    """numpy2x's object for ``numpy`` or ``numpy.<sub>``: the numpy2x module,
+    its own submodule replacement (numpy2x.random) or NumPy's submodule."""
+    numpy2x = _original_import("numpy2x")
+    obj = numpy2x
     for part in name.split(".")[1:]:
         obj = getattr(obj, part)
     return obj
@@ -83,12 +83,12 @@ def _import(name, globals=None, locals=None, fromlist=(), level=0):
             _original_import(name, globals, locals, fromlist, level)  # load NumPy's submodule
         # `import numpy.linalg` binds the top-level name; `from numpy.random
         # import x` reads x from the submodule itself.
-        return _viproc_counterpart(name if fromlist else "numpy")
+        return _numpy2x_counterpart(name if fromlist else "numpy")
     return _original_import(name, globals, locals, fromlist, level)
 
 
 def install():
-    """Route ``import numpy`` of user code to viproc (idempotent)."""
+    """Route ``import numpy`` of user code to numpy2x (idempotent)."""
     global _original_import
     if _original_import is None:
         _original_import = builtins.__import__
@@ -96,6 +96,6 @@ def install():
 
 
 def autoload():
-    """Called by viproc.pth at interpreter start: install() if VIPROC=1."""
-    if os.environ.get("VIPROC", "") == "1":
+    """Called by numpy2x.pth at interpreter start: install() if NUMPY2X=1."""
+    if os.environ.get("NUMPY2X", "") == "1":
         install()

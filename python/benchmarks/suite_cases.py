@@ -1,7 +1,7 @@
-"""Cases of the viproc benchmark suite (suite.py).
+"""Cases of the numpy2x benchmark suite (suite.py).
 
 Every case is plain, sequential NumPy code. It runs unchanged on NumPy
-arrays and on viproc arrays (NumPy dispatches through the array protocols),
+arrays and on numpy2x arrays (NumPy dispatches through the array protocols),
 so the same function measures both.
 
 A case declares:
@@ -678,7 +678,7 @@ def _():
 # --- element types ----------------------------------------------------------
 # Variants carry a third entry, the dtype (a name, or "a+b" for a mixed-type
 # program); `make` then receives it. float16 and the mixed programs (type
-# promotion casts an operand) are paths viproc does not run asynchronously
+# promotion casts an operand) are paths numpy2x does not run asynchronously
 # yet; they show up as fallbacks.
 
 DTYPES = ["float64", "float32", "int32", "int16", "complex128", "float16"]

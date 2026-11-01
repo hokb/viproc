@@ -1,10 +1,10 @@
-# Error handling in viproc
+# Error handling in numpy2x
 
 This document collects the design decisions about errors: where they arise,
 how a failed op is recorded, when and how the error reaches Python, and what
 the user sees. CLAUDE.md summarizes the execution model; this document is the
 reference for everything error-related and records *why* each decision was
-taken. Issue: hokb/viproc#18.
+taken. Issue: hokb/numpy2x#18.
 
 Status labels as in `memory-management.md` (Decided, Implemented, Proposed).
 
@@ -28,7 +28,7 @@ shape errors, dtypes NumPy cannot resolve, invalid arguments (`axis`,
 `order`, ...). The main thread knows everything they depend on when it
 issues the op (shapes are a stage of their own and known at issue in phase
 1), so they are raised right there, at the call, with NumPy's own error:
-viproc lets NumPy raise them (dtype resolution, a zero-stride probe for
+numpy2x lets NumPy raise them (dtype resolution, a zero-stride probe for
 views, the fallback). Nothing is asynchronous about them.
 
 **Run-time errors** depend on element values and arise while a kernel runs,
@@ -68,8 +68,8 @@ refers to before it was reported stays until it is (up to 64; further ones are
 only counted). The table belongs to the runtime and outlives it only while an
 array still refers to a record.
 
-A sync point on any of these arrays raises the error (`vp_array_wait`,
-`vp_array_prepare_write`, `ErrorTable::raise_at_sync_point`), every time:
+A sync point on any of these arrays raises the error (`nx_array_wait`,
+`nx_array_prepare_write`, `ErrorTable::raise_at_sync_point`), every time:
 their data is not NumPy's.
 
 ## E3 — Fail fast: raised in the main thread right away
@@ -82,35 +82,35 @@ can still handle it (E4).
 1. The thread that runs the failing kernel records it (E2) **before the task
    completes**: a sync point that sees the task completed finds the record.
 2. When the table goes from no unreported error to one, it calls the
-   bridge's notifier (`vp_set_error_notify`) on that thread. The Python bridge
+   bridge's notifier (`nx_set_error_notify`) on that thread. The Python bridge
    schedules `pending_raise` with `Py_AddPendingCall`: no GIL and no thread
    state needed, so the failing thread takes no lock of Python's to report.
    The interpreter runs it in the main thread at its next check (the next
    call or loop iteration of the running Python code; while the main thread
-   waits in viproc with the GIL released, as soon as it is back), and it
+   waits in numpy2x with the GIL released, as soon as it is back), and it
    raises the error there. Direct ops (small ready data, run on the main
    thread) fail the same way, so their error appears right after the call,
    as in NumPy.
-3. Never inside viproc's or NumPy's own Python code: their `except
+3. Never inside numpy2x's or NumPy's own Python code: their `except
    ValueError:` blocks around fallbacks would swallow it. There
    `pending_raise` schedules itself again, so the error surfaces in the
-   user's code (`in_user_code`: the innermost frame outside viproc and NumPy,
+   user's code (`in_user_code`: the innermost frame outside numpy2x and NumPy,
    the issue site's rule).
-4. Every call into viproc from user code checks the table as well
+4. Every call into numpy2x from user code checks the table as well
    (`check_async_errors`: in `check_runtime`, which every C entry point
    calls, and in `fast_ufunc`, which every operator and ufunc call goes
-   through): one atomic load while no op failed (`vp_error_pending`). This
+   through): one atomic load while no op failed (`nx_error_pending`). This
    covers what the interpreter's pending calls do not (a full queue of
-   pending calls, viproc used from another thread than Python's main
+   pending calls, numpy2x used from another thread than Python's main
    thread).
 
 Raised is the error of the **earliest issued** failed op recorded so far,
 with the number of further unreported failures (`"[2 more failed ops not
 reported]"`); all records count as reported then, and it is raised once. A
-sync point raising an error marks its record reported too. `viproc.wait_all()`
+sync point raising an error marks its record reported too. `numpy2x.wait_all()`
 raises after waiting (while it waits, nothing else runs in the main thread, so
 it reports the earliest of all ops that failed), and so do
-`viproc.shutdown()` / `viproc.init()`; at interpreter exit Python prints an
+`numpy2x.shutdown()` / `numpy2x.init()`; at interpreter exit Python prints an
 error nobody reported ("Exception ignored in atexit callback").
 
 The raised exception's traceback shows where the main thread was, which can
@@ -122,8 +122,8 @@ catch around a sync point (`_ndarray.py`).
 
 ## E4 — Exception types
 
-`viproc.AsyncError` (a `RuntimeError`) is the base. Where the kernel names
-the type, viproc raises a subclass of both `AsyncError` and NumPy's type:
+`numpy2x.AsyncError` (a `RuntimeError`) is the base. Where the kernel names
+the type, numpy2x raises a subclass of both `AsyncError` and NumPy's type:
 `AsyncIndexError` (`IndexError`), `AsyncValueError` (`ValueError`) and
 `AsyncLinAlgError` (`numpy.linalg.LinAlgError`: the linalg loops report a
 singular matrix or no convergence through the FP invalid flag, which
@@ -135,7 +135,7 @@ that wants to know that the error came from an earlier op catches
 issued:
 
 ```
-viproc.AsyncValueError: Integers to negative integer powers are not allowed.
+numpy2x.AsyncValueError: Integers to negative integer powers are not allowed.
     (in numpy.power, issued at prog.py:12 in step)
 ```
 
@@ -146,8 +146,8 @@ which for an asynchronous error is a later one. The message therefore names
 the op that failed:
 
 - **the issue site**: file, line and function of the first stack frame
-  outside viproc and NumPy (the user's code), captured by the main thread
-  at issue (`issue_site()` in `_viproc.c`), cached per (code object,
+  outside numpy2x and NumPy (the user's code), captured by the main thread
+  at issue (`issue_site()` in `_numpy2x.c`), cached per (code object,
   bytecode offset) and interned once, so every task carries a pointer
   (`Task::issue_site()`, no per-op cost);
 - **the op**: the NumPy function the task runs (`numpy.power`,
@@ -164,7 +164,7 @@ it is cached per bytecode position, but a stack depends on all callers and
 cannot be cached; keeping frame objects alive would also keep their locals
 alive (arrays, memory) until the op completes. The issue site plus the op
 name identify the failing instruction exactly. An opt-in debug mode that
-records the stack per op (for example `VIPROC_TRACEBACK=1`) would fit the
+records the stack per op (for example `NUMPY2X_TRACEBACK=1`) would fit the
 same channel; not implemented.
 
 ## E6 — Loops that raise through the Python API
@@ -174,7 +174,7 @@ exponent they call `npy_gil_error(PyExc_ValueError, ...)`, which takes the
 GIL (`PyGILState_Ensure`), sets the exception on the calling thread's Python
 thread state, releases the GIL and returns; the loop then reports success
 (0). NumPy itself checks `PyErr_Occurred()` after the call. These loops do
-not set `requires_pyapi`, so viproc used to run them on workers: the error
+not set `requires_pyapi`, so numpy2x used to run them on workers: the error
 was lost (a worker had no thread state: `PyGILState_Ensure` created a
 temporary one and `PyGILState_Release` deleted it, error included) and the
 op returned a result; on the main thread the error leaked (`SystemError`).
@@ -182,7 +182,7 @@ The NumPy bug (undocumented; a draft issue is in the project files,
 `numpy-issue-int-power/`) is the loop's contract: a strided loop must return
 -1 on failure.
 
-viproc watches these loops (`UfuncLoop::raises_through_pyapi`, set at
+numpy2x watches these loops (`UfuncLoop::raises_through_pyapi`, set at
 resolution for `power` with a signed integer exponent) on the thread that
 runs them (`UfuncLoop::call_watched`):
 
@@ -205,7 +205,7 @@ Cost on success: a thread-local load and two pointer reads per loop call
 (per op, or per buffer of NumPy's iterator). `int ** int` keeps running
 asynchronously and in parallel.
 
-**Rejected alternatives** (both were tried in hokb/viproc#17):
+**Rejected alternatives** (both were tried in hokb/numpy2x#17):
 
 - *Scanning the exponents for negative values before the call.* An extra
   pass over the data on every integer power: 3–10% slower on large data,
@@ -246,13 +246,13 @@ NumPy reports divide-by-zero, overflow, underflow and invalid after each
 ufunc call (`_check_ufunc_fperr`) under the `np.errstate` in effect: a
 `RuntimeWarning` ("divide by zero encountered in divide"),
 `FloatingPointError` under `'raise'`, or the errstate's `call`, `log` or
-`print`. viproc does the same for its ops:
+`print`. numpy2x does the same for its ops:
 
 - **The mode is the issuing code's.** NumPy keeps errstate in a context
   variable (`numpy.ufunc.extobj`, a new capsule per `errstate` block). Every
-  call into viproc compares it with the capsule seen last (one
-  `PyContextVar_Get`, `fp_sync` in `_viproc.c`); on a change its modes go to
-  the runtime (`vp_set_fp_mode`: three bits per category, NumPy's
+  call into numpy2x compares it with the capsule seen last (one
+  `PyContextVar_Get`, `fp_sync` in `_numpy2x.c`); on a change its modes go to
+  the runtime (`nx_set_fp_mode`: three bits per category, NumPy's
   `UFUNC_ERR_*` values, plus an index for the call/log object), which hands
   them to every op issued from then on (`Task::set_fp_mode`). An op issued
   inside `with np.errstate(all="ignore")` stays silent even if it completes
@@ -281,9 +281,9 @@ ufunc call (`_check_ufunc_fperr`) under the `np.errstate` in effect: a
   arguments; `print` to stderr; NumPy's `NameError` if no call object is set.
 
 Accepted differences (E7): the warning comes a little after the call (at the
-next call into viproc, the interpreter's next check, a sync point or
+next call into numpy2x, the interpreter's next check, a sync point or
 `wait_all()`), and NumPy functions written in Python (`np.sum`, `mean`)
-warn from NumPy's own file and line, viproc from the user's line that
+warn from NumPy's own file and line, numpy2x from the user's line that
 called them. Tests: `python/tests/test_fp_errors.py`.
 
 ## Lesson: why #17 first proposed a solution against G3
@@ -299,7 +299,7 @@ happens. How it happened:
    but was not treated as a performance change, so neither the benchmark
    suite nor a before/after timing was run before pushing; the cost came to
    light only when the maintainer asked.
-2. **The error channel was missing.** viproc had no way for a loop that
+2. **The error channel was missing.** numpy2x had no way for a loop that
    raises through Python to report from a worker, so both fixes worked around
    the gap (prevent the error, or keep it off the workers) instead of
    closing it.

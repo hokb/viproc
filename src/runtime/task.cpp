@@ -11,7 +11,7 @@
 #include <cstring>
 #include <exception>
 
-namespace viproc {
+namespace numpy2x {
 
 namespace {
 using MetadataPool = FixedPool<sizeof(Metadata), alignof(Metadata)>;
@@ -107,15 +107,15 @@ namespace {
 
 #if defined(__has_feature)
 #if __has_feature(thread_sanitizer)
-#define VIPROC_TSAN 1
+#define NUMPY2X_TSAN 1
 #endif
 #endif
 #if defined(__SANITIZE_THREAD__)
-#define VIPROC_TSAN 1
+#define NUMPY2X_TSAN 1
 #endif
 
 void acquire_fence() {
-#if !defined(VIPROC_TSAN) // TSan does not model fences (GCC: -Werror=tsan)
+#if !defined(NUMPY2X_TSAN) // TSan does not model fences (GCC: -Werror=tsan)
     std::atomic_thread_fence(std::memory_order_acquire);
 #endif
 }
@@ -464,4 +464,4 @@ TaskList Task::execute(ErrorTable* errors) {
     return runnable;
 }
 
-} // namespace viproc
+} // namespace numpy2x

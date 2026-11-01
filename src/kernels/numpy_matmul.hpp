@@ -4,7 +4,7 @@
 // matmul is the gufunc (m?,n),(n,p?)->(m?,p?). NumPy runs it through
 // PyUFunc_GeneralizedFunctionInternal: an iterator over the broadcast batch
 // dimensions without buffering (operands are only copied for a cast, a
-// misalignment or an overlap with the output; viproc issues none of these),
+// misalignment or an overlap with the output; numpy2x issues none of these),
 // and one loop call per inner batch row with
 //   dims    = {count, m, n, p}                (missing m or p: 1)
 //   strides = {a, b, out outer strides, a_m, a_n, b_n, b_p, out_m, out_p}
@@ -13,11 +13,11 @@
 // syrk (a @ a.T), gemv or dot where the strides allow it, copies to a
 // BLAS-able buffer otherwise, a plain loop for integers and bool. Only the
 // core strides and pointers decide which; how the batch is split into calls
-// does not change any value. viproc passes the same core strides, so it
+// does not change any value. numpy2x passes the same core strides, so it
 // makes the same BLAS calls.
 //
 // BLAS results depend on the BLAS library's own thread count (OpenBLAS
-// splits large products differently with 1, 2 or 4 threads), so viproc
+// splits large products differently with 1, 2 or 4 threads), so numpy2x
 // leaves BLAS threading as NumPy has it: concurrent calls from several
 // workers give the values of the same calls made one after the other.
 #pragma once
@@ -26,7 +26,7 @@
 
 #include <memory>
 
-namespace viproc::numpy {
+namespace numpy2x::numpy {
 
 // Shape and layout of np.matmul(a, b) (NumPy's gufunc rules): false if NumPy
 // raises (0-d operand, core dimension mismatch, batch shapes that do not
@@ -41,4 +41,4 @@ bool matmul_layout(const Layout& a, const Layout& b, Layout& out, std::int64_t& 
 // matmul_layout(). Any thread, without the GIL.
 std::shared_ptr<Kernel> make_matmul_kernel(const UfuncLoop* loop);
 
-} // namespace viproc::numpy
+} // namespace numpy2x::numpy

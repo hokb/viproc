@@ -1,11 +1,11 @@
-"""numpy.fft on NumPy's pocketfft gufuncs (hokb/viproc#25 step 6c):
+"""numpy.fft on NumPy's pocketfft gufuncs (hokb/numpy2x#25 step 6c):
 bit-identical to NumPy (values, dtypes, layouts, errors) and on the
 asynchronous path."""
 
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 from async_path import SYNC_BELOW, assert_async, pending
 from test_compositions import DTYPES, check, det, same, sample  # noqa: F401 (det: fixture)
 from test_joining import path  # noqa: F401 (fixture)
@@ -62,13 +62,13 @@ def test_out(dtype, path):
             continue
         for norm in ("backward", "ortho"):
             o = np.zeros((6, n_out), od)
-            vo = viproc.asarray(o)
+            vo = numpy2x.asarray(o)
             r = f(x, norm=norm, out=o)
-            vr = f(viproc.asarray(x), norm=norm, out=vo)
+            vr = f(numpy2x.asarray(x), norm=norm, out=vo)
             assert r is o and vr is vo
             same(vo, o)
     with pytest.raises(ValueError):
-        F.fft(viproc.asarray(x), out=viproc.asarray(np.zeros((6, 7), np.complex128)))
+        F.fft(numpy2x.asarray(x), out=numpy2x.asarray(np.zeros((6, 7), np.complex128)))
 
 
 ASYNC = [  # name, call, shape, dtype, tasks
@@ -95,21 +95,21 @@ ASYNC = [  # name, call, shape, dtype, tasks
 def test_async(call, shape, dtype, ops, det):
     x = sample(shape, dtype, special=False)
     for _ in range(2):  # the second call runs on the plans of the first
-        v = pending(viproc.asarray(x))
+        v = pending(numpy2x.asarray(x))
         got = assert_async(call, v, ops=ops)
         same(got, call(x))
 
 
 def test_plans_survive_a_new_runtime(det):
     # numpy.fft calls are planned once (_fft_plans, _gufunc_plans); a plan
-    # holds no viproc array, so it serves the next runtime too.
+    # holds no numpy2x array, so it serves the next runtime too.
     x = sample((64, 100), "c16", special=False)
     for norm in (None, "ortho", "forward"):
         for axis in (-1, 0):
-            same(F.fft(viproc.asarray(x), axis=axis, norm=norm), F.fft(x, axis=axis, norm=norm))
-    viproc.init(sync_below=SYNC_BELOW, adaptive=False)  # a new runtime (det restores)
+            same(F.fft(numpy2x.asarray(x), axis=axis, norm=norm), F.fft(x, axis=axis, norm=norm))
+    numpy2x.init(sync_below=SYNC_BELOW, adaptive=False)  # a new runtime (det restores)
     for norm in (None, "ortho", "forward"):
         for axis in (-1, 0):
-            v = pending(viproc.asarray(x))
+            v = pending(numpy2x.asarray(x))
             got = assert_async(lambda a: F.fft(a, axis=axis, norm=norm), v, ops=1)
             same(got, F.fft(x, axis=axis, norm=norm))

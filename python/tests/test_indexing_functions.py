@@ -1,5 +1,5 @@
-"""Indexing functions on viproc's gather / scatter / select tasks
-(_indexing.py, hokb/viproc#25 step 4): take, take_along_axis, put,
+"""Indexing functions on numpy2x's gather / scatter / select tasks
+(_indexing.py, hokb/numpy2x#25 step 4): take, take_along_axis, put,
 put_along_axis, compress, extract, place, select, copyto(where=) and
 a[mask] = array, bit-identical to NumPy (values, dtype, shape, layout and the
 written arrays) and on the asynchronous path."""
@@ -9,7 +9,7 @@ import warnings
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 from async_path import SIZE, assert_async
 from test_compositions import DTYPES, big, det, sample, same  # noqa: F401
 from test_compositions import check as check_now
@@ -27,7 +27,7 @@ def synced(fn):
     an IndexError) is raised in the call, as NumPy raises it."""
     def call(*args):
         r = fn(*args)
-        if isinstance(r, viproc.ndarray):
+        if isinstance(r, numpy2x.ndarray):
             r.wait()
         return r
 
@@ -39,7 +39,7 @@ def check(fn, *arrays):
 
 
 def check_inplace(fn, x, *rest):
-    """fn writes into its first argument: the NumPy and the viproc array (all
+    """fn writes into its first argument: the NumPy and the numpy2x array (all
     layouts) end up equal, the calls return the same and raise alike."""
     views = [lambda a: a]
     if x.ndim >= 2:
@@ -47,14 +47,14 @@ def check_inplace(fn, x, *rest):
     elif x.ndim == 1:
         views.append(lambda a: a[::-3])
     for view in views:  # a fresh base each time: fn writes into it
-        xn, v = view(x.copy()), view(viproc.asarray(x))
-        vr = [viproc.asarray(a) if isinstance(a, np.ndarray) else a for a in rest]
+        xn, v = view(x.copy()), view(numpy2x.asarray(x))
+        vr = [numpy2x.asarray(a) if isinstance(a, np.ndarray) else a for a in rest]
         try:
             want = fn(xn, *rest)
         except Exception as e:  # noqa: BLE001
             with pytest.raises(type(e)):
                 fn(v, *vr)
-                viproc.wait_all()
+                numpy2x.wait_all()
             continue
         got = fn(v, *vr)
         assert got is None and want is None
@@ -77,7 +77,7 @@ def test_take(shape, dtype):
         check((lambda a: np.take(a, [-7, 0, n, 3 * n + 1], axis=0, mode=mode)), x)
     check((lambda a: np.take(a, [0, x.size])), x)  # IndexError (async)
     check((lambda a: np.take(a, [0.5])), x)  # TypeError (float indices)
-    # a viproc index array, also in the modes
+    # a numpy2x index array, also in the modes
     check((lambda a, i: np.take(a, i, axis=0)), x, np.array([n - 1, 0, -n], np.int64))
     check((lambda a, i: np.take(a, i, axis=0, mode="wrap")), x,
           np.array([5 * n, -1], np.int32))
@@ -85,11 +85,11 @@ def test_take(shape, dtype):
 
 
 def test_take_out_of_bounds_is_async():
-    v = viproc.asarray(data((10,)))
-    i = viproc.asarray(np.array([0, 10]))
+    v = numpy2x.asarray(data((10,)))
+    i = numpy2x.asarray(np.array([0, 10]))
     with pytest.raises(IndexError):  # at the call (ready data, run directly) or at the sync
         np.take(v, i).numpy()
-    viproc.wait_all()
+    numpy2x.wait_all()
 
 
 @pytest.mark.parametrize("shape", SHAPES[1:])
@@ -135,7 +135,7 @@ def test_compress_extract_place(shape, dtype):
         c = rng.random(x.size if axis is None else shape[axis]) > 0.4
         check(lambda a: np.compress(c, a, axis=axis), x)
         check(lambda a: a.compress(c.tolist(), axis), x)
-        check(lambda a, m: np.compress(m, a, axis=axis), x, c)  # a viproc condition
+        check(lambda a, m: np.compress(m, a, axis=axis), x, c)  # a numpy2x condition
         check(lambda a: np.compress(c[:2], a, axis=axis), x)  # shorter: a prefix
     check(lambda a: np.compress(np.ones(shape[0] + 1, bool), a, axis=0), x)  # IndexError
     check(lambda a: np.compress(cond, a, axis=0), x)
@@ -239,24 +239,24 @@ def test_async_path(det, call, inputs, tasks, syncs):
 @pytest.mark.parametrize("vals", [
     np.array([1.5, 2.5]), np.array(1.5), np.array([1, 2], np.int64), np.array([1, 2], np.uint64),
     np.array([1, 2], np.int16), np.float64(1.5), [1.5, 2.5], 1.5])
-@pytest.mark.parametrize("viproc_vals", [False, True])
-def test_place_casts_array_values_safely(vals, viproc_vals):
+@pytest.mark.parametrize("numpy2x_vals", [False, True])
+def test_place_casts_array_values_safely(vals, numpy2x_vals):
     """NumPy's arr_place converts array values with safe casting (TypeError),
     Python and NumPy scalars and sequences as they come (#30 review)."""
-    if viproc_vals and not isinstance(vals, np.ndarray):
-        pytest.skip("only arrays become viproc arrays")
+    if numpy2x_vals and not isinstance(vals, np.ndarray):
+        pytest.skip("only arrays become numpy2x arrays")
     mask = np.arange(SIZE) % 2 == 0
 
     def run(xp):
         a = xp.asarray(np.zeros(SIZE, np.int32))
-        v = viproc.asarray(vals) if viproc_vals and xp is viproc else vals
+        v = numpy2x.asarray(vals) if numpy2x_vals and xp is numpy2x else vals
         try:
             xp.place(a, mask, v)
         except Exception as e:
             return type(e), str(e)
         return np.array(a)
 
-    expected, got = run(np), run(viproc)
+    expected, got = run(np), run(numpy2x)
     if isinstance(expected, tuple):
         assert got == expected
     else:
@@ -265,6 +265,6 @@ def test_place_casts_array_values_safely(vals, viproc_vals):
 
 def test_take_scalar_index_owns_its_data():
     x = np.arange(2.0 * SIZE).reshape(2, -1)
-    r, e = np.take(viproc.asarray(x), 1, axis=0), np.take(x, 1, axis=0)
+    r, e = np.take(numpy2x.asarray(x), 1, axis=0), np.take(x, 1, axis=0)
     assert (r.flags.owndata, r.base is None, r.strides) == (e.flags.owndata, e.base is None, e.strides)
     same(r, e)

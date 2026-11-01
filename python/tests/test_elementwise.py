@@ -3,7 +3,7 @@
 NumPy's loops are not layout-independent: their SIMD paths (complex
 multiply, float32 exp/sin, ...) round differently from the scalar fallbacks,
 and which one runs depends on the strides NumPy's ufunc machinery passes.
-viproc must call the loops exactly as NumPy does: bit-identical results and
+numpy2x must call the loops exactly as NumPy does: bit-identical results and
 NumPy's result layouts for strided, reversed, transposed and broadcast
 operands, with and without casts."""
 
@@ -12,7 +12,7 @@ import warnings
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 
 DTYPES = ["b1", "i4", "i8", "f4", "f8", "c8", "c16"]
 UNARY = [np.exp, np.log, np.sin, np.cos, np.tanh, np.sqrt, np.absolute, np.negative,
@@ -22,7 +22,7 @@ BINARY = [np.multiply, np.divide, np.add, np.subtract, np.power, np.maximum, np.
 
 
 def fallbacks():
-    return viproc._ndarray.fallback_calls
+    return numpy2x._ndarray.fallback_calls
 
 
 def data(rng, shape, dtype):
@@ -61,7 +61,7 @@ def test_ops_on_strided_reversed_and_broadcast_operands_are_bit_identical(seed):
             shape = tuple(int(s) for s in rng.integers(1, 30, size=int(rng.integers(1, 4))))
             k1, k2 = rng.choice(list(LAYOUTS), 2)
             x, y = data(rng, shape, dt), data(rng, shape, dt)
-            a, va = LAYOUTS[k1](x), LAYOUTS[k1](viproc.asarray(x))
+            a, va = LAYOUTS[k1](x), LAYOUTS[k1](numpy2x.asarray(x))
             if rng.random() < 0.4:
                 op = UNARY[int(rng.integers(len(UNARY)))]
                 assert identical(op(a), op(va)), (op.__name__, dt, shape, k1)
@@ -71,9 +71,9 @@ def test_ops_on_strided_reversed_and_broadcast_operands_are_bit_identical(seed):
                     continue
                 if rng.random() < 0.3:  # broadcast a trailing part
                     y = data(rng, a.shape[int(rng.integers(0, a.ndim)):], dt)
-                    b, vb = y, viproc.asarray(y)
+                    b, vb = y, numpy2x.asarray(y)
                 else:
-                    b, vb = LAYOUTS[k2](y), LAYOUTS[k2](viproc.asarray(y))
+                    b, vb = LAYOUTS[k2](y), LAYOUTS[k2](numpy2x.asarray(y))
                     if b.shape != a.shape:
                         continue
                 assert identical(op(a, b), op(va, vb)), (op.__name__, dt, shape, k1, k2)
@@ -86,7 +86,7 @@ def test_single_elements_get_numpys_strides():
     # and float32 arctan2's SIMD and scalar paths differ in the last bit.
     x = np.array([1.5], np.float32)
     y = np.array([-2.25], np.float32)
-    vx, vy = viproc.asarray(x), viproc.asarray(y)
+    vx, vy = numpy2x.asarray(x), numpy2x.asarray(y)
     assert identical(np.arctan2(x[::-1], y[::-1]), np.arctan2(vx[::-1], vy[::-1]))
     assert identical(np.arctan2(x, y), np.arctan2(vx, vy))
 
@@ -113,8 +113,8 @@ def test_mixed_dtypes_are_cast_asynchronously_as_numpy_casts(seed):
             except (TypeError, ValueError):
                 continue
             if e.dtype not in [np.dtype(d) for d in DTYPES]:
-                continue  # e.g. bool ** bool is int8: not a viproc dtype
-            g = op(LAYOUTS[k1](viproc.asarray(x)), LAYOUTS[k2](viproc.asarray(y)))
+                continue  # e.g. bool ** bool is int8: not a numpy2x dtype
+            g = op(LAYOUTS[k1](numpy2x.asarray(x)), LAYOUTS[k2](numpy2x.asarray(y)))
             assert identical(e, g), (op.__name__, d1, d2, a.shape, b.shape, k1, k2)
             checked += 1
     assert checked > 150
@@ -132,13 +132,13 @@ def test_astype_casts_asynchronously_with_numpys_layout():
             for k in ["C", "T", "rev", "F"]:
                 if k == "F":
                     a = np.asfortranarray(x)
-                    v = viproc.asarray(a)
+                    v = numpy2x.asarray(a)
                 else:
-                    a, v = LAYOUTS[k](x), LAYOUTS[k](viproc.asarray(x))
+                    a, v = LAYOUTS[k](x), LAYOUTS[k](numpy2x.asarray(x))
                 to, order = str(rng.choice(DTYPES)), str(rng.choice(["K", "C"]))
                 assert identical(a.astype(to, order=order), v.astype(to, order=order))
     assert fallbacks() == f0
-    c = viproc.asarray(np.array([1 + 2j]))
+    c = numpy2x.asarray(np.array([1 + 2j]))
     with pytest.warns(np.exceptions.ComplexWarning):
         c.astype(np.float64)
 
@@ -147,7 +147,7 @@ def test_views_need_no_sync():
     rng = np.random.default_rng(8)
     x = rng.standard_normal((4, 5, 6))
     c = (x + 1j * x[::-1]).astype(np.complex128)
-    v, vc = viproc.asarray(x), viproc.asarray(c)
+    v, vc = numpy2x.asarray(x), numpy2x.asarray(c)
     f0 = fallbacks()
     cases = [
         lambda a: a.T, lambda a: np.transpose(a, (1, 0, 2)), lambda a: a.transpose(2, 0, 1),
@@ -163,16 +163,16 @@ def test_views_need_no_sync():
                                         lambda a: a.view(np.float64), np.real)]
     assert fallbacks() == f0
     for e, g in results:
-        assert isinstance(g, viproc.ndarray)
+        assert isinstance(g, numpy2x.ndarray)
         assert identical(e, g)
 
 
 def test_writes_through_views_and_read_only_views():
     x = np.arange(24.0).reshape(4, 6)
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     v.T[0] = -1.0
     x.T[0] = -1.0
-    r = viproc.asarray(np.array([1 + 2j, 3 + 4j]))
+    r = numpy2x.asarray(np.array([1 + 2j, 3 + 4j]))
     r.real[...] = 7.0
     assert np.array_equal(np.asarray(v), x)
     assert np.array_equal(np.asarray(r), [7 + 2j, 7 + 4j])

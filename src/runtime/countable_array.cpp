@@ -2,7 +2,7 @@
 
 #include "element_pool.hpp"
 
-namespace viproc {
+namespace numpy2x {
 
 CountableArray::CountableArray(std::size_t nbytes) : nbytes_(nbytes) {
     // Inline also for 0 bytes: a buffer never has a null pointer.
@@ -64,4 +64,4 @@ bool CountableArray::take_block(CountableArray& src) {
     return true;
 }
 
-} // namespace viproc
+} // namespace numpy2x

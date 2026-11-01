@@ -1,17 +1,17 @@
-"""Indexing functions on the gather / scatter / select tasks (hokb/viproc#25,
+"""Indexing functions on the gather / scatter / select tasks (hokb/numpy2x#25,
 step 4): take, take_along_axis, put, put_along_axis, compress, extract,
 place, select, copyto(where=).
 
 The code follows NumPy's (item_selection.c: PyArray_TakeFrom, PyArray_PutTo,
 PyArray_Compress; lib/_shape_base_impl.py, lib/_function_base_impl.py,
 multiarraymodule.c: copyto; BSD-3-Clause) without the asanyarray() calls,
-which would sync a viproc argument. Where NumPy needs the data to know the
+which would sync a numpy2x argument. Where NumPy needs the data to know the
 result's shape (compress, extract, place: the positions of a condition's
 True values), the handler syncs on the condition only, as boolean indexing
 does. A handler returns _NOPE for arguments it does not cover: NumPy then
 runs the call in the eager fallback, with its own errors.
 
-Index errors of indices viproc does not see on the main thread (a pending
+Index errors of indices numpy2x does not see on the main thread (a pending
 index array) surface asynchronously as AsyncIndexError (an IndexError), as
 for advanced indexing (error-handling.md).
 """
@@ -20,7 +20,7 @@ import numpy as np
 from numpy.lib.array_utils import normalize_axis_index
 
 from . import _ndarray as _nd
-from . import _viproc
+from . import _numpy2x
 
 _NOPE = _nd._NOPE
 ndarray = _nd.ndarray
@@ -40,11 +40,11 @@ def _c_strides(shape, itemsize):
     return strides
 
 
-_MODES = {"raise": 0, "wrap": 1, "clip": 2}  # VP_INDEX_RAISE, _WRAP, _CLIP
+_MODES = {"raise": 0, "wrap": 1, "clip": 2}  # NX_INDEX_RAISE, _WRAP, _CLIP
 
 
 def _indices(indices):
-    """The index array as an int32/int64 viproc array; None if not covered.
+    """The index array as an int32/int64 numpy2x array; None if not covered.
     NumPy's mode is the gather's / scatter's (an index out of bounds in mode
     "raise" fails the task: AsyncIndexError, no check pass)."""
     if isinstance(indices, ndarray):
@@ -77,13 +77,13 @@ def _take(a, indices, axis=None, out=None, mode="raise"):
         r = _take(a, idx.reshape(1), axis, mode=mode)
         r = r[(slice(None),) * axis + (0,)]
         if isinstance(r, ndarray) and r.base is not None:
-            _viproc.own(r)  # NumPy's result is a new array, no view
+            _numpy2x.own(r)  # NumPy's result is a new array, no view
         return r
     # NumPy's result: a new C-ordered array of a.shape[:axis] + idx.shape +
     # a.shape[axis + 1:]
     shape = a.shape[:axis] + idx.shape + a.shape[axis + 1:]
     res = list(range(axis)) + [-1 - d for d in range(idx.ndim)] + list(range(axis + 1, a.ndim))
-    return _viproc.gather(a, (idx,), (axis,), res, _c_strides(shape, a.itemsize), _MODES[mode])
+    return _numpy2x.gather(a, (idx,), (axis,), res, _c_strides(shape, a.itemsize), _MODES[mode])
 
 
 def _flat_target(a):
@@ -113,7 +113,7 @@ def _put(a, ind, v, mode="raise"):
     vals = vals.reshape(-1)
     if nv != ni and nv != 1:  # values repeat: dest[idx[i]] = values[i % nv]
         vals = vals[_nd.asarray(np.arange(ni, dtype=np.intp) % nv)]
-    _viproc.scatter(flat, (idx,), (0,), (-1,), vals, _MODES[mode])
+    _numpy2x.scatter(flat, (idx,), (0,), (-1,), vals, _MODES[mode])
     return None
 
 
@@ -144,7 +144,7 @@ def _put_along_axis(arr, indices, values, axis):
 
 def _condition_indices(condition):
     """The positions of the True values of a 1-d condition (a sync on a
-    viproc condition: they decide the result's shape)."""
+    numpy2x condition: they decide the result's shape)."""
     c = condition.numpy() if isinstance(condition, ndarray) else np.asarray(condition)
     if c.ndim != 1:
         return None
@@ -219,7 +219,7 @@ def _select(condlist, choicelist, default=0):
     dflt = default if type(default) in (int, float, complex) or isinstance(default, ndarray) \
         else np.asarray(default)
     try:
-        # dtypes for arrays (np.result_type of a viproc array would export it)
+        # dtypes for arrays (np.result_type of a numpy2x array would export it)
         dtype = np.result_type(*(x.dtype if isinstance(x, ndarray) else x
                                  for x in choices + [dflt]))
     except TypeError:

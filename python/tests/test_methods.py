@@ -1,6 +1,6 @@
-"""ndarray methods on viproc arrays: every method of numpy.ndarray exists,
+"""ndarray methods on numpy2x arrays: every method of numpy.ndarray exists,
 gives NumPy's result, and those whose function form runs asynchronously take
-the asynchronous path (hokb/viproc#25, step 1)."""
+the asynchronous path (hokb/numpy2x#25, step 1)."""
 
 import io
 import operator
@@ -9,12 +9,12 @@ import pickle
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 from async_path import SIZE, assert_async, deterministic, pending
 
 rng = np.random.default_rng(1)
 
-# Attributes of numpy.ndarray viproc does not offer: `ctypes` (a raw pointer to
+# Attributes of numpy.ndarray numpy2x does not offer: `ctypes` (a raw pointer to
 # runtime memory would bypass the runtime).
 NOT_OFFERED = {"ctypes"}
 
@@ -33,13 +33,13 @@ def same(r, expected):
 
 def pair(shape=(6, 7), dtype=np.float64):
     x = (rng.standard_normal(shape) * 10).astype(dtype)
-    return x, viproc.asarray(x)
+    return x, numpy2x.asarray(x)
 
 
 def test_every_ndarray_attribute_exists():
     missing = [name for name in dir(np.ndarray)
                if not name.startswith("_") and name not in NOT_OFFERED
-               and not any(name in k.__dict__ for k in type(viproc.asarray(np.ones(3))).__mro__)]
+               and not any(name in k.__dict__ for k in type(numpy2x.asarray(np.ones(3))).__mro__)]
     assert missing == []
 
 
@@ -93,9 +93,9 @@ def test_method_gives_numpys_result(call, layout):
 def test_searchsorted():
     x = np.sort(rng.standard_normal(50))
     q = rng.standard_normal(20)
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     same(v.searchsorted(q), x.searchsorted(q))
-    same(v.searchsorted(viproc.asarray(q), side="right"), x.searchsorted(q, side="right"))
+    same(v.searchsorted(numpy2x.asarray(q), side="right"), x.searchsorted(q, side="right"))
 
 
 @pytest.mark.parametrize("layout", ["c", "t"])
@@ -133,7 +133,7 @@ def test_fill_casts_as_numpy_and_rejects_sequences():
     with pytest.raises(ValueError):
         np.ones(3).fill([1, 2, 3])
     with pytest.raises(ValueError):
-        viproc.asarray(np.ones(3)).fill([1, 2, 3])
+        numpy2x.asarray(np.ones(3)).fill([1, 2, 3])
 
 
 def test_flags_without_sync():
@@ -152,11 +152,11 @@ def test_flags_without_sync():
         v[0, 0] = 1.0
     v.setflags(write=True)  # NumPy: an array owning its data may
     assert v.flags.writeable
-    w = viproc.asarray(np.ones(3))
+    w = numpy2x.asarray(np.ones(3))
     w.setflags(write=False)
     with pytest.raises(ValueError):
         w.fill(0.0)
-    assert not np.broadcast_to(viproc.asarray(np.ones(3)), (2, 3)).flags.writeable
+    assert not np.broadcast_to(numpy2x.asarray(np.ones(3)), (2, 3)).flags.writeable
 
 
 def test_to_device_and_files(tmp_path):
@@ -185,12 +185,12 @@ def det():
 
 def big(dtype=np.float64):
     x = (rng.random(SIZE) + 0.5).astype(dtype)
-    return x, pending(viproc.asarray(x))
+    return x, pending(numpy2x.asarray(x))
 
 
 def test_conj_is_an_async_ufunc(det):
     x = (rng.random(SIZE) + 1j * rng.random(SIZE))
-    v = pending(viproc.asarray(x))
+    v = pending(numpy2x.asarray(x))
     same(assert_async(v.conj), x.conj())
     same(assert_async(v.conjugate), x.conjugate())
 
@@ -199,7 +199,7 @@ def test_conj_is_an_async_ufunc(det):
 def test_conj_of_real_data_is_the_array(dtype):
     """NumPy's conj()/conjugate() return a real array itself (no copy)."""
     x = np.ones((3, 4), dtype)
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     assert x.conj() is x and v.conj() is v and v.conjugate() is v
     assert v[:, ::2].conj().shape == (3, 2)
 
@@ -236,7 +236,7 @@ def test_sort_methods_take_async_path(det, call):
 
 def test_trace_takes_async_path(det):
     x = rng.random((3000, 3000))
-    v = pending(viproc.asarray(x))
+    v = pending(numpy2x.asarray(x))
     same(assert_async(v.trace), x.trace())
 
 
@@ -249,7 +249,7 @@ FALLING_BACK = [
 ]
 
 
-@pytest.mark.xfail(strict=True, reason="the function form falls back (hokb/viproc#25)")
+@pytest.mark.xfail(strict=True, reason="the function form falls back (hokb/numpy2x#25)")
 @pytest.mark.parametrize("call, ops", [(c, o) for _, c, o in FALLING_BACK],
                          ids=[n for n, _, _ in FALLING_BACK])
 def test_method_takes_async_path(det, call, ops):
@@ -307,7 +307,7 @@ def _base_kind(r, a, c):
 @pytest.mark.parametrize("case", BASE_CASES.values(), ids=BASE_CASES.keys())
 def test_base(case):
     x, xc = np.ones((4, 6)), np.ones((4, 6), complex)
-    v, vc = viproc.asarray(x), viproc.asarray(xc)
+    v, vc = numpy2x.asarray(x), numpy2x.asarray(xc)
     r, s = case(x, xc), case(v, vc)
     assert _base_kind(s, v, vc) == _base_kind(r, x, xc)
     assert s.flags.owndata == r.flags.owndata
@@ -315,7 +315,7 @@ def test_base(case):
 
 
 def test_base_keeps_the_array_alive():
-    v = viproc.asarray(np.arange(6.0))
+    v = numpy2x.asarray(np.arange(6.0))
     w = v[1:]
     del v
     assert w.base.shape == (6,)
@@ -327,7 +327,7 @@ def _f(x):
 
 
 # (name, make(x) from a C-ordered NumPy array, resize(a)); the same code
-# runs on the NumPy array and on the viproc array, so references match.
+# runs on the NumPy array and on the numpy2x array, so references match.
 RESIZE_CASES = [
     ("grow", lambda x: x.ravel().copy(), lambda a: a.resize(9)),
     ("shrink", lambda x: x.ravel().copy(), lambda a: a.resize(4)),
@@ -378,14 +378,14 @@ def _resize_outcome(make, op, x):
 def test_resize(case, dtype):
     _, make, op = case
     x = (np.arange(6).reshape(2, 3) + 1).astype(dtype)
-    assert _resize_outcome(make, op, viproc.asarray(x)) == _resize_outcome(make, op, x)
+    assert _resize_outcome(make, op, numpy2x.asarray(x)) == _resize_outcome(make, op, x)
 
 
 def test_resize_keeps_identity_and_references():
     import weakref
 
     messages = {}
-    for mod in (np, viproc):
+    for mod in (np, numpy2x):
         a = mod.arange(6.0)
         a.resize(8)
         assert a.shape == (8,)
@@ -394,8 +394,8 @@ def test_resize_keeps_identity_and_references():
             a.resize(3)
         with pytest.raises(ValueError, match="own its data") as e2:
             b.resize(3)
-        a.resize(3, refcheck=False)  # NumPy's view b dangles; viproc's keeps the old data
-        if mod is viproc:
+        a.resize(3, refcheck=False)  # NumPy's view b dangles; numpy2x's keeps the old data
+        if mod is numpy2x:
             assert b.tolist() == [0, 1, 2, 3, 4, 5, 0, 0] and a.tolist() == [0, 1, 2]
         c = mod.arange(4.0)
         w = weakref.ref(c)
@@ -403,7 +403,7 @@ def test_resize_keeps_identity_and_references():
             c.resize(5, refcheck=False)  # weak references refuse even then
         assert w() is c
         messages[mod] = [str(e.value) for e in (e1, e2, e3)]
-    assert messages[np] == messages[viproc]
+    assert messages[np] == messages[numpy2x]
 
 
 def test_resize_is_async(det):
@@ -429,7 +429,7 @@ def test_flags_object_is_a_snapshot():
                 f.owndata, f.c_contiguous)
 
     x = np.ones(4)
-    assert run(viproc.asarray(x)) == run(x.copy())
+    assert run(numpy2x.asarray(x)) == run(x.copy())
 
 
 SETFLAGS_CASES = [
@@ -442,7 +442,7 @@ SETFLAGS_CASES = [
 
 
 def m_of(a):
-    return viproc if isinstance(a, viproc.ndarray) else np
+    return numpy2x if isinstance(a, numpy2x.ndarray) else np
 
 
 @pytest.mark.parametrize("case", SETFLAGS_CASES, ids=[c[0] for c in SETFLAGS_CASES])
@@ -462,7 +462,7 @@ def test_setflags_writeable_again(case):
                 out.append(str(e))
         return out
 
-    assert run(viproc) == run(np)
+    assert run(numpy2x) == run(np)
 
 
 FLAG_ATTRS = ("c_contiguous", "f_contiguous", "contiguous", "fortran", "owndata", "writeable",
@@ -499,9 +499,9 @@ def test_flags_as_numpy(case):
     """Every attribute, key and the repr of a.flags as NumPy's (no probe:
     the bits come from the layout, ALIGNED from offset and strides)."""
     _, make = case
-    x = np.arange(48.0).reshape(6, 8).copy()  # owns its data, as viproc's copy
-    a, b = make(x), make(viproc.asarray(x))
-    assert isinstance(b, viproc.ndarray)
+    x = np.arange(48.0).reshape(6, 8).copy()  # owns its data, as numpy2x's copy
+    a, b = make(x), make(numpy2x.asarray(x))
+    assert isinstance(b, numpy2x.ndarray)
     assert _flags_of(b.flags) == _flags_of(a.flags)
     assert b.flags == a.flags and a.flags == b.flags and not (b.flags != a.flags)
     assert b.flags is not b.flags  # a new object per access, as NumPy's
@@ -557,7 +557,7 @@ def test_setflags_as_numpy(case):
             out.append(str(e))
         return out
 
-    assert run(make(viproc.asarray(x))) == run(make(x.copy()))
+    assert run(make(numpy2x.asarray(x))) == run(make(x.copy()))
 
 
 def test_setflags_writeable_view_of_read_only_base():
@@ -571,4 +571,4 @@ def test_setflags_writeable_view_of_read_only_base():
         except ValueError as e:
             return str(e)
 
-    assert run(viproc) == run(np)
+    assert run(numpy2x) == run(np)

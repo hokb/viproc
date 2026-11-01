@@ -1,4 +1,4 @@
-# Development loop (Windows): pull the checkout, build and install viproc into
+# Development loop (Windows): pull the checkout, build and install numpy2x into
 # .venv (pip + scikit-build-core, incremental build in build\pip-<tag>), run
 # the Python tests. Called by dev.cmd; Linux: dev.sh.
 param(
@@ -26,7 +26,7 @@ try {
     if (-not (Test-Path $venvPython)) {
         Step 'create .venv'
         if ($Python) { $base = @($Python) }
-        elseif ($env:VIPROC_PYTHON) { $base = @($env:VIPROC_PYTHON) }
+        elseif ($env:NUMPY2X_PYTHON) { $base = @($env:NUMPY2X_PYTHON) }
         elseif (Get-Command py -ErrorAction SilentlyContinue) { $base = @('py', '-3') }
         else { $base = @('python') }
         $exe = $base[0]; $pre = @($base | Select-Object -Skip 1)
@@ -43,7 +43,7 @@ try {
     # Installed into .venv once, so builds need no isolated environment (faster).
     Run $venvPython @('-m', 'pip', 'install', '-q', '--upgrade', 'pip', 'scikit-build-core', 'numpy>=2.0', 'pytest', 'cmake>=3.24')
 
-    Step 'build and install viproc (Release)'
+    Step 'build and install numpy2x (Release)'
     # scikit-build-core picks the Visual Studio generator, so no developer
     # prompt is needed. Its target architecture follows VSCMD_ARG_TGT_ARCH,
     # which a developer prompt sets (x86 by default); build for the
@@ -63,7 +63,7 @@ try {
         }
     }
     Run $venvPython @('-m', 'pip', 'install', '--no-build-isolation', '--no-deps', '.')
-    Run $venvPython @('-c', 'import viproc, numpy; print(''viproc'', viproc.__version__, ''numpy'', numpy.__version__, viproc.__file__)')
+    Run $venvPython @('-c', 'import numpy2x, numpy; print(''numpy2x'', numpy2x.__version__, ''numpy'', numpy.__version__, numpy2x.__file__)')
 
     if (-not $NoTest) {
         Step 'pytest'

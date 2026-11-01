@@ -4,7 +4,7 @@
 #include <bit>
 #include <chrono>
 
-namespace viproc {
+namespace numpy2x {
 
 namespace {
 
@@ -187,4 +187,4 @@ void OffloadPolicy::maybe_switch(SiteStats& s) {
     s.blocked = 0;
 }
 
-} // namespace viproc
+} // namespace numpy2x

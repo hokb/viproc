@@ -1,5 +1,5 @@
-"""python -m viproc, VIPROC=1, viproc.random and viproc.disabled(): NumPy
-programs run unchanged, user code gets viproc, libraries keep NumPy, results
+"""python -m numpy2x, NUMPY2X=1, numpy2x.random and numpy2x.disabled(): NumPy
+programs run unchanged, user code gets numpy2x, libraries keep NumPy, results
 are bit-identical to plain NumPy."""
 
 import os
@@ -10,13 +10,13 @@ import textwrap
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 
 
 def run(args, tmp_path, env=None):
     child_env = dict(os.environ)
     child_env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
-    child_env.pop("VIPROC", None)
+    child_env.pop("NUMPY2X", None)
     child_env.update(env or {})
     return subprocess.run([sys.executable, *args], cwd=tmp_path, env=child_env,
                           capture_output=True, text=True, timeout=120)
@@ -61,67 +61,67 @@ def program(tmp_path):
     return tmp_path
 
 
-def test_python_m_viproc_runs_a_numpy_program_with_viproc(program):
-    r = run(["-m", "viproc", "prog.py", "x", "--y"], program)
+def test_python_m_numpy2x_runs_a_numpy_program_with_numpy2x(program):
+    r = run(["-m", "numpy2x", "prog.py", "x", "--y"], program)
     assert r.returncode == 0, r.stderr
-    # user code: viproc; a module in site-packages: NumPy; numpy.linalg: NumPy's
-    assert r.stdout.split() == ["viproc", "ndarray", "numpy", "numpy.linalg", "['x',", "'--y']"]
+    # user code: numpy2x; a module in site-packages: NumPy; numpy.linalg: NumPy's
+    assert r.stdout.split() == ["numpy2x", "ndarray", "numpy", "numpy.linalg", "['x',", "'--y']"]
 
 
-def test_the_same_program_without_viproc_is_plain_numpy(program):
+def test_the_same_program_without_numpy2x_is_plain_numpy(program):
     r = run(["prog.py"], program)
     assert r.returncode == 0, r.stderr
     assert r.stdout.split()[:3] == ["numpy", "ndarray", "numpy"]
 
 
-def test_viproc_env_variable_enables_it_at_startup(program):
-    # viproc.pth exists only in a pip installation; the same call by hand:
-    r = run(["-c", "import _viproc_hook; _viproc_hook.autoload(); import numpy; "
-             "print(numpy.__name__)"], program, env={"VIPROC": "1"})
+def test_numpy2x_env_variable_enables_it_at_startup(program):
+    # numpy2x.pth exists only in a pip installation; the same call by hand:
+    r = run(["-c", "import _numpy2x_hook; _numpy2x_hook.autoload(); import numpy; "
+             "print(numpy.__name__)"], program, env={"NUMPY2X": "1"})
     assert r.returncode == 0, r.stderr
-    assert r.stdout.split() == ["viproc"]
-    r = run(["-c", "import _viproc_hook; _viproc_hook.autoload(); import numpy; "
+    assert r.stdout.split() == ["numpy2x"]
+    r = run(["-c", "import _numpy2x_hook; _numpy2x_hook.autoload(); import numpy; "
              "print(numpy.__name__)"], program)
     assert r.stdout.split() == ["numpy"]
 
 
-def test_python_m_viproc_module_and_command(program):
+def test_python_m_numpy2x_module_and_command(program):
     (program / "mod.py").write_text("import numpy as np, sys\nprint(np.__name__, sys.argv[1:])\n")
-    r = run(["-m", "viproc", "-m", "mod", "a"], program)
+    r = run(["-m", "numpy2x", "-m", "mod", "a"], program)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.split() == ["viproc", "['a']"]
-    r = run(["-m", "viproc", "-c", "import numpy, sys; print(numpy.__name__, sys.argv)", "b"],
+    assert r.stdout.split() == ["numpy2x", "['a']"]
+    r = run(["-m", "numpy2x", "-c", "import numpy, sys; print(numpy.__name__, sys.argv)", "b"],
             program)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.split() == ["viproc", "['-c',", "'b']"]
+    assert r.stdout.split() == ["numpy2x", "['-c',", "'b']"]
 
 
-def test_python_m_viproc_keeps_exit_codes_and_errors(program):
+def test_python_m_numpy2x_keeps_exit_codes_and_errors(program):
     (program / "fail.py").write_text("import numpy as np\nnp.zeros(3)\nraise SystemExit(3)\n")
-    assert run(["-m", "viproc", "fail.py"], program).returncode == 3
+    assert run(["-m", "numpy2x", "fail.py"], program).returncode == 3
     (program / "boom.py").write_text("raise ValueError('boom')\n")
-    r = run(["-m", "viproc", "boom.py"], program)
+    r = run(["-m", "numpy2x", "boom.py"], program)
     assert r.returncode == 1 and "ValueError: boom" in r.stderr
 
 
-def test_random_returns_viproc_arrays_with_numpy_values():
+def test_random_returns_numpy2x_arrays_with_numpy_values():
     for make in (lambda m: m.default_rng(5), lambda m: m.RandomState(5),
                  lambda m: m.Generator(m.PCG64(5))):
-        got, expected = make(viproc.random), make(np.random)
+        got, expected = make(numpy2x.random), make(np.random)
         for draw in (lambda g: g.random(1000) if hasattr(g, "random") else g.rand(1000),
                      lambda g: g.normal(1.0, 2.0, size=(10, 20)),
                      lambda g: g.integers(0, 9, 50) if hasattr(g, "integers")
                      else g.randint(0, 9, 50)):
             x = draw(got)
-            assert isinstance(x, viproc.ndarray)
+            assert isinstance(x, numpy2x.ndarray)
             assert np.array_equal(np.asarray(x), draw(expected))
-    viproc.random.seed(7)
-    x = viproc.random.rand(5)
+    numpy2x.random.seed(7)
+    x = numpy2x.random.rand(5)
     np.random.seed(7)
-    assert isinstance(x, viproc.ndarray) and np.array_equal(np.asarray(x), np.random.rand(5))
-    assert isinstance(viproc.random.default_rng(0).random(), float)  # scalars stay scalars
+    assert isinstance(x, numpy2x.ndarray) and np.array_equal(np.asarray(x), np.random.rand(5))
+    assert isinstance(numpy2x.random.default_rng(0).random(), float)  # scalars stay scalars
     out = np.empty(4)
-    assert viproc.random.default_rng(0).random(4, out=out) is out  # out= is the caller's
+    assert numpy2x.random.default_rng(0).random(4, out=out) is out  # out= is the caller's
 
 
 def test_disabled_gives_numpy_arrays_and_numpy_results():
@@ -129,49 +129,49 @@ def test_disabled_gives_numpy_arrays_and_numpy_results():
         a = m.random.default_rng(3).standard_normal(5000)
         return m.asarray(np.sin(a) * 2.0 + m.arange(5000) / 3.0)
 
-    with viproc.disabled():
-        assert not viproc.enabled()
-        plain = program(viproc)
+    with numpy2x.disabled():
+        assert not numpy2x.enabled()
+        plain = program(numpy2x)
         assert type(plain) is np.ndarray
-        assert type(viproc.zeros(3)) is np.ndarray and type(viproc.array([1, 2])) is np.ndarray
-    assert viproc.enabled()
-    accelerated = program(viproc)
-    assert isinstance(accelerated, viproc.ndarray)
+        assert type(numpy2x.zeros(3)) is np.ndarray and type(numpy2x.array([1, 2])) is np.ndarray
+    assert numpy2x.enabled()
+    accelerated = program(numpy2x)
+    assert isinstance(accelerated, numpy2x.ndarray)
     assert np.array_equal(np.asarray(accelerated), plain)
-    viproc.enable(False)
+    numpy2x.enable(False)
     try:
-        assert type(viproc.ones(2)) is np.ndarray
+        assert type(numpy2x.ones(2)) is np.ndarray
     finally:
-        viproc.enable(True)
+        numpy2x.enable(True)
 
 
 def test_array_and_creation_functions_follow_numpys_signatures():
-    a = viproc.array([1.0, 2.0], ndmin=3)
-    assert isinstance(a, viproc.ndarray) and a.shape == (1, 1, 2)
-    v = viproc.asarray(np.arange(4.0))
-    assert viproc.asarray(v) is v and viproc.array(v, copy=False) is v
-    c = viproc.array(v)
+    a = numpy2x.array([1.0, 2.0], ndmin=3)
+    assert isinstance(a, numpy2x.ndarray) and a.shape == (1, 1, 2)
+    v = numpy2x.asarray(np.arange(4.0))
+    assert numpy2x.asarray(v) is v and numpy2x.array(v, copy=False) is v
+    c = numpy2x.array(v)
     assert c is not v and np.array_equal(np.asarray(c), np.arange(4.0))
-    assert viproc.array(v, dtype=np.float32).dtype == np.float32
-    # dtypes viproc does not run asynchronously stay NumPy arrays, as NumPy makes them
-    o = viproc.array([1, "a"], dtype=object)
+    assert numpy2x.array(v, dtype=np.float32).dtype == np.float32
+    # dtypes numpy2x does not run asynchronously stay NumPy arrays, as NumPy makes them
+    o = numpy2x.array([1, "a"], dtype=object)
     assert type(o) is np.ndarray and o.dtype == object
-    assert type(viproc.zeros(3, dtype=np.float16)) is np.ndarray
+    assert type(numpy2x.zeros(3, dtype=np.float16)) is np.ndarray
     buf = bytearray(np.arange(3.0).tobytes())
-    f = viproc.frombuffer(buf)  # a view of the caller's buffer: copied
+    f = numpy2x.frombuffer(buf)  # a view of the caller's buffer: copied
     buf[:8] = np.float64(9.0).tobytes()
-    assert isinstance(f, viproc.ndarray) and np.array_equal(np.asarray(f), [0.0, 1.0, 2.0])
-    x, step = viproc.linspace(0, 1, 5, retstep=True)
-    assert isinstance(x, viproc.ndarray) and step == 0.25
-    assert isinstance(viproc.identity(3), viproc.ndarray)
+    assert isinstance(f, numpy2x.ndarray) and np.array_equal(np.asarray(f), [0.0, 1.0, 2.0])
+    x, step = numpy2x.linspace(0, 1, 5, retstep=True)
+    assert isinstance(x, numpy2x.ndarray) and step == 0.25
+    assert isinstance(numpy2x.identity(3), numpy2x.ndarray)
 
 
 def test_user_code_detection():
-    import _viproc_hook
+    import _numpy2x_hook
 
-    assert _viproc_hook.is_user_code({"__name__": "__main__"})
-    assert _viproc_hook.is_user_code({"__name__": "mod", "__file__": __file__})
-    assert not _viproc_hook.is_user_code({"__name__": "viproc._ndarray", "__file__": __file__})
-    assert not _viproc_hook.is_user_code({"__name__": "json", "__file__": textwrap.__file__})
-    assert not _viproc_hook.is_user_code({"__name__": "numpy.linalg", "__file__": np.__file__})
-    assert not _viproc_hook.is_user_code(None)
+    assert _numpy2x_hook.is_user_code({"__name__": "__main__"})
+    assert _numpy2x_hook.is_user_code({"__name__": "mod", "__file__": __file__})
+    assert not _numpy2x_hook.is_user_code({"__name__": "numpy2x._ndarray", "__file__": __file__})
+    assert not _numpy2x_hook.is_user_code({"__name__": "json", "__file__": textwrap.__file__})
+    assert not _numpy2x_hook.is_user_code({"__name__": "numpy.linalg", "__file__": np.__file__})
+    assert not _numpy2x_hook.is_user_code(None)

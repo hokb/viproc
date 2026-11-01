@@ -1,4 +1,4 @@
-"""Break-even of the task path for small data: viproc vs. NumPy per sync_below.
+"""Break-even of the task path for small data: numpy2x vs. NumPy per sync_below.
 
 Ready ops below `sync_below` elements take the direct path (no task, run on
 the main thread); above it they become tasks, and a chain of dependent ops
@@ -18,7 +18,7 @@ import time
 
 import numpy
 
-import viproc
+import numpy2x
 
 
 def chains_sin(np, xs, length):
@@ -83,14 +83,14 @@ def main():
             for name, f in PATTERNS.items() for n in sizes}
     rows = {}
     for th in thresholds:
-        viproc.init(sync_below=th, adaptive=False if args.deterministic else True)
+        numpy2x.init(sync_below=th, adaptive=False if args.deterministic else True)
         for name, f in PATTERNS.items():
             for n in sizes:
-                xs = [viproc.asarray(x) for x in data[n]]
+                xs = [numpy2x.asarray(x) for x in data[n]]
 
                 def run():
-                    r = f(viproc, xs, args.length)
-                    viproc.wait_all()
+                    r = f(numpy2x, xs, args.length)
+                    numpy2x.wait_all()
                     return r
 
                 ref = f(numpy, data[n], args.length)

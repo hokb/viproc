@@ -1,4 +1,4 @@
-"""viproc demo: the same NumPy code, once with NumPy and once with viproc.
+"""numpy2x demo: the same NumPy code, once with NumPy and once with numpy2x.
 
 Run (with the build's package on PYTHONPATH, see README):
     python python/examples/demo.py
@@ -8,7 +8,7 @@ import time
 
 import numpy as np
 
-import viproc
+import numpy2x
 
 
 def program(xs):
@@ -29,18 +29,18 @@ t0 = time.perf_counter()
 expected = program(data)
 t_numpy = time.perf_counter() - t0
 
-# 2) viproc: wrap the inputs, run the very same function
-vdata = [viproc.asarray(d) for d in data]
-viproc.wait_all()
+# 2) numpy2x: wrap the inputs, run the very same function
+vdata = [numpy2x.asarray(d) for d in data]
+numpy2x.wait_all()
 t0 = time.perf_counter()
 result = program(vdata)      # returns almost immediately ...
 t_issue = time.perf_counter() - t0
 result.wait()                # ... the work runs in the background
-t_viproc = time.perf_counter() - t0
+t_numpy2x = time.perf_counter() - t0
 
-print(f"workers:              {viproc.workers()}")
+print(f"workers:              {numpy2x.workers()}")
 print(f"NumPy:                {t_numpy * 1000:7.1f} ms")
-print(f"viproc (issuing):     {t_issue * 1000:7.1f} ms")
-print(f"viproc (total):       {t_viproc * 1000:7.1f} ms  -> {t_numpy / t_viproc:.2f}x")
+print(f"numpy2x (issuing):     {t_issue * 1000:7.1f} ms")
+print(f"numpy2x (total):       {t_numpy2x * 1000:7.1f} ms  -> {t_numpy / t_numpy2x:.2f}x")
 print(f"identical to NumPy:   {np.array_equal(np.asarray(result), expected)}")
 print("first values:        ", result[:4])

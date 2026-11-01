@@ -1,15 +1,15 @@
-"""Joining and copying functions as one placement task each (hokb/viproc#25,
+"""Joining and copying functions as one placement task each (hokb/numpy2x#25,
 step 3): concatenate, stack, hstack, vstack, dstack, column_stack, append,
 tile, repeat, pad (constant mode), roll, delete, insert.
 
 NumPy builds these results by assigning its inputs into views of a new array
-(``new[slices] = arr``). viproc records the same assignments as parts of one
-new array (``_Placer``) and issues them as a single task (``vp_place``):
+(``new[slices] = arr``). numpy2x records the same assignments as parts of one
+new array (``_Placer``) and issues them as a single task (``nx_place``):
 element copies, so the values are NumPy's; the result's layout is the one
 NumPy allocates. The code follows NumPy's (numpy/_core/shape_base.py,
 multiarraymodule.c, item_selection.c, lib/_function_base_impl.py,
 lib/_shape_base_impl.py, lib/_arraypad_impl.py, numeric.py; BSD-3-Clause)
-without the asanyarray() calls, which would sync a viproc argument. A handler
+without the asanyarray() calls, which would sync a numpy2x argument. A handler
 returns _NOPE for arguments it does not cover: NumPy then runs the call in
 the eager fallback, with its own errors.
 """
@@ -21,7 +21,7 @@ import numpy as np
 from numpy.lib.array_utils import normalize_axis_index, normalize_axis_tuple
 
 from . import _ndarray as _nd
-from . import _viproc
+from . import _numpy2x
 
 _NV = np._NoValue
 _NOPE = _nd._NOPE
@@ -33,7 +33,7 @@ def _vp(x):
 
 
 def _arr(x):
-    """asanyarray() that keeps viproc arrays as they are (no sync)."""
+    """asanyarray() that keeps numpy2x arrays as they are (no sync)."""
     return x if isinstance(x, ndarray) else np.asanyarray(x)
 
 
@@ -100,8 +100,8 @@ def _order_strides(shape, itemsize, order):
 
 
 def _as_dtype(x, dtype):
-    """x as a viproc array of `dtype`, cast as NumPy's assignment casts
-    (unsafe): a viproc array through an async cast, anything else on the
+    """x as a numpy2x array of `dtype`, cast as NumPy's assignment casts
+    (unsafe): a numpy2x array through an async cast, anything else on the
     host (NumPy's conversion and errors), then imported."""
     if isinstance(x, ndarray):
         return x if x.dtype == dtype else x.astype(dtype)
@@ -112,7 +112,7 @@ class _Placer:
     """A new array of `dtype` and `shape` with dense byte `strides`,
     assembled as NumPy assembles it: ``p[key] = value`` records the
     assignment into the view ``new[key]`` (keys of slices and None only),
-    result() issues all of them as one task (vp_place)."""
+    result() issues all of them as one task (nx_place)."""
 
     def __init__(self, dtype, shape, strides):
         self.dtype = dtype
@@ -155,7 +155,7 @@ class _Placer:
     def result(self):
         if 0 in self.shape:
             return _NOPE  # empty: NumPy's own strides, no data to wait for
-        return _viproc.place(self.dtype, self.shape, self.strides, self.parts)
+        return _numpy2x.place(self.dtype, self.shape, self.strides, self.parts)
 
 
 def _assign_error(value, shape):
@@ -554,7 +554,7 @@ def _small_ready(func, handler):
         arrays = [x for a in args[:3] + tuple(kwargs.values())
                   for x in (a if isinstance(a, (list, tuple)) else (a,)) if isinstance(x, ndarray)]
         if (arrays and sum(x.size for x in arrays) <= _nd._small_ops[0]
-                and all(_viproc.ready(x) for x in arrays)):
+                and all(_numpy2x.ready(x) for x in arrays)):
             return _nd.fresh(func(*_nd._tree(args, _nd._to_numpy),
                                   **{k: _nd._tree(v, _nd._to_numpy) for k, v in kwargs.items()}))
         return handler(*args, **kwargs)

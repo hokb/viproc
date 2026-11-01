@@ -2,7 +2,7 @@
 
 #include <cstddef>
 
-namespace viproc {
+namespace numpy2x {
 
 // Number of physical cores this process may run on (SMT siblings counted
 // once; affinity respected where the OS reports it). The default worker
@@ -12,4 +12,4 @@ namespace viproc {
 // unknown. Thread-safe; reads the OS topology on every call.
 std::size_t physical_core_count();
 
-} // namespace viproc
+} // namespace numpy2x

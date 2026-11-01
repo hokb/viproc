@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-namespace viproc {
+namespace numpy2x {
 
 Layout Layout::contiguous(DType dtype, Shape shape) {
     Layout l;
@@ -260,4 +260,4 @@ Layout broadcast_to(const Layout& in, const Shape& target) {
     return l;
 }
 
-} // namespace viproc
+} // namespace numpy2x

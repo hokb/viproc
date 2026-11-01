@@ -8,7 +8,7 @@
 #include <span>
 #include <vector>
 
-namespace viproc {
+namespace numpy2x {
 
 enum class DType : std::uint8_t { Bool, Int32, Int64, Float32, Float64, Complex64, Complex128 };
 
@@ -126,4 +126,4 @@ bool for_each_row(const Shape& shape, const std::vector<Layout>& layouts, Operan
     }
 }
 
-} // namespace viproc
+} // namespace numpy2x

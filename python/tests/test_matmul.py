@@ -6,7 +6,7 @@ memory layout), for all shapes, broadcasts and operand layouts."""
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 
 pytestmark = pytest.mark.filterwarnings("ignore::RuntimeWarning")  # NumPy's FP warnings
 N = 150  # random cases per dtype
@@ -14,7 +14,7 @@ DTYPES = [np.bool_, np.int32, np.int64, np.float32, np.float64, np.complex64, np
 
 
 def fallbacks():
-    return viproc._ndarray.fallback_calls
+    return numpy2x._ndarray.fallback_calls
 
 
 def same(got, expected):
@@ -23,7 +23,7 @@ def same(got, expected):
     if got_a.shape != expected_a.shape or got_a.dtype != expected_a.dtype:
         return False
     if np.isscalar(expected) != (np.isscalar(got) or getattr(got, "_scalar", False)):
-        return False  # NumPy's scalar: viproc's, or a pending 0-d array marked as one
+        return False  # NumPy's scalar: numpy2x's, or a pending 0-d array marked as one
     if expected_a.ndim and expected_a.size > 1 and got_a.strides != expected_a.strides:
         return False
     if expected_a.dtype.kind in "fc":
@@ -49,7 +49,7 @@ def data(rng, shape, dtype):
 
 def layout(rng, shape):
     """A random transform producing `shape`: (source shape, fn) with fn
-    applied identically to the NumPy and the viproc source."""
+    applied identically to the NumPy and the numpy2x source."""
     nd = len(shape)
     k = int(rng.integers(0, 5))
     if k == 1 and nd >= 2:  # transposed source (F order for 2-d)
@@ -78,7 +78,7 @@ def layout(rng, shape):
 def operand(rng, shape, dtype, pending):
     src, fn = layout(rng, shape)
     x = data(rng, src, dtype)
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     if pending:  # make it the result of an op: issued, maybe not ready yet
         x = x.copy()
         v = v.copy()
@@ -111,7 +111,7 @@ def test_matmul_fuzz(dtype):
         before = fallbacks()
         got = va @ vb
         assert fallbacks() == before, (sa, sb)
-        assert isinstance(got, viproc.ndarray) or np.isscalar(got)
+        assert isinstance(got, numpy2x.ndarray) or np.isscalar(got)
         assert same(got, expected), (sa, sb, dtype)
         assert same(np.matmul(va, vb), expected)
 
@@ -126,7 +126,7 @@ def test_matmul_blas_paths(dtype):
         a = data(rng, (n, n + 1), dtype)
         b = data(rng, (n + 1, n), dtype)
         v = data(rng, (n + 1,), dtype)
-        va, vb, vv = viproc.asarray(a), viproc.asarray(b), viproc.asarray(v)
+        va, vb, vv = numpy2x.asarray(a), numpy2x.asarray(b), numpy2x.asarray(v)
         cases = [
             (lambda x, y, z: x @ y),
             (lambda x, y, z: x @ x.T),
@@ -147,7 +147,7 @@ def test_matmul_many_concurrent():
     """Independent products overlap on the workers; values as NumPy's."""
     rng = np.random.default_rng(3)
     ms = [data(rng, (300, 300), np.float64) for _ in range(8)]
-    vs = [viproc.asarray(m) for m in ms]
+    vs = [numpy2x.asarray(m) for m in ms]
     expected = [(m @ m) @ m for m in ms]
     got = [(v @ v) @ v for v in vs]
     for g, e in zip(got, expected):
@@ -156,33 +156,33 @@ def test_matmul_many_concurrent():
 
 def test_matmul_scalar_result():
     a = np.arange(5.0)
-    va = viproc.asarray(a)
+    va = numpy2x.asarray(a)
     r = va @ va
     assert np.isscalar(r) or r._scalar
     assert float(r) == a @ a
     big = np.arange(5000.0)
-    vb = viproc.asarray(big)
+    vb = numpy2x.asarray(big)
     assert same(np.asarray(float(vb @ vb)), np.asarray(big @ big))
 
 
 def test_matmul_errors_as_numpy():
-    a = viproc.asarray(np.ones((2, 3)))
+    a = numpy2x.asarray(np.ones((2, 3)))
     with pytest.raises(ValueError):
         a @ a
     with pytest.raises(ValueError):
-        np.matmul(a, viproc.asarray(np.float64(2.0)))
+        np.matmul(a, numpy2x.asarray(np.float64(2.0)))
     with pytest.raises(ValueError):
-        viproc.asarray(np.ones((2, 2, 3))) @ viproc.asarray(np.ones((3, 3, 4)))
+        numpy2x.asarray(np.ones((2, 2, 3))) @ numpy2x.asarray(np.ones((3, 3, 4)))
 
 
 def test_matmul_mixed_operands():
     rng = np.random.default_rng(5)
     a = data(rng, (4, 6), np.float64)
     b = data(rng, (6, 3), np.float64)
-    va = viproc.asarray(a)
+    va = numpy2x.asarray(a)
     assert same(va @ b, a @ b)
-    assert same(a @ viproc.asarray(b), a @ b)
-    # different dtypes: NumPy casts in its iterator; viproc lets NumPy run it
+    assert same(a @ numpy2x.asarray(b), a @ b)
+    # different dtypes: NumPy casts in its iterator; numpy2x lets NumPy run it
     assert same(va @ b.astype(np.float32), a @ b.astype(np.float32))
     assert same(va @ b.astype(np.int32), a @ b.astype(np.int32))
 
@@ -190,7 +190,7 @@ def test_matmul_mixed_operands():
 def dot_operand(rng, shape, dtype):
     src, fn = layout(rng, shape)
     x = data(rng, src, dtype)
-    return fn(x), fn(viproc.asarray(x).copy())
+    return fn(x), fn(numpy2x.asarray(x).copy())
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -211,9 +211,9 @@ def test_dot_fuzz(dtype):
 def test_dot_async_cases():
     """dot of vectors and matrices runs asynchronously (no fallback)."""
     rng = np.random.default_rng(11)
-    a = viproc.asarray(data(rng, (30, 20), np.float64))
-    b = viproc.asarray(data(rng, (20, 10), np.float64))
-    v = viproc.asarray(data(rng, (20,), np.float64))
+    a = numpy2x.asarray(data(rng, (30, 20), np.float64))
+    b = numpy2x.asarray(data(rng, (20, 10), np.float64))
+    v = numpy2x.asarray(data(rng, (20,), np.float64))
     before = fallbacks()
     for r in [np.dot(a, b), a.dot(b), np.dot(a, v), np.dot(v, b), np.dot(v, v),
               np.dot(a[:, ::2], b[::2]), np.dot(a, a.T)]:
@@ -225,8 +225,8 @@ def test_dot_fallbacks_stay_numpy():
     rng = np.random.default_rng(12)
     a = data(rng, (3, 4, 5), np.float64)
     b = data(rng, (2, 5, 3), np.float64)
-    assert same(np.dot(viproc.asarray(a), viproc.asarray(b)), np.dot(a, b))
-    assert same(np.dot(viproc.asarray(a), 2.5), np.dot(a, 2.5))
+    assert same(np.dot(numpy2x.asarray(a), numpy2x.asarray(b)), np.dot(a, b))
+    assert same(np.dot(numpy2x.asarray(a), 2.5), np.dot(a, 2.5))
     out = np.empty((3, 4, 2, 3))
-    np.dot(viproc.asarray(a), viproc.asarray(b), out=out)
+    np.dot(numpy2x.asarray(a), numpy2x.asarray(b), out=out)
     assert same(out, np.dot(a, b))

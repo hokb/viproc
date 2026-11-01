@@ -1,5 +1,5 @@
 # escape=`
-# viproc on Windows, native: MSVC build of the runtime and the Python
+# numpy2x on Windows, native: MSVC build of the runtime and the Python
 # bridge with the official Windows CPython. Runs the test suites by default
 # and doubles as a command line (docker/README.md).
 #
@@ -8,9 +8,9 @@
 # Windows version must suit the host: WINDOWS_VERSION=ltsc2022 (Windows
 # Server 2022 / Windows 11), ltsc2025 (Windows Server 2025).
 #
-#   docker build -f docker/windows/Dockerfile -t viproc:windows .
-#   docker run --rm viproc:windows                 # all test suites (ctest)
-#   docker run --rm -it viproc:windows python      # Python with viproc
+#   docker build -f docker/windows/Dockerfile -t numpy2x:windows .
+#   docker run --rm numpy2x:windows                 # all test suites (ctest)
+#   docker run --rm -it numpy2x:windows python      # Python with numpy2x
 ARG WINDOWS_VERSION=ltsc2022
 FROM mcr.microsoft.com/windows/servercore:${WINDOWS_VERSION}
 
@@ -39,10 +39,10 @@ RUN Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/python/$env:PYTHON
 
 RUN python -m pip install --no-cache-dir --no-warn-script-location "numpy==$env:NUMPY_VERSION" pytest
 
-ENV VIPROC_PLATFORM=windows `
-    VIPROC_SRC=C:\src `
-    VIPROC_BUILD=C:\build `
-    VIPROC_BUILD_TYPE=${BUILD_TYPE} `
+ENV NUMPY2X_PLATFORM=windows `
+    NUMPY2X_SRC=C:\src `
+    NUMPY2X_BUILD=C:\build `
+    NUMPY2X_BUILD_TYPE=${BUILD_TYPE} `
     VS_INSTALL=C:\BuildTools `
     PYTHONPATH=C:\build\python `
     PYTHONPYCACHEPREFIX=C:\pycache `

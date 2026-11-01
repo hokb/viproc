@@ -5,29 +5,29 @@ dtype views. Shapes, strides, values and errors follow NumPy."""
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 
 
 def fallbacks():
-    return viproc._ndarray.fallback_calls
+    return numpy2x._ndarray.fallback_calls
 
 
 def layouts(rng):
-    """(numpy array, matching viproc array) pairs in various layouts."""
+    """(numpy array, matching numpy2x array) pairs in various layouts."""
     for shape in [(), (5,), (4, 6), (3, 1, 5), (2, 3, 4), (0, 3), (3, 4, 1, 2)]:
         base = rng.standard_normal(shape)
-        yield base, viproc.asarray(base)
+        yield base, numpy2x.asarray(base)
         if base.ndim >= 2:
             f = np.asfortranarray(base)
-            yield f, viproc.asarray(f)
-            yield base.T, viproc.asarray(base).T
+            yield f, numpy2x.asarray(f)
+            yield base.T, numpy2x.asarray(base).T
         if base.ndim >= 1 and base.shape[0] > 1:
-            yield base[::2], viproc.asarray(base)[::2]
-            yield base[::-1], viproc.asarray(base)[::-1]
+            yield base[::2], numpy2x.asarray(base)[::2]
+            yield base[::-1], numpy2x.asarray(base)[::-1]
 
 
 def same(v, n):
-    assert isinstance(v, viproc.ndarray), type(v)
+    assert isinstance(v, numpy2x.ndarray), type(v)
     assert v.shape == n.shape
     assert v.dtype == n.dtype
     assert v.strides == n.strides, (v.strides, n.strides)
@@ -87,9 +87,9 @@ def test_basic_indexing_fuzz():
 def test_view_functions(fn, args):
     rng = np.random.default_rng(2)
     base = rng.standard_normal((3, 1, 5))
-    vbase = viproc.asarray(base)
+    vbase = numpy2x.asarray(base)
     f = np.asfortranarray(base)
-    for n, v in [(base, vbase), (f, viproc.asarray(f)), (base[::-1, :, ::2], vbase[::-1, :, ::2]),
+    for n, v in [(base, vbase), (f, numpy2x.asarray(f)), (base[::-1, :, ::2], vbase[::-1, :, ::2]),
                  (base.transpose(2, 1, 0), vbase.transpose(2, 1, 0))]:
         before = fallbacks()
         got = fn(v, *args)
@@ -98,7 +98,7 @@ def test_view_functions(fn, args):
 
 
 def test_view_errors_are_numpys():
-    v, n = viproc.asarray(np.ones((2, 3))), np.ones((2, 3))
+    v, n = numpy2x.asarray(np.ones((2, 3))), np.ones((2, 3))
     for fn in [lambda a: np.transpose(a, (0, 0)), lambda a: np.broadcast_to(a, (3, 3)),
                lambda a: a.reshape(4, 2), lambda a: a.reshape(-1, -1),
                lambda a: np.squeeze(a, 0), lambda a: a[2], lambda a: a[:, :, :],
@@ -112,12 +112,12 @@ def test_view_errors_are_numpys():
 
 def test_reshape_copies_like_numpy():
     n = np.arange(24.0).reshape(4, 6)[:, :3]
-    v = viproc.asarray(np.arange(24.0).reshape(4, 6))[:, :3]
+    v = numpy2x.asarray(np.arange(24.0).reshape(4, 6))[:, :3]
     for order in "CFA":
         same(v.reshape(-1, order=order), n.reshape(-1, order=order))
     with pytest.raises(ValueError, match="Unable to avoid creating a copy"):
         np.reshape(v, (12,), copy=False)
-    r = np.reshape(viproc.asarray(n.copy()), (12,), copy=True)
+    r = np.reshape(numpy2x.asarray(n.copy()), (12,), copy=True)
     same(r, np.reshape(n.copy(), (12,), copy=True))
 
 
@@ -125,7 +125,7 @@ def test_ravel_copies_like_numpy():
     """ravel views only contiguous data (PyArray_Ravel), unlike reshape: a
     strided 1-d array is copied, which decides the strides of later calls."""
     base = np.arange(24.0).reshape(4, 6)
-    vbase = viproc.asarray(base)
+    vbase = numpy2x.asarray(base)
     for key in [(slice(None, None, -3),), (slice(None), slice(None, None, 2)), (slice(None),),
                 (slice(None, None, -1), slice(None))]:
         for t in (False, True):
@@ -141,7 +141,7 @@ def test_ravel_copies_like_numpy():
 
 
 def test_views_share_storage_and_readonly():
-    v = viproc.asarray(np.arange(12.0).reshape(3, 4))
+    v = numpy2x.asarray(np.arange(12.0).reshape(3, 4))
     t = v.T
     t[0, 1] = 100.0
     assert float(v[1, 0]) == 100.0
@@ -155,14 +155,14 @@ def test_views_share_storage_and_readonly():
 
 def test_complex_parts_and_dtype_views():
     n = (np.arange(6.0) + 1j * np.arange(6.0)[::-1]).reshape(2, 3)
-    v = viproc.asarray(n)
+    v = numpy2x.asarray(n)
     same(v.real, n.real)
     same(v.imag, n.imag)
     same(v.T.imag, n.T.imag)
     same(v.view(np.float64), n.view(np.float64))
     i = np.arange(6, dtype=np.int64)
-    same(viproc.asarray(i).view(np.float64), i.view(np.float64))
-    same(viproc.asarray(i).view(np.int32), i.view(np.int32))
+    same(numpy2x.asarray(i).view(np.float64), i.view(np.float64))
+    same(numpy2x.asarray(i).view(np.int32), i.view(np.int32))
 
 
 def test_reshape_fuzz():
@@ -193,14 +193,14 @@ def test_reshape_fuzz():
 
 def test_getitem_slot_paths():
     n = np.arange(12.0).reshape(3, 4)
-    v = viproc.asarray(n)
+    v = numpy2x.asarray(n)
     assert type(v[1, 2]) is np.float64 and v[1, 2] == n[1, 2]  # ready: NumPy's scalar
     big = np.arange(1e5).reshape(100, 1000)
-    p = np.sin(viproc.asarray(big))  # above sync_below: pending (async)
+    p = np.sin(numpy2x.asarray(big))  # above sync_below: pending (async)
     s = p[1, 2]  # pending: a 0-d snapshot instead of a sync
     assert not isinstance(s, np.ndarray) and float(s) == np.sin(big)[1, 2]
     e = v[1, ...][2:3][..., 0]  # Ellipsis: a 0-d array, as NumPy
-    assert isinstance(e, viproc.ndarray) and e.shape == () and float(e) == n[1, 2]
+    assert isinstance(e, numpy2x.ndarray) and e.shape == () and float(e) == n[1, 2]
     same(v[np.array([2, 0])], n[np.array([2, 0])])  # advanced: the Python hook
     same(v[[True, False, True]], n[[True, False, True]])
     for key in [(3, 0), (0, 0, 0), 1.5, "x"]:

@@ -1,5 +1,5 @@
 """where= on ufunc calls, ufunc.at, ufunc.reduceat and reductions into out=
-(hokb/viproc#25 step 5c): bit-identical to NumPy (values, dtypes, layouts,
+(hokb/numpy2x#25 step 5c): bit-identical to NumPy (values, dtypes, layouts,
 errors) and on the asynchronous path."""
 
 import warnings
@@ -7,7 +7,7 @@ import warnings
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 from async_path import SIZE, assert_async
 from test_compositions import DTYPES, big, check, det, same, sample  # noqa: F401 (det: fixture)
 from test_joining import path  # noqa: F401 (fixture)
@@ -17,7 +17,7 @@ SHAPES = [(7,), (4, 5), (3, 4, 2), (3000,)]
 
 
 def both(fn, *arrays):
-    """fn(*arrays) mutates its first argument: on NumPy copies and on viproc
+    """fn(*arrays) mutates its first argument: on NumPy copies and on numpy2x
     arrays, the first one in each layout; same results or the same error
     type (AsyncError subclasses NumPy's)."""
     base = arrays[0]
@@ -26,9 +26,9 @@ def both(fn, *arrays):
         if key == "t" and base.ndim < 2:
             continue
         x = np.array(base)
-        v = viproc.asarray(np.array(base))
+        v = numpy2x.asarray(np.array(base))
         x, v = (x.T, v.T) if key == "t" else (x[key], v[key])
-        vr = [viproc.asarray(a) if isinstance(a, np.ndarray) else a for a in rest]
+        vr = [numpy2x.asarray(a) if isinstance(a, np.ndarray) else a for a in rest]
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
@@ -36,7 +36,7 @@ def both(fn, *arrays):
             except Exception as e:  # noqa: BLE001
                 with pytest.raises(type(e)):
                     fn(v, *vr)
-                    viproc.wait_all()
+                    numpy2x.wait_all()
                 continue
             fn(v, *vr)
         same(v, x)
@@ -76,8 +76,8 @@ def test_where_without_out(path):
             want = np.sin(layout(x), where=layout(m))
         with warnings.catch_warnings(record=True) as got_w:
             warnings.simplefilter("always")
-            got = np.sin(layout(viproc.asarray(x)), where=layout(viproc.asarray(m)))
-            viproc.wait_all()  # FP warnings of the task (error-handling.md, E8)
+            got = np.sin(layout(numpy2x.asarray(x)), where=layout(numpy2x.asarray(m)))
+            numpy2x.wait_all()  # FP warnings of the task (error-handling.md, E8)
         assert [str(w.message) for w in got_w] == [str(w.message) for w in want_w]
         assert got_w[0].filename == __file__
         g = np.asarray(got)
@@ -107,11 +107,11 @@ def test_at(shape, dtype, path):
 
 
 def test_at_out_of_bounds_changes_nothing():
-    a = viproc.asarray(np.zeros((5, 2)))  # 2-d: not NumPy's indexed loop
-    idx = viproc.asarray(np.array([1, 2, 9]))
+    a = numpy2x.asarray(np.zeros((5, 2)))  # 2-d: not NumPy's indexed loop
+    idx = numpy2x.asarray(np.array([1, 2, 9]))
     with pytest.raises(IndexError):
         np.add.at(a, idx, 1.0)
-        viproc.wait_all()
+        numpy2x.wait_all()
     with pytest.raises(IndexError):  # a failed array stays failed (error-handling.md)
         a.numpy()
 
@@ -142,36 +142,36 @@ def test_reduce_into_out(dtype, path):
                      (np.min, np.dtype(dtype))]:
             for order in ("C", "F"):
                 out = np.zeros(shape, d, order=order)
-                vout = viproc.asarray(out)
+                vout = numpy2x.asarray(out)
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     r = f(x, axis=axis, out=out)
-                    vr = f(viproc.asarray(x), axis=axis, out=vout)
+                    vr = f(numpy2x.asarray(x), axis=axis, out=vout)
                 assert vr is vout and r is out
                 same(vout, out)
         out = np.zeros((40, 1), acc)
-        vout = viproc.asarray(out)
+        vout = numpy2x.asarray(out)
         np.add.reduce(x, axis=1, keepdims=True, out=out)
-        assert np.add.reduce(viproc.asarray(x), axis=1, keepdims=True, out=vout) is vout
+        assert np.add.reduce(numpy2x.asarray(x), axis=1, keepdims=True, out=vout) is vout
         same(vout, out)
     # out= of another dtype or layout: NumPy runs it
     out = np.zeros(30, np.float32)
-    vout = viproc.asarray(out)
+    vout = numpy2x.asarray(out)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
             np.sum(x, axis=0, out=out)
         except TypeError:
             with pytest.raises(TypeError):
-                np.sum(viproc.asarray(x), axis=0, out=vout)
+                np.sum(numpy2x.asarray(x), axis=0, out=vout)
         else:
-            np.sum(viproc.asarray(x), axis=0, out=vout)
+            np.sum(numpy2x.asarray(x), axis=0, out=vout)
             same(vout, out)
 
 
 def test_reduce_into_view_of_input():
     x = sample((40, 30), np.float64)
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     np.add.reduce(x, axis=0, out=x[0])
     np.add.reduce(v, axis=0, out=v[0])
     same(v, x)
@@ -190,8 +190,8 @@ def test_where_async_path(det, call, inp, tasks):
     x, v = big(*inp)
     m = rng.random(inp[0]) > 0.5
     o = np.zeros(inp[0], np.float64)
-    vo, vm = viproc.asarray(o), viproc.asarray(m)
-    viproc.wait_all()
+    vo, vm = numpy2x.asarray(o), numpy2x.asarray(m)
+    numpy2x.wait_all()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         want = call(x, o, m)
@@ -205,11 +205,11 @@ def test_where_async_path(det, call, inp, tasks):
 
 def test_at_async_path(det):
     a = np.zeros((1000, 8))
-    va = viproc.asarray(a)
+    va = numpy2x.asarray(a)
     idx = rng.integers(0, 1000, SIZE)
     x, v = big((SIZE, 8), np.float64)
-    vidx = viproc.asarray(idx)
-    viproc.wait_all()
+    vidx = numpy2x.asarray(idx)
+    numpy2x.wait_all()
     np.add.at(a, idx, x)
     assert assert_async(lambda: np.add.at(va, vidx, v), ops=1) is None
     same(va, a)
@@ -226,8 +226,8 @@ def test_reduceat_async_path(det):
 def test_reduce_out_async_path(det):
     x, v = big((100, 60), np.float64)
     out = np.zeros(60)
-    vout = viproc.asarray(out)
-    viproc.wait_all()
+    vout = numpy2x.asarray(out)
+    numpy2x.wait_all()
     np.sum(x, axis=0, out=out)
     assert assert_async(lambda a: np.sum(a, axis=0, out=vout), v) is vout
     same(vout, out)

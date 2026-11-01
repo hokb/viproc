@@ -1,21 +1,21 @@
-# viproc optimizations
+# numpy2x optimizations
 
-Every optimization of viproc with the case it covers, how it is
+Every optimization of numpy2x with the case it covers, how it is
 implemented, its state and its measured effect. All implemented
 optimizations keep results bit-identical to NumPy (G2,
 `docs/design/goals.md`). Keep this list up to date with every change that
 affects performance; the measurements behind it live in
 `docs/benchmarks.md`.
 
-**Target mode:** Python starts with `python -m viproc` or `VIPROC=1`. In
-user code `np` is then the viproc module; every function creates and
-returns viproc arrays. There is no switch to ndarrays and no ndarray hook.
+**Target mode:** Python starts with `python -m numpy2x` or `NUMPY2X=1`. In
+user code `np` is then the numpy2x module; every function creates and
+returns numpy2x arrays. There is no switch to ndarrays and no ndarray hook.
 The hook stays shelved until it is investigated for Python paths
 specifically. `shape_map.py --module` measures this mode.
 
 **Measurements:** Linux VM, 4 cores, 4 workers, Release build, NumPy
 2.5.3. Numbers from `docs/benchmarks.md`, `shape_map.py`, `break_even.py`
-and callgrind. Speedup = NumPy time / viproc time. Runs on different VMs
+and callgrind. Speedup = NumPy time / numpy2x time. Runs on different VMs
 (2.1 and 2.8 GHz) do not compare directly.
 
 **State:** Done = in `main`. Prototype = built, not the
@@ -24,7 +24,7 @@ against.
 
 ## Current state (2026-10-28)
 
-In the target mode viproc reaches parity at ~1,000 elements and 1.6x at
+In the target mode numpy2x reaches parity at ~1,000 elements and 1.6x at
 1 million elements; below that the median is 0.80-0.90x. Quick shape map
 `--module`, 34 cases, 566 measurements, all bit-identical, build
 `#aec431ca` (code of `d4dc513`).
@@ -92,7 +92,7 @@ mode a small ufunc call costs ~10% more instructions than NumPy's
 
 | optimization | case | implementation | state | effect |
 | --- | --- | --- | --- | --- |
-| Hot path in C | Every op | `_viproc._Array`: operators, `__array_ufunc__`, dtype resolution, broadcasting in C instead of Python | Done (`f443b29`) | ~35 µs → ~3-7 µs per op |
+| Hot path in C | Every op | `_numpy2x._Array`: operators, `__array_ufunc__`, dtype resolution, broadcasting in C instead of Python | Done (`f443b29`) | ~35 µs → ~3-7 µs per op |
 | Issue site keyed by code address | Every op | Cache per (code address, bytecode offset), never a dict keyed by code objects | Done (`ad55be7`) | Hashing was ~20% of the per-op cost |
 | C lookup tables | Every op | Open-addressing tables keyed by (pointer, int) instead of dicts with tuple keys | Done (`e2f5eb2`) | ~10,500 → ~7,100 instructions; ~1.1 → ~0.8 µs |
 | Direct path | Small ready ops (< `sync_below` = 2048) | The kernel runs in the issue, the result is ready, no task | Done (`bc07d90`) | `x * y` (8 elements) 0.63 µs (NumPy 0.35); before ~1 µs of task protocol per op |
@@ -102,10 +102,10 @@ mode a small ufunc call costs ~10% more instructions than NumPy's
 | Views without ndarrays, `a[key]` in the C slot | Slicing, `.T`, `reshape` | Layout computed after NumPy's rules, basic keys in C | Done (`5db8972`) | `a[1:3]` 1.45 → 0.12 µs (NumPy 0.10) |
 | Index assignment in C | `out[i] = s` in loops | `mp_ass_subscript`: small and ready in NumPy's slot, else an assign task | Done | `out[3] = s` 3.1 → 0.22 µs (NumPy 0.16) |
 | `np.where` in C | `where` on small data | Select task, or NumPy on borrowed views | Done | 30,300 → 12,000 instructions (NumPy 10,100) |
-| Ufunc proxies in the viproc module | `np.abs(x)` with `np` = viproc | The call goes straight to `fast_ufunc`, without NumPy's override dispatch | Done | `abs` 7,900 → 5,400 instructions (NumPy 4,500) |
-| Reduction proxies in the viproc module | `np.sum(x, axis=0)` with `np` = viproc, Python loops over rows/columns | `viproc.sum`, `prod`, `max`, `min`, `amax`, `amin`, `any`, `all`, `mean`, `var`, `std`, `argmax`, `argmin` take `Array_array_function`'s steps without NumPy's `__array_function__` dispatch | Done | `np.sum(x, axis=0)` 15,100 → 8,800 instructions, `np.sum(x)` 22,800 → 16,600 |
+| Ufunc proxies in the numpy2x module | `np.abs(x)` with `np` = numpy2x | The call goes straight to `fast_ufunc`, without NumPy's override dispatch | Done | `abs` 7,900 → 5,400 instructions (NumPy 4,500) |
+| Reduction proxies in the numpy2x module | `np.sum(x, axis=0)` with `np` = numpy2x, Python loops over rows/columns | `numpy2x.sum`, `prod`, `max`, `min`, `amax`, `amin`, `any`, `all`, `mean`, `var`, `std`, `argmax`, `argmin` take `Array_array_function`'s steps without NumPy's `__array_function__` dispatch | Done | `np.sum(x, axis=0)` 15,100 → 8,800 instructions, `np.sum(x)` 22,800 → 16,600 |
 | Expensive loops below `sync_below` as tasks | Ready ops of a few hundred to 2,048 elements with costly loops (`sin`, `power`, ...), loops over columns | The direct path times the shared kernel of each loop (`DirectCost`, ns per element); an op estimated above 10 µs of NumPy time takes the task path and the adaptive policy (adaptive mode only; every 32nd re-timed by its task on the worker, not on the main thread). Lower budgets lost where cheap consumers follow: 2 µs `ind_cores_f32` at 1,000 elements 0.6x → 0.15x, 5 µs `expr8` at 1,000 elements 1.0x → 0.6x | Done | `array_pipelining.py` loop over 1,500 columns 0.88x → 1.7-2.0x on 4 cores; `break_even.py` `chains_sin` at 2,000 elements 1.48 → 1.79; quick shape map `--module` (with the reduction proxies) 0.943 → 0.984, loops 0.76 → 0.85 |
-| Direct-path budget per machine | The same on faster cores: a 12700K runs a column's `sin` (1,500 doubles) in 6.1 µs, below the fixed 10 µs | The bridge sets `direct_budget_ns` to 9 times a direct `a * b` of 8 doubles, timed once per process (`_scale_budget`, ~0.5 ms; VM 4.7 µs, 12700K 3.0 µs; `VIPROC_DIRECT_BUDGET_NS` overrides). Rejected: a C probe (pointer walks) rated the 12700K as fast as the VM; the VM's 10 µs scaled by the `a * b` ratio (6.2 µs there) left `sin` at the edge | Done | 12700K, 4 workers: `array_pipelining.py` `loop` 1,000² 1.13x → 2.9x, 1,500² 1.10x → 4.2x; quick module shape map 1.08 → 1.10, `expr8` at 1,000 elements 1.0x → 1.6x; VM unchanged within noise |
+| Direct-path budget per machine | The same on faster cores: a 12700K runs a column's `sin` (1,500 doubles) in 6.1 µs, below the fixed 10 µs | The bridge sets `direct_budget_ns` to 9 times a direct `a * b` of 8 doubles, timed once per process (`_scale_budget`, ~0.5 ms; VM 4.7 µs, 12700K 3.0 µs; `NUMPY2X_DIRECT_BUDGET_NS` overrides). Rejected: a C probe (pointer walks) rated the 12700K as fast as the VM; the VM's 10 µs scaled by the `a * b` ratio (6.2 µs there) left `sin` at the edge | Done | 12700K, 4 workers: `array_pipelining.py` `loop` 1,000² 1.13x → 2.9x, 1,500² 1.10x → 4.2x; quick module shape map 1.08 → 1.10, `expr8` at 1,000 elements 1.0x → 1.6x; VM unchanged within noise |
 | Small-op promotion by measured costs and chains | Ops below `sync_below` with cheap kernels whose followers make the work (a loop over 200 x 200 columns: `sin` ~0.8 µs alone, with `abs` and `sum` ~1.8 µs, on a 12700K); ops below 256 elements were never timed | Kernel costs per log2 size class from 64 elements (`DirectCost`, inter-/extrapolated; reduce kernels too); task costs measured at start (`_calibrate`: task surcharge t - d, follower surcharge c - d); chain credit (`AliasGroup::chain_`, `ChainScore`): followers' NumPy time counts for the op they follow; close promotions confirmed by an A/B measurement of the site's issue period (warm-up 16 for tasks); blame of a chain from its last op; promoted ops of inline sites run directly. The Accelerator (ILNumerics.Core v6) has no kernel costs for this: it always forks and suppresses per call site after blocked syncs (+2/-1, threshold 20, final) | Done | 12700K, quick module shape map 1.096 -> 1.093/1.097 (all 715 points 1.173 -> 1.179/1.192; 42 cases better, 17 worse by > 25%, stable losses `ind_cores_f32` 100x10 0.86 -> 0.63, `loop_accum` 100x1000 1.38 -> 0.93); `array_pipelining.py` as main (1,000² 2.89x, 1,500² 4.21x at 4 workers); 200² stays direct (all ops as tasks: 502 vs. 480 µs with random data). Rejected on the way: the budget of the model alone (1 µs: 11 workers 2.1x instead of 2.5x at 1,000²), the A/B probe alone |
 | FFT plans | Repeated `fft` of one shape | Plan once per (dtype, shape, strides, n, axis, norm) | Done (`75715d2`) | Issue ~70-100 → ~30 µs; ILNumerics FFFT n = 100: 0.65x → 2.7x |
 | Reduction and gufunc plans | Repeated calls of one signature | `_reduce_plans`, `_gufunc_plans`: one dict lookup per call | Done | No measurement of its own |
@@ -124,19 +124,19 @@ NumPy's own loops the way NumPy calls them.
 | Reduction templates once per signature | Reductions with casts or strides | Template over a dummy address, `NpyIter_ResetBasePointers` on the worker | Done | Side 100: 39-59 → 20-39 µs per step; 8 x 8: 7.7 → 4.3 µs per op |
 | Branch-free `np.where` | Random condition | Masked blend per word instead of a branch per element | Done (`0c99e19`) | 1e4 elements: 5 µs (NumPy 40 µs) |
 | `matmul`, `@`, `np.dot` | Matrix products | NumPy's matmul gufunc loop per batch row | Done (`233fe84`) | `matmul_batch`: 11,540 fallbacks → 0; small 0.48 → 1.04x |
-| Linalg serialized from 64 x 64 | Many concurrent LAPACK calls | Process-wide mutex (`VP_GUFUNC_SERIAL`) | Done | 8 concurrent `inv` of 300 x 300: 20 ms-1.1 s → 17-47 ms |
-| Linalg, FFT, sort asynchronously | `numpy.linalg`, `numpy.fft`, `np.sort` | NumPy's wrappers ported onto `vp_gufunc` and `vp_sort` | Done (#34-#37) | `np.sort` of 10 elements 0.76 µs (NumPy 0.79); FFT see plans |
+| Linalg serialized from 64 x 64 | Many concurrent LAPACK calls | Process-wide mutex (`NX_GUFUNC_SERIAL`) | Done | 8 concurrent `inv` of 300 x 300: 20 ms-1.1 s → 17-47 ms |
+| Linalg, FFT, sort asynchronously | `numpy.linalg`, `numpy.fft`, `np.sort` | NumPy's wrappers ported onto `nx_gufunc` and `nx_sort` | Done (#34-#37) | `np.sort` of 10 elements 0.76 µs (NumPy 0.79); FFT see plans |
 | Joining, compositions, indexing functions, accumulation, ufunc methods | `concatenate`, `clip`, `take`, `cumsum`, `where=`, ... | One placement task per join; NumPy's code ported without the syncing `asanyarray` | Done (#27-#33) | Fewer fallbacks; no overall measurement |
 
 ## Shelved or rejected
 
-The ndarray hook and the ndarray/viproc switch are shelved; the other
+The ndarray hook and the ndarray/numpy2x switch are shelved; the other
 ideas were measured and rejected.
 
 | optimization | case | implementation | state | effect / reason |
 | --- | --- | --- | --- | --- |
-| ndarray operator hook | ndarray inputs, programs that do not create viproc arrays | `numpy.ndarray` operators routed to viproc (`enable_hook()`) | Prototype, shelved (branch `claude/project-thread-vf3lz1`) | Suite: arrays 85, module + hook 62, hook 57; small data better, medium and large worse (`stencil_1d` medium 6.62 → 0.56x, `kmeans_points` large 6.56 → 0.60x) |
-| Small results as ndarrays (switch) | Small data | `VIPROC_HOST_SMALL=1`: small results stay NumPy's | Prototype, shelved (branch `claude/project-thread-vf3lz1`) | A single op does not know how its result is used later (k-means trace); copies and syncs at the boundary |
+| ndarray operator hook | ndarray inputs, programs that do not create numpy2x arrays | `numpy.ndarray` operators routed to numpy2x (`enable_hook()`) | Prototype, shelved (branch `claude/project-thread-vf3lz1`) | Suite: arrays 85, module + hook 62, hook 57; small data better, medium and large worse (`stencil_1d` medium 6.62 → 0.56x, `kmeans_points` large 6.56 → 0.60x) |
+| Small results as ndarrays (switch) | Small data | `NUMPY2X_HOST_SMALL=1`: small results stay NumPy's | Prototype, shelved (branch `claude/project-thread-vf3lz1`) | A single op does not know how its result is used later (k-means trace); copies and syncs at the boundary |
 | `sync_below` at 200 or 500 | Chains on small data | Lower the threshold in elements | Measured, not adopted (`942b5a1`) | Expensive ops up to 2x faster, cheap ones 3x and results read right away up to 6x slower |
 | Spinner hand-off on every pickup | Task stream | Hand off unconditionally | Rejected | Sync-heavy loops -12% (`converge`, `cond_newton`) |
 | Wake sleepers for local tasks | Local queue | Wake-up on every local push | Rejected | Undid the `expr_where` gain, `sum_cores` stayed |

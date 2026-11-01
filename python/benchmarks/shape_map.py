@@ -1,9 +1,9 @@
-"""viproc shape map: speedup vs. NumPy over the 2-d problem size (rows x cols).
+"""numpy2x shape map: speedup vs. NumPy over the 2-d problem size (rows x cols).
 
 Runs every case of shape_map_cases.py at every point of a log-spaced grid
-of shapes (rows, cols), as plain NumPy and on viproc (one worker per core),
+of shapes (rows, cols), as plain NumPy and on numpy2x (one worker per core),
 checks that the results are identical and condenses the per-case speedups
-(NumPy time / viproc time) of each grid point into
+(NumPy time / numpy2x time) of each grid point into
 
 - the **median** over the cases (the representative value of the point:
   robust against single outliers; on ratios, the median of the logs is
@@ -69,10 +69,10 @@ def fits(case, elements, ram, itemsize=8):
 
 
 def measure(case, shape, cores, workers, target, repeat, seed, module=False):
-    """NumPy and viproc time of one case at one shape (best of `repeat`).
-    module: the viproc run calls the cases' `np.*` through the viproc module,
-    as `python -m viproc` / `import viproc as np` do (ufunc proxies, where)."""
-    import viproc
+    """NumPy and numpy2x time of one case at one shape (best of `repeat`).
+    module: the numpy2x run calls the cases' `np.*` through the numpy2x module,
+    as `python -m numpy2x` / `import numpy2x as np` do (ufunc proxies, where)."""
+    import numpy2x
 
     width = cores if case.width == "cores" else case.width
     rng = np.random.default_rng(seed)
@@ -83,31 +83,31 @@ def measure(case, shape, cores, workers, target, repeat, seed, module=False):
     warm = time.perf_counter() - t0
     t_np, _ = best_of(lambda: case.run(data, reps), repeats_for(warm, repeat))
 
-    viproc.init()  # its fixed 2 workers
-    vdata = [viproc.asarray(a) for a in data]
-    viproc.wait_all()
+    numpy2x.init()  # its fixed 2 workers
+    vdata = [numpy2x.asarray(a) for a in data]
+    numpy2x.wait_all()
 
     def run():
         if module:
-            shape_map_cases.np = viproc
+            shape_map_cases.np = numpy2x
         try:
             out = case.run(vdata, reps)
         finally:
             shape_map_cases.np = np
-        viproc.wait_all()
+        numpy2x.wait_all()
         return out
 
-    f0 = viproc._ndarray.fallback_calls
+    f0 = numpy2x._ndarray.fallback_calls
     t0 = time.perf_counter()
     same = identical(materialize(run()), expected)  # also the warm-up
     warm = time.perf_counter() - t0
-    fallbacks = viproc._ndarray.fallback_calls - f0
+    fallbacks = numpy2x._ndarray.fallback_calls - f0
     t_vp, _ = best_of(run, repeats_for(warm, repeat))
     del vdata, expected
-    viproc.shutdown()
+    numpy2x.shutdown()
     return {"case": case.name, "group": case.group, "complexity": case.complexity,
             "width": width, "reps": reps,
-            "numpy_s": t_np, "viproc_s": t_vp, "speedup": t_np / t_vp,
+            "numpy_s": t_np, "numpy2x_s": t_vp, "speedup": t_np / t_vp,
             "identical": bool(same), "fallbacks": fallbacks}
 
 
@@ -178,7 +178,7 @@ def summarize(results):
 def run_map(args):
     cores = args.cores or usable_cores()
     ram = physical_memory()
-    workers = 2  # viproc's fixed worker count
+    workers = 2  # numpy2x's fixed worker count
     target = 0.02 if args.quick else 0.04
     repeat = args.repeat or 3
     cols = grid_axis(args.max_cols, args.quick)
@@ -190,7 +190,7 @@ def run_map(args):
     info = machine_info(cores, ram)
     info.update({"workers": workers, "repeat": repeat, "target_s": target,
                  "rows": rows, "cols": cols, "cases": len(cases), "module": args.module})
-    print(f"viproc shape map: {len(rows)} x {len(cols)} shapes + 0-d, {len(cases)} cases, "
+    print(f"numpy2x shape map: {len(rows)} x {len(cols)} shapes + 0-d, {len(cases)} cases, "
           f"{cores} cores, {workers} workers, build {info['build']}", flush=True)
 
     results, skipped = [], []
@@ -226,16 +226,16 @@ def run_map(args):
 
 def labels(run):
     """What a run compares: `subject` vs. `baseline`, speedup = baseline time /
-    subject time. Runs of this script compare viproc with NumPy; other
+    subject time. Runs of this script compare numpy2x with NumPy; other
     comparisons store their own labels in the run."""
-    out = {"subject": "viproc", "baseline": "NumPy", "title": "viproc shape map",
+    out = {"subject": "numpy2x", "baseline": "NumPy", "title": "numpy2x shape map",
            "prefix": "shape_map", "check": "Bit-identical to NumPy", "header": None,
            "note": None}
     out.update(run.get("labels") or {})
     if out["header"] is None:
         m = run["machine"]
         if m.get("module"):
-            out["title"] += " (viproc arrays, viproc module)"
+            out["title"] += " (numpy2x arrays, numpy2x module)"
         out["header"] = (f"{m['cpu']}, {m['cores']} cores, {m['workers']} workers, "
                          f"NumPy {m['numpy']}, build {m['build']}")
     return out
@@ -570,7 +570,7 @@ def write_outliers(run, path, below=0.95, top=40):
         shape = "x".join(map(str, r["shape"])) or "0-d"
         lines.append(f"| {k} | {r['case']} | {r['group']} | {shape} | {r['elements']:,} | "
                      f"**{r['speedup']:.2f}** | {r['numpy_s'] / r['reps'] * 1e6:.1f} | "
-                     f"{r['viproc_s'] / r['reps'] * 1e6:.1f} | {r['fallbacks']} |")
+                     f"{r['numpy2x_s'] / r['reps'] * 1e6:.1f} | {r['fallbacks']} |")
     cases = {}
     for r in res:
         cases.setdefault(r["case"], []).append(r)
@@ -678,8 +678,8 @@ def main():
                    help="comma-separated case groups (default: all); with --plot: report "
                         "only these groups of the run")
     p.add_argument("--module", action="store_true",
-                   help="viproc runs call np.* through the viproc module on viproc arrays "
-                        "(python -m viproc)")
+                   help="numpy2x runs call np.* through the numpy2x module on numpy2x arrays "
+                        "(python -m numpy2x)")
     p.add_argument("--plot", metavar="SHAPE_MAP_JSON", help="only redraw the reports of a run")
     p.add_argument("--reference", action="store_true",
                    help="allow --out to replace results committed to git (reference runs)")

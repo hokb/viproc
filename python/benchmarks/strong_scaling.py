@@ -1,4 +1,4 @@
-"""Strong-scaling benchmark: one fixed array program, NumPy vs. viproc at
+"""Strong-scaling benchmark: one fixed array program, NumPy vs. numpy2x at
 1, 2, 4, ... worker threads.
 
 The program has `chains` independent dependency chains of `length` ops each,
@@ -15,11 +15,11 @@ import time
 
 import numpy as np
 
-import viproc
+import numpy2x
 
 
 def program(xs, length):
-    """Sequential NumPy code; runs unchanged on NumPy or viproc arrays."""
+    """Sequential NumPy code; runs unchanged on NumPy or numpy2x arrays."""
     xs = list(xs)
     for _ in range(length):
         for i, x in enumerate(xs):
@@ -46,7 +46,7 @@ def main():
     p.add_argument("--length", type=int, default=10)
     p.add_argument("--repeat", type=int, default=3)
     p.add_argument("--sync-below", type=int, default=None,
-                   help="ops with ready inputs and fewer elements run inline (default: viproc's)")
+                   help="ops with ready inputs and fewer elements run inline (default: numpy2x's)")
     p.add_argument("--deterministic", action="store_true", help="disable the adaptive policy")
     args = p.parse_args()
 
@@ -60,11 +60,11 @@ def main():
           f"{os.cpu_count()} CPUs")
     print(f"{'numpy':>12}: {t_np * 1e3:8.1f} ms")
 
-    for w in (2,):  # viproc's fixed worker count
-        viproc.init(sync_below=args.sync_below,
+    for w in (2,):  # numpy2x's fixed worker count
+        numpy2x.init(sync_below=args.sync_below,
                     adaptive=False if args.deterministic else None)
-        vdata = [viproc.asarray(d) for d in data]
-        viproc.wait_all()
+        vdata = [numpy2x.asarray(d) for d in data]
+        numpy2x.wait_all()
 
         def run():
             program(vdata, args.length).wait()
@@ -72,8 +72,8 @@ def main():
         result = program(vdata, args.length)
         assert np.array_equal(np.asarray(result), expected), "result differs from NumPy"
         t = best_of(run, args.repeat)
-        print(f"{'viproc w=' + str(w):>12}: {t * 1e3:8.1f} ms   speedup vs numpy {t_np / t:5.2f}x")
-    viproc.shutdown()
+        print(f"{'numpy2x w=' + str(w):>12}: {t * 1e3:8.1f} ms   speedup vs numpy {t_np / t:5.2f}x")
+    numpy2x.shutdown()
 
 
 if __name__ == "__main__":

@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1
-# viproc on Linux: builds the runtime and the Python bridge, runs the test
+# numpy2x on Linux: builds the runtime and the Python bridge, runs the test
 # suites by default and doubles as a command line (docker/README.md).
 #
-#   docker build -f docker/linux/Dockerfile -t viproc:linux .
-#   docker run --rm viproc:linux                 # all test suites (ctest)
-#   docker run --rm -it viproc:linux python      # Python with viproc
+#   docker build -f docker/linux/Dockerfile -t numpy2x:linux .
+#   docker run --rm numpy2x:linux                 # all test suites (ctest)
+#   docker run --rm -it numpy2x:linux python      # Python with numpy2x
 ARG PYTHON_VERSION=3.13
 FROM python:${PYTHON_VERSION}-bookworm
 
@@ -20,17 +20,17 @@ RUN --mount=type=secret,id=ca,required=false \
 COPY . /src
 # The command line, with LF line endings even from a Windows checkout made
 # before .gitattributes (CRLF breaks the "#!/bin/bash" line).
-RUN sed 's/\r$//' /src/docker/entrypoint.sh > /usr/local/bin/viproc \
-    && chmod 755 /usr/local/bin/viproc
+RUN sed 's/\r$//' /src/docker/entrypoint.sh > /usr/local/bin/numpy2x \
+    && chmod 755 /usr/local/bin/numpy2x
 RUN cmake -S /src -B /build -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
     && cmake --build /build
 
-ENV VIPROC_PLATFORM=linux \
-    VIPROC_SRC=/src \
-    VIPROC_BUILD=/build \
+ENV NUMPY2X_PLATFORM=linux \
+    NUMPY2X_SRC=/src \
+    NUMPY2X_BUILD=/build \
     PYTHONPATH=/build/python \
     PYTHONPYCACHEPREFIX=/tmp/pycache \
     OPENBLAS_NUM_THREADS=1
 WORKDIR /work
-ENTRYPOINT ["/usr/local/bin/viproc"]
+ENTRYPOINT ["/usr/local/bin/numpy2x"]
 CMD ["test"]

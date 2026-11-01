@@ -4,11 +4,11 @@ boolean masks, scalar indexing. Results, layouts and errors follow NumPy."""
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 
 
 def fallbacks():
-    return viproc._ndarray.fallback_calls
+    return numpy2x._ndarray.fallback_calls
 
 
 def strides_of_real_axes(a):
@@ -54,7 +54,7 @@ def test_advanced_indexing_matches_numpy(seed):
         def layout(b):
             return [b, b.T, b[..., ::-1]][k]
 
-        a, v = layout(x), layout(viproc.asarray(x))
+        a, v = layout(x), layout(numpy2x.asarray(x))
         key = random_key(rng, a.shape)
         try:
             expected = a[key]
@@ -74,7 +74,7 @@ def test_advanced_indexing_matches_numpy(seed):
         eshape = expected.shape
         values = (rng.standard_normal(eshape[int(rng.integers(0, len(eshape) + 1)):])
                   * 10).astype(dtype)
-        y, w = x.copy(), viproc.asarray(x.copy())
+        y, w = x.copy(), numpy2x.asarray(x.copy())
         layout(y)[key] = values
         layout(w)[key] = values
         assert np.array_equal(np.asarray(w), y), key
@@ -85,16 +85,16 @@ def test_advanced_indexing_matches_numpy(seed):
 def test_integer_array_indexing_runs_asynchronously():
     rng = np.random.default_rng(5)
     x = rng.standard_normal((300, 200))
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     rows, cols = rng.integers(0, 300, 50), rng.integers(0, 200, 50)
-    vr = viproc.asarray(rows)  # index arrays may be viproc arrays (pending)
+    vr = numpy2x.asarray(rows)  # index arrays may be numpy2x arrays (pending)
     f0 = fallbacks()
     y = np.sin(v)  # pending
     r1 = y[vr]
     r2 = y[:, cols]
-    r3 = y[vr, viproc.asarray(cols)]
+    r3 = y[vr, numpy2x.asarray(cols)]
     r4 = y[rows[:, None], cols]
-    z = viproc.asarray(np.zeros((300, 200)))
+    z = numpy2x.asarray(np.zeros((300, 200)))
     z[vr] = y[vr] * 2.0
     z[rows, cols] += 1.0
     assert fallbacks() == f0
@@ -109,14 +109,14 @@ def test_integer_array_indexing_runs_asynchronously():
 
 
 def test_out_of_bounds_indices_raise_index_error():
-    v = viproc.asarray(np.arange(10000.0))  # large: a gather task
-    idx = viproc.asarray(np.array([1, 12000]))
+    v = numpy2x.asarray(np.arange(10000.0))  # large: a gather task
+    idx = numpy2x.asarray(np.array([1, 12000]))
     with pytest.raises(IndexError, match="index 12000 is out of bounds"):
         r = v[idx]  # raised as soon as the task failed, at the latest here:
         np.asarray(r)
     with pytest.raises(IndexError):
         np.asarray(v[[3, -10001]])
-    small = viproc.asarray(np.arange(10.0))  # small and ready: NumPy, right away
+    small = numpy2x.asarray(np.arange(10.0))  # small and ready: NumPy, right away
     with pytest.raises(IndexError):
         small[[1, 12]]
     with pytest.raises(IndexError, match="out of bounds for axis 0 with size 10"):
@@ -125,7 +125,7 @@ def test_out_of_bounds_indices_raise_index_error():
 
 def test_repeated_indices_last_write_wins_as_in_numpy():
     x = np.zeros(5)
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     idx = np.array([1, 3, 1, 1])
     vals = np.array([1.0, 2.0, 3.0, 4.0])
     x[idx] = vals
@@ -139,12 +139,12 @@ def test_repeated_indices_last_write_wins_as_in_numpy():
 def test_mask_assignment_of_a_scalar_needs_no_sync():
     rng = np.random.default_rng(6)
     x = rng.standard_normal((40, 30))
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     f0 = fallbacks()
     y = np.cos(v)
     mask = y > 0.5  # pending
     y[mask] = 0.0
-    row_mask = viproc.asarray(rng.random(40) < 0.5)
+    row_mask = numpy2x.asarray(rng.random(40) < 0.5)
     y[row_mask] = -1.0  # rows: the mask covers the leading axis
     assert fallbacks() == f0
     e = np.cos(x)
@@ -167,12 +167,12 @@ def test_partial_writes_after_copy_on_write_keep_the_other_elements():
         e = x * 1.07
         before = e.copy()
         write(e)
-        y = viproc.asarray(x) * 1.07
+        y = numpy2x.asarray(x) * 1.07
         exported = np.asarray(y)  # an alias of y's memory while it lives
         write(y)
         assert np.array_equal(np.asarray(y), e)
         assert np.array_equal(exported, e)
-        y = viproc.asarray(x) * 1.07
+        y = numpy2x.asarray(x) * 1.07
         t = y + 0.0  # a (possibly still pending) task reader
         write(y)
         assert np.array_equal(np.asarray(y), e)
@@ -182,12 +182,12 @@ def test_partial_writes_after_copy_on_write_keep_the_other_elements():
 def test_boolean_mask_indexing():
     rng = np.random.default_rng(7)
     x = rng.standard_normal((20, 7))
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     m = x[:, 0] > 0
     assert np.array_equal(np.asarray(v[v > 0]), x[x > 0])
     assert np.array_equal(np.asarray(v[m]), x[m])
     assert np.array_equal(np.asarray(v[m, 2:5]), x[m, 2:5])
-    w = viproc.asarray(x.copy())
+    w = numpy2x.asarray(x.copy())
     w[w < 0] = np.arange(int((x < 0).sum()), dtype=float)
     e = x.copy()
     e[e < 0] = np.arange(int((x < 0).sum()), dtype=float)
@@ -196,7 +196,7 @@ def test_boolean_mask_indexing():
 
 def test_scalar_indexing_of_pending_arrays_does_not_sync():
     x = np.arange(12.0).reshape(3, 4)
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     y = v * 2.0
     f0 = fallbacks()
     s = y[1, 2]
@@ -204,8 +204,8 @@ def test_scalar_indexing_of_pending_arrays_does_not_sync():
     y[1, 2] = -5.0  # s is a snapshot, as NumPy's scalar
     assert float(s) == 12.0
     assert float(y[1, 2]) == -5.0
-    ready = viproc.asarray(x)
-    viproc.wait_all()
+    ready = numpy2x.asarray(x)
+    numpy2x.wait_all()
     assert isinstance(ready[0, 1], np.float64)  # ready data: NumPy's scalar
 
 
@@ -216,7 +216,7 @@ def test_where_runs_as_a_select_task():
         c = rng.random((30, 20)) < 0.5
         x = (rng.standard_normal((30, 20)) * 5).astype(dx)
         y = (rng.standard_normal(20) * 5).astype(dy)
-        vc, vx, vy = viproc.asarray(c), viproc.asarray(x), viproc.asarray(y)
+        vc, vx, vy = numpy2x.asarray(c), numpy2x.asarray(x), numpy2x.asarray(y)
         for got, expected in [(np.where(vc, vx, vy), np.where(c, x, y)),
                               (np.where(vx > 0, vx, 0.5), np.where(x > 0, x, 0.5)),
                               (np.where(vc.T, vx.T, 1), np.where(c.T, x.T, 1)),

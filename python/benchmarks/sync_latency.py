@@ -2,7 +2,7 @@
 
 This is the pattern the dispatch policy targets (see "Dispatch decision" in
 CLAUDE.md): there is nothing to overlap, so handing the op to a worker only
-adds latency. viproc should stay close to NumPy here.
+adds latency. numpy2x should stay close to NumPy here.
 
 Usage: PYTHONPATH=build/python python3 python/benchmarks/sync_latency.py
 """
@@ -12,7 +12,7 @@ import time
 
 import numpy as np
 
-import viproc
+import numpy2x
 
 
 def per_op_us(fn, n):
@@ -29,15 +29,15 @@ def main():
     p.add_argument("--ops", type=int, default=2000)
     p.add_argument("--deterministic", action="store_true", help="disable the adaptive policy")
     args = p.parse_args()
-    viproc.init(adaptive=False if args.deterministic else None)
-    print(f"{'elements':>10} {'numpy':>10} {'viproc':>10}   (us per op, result read right away)")
+    numpy2x.init(adaptive=False if args.deterministic else None)
+    print(f"{'elements':>10} {'numpy':>10} {'numpy2x':>10}   (us per op, result read right away)")
     for size in (int(s) for s in args.sizes.split(",")):
         a, b = np.random.rand(size), np.random.rand(size)
-        va, vb = viproc.asarray(a), viproc.asarray(b)
+        va, vb = numpy2x.asarray(a), numpy2x.asarray(b)
         t_np = per_op_us(lambda: (a * b)[0], args.ops)
         t_vp = per_op_us(lambda: (va * vb).wait(), args.ops)
         print(f"{size:>10} {t_np:>10.2f} {t_vp:>10.2f}")
-    print("dispatch:", viproc.offload_stats())
+    print("dispatch:", numpy2x.offload_stats())
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 """ufunc.accumulate (np.cumsum, np.cumprod, np.nancumsum, np.nancumprod) and
-ufunc.outer (_ufuncs.py, hokb/viproc#25 step 5): bit-identical to NumPy
+ufunc.outer (_ufuncs.py, hokb/numpy2x#25 step 5): bit-identical to NumPy
 (values, dtype, shape and layout) over ufuncs, dtypes, layouts, axes and
 dtype=, and on the asynchronous path."""
 
@@ -8,7 +8,7 @@ import warnings
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 from async_path import SIZE, assert_async, counters
 from test_compositions import DTYPES, big, check, det, same, sample  # noqa: F401 (det: fixture)
 from test_joining import path  # noqa: F401 (fixture)
@@ -55,9 +55,9 @@ def test_accumulate_errors_and_edges(path):
     check(lambda a: np.add.accumulate(a[0, 0]), x)
     check(lambda a: np.cumsum(a, dtype="U3"), x)
     check(lambda a: np.isnan.accumulate(a), x)  # unary: ValueError
-    out, vout = np.zeros((4, 5)), viproc.asarray(np.zeros((4, 5)))  # out=: fallback
+    out, vout = np.zeros((4, 5)), numpy2x.asarray(np.zeros((4, 5)))  # out=: fallback
     np.cumsum(x, axis=0, out=out)
-    np.cumsum(viproc.asarray(x), axis=0, out=vout)
+    np.cumsum(numpy2x.asarray(x), axis=0, out=vout)
     same(vout, out)
 
 
@@ -104,11 +104,11 @@ def test_async_path(det, call, inp, tasks):
 def test_small_ready_inputs_run_in_numpy(det):
     """Small ready inputs: NumPy's function right away, no task, no fallback."""
     x = sample((100,), np.float64, special=False)
-    v = viproc.asarray(x)
-    viproc.wait_all()
+    v = numpy2x.asarray(x)
+    numpy2x.wait_all()
     before = counters()
     r = np.cumsum(v)
     after = counters()
-    assert type(r) is viproc.ndarray
+    assert type(r) is numpy2x.ndarray
     assert after["tasks"] == before["tasks"] and after["fallbacks"] == before["fallbacks"]
     same(r, np.cumsum(x))

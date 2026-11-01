@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <vector>
 
-namespace viproc::numpy {
+namespace numpy2x::numpy {
 
 namespace {
 
@@ -180,4 +180,4 @@ std::shared_ptr<Kernel> make_matmul_kernel(const UfuncLoop* loop) {
     return std::make_shared<MatmulKernel>(loop);
 }
 
-} // namespace viproc::numpy
+} // namespace numpy2x::numpy

@@ -1,7 +1,7 @@
 // Kernel adapter: runs element-wise array ops with NumPy's own ufunc loops.
 #pragma once
 
-#include "viproc_python.h"
+#include "numpy2x_python.h"
 
 #include "runtime/runtime.hpp"
 
@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace viproc::numpy {
+namespace numpy2x::numpy {
 
 // Must be called once, with the GIL held, before anything else in this file.
 bool init();
@@ -142,7 +142,7 @@ class LoopCache {
     // kernel gets a copy (NpyIter_Copy), which it points at the real buffers
     // (NpyIter_ResetBasePointers) and runs NumPy's loop over without the GIL.
     // `out_given`: the output is an existing array (out=, in-place
-    // operators); otherwise viproc allocated it in NumPy's layout, and the
+    // operators); otherwise numpy2x allocated it in NumPy's layout, and the
     // iterator must not reverse axes, as NumPy's would not with an output it
     // allocates itself. Returns nullptr (reason in `error`, Python error
     // cleared) if NumPy cannot. Main thread with the GIL.
@@ -288,4 +288,4 @@ PyObject* export_ndarray(const Array& a, bool writable);
 PyObject* borrow_ndarray(const Array& a);
 bool pin_borrowed(const Array& a, PyObject* view);
 
-} // namespace viproc::numpy
+} // namespace numpy2x::numpy

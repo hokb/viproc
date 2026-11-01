@@ -1,8 +1,8 @@
 #!/bin/bash
-# Runs the viproc benchmark suite (python/benchmarks/suite.py) in the Linux
+# Runs the numpy2x benchmark suite (python/benchmarks/suite.py) in the Linux
 # image and in the Windows build (Wine image), then merges both into one
 # comparison report. Builds the images from this checkout first (Docker's
-# cache makes that quick when nothing changed; VIPROC_NO_BUILD=1 skips it).
+# cache makes that quick when nothing changed; NUMPY2X_NO_BUILD=1 skips it).
 #
 #   docker/benchmark.sh [--quick] [SUITE_ARGS...]
 #
@@ -11,13 +11,13 @@
 # to the current directory:
 #   reports/report.{html,md}               comparison of the platforms
 #   reports/<image>/report.{html,md}       details, and results.json
-# Output directory: VIPROC_BENCH_OUT (default reports). Images:
-# VIPROC_IMAGES="linux wine" (default).
+# Output directory: NUMPY2X_BENCH_OUT (default reports). Images:
+# NUMPY2X_IMAGES="linux wine" (default).
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
-out=${VIPROC_BENCH_OUT:-reports}
-images=${VIPROC_IMAGES:-linux wine}
+out=${NUMPY2X_BENCH_OUT:-reports}
+images=${NUMPY2X_IMAGES:-linux wine}
 mkdir -p "$out"
 
 containers=()
@@ -34,7 +34,7 @@ run_and_copy() {
     local sub=$1 img=$2
     shift 2
     local cid
-    cid=$(docker create -e VIPROC_REPORTS_COPIED=1 "$img" "$@")
+    cid=$(docker create -e NUMPY2X_REPORTS_COPIED=1 "$img" "$@")
     containers+=("$cid")
     if [[ -n ${COPY_IN:-} ]]; then
         docker cp "$COPY_IN/." "$cid:/work/in"
@@ -48,18 +48,18 @@ run_and_copy() {
 
 results=()
 for img in $images; do
-    if [[ -z ${VIPROC_NO_BUILD:-} ]]; then
-        echo "== building viproc:$img (cached when unchanged)"
-        docker build -f "$repo/docker/$img/Dockerfile" -t "viproc:$img" "$repo"
+    if [[ -z ${NUMPY2X_NO_BUILD:-} ]]; then
+        echo "== building numpy2x:$img (cached when unchanged)"
+        docker build -f "$repo/docker/$img/Dockerfile" -t "numpy2x:$img" "$repo"
     fi
-    echo "== benchmark suite on viproc:$img"
-    run_and_copy "$img" "viproc:$img" benchmark suite --out "/work/reports/$img" "$@"
+    echo "== benchmark suite on numpy2x:$img"
+    run_and_copy "$img" "numpy2x:$img" benchmark suite --out "/work/reports/$img" "$@"
     results+=("/work/in/$img/results.json")
 done
 
 if [[ ${#results[@]} -gt 1 ]]; then
     echo "== comparison"
-    COPY_IN=$out run_and_copy . viproc:linux \
+    COPY_IN=$out run_and_copy . numpy2x:linux \
         python /src/python/benchmarks/suite.py --merge "${results[@]}" --out /work/reports
 fi
 echo "== reports in $(cd "$out" && pwd)/ (report.html: comparison; <image>/report.html: details)"

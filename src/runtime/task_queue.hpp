@@ -10,7 +10,7 @@
 #include <mutex>
 #include <vector>
 
-namespace viproc {
+namespace numpy2x {
 
 // Multi-producer, multi-consumer FIFO of tasks (Dmitry Vyukov's bounded
 // MPMC queue): a push or pop is one CAS on its index plus a release store
@@ -103,4 +103,4 @@ class TaskQueue {
     std::deque<std::shared_ptr<Task>> overflow_;
 };
 
-} // namespace viproc
+} // namespace numpy2x

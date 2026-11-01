@@ -1,7 +1,7 @@
 # Build output
 /reports/
 /bench_win/
-/viproc-benchmark/
+/numpy2x-benchmark/
 /build*/
 /out/
 /install/

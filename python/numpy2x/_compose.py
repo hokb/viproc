@@ -1,4 +1,4 @@
-"""NumPy functions composed of viproc's asynchronous ops (hokb/viproc#25,
+"""NumPy functions composed of numpy2x's asynchronous ops (hokb/numpy2x#25,
 step 2).
 
 Each handler issues the ufunc calls, reductions, assignments and views that
@@ -7,7 +7,7 @@ and layouts, so results are NumPy's bit for bit. The code follows NumPy's
 (numpy/_core/_methods.py, fromnumeric.py, numeric.py, calculation.c,
 lib/_function_base_impl.py, _nanfunctions_impl.py, _twodim_base_impl.py,
 linalg/_linalg.py; BSD-3-Clause) without the asanyarray() calls, which would
-sync a viproc argument. A handler returns _NOPE for arguments it does not
+sync a numpy2x argument. A handler returns _NOPE for arguments it does not
 cover: NumPy then runs the call in the eager fallback, with its own errors.
 
 Where NumPy decides something from the data (a warning for an all-NaN slice,
@@ -24,7 +24,7 @@ from numpy.lib import _stride_tricks_impl as _stride_tricks
 from numpy.lib.array_utils import normalize_axis_index, normalize_axis_tuple
 
 from . import _ndarray as _nd
-from . import _viproc
+from . import _numpy2x
 
 _NV = np._NoValue
 _NOPE = _nd._NOPE
@@ -36,12 +36,12 @@ def _vp(x):
 
 
 def _arr(x):
-    """asanyarray() that keeps viproc arrays as they are (no sync)."""
+    """asanyarray() that keeps numpy2x arrays as they are (no sync)."""
     return x if isinstance(x, ndarray) else np.asanyarray(x)
 
 
 def _layout_flags(a):
-    """NumPy's flags for a's layout (no sync: viproc computes them in C)."""
+    """NumPy's flags for a's layout (no sync: numpy2x computes them in C)."""
     return a.flags
 
 
@@ -276,7 +276,7 @@ def _average(a, axis=None, weights=None, returned=False, *, keepdims=_NV):
         wc = wgt if wgt.dtype == result_dtype else wgt.astype(result_dtype)
         avg = np.multiply(ac, wc).sum(axis, **keepdims_kw) / scl
     if returned:
-        shape = getattr(avg, "shape", ())  # np.shape of a viproc array would export it
+        shape = getattr(avg, "shape", ())  # np.shape of a numpy2x array would export it
         if getattr(scl, "shape", ()) != shape:
             scl = np.broadcast_to(scl, shape).copy()
         return avg, scl
@@ -536,7 +536,7 @@ def _probe(a):
 
 def _like(create):
     """zeros_like & co.: NumPy's function on a probe with a's layout (no
-    sync, no task: fresh memory, adopted, as viproc.zeros)."""
+    sync, no task: fresh memory, adopted, as numpy2x.zeros)."""
     def handler(prototype, *args, **kwargs):
         if not _vp(prototype) or any(isinstance(v, ndarray) for v in args + tuple(kwargs.values())):
             return _NOPE
@@ -574,7 +574,7 @@ def _diag(v, k=0):
         i = k if k >= 0 else (-k) * n
         item = v.dtype.itemsize
         # res[:n - k].flat[i::n + 1] = v
-        _viproc.view(res, (v.shape[0],), ((n + 1) * item,), i * item)[...] = v
+        _numpy2x.view(res, (v.shape[0],), ((n + 1) * item,), i * item)[...] = v
     return res
 
 

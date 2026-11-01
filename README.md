@@ -1,8 +1,8 @@
-# viproc
+# numpy2x
 
-**viproc runs NumPy programs faster. No annotations. Bit-equal results. Single node strong scaling.**
+**numpy2x runs NumPy programs faster. No annotations. Bit-equal results. Single node strong scaling.**
 
-viproc, a **vi**rtual **proc**essor for numerical programs, turns array instructions into
+numpy2x turns array instructions into
 autonomously scheduling workloads. At runtime, thousands of such tasks cooperatively make
 local decisions based on the actual data and hardware state, involving parallel computing
 resources efficiently.
@@ -16,26 +16,26 @@ print(s)              # only here does the program wait
 
 Every array instruction becomes a task. A task starts as soon as its inputs exist, on
 whichever core is free. The Python thread does not compute: it only issues instructions and
-runs ahead. Unlike existing approaches, viproc does not analyse program dependencies at all,
+runs ahead. Unlike existing approaches, numpy2x does not analyse program dependencies at all,
 and there is no central scheduler.
 Parallelism thus appears wherever the data allows it, across loops, functions and modules,
-in unchanged programs (`python -m viproc prog.py`). Today the tasks run on the cores of a
+in unchanged programs (`python -m numpy2x prog.py`). Today the tasks run on the cores of a
 multi-core CPU; the model is designed for heterogeneous hardware.
 
 ## Complexity becomes performance
 
-The question viproc answers is not whether a single array operation runs as fast as, or
+The question numpy2x answers is not whether a single array operation runs as fast as, or
 faster than, NumPy. It is: **can whole programs scale strongly**, a fixed program with a
 fixed problem size getting faster with more cores?
 
-A benchmark that consists of a single operation does not get faster with viproc: there is
-nothing to overlap it with, and viproc does not split single operations. Real programs are
+A benchmark that consists of a single operation does not get faster with numpy2x: there is
+nothing to overlap it with, and numpy2x does not split single operations. Real programs are
 not single operations. They compute several quantities, branch into independent
 sub-expressions, mix reductions with element-wise work, loop over arrays and call functions
 in modules. **In practice, complexity always comes with parallel potential**: the more a
-program does, the more of its array instructions do not depend on each other. viproc finds
+program does, the more of its array instructions do not depend on each other. numpy2x finds
 that potential at runtime, without analysis or annotations, and turns it into parallel
-execution. **viproc turns complexity into performance.**
+execution. **numpy2x turns complexity into performance.**
 
 The goals follow from this, and they are stated for whole programs, not for single
 operations:
@@ -54,7 +54,7 @@ isolation.
 ## How it works
 
 - **Granularity: the array operation.** One instruction is one NumPy operation (`a + b`,
-  `np.sin(x)`, `x.sum(axis=0)`, `x[idx]`, `a @ b`, ...). viproc does not split single
+  `np.sin(x)`, `x.sum(axis=0)`, `x[idx]`, `a @ b`, ...). numpy2x does not split single
   operations across threads; it overlaps whole array instructions, the way a superscalar
   CPU overlaps machine instructions.
 - **Scope: a dynamic window of active instructions that runs ahead.** Every instruction
@@ -89,16 +89,16 @@ The execution model follows the
   ```
   `Parallel.For` gives wrong results here; the ILNumerics Accelerator runs the loop about 3x
   faster than sequentially (1500 x 1500), with correct results.
-- **Identical results, guaranteed (today).** viproc currently guarantees results that are
+- **Identical results, guaranteed (today).** numpy2x currently guarantees results that are
   bit-identical to plain NumPy: values, dtypes, shapes, strides, warnings and errors.
   Every instruction is computed by the installed NumPy version's own inner loops and
   operators (including their SIMD paths), called exactly as NumPy calls them; whatever
-  viproc cannot run asynchronously with NumPy's semantics falls back to NumPy itself.
-  The price is a small overhead on small computations: the viproc layer (task, arrays,
+  numpy2x cannot run asynchronously with NumPy's semantics falls back to NumPy itself.
+  The price is a small overhead on small computations: the numpy2x layer (task, arrays,
   dispatch) comes on top of NumPy's own work, while the kernels themselves cannot get
   faster than NumPy's.
 - **Faster where there is parallel potential; at least 0.8x of NumPy elsewhere.** Programs
-  with independent array operations on medium-sized and large data viproc commonly runs
+  with independent array operations on medium-sized and large data numpy2x commonly runs
   efficiently in parallel. Every program is to run at 0.8x of NumPy's speed or faster (the
   current goal, see [Complexity becomes performance](#complexity-becomes-performance)); for
   single expressions on small data without parallel potential, the long-term target is
@@ -113,16 +113,16 @@ measurements in [docs/benchmarks.md](docs/benchmarks.md), architecture and build
 
 ## Where it helps, and where it does not (yet)
 
-viproc gains where a program issues many array instructions that do not all depend on each
+numpy2x gains where a program issues many array instructions that do not all depend on each
 other: several independent expressions, chains over different arrays, reductions next to
 element-wise work, iterative algorithms over arrays (k-means, simulations, image and signal
 pipelines), on medium and large data. The more complex a program gets, the more parallel
-potential it brings: viproc shines on real-world algorithms, not on toy examples of one or
+potential it brings: numpy2x shines on real-world algorithms, not on toy examples of one or
 two operations.
 
-viproc turns complexity into performance. A benchmark of one operation cannot get faster:
+numpy2x turns complexity into performance. A benchmark of one operation cannot get faster:
 there is nothing to run next to it. Real programs consist of many operations, and complexity
-always brings parallel potential with it; viproc turns that potential into parallelism. The
+always brings parallel potential with it; numpy2x turns that potential into parallelism. The
 goal: every program runs at 0.8x NumPy's speed or faster, complex programs run clearly faster.
 
 Example: ILNumerics' array-pipelining demo, a plain Python loop over the columns of a matrix
@@ -134,19 +134,19 @@ for i in range(A.shape[1]):
     # C[0:i+1] = ...   every iteration overwrites the earlier ones (loop_dep)
 ```
 
-| | NumPy | NumPy + thread pool (manual Parallel.For) | viproc, 4 workers |
+| | NumPy | NumPy + thread pool (manual Parallel.For) | numpy2x, 4 workers |
 |---|---:|---:|---:|
 | `loop` | 1.0x | 0.25x | 1.7-2.0x |
 | `loop_dep` | 1.0x | wrong results | 1.7x |
 | `np.sum(np.abs(np.sin(A)), axis=0)` | 1.0x | – | 3.4x |
 
-Nothing in the loop is annotated: viproc overlaps the small operations of different
+Nothing in the loop is annotated: numpy2x overlaps the small operations of different
 iterations and keeps the order where it matters (`loop_dep`). The gain is bounded by how fast
 the Python thread issues the operations (~7 µs per iteration here); details in
 [docs/benchmarks.md](docs/benchmarks.md).
 
 Programs that spend their time in algorithms or loops over **scalar** data, one element
-at a time, offer little array-level parallelism and gain little from viproc today (the
+at a time, offer little array-level parallelism and gain little from numpy2x today (the
 target is NumPy's speed for them; the per-op overhead can make them slightly slower). For
 them the manual options remain: vectorizing the loop into array operations, or parallelizing it explicitly (`multiprocessing`, `concurrent.futures`, Numba's
 `prange`, ...).
@@ -154,55 +154,55 @@ them the manual options remain: vectorizing the loop into array operations, or p
 ## Install
 
 ```bash
-git clone https://github.com/hokb/viproc
-cd viproc
+git clone https://github.com/hokb/numpy2x
+cd numpy2x
 pip install .           # into the active Python environment (a venv, conda, ...)
 ```
 
-viproc is a regular Python package: one extension module (`_viproc.*.pyd` / `.so`, runtime
+numpy2x is a regular Python package: one extension module (`_numpy2x.*.pyd` / `.so`, runtime
 linked in statically) plus Python files. It needs Python >= 3.12 (64 bit), NumPy >= 2.5 and,
 until there are prebuilt wheels, a C++20 compiler (Visual Studio with the C++ workload on
-Windows, GCC or Clang on Linux). NumPy itself is not modified: viproc arrays take part through
+Windows, GCC or Clang on Linux). NumPy itself is not modified: numpy2x arrays take part through
 NumPy's array protocols.
 
-Without a checkout, `pip install git+https://github.com/hokb/viproc` does the same.
+Without a checkout, `pip install git+https://github.com/hokb/numpy2x` does the same.
 
 There is no prebuilt wheel yet, so pip builds one from the sources on your machine and installs
 it: its build backend (scikit-build-core, see `pyproject.toml`) runs CMake, compiles the
 extension module and packs it into a wheel. pip fetches CMake and Ninja itself if they are
 missing; the C++20 compiler named above must be installed. The build takes about a minute.
-`pip wheel .` instead keeps the wheel (`viproc-*.whl`), to install on other machines with the same
+`pip wheel .` instead keeps the wheel (`numpy2x-*.whl`), to install on other machines with the same
 platform, Python version and architecture.
 
-Testing viproc on your own code, in your existing Python and IDE (PyCharm, VS Code, Spyder,
+Testing numpy2x on your own code, in your existing Python and IDE (PyCharm, VS Code, Spyder,
 Jupyter): see [docs/testing.md](docs/testing.md).
 
 ## Usage
 
-Installing makes viproc available to your Python. To bring it into an existing NumPy program,
+Installing makes numpy2x available to your Python. To bring it into an existing NumPy program,
 use one of three ways:
 
-**1. Run the program with `python -m viproc`** (no code change):
+**1. Run the program with `python -m numpy2x`** (no code change):
 
 ```bash
-python -m viproc prog.py [args]       # also: -m module, -c "code"; no arguments: console
-VIPROC=1 python prog.py               # the same, through viproc.pth
+python -m numpy2x prog.py [args]       # also: -m module, -c "code"; no arguments: console
+NUMPY2X=1 python prog.py               # the same, through numpy2x.pth
 python prog.py                        # plain NumPy, for comparison
 ```
 
-`import numpy` in the program's own code then actually imports viproc: all NumPy functions
+`import numpy` in the program's own code then actually imports numpy2x: all NumPy functions
 (`np.zeros`, `np.arange`, `np.loadtxt`, `np.random.*`, `np.sin`, `np.sum`, ...) are there. The
-ones that create arrays return viproc arrays, and the ones on viproc arrays run asynchronously
-where viproc supports them, otherwise in NumPy itself. The standard library and installed
-packages (SciPy, pandas, ...) keep the real NumPy; viproc arrays they receive are synced and
+ones that create arrays return numpy2x arrays, and the ones on numpy2x arrays run asynchronously
+where numpy2x supports them, otherwise in NumPy itself. The standard library and installed
+packages (SciPy, pandas, ...) keep the real NumPy; numpy2x arrays they receive are synced and
 read through NumPy's array protocols. Results are bit-identical to plain NumPy.
 
-**2. Import viproc in place of NumPy** (one line changed):
+**2. Import numpy2x in place of NumPy** (one line changed):
 
 ```python
-import viproc as np          # was: import numpy as np
+import numpy2x as np          # was: import numpy as np
 
-x = np.random.default_rng(0).standard_normal((2000, 2000))   # a viproc array
+x = np.random.default_rng(0).standard_normal((2000, 2000))   # a numpy2x array
 y = np.sin(x) * np.cos(x)    # returns immediately, computed in the background
 print(float(y.sum()))        # sync point
 ```
@@ -211,46 +211,46 @@ print(float(y.sum()))        # sync point
 
 ```python
 import numpy as np
-import viproc
+import numpy2x
 
-a = viproc.asarray(np.random.rand(1_000_000))   # NumPy array -> viproc array
-b = viproc.asarray(np.random.rand(1_000_000))
-c = np.sin(a) * b + 1.0      # NumPy's functions on viproc arrays run in viproc
+a = numpy2x.asarray(np.random.rand(1_000_000))   # NumPy array -> numpy2x array
+b = numpy2x.asarray(np.random.rand(1_000_000))
+c = np.sin(a) * b + 1.0      # NumPy's functions on numpy2x arrays run in numpy2x
 d = np.cos(b) - a            # independent of c: runs in parallel
 print((c + d)[:5])           # sync point
 ```
 
-### Benchmarking: the same code with and without viproc
+### Benchmarking: the same code with and without numpy2x
 
 ```python
 import time
-import numpy as np            # viproc under python -m viproc
-import viproc
+import numpy as np            # numpy2x under python -m numpy2x
+import numpy2x
 
 def program():
     x = np.random.default_rng(0).standard_normal((2000, 2000))
     return float((np.sin(x) * np.cos(x)).sum())
 
-t0 = time.perf_counter(); program(); t_viproc = time.perf_counter() - t0
-with viproc.disabled():       # creation functions return NumPy arrays: plain NumPy
+t0 = time.perf_counter(); program(); t_numpy2x = time.perf_counter() - t0
+with numpy2x.disabled():       # creation functions return NumPy arrays: plain NumPy
     t0 = time.perf_counter(); program(); t_numpy = time.perf_counter() - t0
 ```
 
-`viproc.enable(False)` / `viproc.enable(True)` switch it for longer stretches. Arrays created
-while viproc was on stay viproc arrays; convert them with `np.asarray(x)` (copy-free,
+`numpy2x.enable(False)` / `numpy2x.enable(True)` switch it for longer stretches. Arrays created
+while numpy2x was on stay numpy2x arrays; convert them with `np.asarray(x)` (copy-free,
 read-only) if the NumPy part should not touch them. Whole programs: `python prog.py` vs.
-`python -m viproc prog.py`.
+`python -m numpy2x prog.py`.
 
-Differences from NumPy under `python -m viproc`: `isinstance(x, np.ndarray)` in user code
-tests for viproc arrays; `np.array(nd)`/`np.asarray(nd)` of a NumPy array always copy it into
-viproc (also with `copy=False`); dtypes viproc does not run (object, str, float16, ...) give
+Differences from NumPy under `python -m numpy2x`: `isinstance(x, np.ndarray)` in user code
+tests for numpy2x arrays; `np.array(nd)`/`np.asarray(nd)` of a NumPy array always copy it into
+numpy2x (also with `copy=False`); dtypes numpy2x does not run (object, str, float16, ...) give
 NumPy arrays, as NumPy does.
 
 ## Build (development, CMake)
 
 `dev.cmd` (Windows, also by double-click) and `./dev.sh` (Linux) pull, build into `.venv` and
-run the tests; run programs with `.venv\Scripts\python -m viproc prog.py` (Linux:
-`.venv/bin/python -m viproc prog.py`). Later builds are incremental (`build/pip-<tag>`), and no
+run the tests; run programs with `.venv\Scripts\python -m numpy2x prog.py` (Linux:
+`.venv/bin/python -m numpy2x prog.py`). Later builds are incremental (`build/pip-<tag>`), and no
 developer prompt is needed on Windows: the build picks Visual Studio for the interpreter's
 architecture. Options: `dev.cmd -NoPull -NoTest -Python <python.exe>`, `./dev.sh --no-pull
 --no-test`, `PYTHON=python3.13 ./dev.sh`.
@@ -271,7 +271,7 @@ Images for Linux, Windows (native, MSVC) and Windows-under-Wine build this check
 test suites by default and serve as a command line ([docker/README.md](docker/README.md)):
 
 ```bash
-docker build -f docker/linux/Dockerfile -t viproc:linux .
-docker run --rm viproc:linux                                # all test suites
-docker run --rm -v "$PWD:/work" viproc:linux python prog.py # run a program with viproc
+docker build -f docker/linux/Dockerfile -t numpy2x:linux .
+docker run --rm numpy2x:linux                                # all test suites
+docker run --rm -v "$PWD:/work" numpy2x:linux python prog.py # run a program with numpy2x
 ```

@@ -1,6 +1,6 @@
 # Array data model
 
-This document defines the data model of a viproc array: which objects make
+This document defines the data model of a numpy2x array: which objects make
 up an array, who creates, reads, writes and releases them, and which checks
 keep the data consistent while the main thread only issues ops and workers
 compute them. It builds on the execution model in CLAUDE.md,
@@ -45,7 +45,7 @@ Task T ── operands: (Metadata, CountableArray captured at issue), …
   current data version (`current`) and the last task writing it
   (`last_writer`, which decides `ready` / `pending`). Main thread only. A
   write through any view changes only G, so the base and all other views
-  see it without viproc knowing the views. In register-renaming terms G is
+  see it without numpy2x knowing the views. In register-renaming terms G is
   the architectural register.
 - **CountableArray** (V): one data version, the "memory" (the physical
   register). `async_reads` and `host_views` live here, because readers read
@@ -100,7 +100,7 @@ write creates no new Metadata: the writing task becomes `G.last_writer`.
 
 ## Python assignments
 
-NumPy has reference semantics and so does a viproc array: a view writes
+NumPy has reference semantics and so does a numpy2x array: a view writes
 into its base. There are no lazy-copy views as in ILNumerics; copies happen
 where NumPy copies, and invisibly as copy-on-write for asynchronous readers.
 
@@ -179,7 +179,7 @@ shared lives in G.
 Checks (main thread, at issue):
 1. **Read-only** target (`broadcast_to`, part of an export): NumPy's error,
    at once.
-2. **Key and value:** pending viproc arrays become dependencies (callbacks,
+2. **Key and value:** pending numpy2x arrays become dependencies (callbacks,
    `async_reads++` on their versions). The value is cast to the target
    dtype. The key kind picks the kernel: basic → assign, integer arrays →
    scatter, boolean mask → masked assignment.
@@ -263,15 +263,15 @@ Each of these rules it out:
    find and patch every view. Readiness, producer and `async_reads` need a
    shared node anyway.
 4. Handing the `ndarray` to the user is not effortless but unsafe: NumPy
-   calls on it bypass viproc and race with the workers (D7, and the
+   calls on it bypass numpy2x and race with the workers (D7, and the
    decision against an `ndarray` subclass, D9).
 5. One host pointer.
 
 Handing data to NumPy is copy-free already (D7: aliasing exports counted
 as host views, adoption of fresh memory). NumPy's custom allocator (NEP 49,
 `PyDataMem_SetHandler`) would only let NumPy allocate fallback results from
-viproc's element pool; it is set per context and applies to every NumPy
-allocation there, so it would have to be set around viproc's own fallback
+numpy2x's element pool; it is set per context and applies to every NumPy
+allocation there, so it would have to be set around numpy2x's own fallback
 calls only. Not needed for this model.
 
 ## Evaluation: how the model was chosen
@@ -285,7 +285,7 @@ A6. A was refined in four steps.
 `ndim`, element count, base offset, then all lengths, then all strides (in
 elements), pooled with its Storage and overwritten on reuse. Element memory
 is separate: a refcounted `CountableArray` of `MemoryHandle`s, one per
-device, shared by views. viproc takes the idea (SD fixed to a pooled
+device, shared by views. numpy2x takes the idea (SD fixed to a pooled
 object, referenced by tasks, published by stage), with three differences:
 
 - Strides stay in **bytes**, as NumPy's (A2).
@@ -304,7 +304,7 @@ value semantics, where a sub-array is a lazy copy. NumPy has reference
 semantics: `b = a[::2]; b[0] = 1` changes `a`. Base and views therefore
 need a shared node holding the current version and the last writer, so a
 write through one view makes all others pending and copy-on-write switches
-all of them together, without viproc knowing the views: the AliasGroup.
+all of them together, without numpy2x knowing the views: the AliasGroup.
 
 **3. A flag instead of the AliasGroup does not work.** "NumPy mode: do not
 copy on write" removes neither need. Copy-on-write is not for value

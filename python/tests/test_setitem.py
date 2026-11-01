@@ -4,7 +4,7 @@ ready data, issued assignments otherwise. Results and errors follow NumPy."""
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 
 DTYPES = [np.bool_, np.int32, np.int64, np.float32, np.float64, np.complex64, np.complex128]
 
@@ -66,7 +66,7 @@ def test_setitem_matches_numpy(state):
         x = (rng.normal(size=shape) * 3).astype(dtype)
         key = random_key(rng, shape)
         value = random_value(rng, dtype)
-        a = viproc.asarray(x)
+        a = numpy2x.asarray(x)
         if state == "pending":
             a = a.copy()  # large: computed by a task
         reader = a + 0 if state == "read" else None
@@ -96,7 +96,7 @@ class _noop:
         return self._w.__exit__(*exc)
 
 
-def test_setitem_with_viproc_values_and_keys():
+def test_setitem_with_numpy2x_values_and_keys():
     rng = np.random.default_rng(9)
     x = rng.normal(size=(50, 60))
     for shape_value, key in [((60,), 3), ((), (2, 5)), ((3, 60), slice(4, 7)),
@@ -105,26 +105,26 @@ def test_setitem_with_viproc_values_and_keys():
         for pending in (False, True):
             e = x.copy()
             e[key] = v
-            a = viproc.asarray(x)
-            vv = viproc.asarray(v)
+            a = numpy2x.asarray(x)
+            vv = numpy2x.asarray(v)
             if pending:
                 a, vv = a * 1.0, vv * 1.0
             a[key] = vv
             assert np.array_equal(np.asarray(a), e)
-    idx = viproc.asarray(np.array([1, 3, 3, 7]))
+    idx = numpy2x.asarray(np.array([1, 3, 3, 7]))
     e = x.copy()
     e[np.asarray(idx)] = 2.5
-    a = viproc.asarray(x)
-    a[idx] = 2.5  # a ready index array of viproc
+    a = numpy2x.asarray(x)
+    a[idx] = 2.5  # a ready index array of numpy2x
     assert np.array_equal(np.asarray(a), e)
-    small = viproc.asarray(np.arange(6.0))
-    small[viproc.asarray(np.array([0, 2]))] = -1.0
+    small = numpy2x.asarray(np.arange(6.0))
+    small[numpy2x.asarray(np.array([0, 2]))] = -1.0
     assert np.array_equal(np.asarray(small), [-1.0, 1, -1, 3, 4, 5])
 
 
 def test_setitem_overlap_and_errors_as_numpy():
     x = np.arange(10.0)
-    a = viproc.asarray(x)
+    a = numpy2x.asarray(x)
     a[1:] = a[:-1]  # overlapping views of one storage
     x[1:] = x[:-1]
     assert np.array_equal(np.asarray(a), x)
@@ -134,7 +134,7 @@ def test_setitem_overlap_and_errors_as_numpy():
         a[10] = 1.0
     with pytest.raises(ValueError, match="read-only"):
         np.broadcast_to(a, (3, 10))[0, 0] = 1.0
-    ints = viproc.asarray(np.zeros(4, np.int32))
+    ints = numpy2x.asarray(np.zeros(4, np.int32))
     with pytest.raises(OverflowError):
         ints[0] = 2**40
     ints[1] = 3.9  # truncated as by NumPy
@@ -146,8 +146,8 @@ def test_element_assignment_of_pending_results():
     is a runtime view only; negative and NumPy integer keys, other dtypes
     and errors as NumPy."""
     a = np.arange(1.0, 5001.0).reshape(50, 100)
-    v = viproc.asarray(a)
-    c = viproc.zeros(100)
+    v = numpy2x.asarray(a)
+    c = numpy2x.zeros(100)
     expected = np.zeros(100)
     for i in range(100):
         c[i] = np.sum(np.sin(v[:, i]), axis=0)
@@ -157,13 +157,13 @@ def test_element_assignment_of_pending_results():
     c[np.int64(3)] = np.max(v[:, 5], axis=0)
     expected[np.int64(3)] = np.max(a[:, 5], axis=0)
     assert np.array_equal(np.asarray(c), expected)
-    ints = viproc.zeros(100, np.int32)
+    ints = numpy2x.zeros(100, np.int32)
     ints[7] = np.sum(v[:, 1], axis=0)  # float64 into int32: cast as NumPy
     ref = np.zeros(100, np.int32)
     ref[7] = np.sum(a[:, 1], axis=0)
     assert np.array_equal(np.asarray(ints), ref)
-    m = viproc.zeros((4, 3000))
-    m[2] = np.sin(viproc.asarray(np.arange(3000.0)))  # a row of a pending result
+    m = numpy2x.zeros((4, 3000))
+    m[2] = np.sin(numpy2x.asarray(np.arange(3000.0)))  # a row of a pending result
     mr = np.zeros((4, 3000))
     mr[2] = np.sin(np.arange(3000.0))
     assert np.array_equal(np.asarray(m), mr)
@@ -175,13 +175,13 @@ def test_element_assignment_of_pending_results():
 
 
 def test_small_ready_assignment_runs_in_numpy_without_tasks():
-    a = viproc.asarray(np.zeros(100))
-    viproc.wait_all()
-    before = viproc.offload_stats()
+    a = numpy2x.asarray(np.zeros(100))
+    numpy2x.wait_all()
+    before = numpy2x.offload_stats()
     for i in range(100):
         a[i] = i
         a[i:i + 2] = 0.5 * i
-    after = viproc.offload_stats()
+    after = numpy2x.offload_stats()
     assert after == before  # neither tasks nor direct ops: NumPy wrote it
     e = np.zeros(100)
     for i in range(100):
@@ -196,7 +196,7 @@ def test_recurrence_in_place_with_pending_readers_matches_numpy():
     # the old buffer over. Readers that do not feed it keep the old data.
     d = np.random.default_rng(3).random((200, 3000))
     for keep_reader in (False, True):
-        x, xn = viproc.asarray(d).copy(), d.copy()
+        x, xn = numpy2x.asarray(d).copy(), d.copy()
         kept, kept_n = [], []
         for i in range(1, x.shape[0]):
             if keep_reader and i % 7 == 0:

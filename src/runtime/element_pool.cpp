@@ -23,7 +23,7 @@
 #include <sys/mman.h>
 #endif
 
-namespace viproc {
+namespace numpy2x {
 
 namespace {
 
@@ -57,14 +57,14 @@ std::align_val_t alignment_for(std::size_t capacity) {
 #if defined(_WIN32)
 // Windows counterpart of transparent huge pages: large pages need the
 // "Lock pages in memory" privilege (SeLockMemoryPrivilege). Opt-in with
-// VIPROC_LARGE_PAGES=1: Windows commits and zeroes a large-page block in
+// NUMPY2X_LARGE_PAGES=1: Windows commits and zeroes a large-page block in
 // VirtualAlloc, on the issuing main thread (measured ~30 ms per 24 MB block,
 // i7-12700K), where Linux's huge pages fault in on the worker that first
 // writes them. Enabled once if requested and the account holds the
 // privilege; 0 otherwise.
 std::size_t large_page_size() {
     static const std::size_t size = [] {
-        const char* env = std::getenv("VIPROC_LARGE_PAGES");
+        const char* env = std::getenv("NUMPY2X_LARGE_PAGES");
         if (env == nullptr || env[0] == '\0' || env[0] == '0') {
             return std::size_t{0};
         }
@@ -88,12 +88,12 @@ std::size_t large_page_size() {
 }
 #endif
 
-// VIPROC_POOL_LIMIT: bytes, optionally with a K/M/G suffix; 0 disables caching.
+// NUMPY2X_POOL_LIMIT: bytes, optionally with a K/M/G suffix; 0 disables caching.
 std::size_t default_limit() {
-#if defined(VIPROC_NO_ELEMENT_POOL)
+#if defined(NUMPY2X_NO_ELEMENT_POOL)
     return 0; // sanitizer builds: every release goes back to the system
 #else
-    if (const char* env = std::getenv("VIPROC_POOL_LIMIT")) {
+    if (const char* env = std::getenv("NUMPY2X_POOL_LIMIT")) {
         char* end = nullptr;
         unsigned long long v = std::strtoull(env, &end, 10);
         switch (end != nullptr ? std::toupper(static_cast<unsigned char>(*end)) : 0) {
@@ -263,4 +263,4 @@ ElementPool::Stats ElementPool::stats() const {
             static_cast<std::uint64_t>(c > 0 ? c : 0), dropped_.load(std::memory_order_relaxed)};
 }
 
-} // namespace viproc
+} // namespace numpy2x

@@ -9,10 +9,10 @@
 //   dims    = {count, size of each core dimension label...}
 //   strides = {outer stride per operand..., core strides per operand axis...}
 // where a core stride is 0 for an axis of extent 1 or a missing flexible
-// dimension. The loops viproc runs this way compute every outer index on its
+// dimension. The loops numpy2x runs this way compute every outer index on its
 // own (linalg: copy the matrix into a LAPACK buffer, call LAPACK; fft: copy,
 // pocketfft's plan per call; vecdot & co.: a dot per index), so how the batch
-// is split into calls does not change any value. viproc passes NumPy's core
+// is split into calls does not change any value. numpy2x passes NumPy's core
 // strides, so each index gets the calls NumPy makes for it.
 #pragma once
 
@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-namespace viproc::numpy {
+namespace numpy2x::numpy {
 
 // The core axes of a gufunc's operands: for each operand (inputs, then
 // outputs) the label index of each core axis of the signature, in order, or
@@ -45,7 +45,7 @@ struct GufuncCore {
 // through the floating-point invalid flag (numpy.linalg's loops, which NumPy's
 // wrappers turn into LinAlgError with errstate(invalid='call')); the op
 // then fails with that message ("LinAlgError: Singular matrix").
-// `options` (bits, as vp_gufunc's flags):
+// `options` (bits, as nx_gufunc's flags):
 //  - kGufuncCheckFinite: the op fails with "LinAlgError: Array must not
 //    contain infs or NaNs" if input 0 has a non-finite element
 //    (numpy.linalg's _assert_finite, which NumPy runs before eig and
@@ -60,4 +60,4 @@ enum : int { kGufuncCheckFinite = 2, kGufuncSerial = 4 };
 std::shared_ptr<Kernel> make_gufunc_kernel(const UfuncLoop* loop, GufuncCore core,
                                            std::string invalid_error, int options = 0);
 
-} // namespace viproc::numpy
+} // namespace numpy2x::numpy

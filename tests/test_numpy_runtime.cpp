@@ -10,8 +10,8 @@
 #include <string>
 #include <vector>
 
-using namespace viproc;
-namespace vnp = viproc::numpy;
+using namespace numpy2x;
+namespace vnp = numpy2x::numpy;
 
 namespace {
 

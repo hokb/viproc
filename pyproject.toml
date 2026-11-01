@@ -1,4 +1,4 @@
-# pip install . builds viproc with CMake (scikit-build-core) and installs the
+# pip install . builds numpy2x with CMake (scikit-build-core) and installs the
 # package. Development loop: dev.cmd (Windows) / ./dev.sh (Linux): pull,
 # build into .venv, test.
 [build-system]
@@ -6,7 +6,7 @@ requires = ["scikit-build-core>=0.10", "numpy>=2.5"]
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "viproc"
+name = "numpy2x"
 dynamic = ["version"]
 description = "Instruction-level parallelism for the array instructions of NumPy programs"
 readme = "README.md"
@@ -27,9 +27,9 @@ wheel.packages = []
 sdist.exclude = ["build*", "reports", ".venv"]
 
 [tool.scikit-build.cmake.define]
-VIPROC_BUILD_TESTS = "OFF"
+NUMPY2X_BUILD_TESTS = "OFF"
 
 [tool.scikit-build.metadata.version]
 provider = "scikit_build_core.metadata.regex"
 input = "CMakeLists.txt"
-regex = 'project\(viproc VERSION (?P<value>[0-9.]+)'
+regex = 'project\(numpy2x VERSION (?P<value>[0-9.]+)'

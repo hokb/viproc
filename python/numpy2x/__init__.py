@@ -1,14 +1,14 @@
-"""viproc: array instruction-level parallelism for NumPy programs.
+"""numpy2x: array instruction-level parallelism for NumPy programs.
 
-Wrap your input data with ``viproc.asarray`` (or create arrays with the
-functions of this module) and keep using NumPy as usual: array ops on viproc
+Wrap your input data with ``numpy2x.asarray`` (or create arrays with the
+functions of this module) and keep using NumPy as usual: array ops on numpy2x
 arrays are issued asynchronously and run in parallel when their inputs are
 ready. Reading data is a sync point.
 
-``import viproc as np`` also works: names this module does not define come
-from NumPy, and NumPy functions dispatch on viproc arrays. ``python -m viproc
+``import numpy2x as np`` also works: names this module does not define come
+from NumPy, and NumPy functions dispatch on numpy2x arrays. ``python -m numpy2x
 prog.py`` runs an unchanged NumPy program that way (``import numpy`` in its
-own code gives viproc); ``with viproc.disabled():`` runs code as plain NumPy.
+own code gives numpy2x); ``with numpy2x.disabled():`` runs code as plain NumPy.
 """
 
 import atexit
@@ -18,13 +18,13 @@ import types as _types
 
 import numpy as _np
 
-# viproc reproduces NumPy's calling patterns, result layouts and wrappers as
+# numpy2x reproduces NumPy's calling patterns, result layouts and wrappers as
 # they are in 2.5; older versions give different results (eig dtypes,
 # layouts, reduction blocks), so they are refused rather than run.
 if _np.lib.NumpyVersion(_np.__version__) < "2.5.0":
-    raise ImportError(f"viproc needs NumPy >= 2.5, found {_np.__version__}")
+    raise ImportError(f"numpy2x needs NumPy >= 2.5, found {_np.__version__}")
 
-from . import _ndarray, _viproc
+from . import _ndarray, _numpy2x
 from ._ndarray import fresh as _fresh
 from ._ndarray import (
     AsyncError,
@@ -46,7 +46,7 @@ from ._ndarray import (
     workers,
 )
 
-__version__ = _viproc.version
+__version__ = _numpy2x.version
 
 
 def _creator(np_func):
@@ -58,12 +58,12 @@ def _creator(np_func):
 
     create.__name__ = np_func.__name__
     create.__qualname__ = np_func.__name__
-    create.__doc__ = f"Like numpy.{np_func.__name__}, returning a viproc array."
+    create.__doc__ = f"Like numpy.{np_func.__name__}, returning a numpy2x array."
     return create
 
 
 # NumPy functions that create arrays from shapes, values or files. Functions
-# of arrays need no wrapper: NumPy dispatches them on viproc arguments.
+# of arrays need no wrapper: NumPy dispatches them on numpy2x arguments.
 for _name in (
     "zeros", "ones", "empty", "full", "zeros_like", "ones_like", "empty_like", "full_like",
     "arange", "linspace", "logspace", "geomspace", "eye", "identity", "tri", "indices",
@@ -75,7 +75,7 @@ del _name
 
 
 class _RandomState:
-    """A NumPy Generator / RandomState whose methods return viproc arrays."""
+    """A NumPy Generator / RandomState whose methods return numpy2x arrays."""
 
     __slots__ = ("_rng",)
 
@@ -109,8 +109,8 @@ def _random_function(fn):
 
 
 class _RandomModule(_types.ModuleType):
-    """numpy.random for viproc: the same functions (and the same global
-    state), returning viproc arrays; default_rng(), Generator(...) and
+    """numpy.random for numpy2x: the same functions (and the same global
+    state), returning numpy2x arrays; default_rng(), Generator(...) and
     RandomState(...) give generators whose methods do too."""
 
     def __getattr__(self, name):
@@ -127,26 +127,26 @@ class _RandomModule(_types.ModuleType):
         return dir(_np.random)
 
 
-random = _RandomModule("viproc.random", _np.random.__doc__)
+random = _RandomModule("numpy2x.random", _np.random.__doc__)
 
 
 def enable(on=True):
-    """Switch viproc on or off for array creation. Off, the creation
-    functions (asarray, zeros, viproc.random, ... and, under python -m
-    viproc, numpy.*) return NumPy's own arrays: the same code runs as plain
-    NumPy. Existing viproc arrays stay viproc arrays."""
+    """Switch numpy2x on or off for array creation. Off, the creation
+    functions (asarray, zeros, numpy2x.random, ... and, under python -m
+    numpy2x, numpy.*) return NumPy's own arrays: the same code runs as plain
+    NumPy. Existing numpy2x arrays stay numpy2x arrays."""
     _ndarray._enabled[0] = bool(on)
 
 
 def enabled():
-    """True while array creation gives viproc arrays (see enable())."""
+    """True while array creation gives numpy2x arrays (see enable())."""
     return _ndarray._enabled[0]
 
 
 @_contextlib.contextmanager
 def disabled():
-    """with viproc.disabled(): ... runs the block as plain NumPy (see
-    enable()), e.g. to time the same code with and without viproc."""
+    """with numpy2x.disabled(): ... runs the block as plain NumPy (see
+    enable()), e.g. to time the same code with and without numpy2x."""
     previous = _ndarray._enabled[0]
     _ndarray._enabled[0] = False
     try:
@@ -156,21 +156,21 @@ def disabled():
 
 
 # Element-wise ufuncs, reductions and np.where without NumPy's dispatch when called
-# through this module (`import viproc as np`, python -m viproc): a viproc
+# through this module (`import numpy2x as np`, python -m numpy2x): a numpy2x
 # argument takes the C hot path right away; everything else is NumPy's own
 # function (attributes, other arguments, `isinstance(np.add, np.ufunc)`).
 for _name in dir(_np):
     _f = getattr(_np, _name)
     if isinstance(_f, _np.ufunc) and _f.signature is None and _f.nout == 1:
-        globals()[_name] = _viproc.ufunc_proxy(_f)
-where = _viproc.where
+        globals()[_name] = _numpy2x.ufunc_proxy(_f)
+where = _numpy2x.where
 # The reductions the C path takes (setup_reductions), the same way.
 for _name in ("sum", "prod", "max", "min", "amax", "amin", "any", "all", "mean", "var", "std",
               "argmax", "argmin"):
-    globals()[_name] = _viproc.ufunc_proxy(getattr(_np, _name), True)
+    globals()[_name] = _numpy2x.ufunc_proxy(getattr(_np, _name), True)
 del _name, _f
-# Pickled as NumPy's ufunc: unpickling gives numpy.<name>, no viproc needed.
-_copyreg.pickle(_viproc.ufunc_proxy,
+# Pickled as NumPy's ufunc: unpickling gives numpy.<name>, no numpy2x needed.
+_copyreg.pickle(_numpy2x.ufunc_proxy,
                 lambda p: (__import__("pydoc").locate, ("numpy." + p._ufunc.__name__,)))
 
 

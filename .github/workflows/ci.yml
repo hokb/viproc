@@ -1,4 +1,4 @@
-# Build viproc with pip (scikit-build-core, Release) and run the Python tests,
+# Build numpy2x with pip (scikit-build-core, Release) and run the Python tests,
 # on Linux (GCC) and Windows (MSVC) - the same steps as dev.sh / dev.cmd.
 name: ci
 on:

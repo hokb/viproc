@@ -4,10 +4,10 @@ Guidance for Claude Code when working in this repository.
 
 ## Project
 
-**viproc** is a layer that adds **instruction-level parallelism for array
+**numpy2x** is a layer that adds **instruction-level parallelism for array
 instructions (array ILP)** to regular NumPy programs. The program is
 written sequentially (`c = a + b`, `m = max(c)`, `s = sum(c, axis=0)`, …);
-viproc executes its array instructions in parallel wherever the data
+numpy2x executes its array instructions in parallel wherever the data
 dependencies allow it. The final computation of every instruction is
 delegated to NumPy's own inner loops, including their SIMD paths.
 
@@ -39,7 +39,7 @@ to plain sequential NumPy execution.
 - A pending array references **the task that computes it** (its producer).
   For an in/out array this is the **last** task that writes it.
 - Arrays do **not** reference the tasks that consume them as inputs.
-- Element memory comes from viproc's element pool and is taken **as late
+- Element memory comes from numpy2x's element pool and is taken **as late
   as possible, by the task that produces it**: right before its kernel
   runs, on the thread that runs it. It takes a dying input's block when it
   holds the only reference to it and the layouts match (element-wise
@@ -267,7 +267,7 @@ per-op layer comes on top of NumPy's own loops and small ops cannot hide it.
 **Complexity becomes performance** (goals.md, G1): the yardstick is whether
 whole programs scale strongly, not whether single ops beat NumPy. A program
 of one op does not get faster; complexity brings parallel potential, which
-viproc turns into parallelism. Current milestone: every program at 0.8x of
+numpy2x turns into parallelism. Current milestone: every program at 0.8x of
 NumPy or faster, complex programs clearly faster.
 
 **Bit-identical results are mandatory (currently).** Every change must keep
@@ -286,7 +286,7 @@ multicore CPUs (`docs/design/goals.md`).
 - **Compute kernels: official NumPy C code, taken from the installed
   NumPy at runtime.** We do not vendor or compile NumPy. The runtime looks
   up NumPy's ufunc inner loops (with their SIMD dispatch) through the NumPy
-  C API and calls them on viproc buffers. No kernels of our own.
+  C API and calls them on numpy2x buffers. No kernels of our own.
 - **Async execution / glue layer (ours):** sits between the user ops
   (`add`, `sum`, `max`, …) and the NumPy ndarray layer. It owns the
   arrays and tasks, the completion events between tasks, the worker
@@ -307,7 +307,7 @@ execution.
   Bohrium (C/C++).
 - **CMake ≥ 3.24** with Ninja.
 - **CPython ≥ 3.12 and NumPy ≥ 2.5** are runtime and build dependencies
-  (NumPy headers via `numpy.get_include()`). viproc reproduces NumPy's
+  (NumPy headers via `numpy.get_include()`). numpy2x reproduces NumPy's
   calling patterns and result layouts, and those change between versions:
   the test suite on the 2.1–2.3 wheels found 22–72 differences (eig
   dtypes, svd(hermitian), heapsort of bool, layouts, reduction blocks),
@@ -334,8 +334,8 @@ docs/benchmarks.md     benchmark results: current breakdown per category and
                        shape map (images in docs/benchmarks/; reference
                        runs there, e.g. windows/, replaced only with
                        --reference: local runs go to ./reports, untracked)
-include/viproc/        Public C ABI (viproc.h). The only interface bridges may use.
-src/runtime/           Runtime core, no Python dependency (library `viproc`)
+include/numpy2x/        Public C ABI (numpy2x.h). The only interface bridges may use.
+src/runtime/           Runtime core, no Python dependency (library `numpy2x`)
   layout.*             DType, Layout (shape, byte strides, offset), broadcasting
   small_vector.hpp     inline-storage vectors (shapes/strides, task operands)
   ref.hpp              Ref<T>: non-atomic intrusive refcount (Array, AliasGroup)
@@ -357,7 +357,7 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
   assign.*             element copy kernels (dst[...] = src; a new array
                        placed from parts: concatenate, tile, pad, ...)
   index.*              gather / scatter / masked assignment / select (indexing, np.where)
-src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
+src/kernels/           Kernel adapters using NumPy (library `numpy2x_numpy`)
   numpy_ufunc.*        UfuncLoop / LoopCache (resolved NumPy loops),
                        element-wise kernel, wrap_ndarray / to_ndarray
   numpy_reduce.*       reduction kernel: NumPy's reduction loop, called in
@@ -371,40 +371,40 @@ src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
                        batch row as PyUFunc_GeneralizedFunctionInternal
   numpy_sort.*         sort/argsort kernel: NumPy's per-dtype sort functions
                        (ArrFuncs->sort/argsort), one call per row
-src/capi/capi.cpp      Implementation of the C ABI (library `viproc_capi`)
-src/viproc_python.h    the only way to include Python.h (MSVC debug fix)
-python/viproc/         Python package
-  _viproc.c            CPython extension (C only, uses viproc.h): base class
+src/capi/capi.cpp      Implementation of the C ABI (library `numpy2x_capi`)
+src/numpy2x_python.h    the only way to include Python.h (MSVC debug fix)
+python/numpy2x/         Python package
+  _numpy2x.c            CPython extension (C only, uses numpy2x.h): base class
                        _Array with the per-op hot path (__array_ufunc__ for
                        element-wise ufuncs, all operators, dtype-resolution
                        cache, scalars, broadcasting, issue sites;
                        reductions, copy, astype, reshape, swapaxes as C
                        methods, NumPy delegate for small ready data)
-  _ndarray.py          viproc.ndarray(_Array): fallbacks, __array_function__,
+  _ndarray.py          numpy2x.ndarray(_Array): fallbacks, __array_function__,
                        indexing, sync points; registers hooks with setup()
   _compose.py          NumPy functions composed of async ops, ported from
                        NumPy's code without its asanyarray (clip, round,
                        isclose, nan*, norm, triu, *_like, ...)
   _join.py             concatenate/stack/tile/repeat/pad/roll/delete/insert
-                       as one placement task each (vp_place)
+                       as one placement task each (nx_place)
   _indexing.py         take, put, *_along_axis, compress, extract, place,
                        select, copyto(where=) on gather/scatter/select tasks
   _ufuncs.py           ufunc calls the C fast path leaves out (several
                        outputs, dtype=/signature=/casting=, cast out=),
                        ufunc.accumulate (cumsum, cumprod, nancum*), outer,
                        where=, ufunc.at, ufunc.reduceat, gufunc calls
-                       (vp_gufunc: casts, out=, axes=/axis=, 1-d matmul)
-  _linalg.py           numpy.linalg wrappers ported onto vp_gufunc (det, inv,
+                       (nx_gufunc: casts, out=, axes=/axis=, 1-d matmul)
+  _linalg.py           numpy.linalg wrappers ported onto nx_gufunc (det, inv,
                        solve, cholesky, eig*, svd; AsyncLinAlgError)
-  _fft.py              numpy.fft wrappers ported onto vp_gufunc (fft, rfft,
+  _fft.py              numpy.fft wrappers ported onto nx_gufunc (fft, rfft,
                        irfft, hfft, n-d transforms)
   _sort.py             np.sort/np.argsort/a.sort beyond the C path (axis=None
                        copies, kinds, NumPy's errors)
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
-  __main__.py          python -m viproc prog.py | -m mod | -c code
-python/_viproc_hook.py import numpy -> viproc for user code (python -m viproc,
-                       VIPROC=1 via viproc.pth, installed by pip next to it)
+  __main__.py          python -m numpy2x prog.py | -m mod | -c code
+python/_numpy2x_hook.py import numpy -> numpy2x for user code (python -m numpy2x,
+                       NUMPY2X=1 via numpy2x.pth, installed by pip next to it)
 python/tests/          pytest tests of the bridge (bit-identical to NumPy)
   async_path.py        assert_async(): an op took the asynchronous path
                        (offload_stats counters: tasks, no fallback, no sync)
@@ -420,13 +420,13 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
                        expressions/loops/control; --groups selects groups)
   array_pipelining.py  ILNumerics' array-pipelining demo (loop over columns,
                        dependent loop, vectorized): NumPy, NumPy threads,
-                       viproc at 1..cores workers
+                       numpy2x at 1..cores workers
 pyproject.toml         pip build (scikit-build-core; CMake installs the package
                        only for SKBUILD), version from CMakeLists.txt
 dev.cmd, dev.sh        one-click dev loop (tools/dev.ps1 on Windows): pull,
                        build into .venv, test
 .github/workflows/ci.yml  pip build + pytest, Linux (GCC) and Windows (MSVC)
-docker/                images that build, test and run viproc (README.md):
+docker/                images that build, test and run numpy2x (README.md):
   entrypoint.sh        command line of the Linux and Wine images
   linux/               GCC, CPython (python:<ver>-bookworm)
   windows/             native Windows container: MSVC, entrypoint.ps1
@@ -437,13 +437,13 @@ tests/
   test_numpy_runtime.cpp  end-to-end with NumPy loops, bit-identical to NumPy
 ```
 
-The build assembles the importable package in `build/python/viproc`
+The build assembles the importable package in `build/python/numpy2x`
 (Python sources copied, extension module built there).
 
 Rules:
 - Bridges (Python, later .NET) only talk to the runtime through
-  `include/viproc/viproc.h`. No C++ types cross the ABI.
-- Include Python via `src/viproc_python.h`, never `<Python.h>` directly:
+  `include/numpy2x/numpy2x.h`. No C++ types cross the ABI.
+- Include Python via `src/numpy2x_python.h`, never `<Python.h>` directly:
   it hides MSVC's `_DEBUG`, which would otherwise make Debug builds link
   `python3XX_d.lib` and use the debug ABI. Test executables that embed
   Python start it through `tests/embed_python.h`.
@@ -456,7 +456,7 @@ Rules:
 ./dev.sh  |  dev.cmd      # one click: git pull, pip-build Release into .venv, pytest
                           # (--no-pull/--no-test, -NoPull/-NoTest); the maintainer's
                           # way to try a merged change on Windows
-pip install .             # scikit-build-core (pyproject.toml), VIPROC_BUILD_TESTS=OFF
+pip install .             # scikit-build-core (pyproject.toml), NUMPY2X_BUILD_TESTS=OFF
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug   # configure
 cmake --build build                                     # build
 ctest --test-dir build --output-on-failure              # run tests
@@ -476,7 +476,7 @@ docker/benchmark.sh [--quick]     # (re)build images, suite on Linux + Windows (
 
 Windows / Visual Studio: Debug builds work with a regular (release)
 Python installation; the extension module is written to
-`build/python/viproc` for every configuration (`ctest -C Debug`).
+`build/python/numpy2x` for every configuration (`ctest -C Debug`).
 
 Docker (`docker/README.md`): each image builds this checkout and runs all
 test suites by default (`test`, ctest only: no benchmark); `python`,
@@ -491,31 +491,31 @@ names its build (`build <time> #<fingerprint>`, `suite.build_stamp`);
 check it before comparing runs.
 
 ```bash
-docker build -f docker/linux/Dockerfile -t viproc:linux .
-docker build -f docker/wine/Dockerfile -t viproc:wine .
-docker run --rm viproc:wine                         # all suites, Windows build
-docker run --rm -v "$PWD:/src" viproc:linux         # test this checkout (incremental)
+docker build -f docker/linux/Dockerfile -t numpy2x:linux .
+docker build -f docker/wine/Dockerfile -t numpy2x:wine .
+docker run --rm numpy2x:wine                         # all suites, Windows build
+docker run --rm -v "$PWD:/src" numpy2x:linux         # test this checkout (incremental)
 ```
 
 Linux and Windows must behave identically: same results, same features
 (temporary elision, element pool, huge pages where the OS allows; Windows
-large pages are opt-in, `VIPROC_LARGE_PAGES=1`, see design doc).
+large pages are opt-in, `NUMPY2X_LARGE_PAGES=1`, see design doc).
 Platform-specific code stays behind small functions with one
 implementation per platform (`capture_stack`/`module_base` in
-`_viproc.c`, `system_allocate` in `element_pool.cpp`), and both builds run
+`_numpy2x.c`, `system_allocate` in `element_pool.cpp`), and both builds run
 the same tests.
 
-Build with `-DVIPROC_WARNINGS_AS_ERRORS=OFF` only for local experiments;
+Build with `-DNUMPY2X_WARNINGS_AS_ERRORS=OFF` only for local experiments;
 the default build treats warnings as errors. Always build and run the tests
 before committing.
 
 ## Architecture (phase 1)
 
 ```
-Python user code  (viproc.asarray(...) / import viproc as np)
+Python user code  (numpy2x.asarray(...) / import numpy2x as np)
         │
-Python bridge     viproc.ndarray, NumPy protocols        ← design from Bohrium npbackend
-        │  C ABI (viproc.h)
+Python bridge     numpy2x.ndarray, NumPy protocols        ← design from Bohrium npbackend
+        │  C ABI (numpy2x.h)
 Runtime           arrays (ready/pending) · tasks · stage events ·
                   worker threads · sync                   ← ours
         │
@@ -561,8 +561,8 @@ reference counting.
      measured by the bridge once per process (`_calibrate` in
      `_ndarray.py`, ~5 ms, interleaved best-of rounds of 64 `a * b` of 8
      doubles: direct d, task of ready inputs t, task of a pending input c;
-     `direct_budget_ns` = t - d, `chain_ns` = c - d, `vp_set_chain_ns`;
-     `VIPROC_DIRECT_BUDGET_NS` overrides). 12700K: t - d 0.3-1.1 µs; VM
+     `direct_budget_ns` = t - d, `chain_ns` = c - d, `nx_set_chain_ns`;
+     `NUMPY2X_DIRECT_BUDGET_NS` overrides). 12700K: t - d 0.3-1.1 µs; VM
      ~2 µs. **Chains:** a small op's result carries its issue site
      (`AliasGroup::chain_`, for 32 ops); small ops reading it (and their
      results) credit their estimated NumPy time to that site (`ChainScore`,
@@ -599,8 +599,8 @@ reference counting.
      inline; in inline mode an exploration call still goes async, first
      every 16th call, doubling up to every 1024th while explorations confirm
      inline; ≤ 1/4 switches back. Reversible, unlike the Accelerator.
-  3. **Deterministic mode:** `adaptive = false` (`viproc.init(adaptive=False)`
-     or `VIPROC_DETERMINISTIC=1`) keeps only rule 1. Results are identical
+  3. **Deterministic mode:** `adaptive = false` (`numpy2x.init(adaptive=False)`
+     or `NUMPY2X_DETERMINISTIC=1`) keeps only rule 1. Results are identical
      in every mode; only where ops run changes.
   Not done yet: a higher N_min for cheap ops (`add` breaks even at ~3,000
   elements), costs of kernels made per op (reductions, gathers, ...).
@@ -625,9 +625,9 @@ reference counting.
   it before the task completes. **Fail fast:** the record's arrival
   schedules a raise in the main thread (`Py_AddPendingCall`, no GIL taken),
   which raises it at the next check of the running user code, as Python
-  raises `KeyboardInterrupt` (never inside viproc's or NumPy's own Python
+  raises `KeyboardInterrupt` (never inside numpy2x's or NumPy's own Python
   code), as `AsyncValueError` / `AsyncIndexError` (subclasses of NumPy's
-  type and `AsyncError`); every call into viproc checks too
+  type and `AsyncError`); every call into numpy2x checks too
   (`check_async_errors`, one atomic load). Raised once; sync points on
   failed arrays raise it every time, `wait_all()` and shutdown
   deterministically. A failed array stays failed, also after it is
@@ -697,7 +697,7 @@ while it runs the program ahead, so a worker gets it only at the switch
 interval (5 ms). Measured (4 worker threads calling `np.sum`): 1e6
 elements: 62 ms serial, 16 ms with an idle main thread, but 148 ms with a
 busy main thread; 1e3 elements: 34 ms serial vs. 6858 ms. Hence workers
-call the loops directly, without the GIL, and viproc reproduces NumPy's
+call the loops directly, without the GIL, and numpy2x reproduces NumPy's
 calling pattern where results depend on it: only floating-point `add`
 reductions (pairwise summation; `sum`, `mean`, `var`, `std`). Element-wise
 ops, `min`/`max`/`any`/`all`/`prod`, linalg and fft give the same result
@@ -743,7 +743,7 @@ Rules:
   `reduction=True` and `fixed_strides` = the inner strides, called with
   `args = {acc, in, acc}` (acc stride 0 along reduced axes). NumPy's float
   `add` loop sums each call pairwise, so the blocks decide the rounding;
-  viproc calls the loop in exactly NumPy's blocks (`ReducePlan`, built at
+  numpy2x calls the loop in exactly NumPy's blocks (`ReducePlan`, built at
   issue time):
   - axes ordered by the input's |stride| (nditer's insertion sort over C
     order; zero strides and extent-1 axes never decide), negative strides
@@ -764,7 +764,7 @@ Rules:
   exactly as `PyUFunc_ReduceWrapper` builds it, but **once per signature**
   (ufunc, input layout, axes, keepdims, `dtype=`, initial or not, buffer
   size) as a template over a dummy address (`ReduceTemplate`; the result
-  NumPy allocates there gives viproc's result layout). Per op the main
+  NumPy allocates there gives numpy2x's result layout). Per op the main
   thread only looks the template up (and makes one more copy while the
   template has fewer than the kernel threads + 1, `IterTemplate::reserve`):
   no element memory, no address. The task takes a copy from the template's
@@ -791,19 +791,19 @@ Rules:
   as NumPy composes it: eigh, argsort, take_along_axis), `svdvals`. NumPy's wrappers are ported: the same
   argument checks (`LinAlgError` at the call), `_commonType` (computation
   in double/cdouble, the input cast first, results cast back), the same
-  gufunc and signature, run through `vp_gufunc` (labels only outputs have,
+  gufunc and signature, run through `nx_gufunc` (labels only outputs have,
   svd's `p`, passed in). NumPy's wrappers raise `LinAlgError` through an
   `errstate(invalid='call')` callback when the loop sets the FP invalid
-  flag; viproc's kernel checks the flag after each loop call and fails
+  flag; numpy2x's kernel checks the flag after each loop call and fails
   the op with the wrapper's message: `AsyncLinAlgError` (a `LinAlgError`)
-  at the next call into viproc and at the result's sync points.
+  at the next call into numpy2x and at the result's sync points.
   `_assert_finite` (eig, eigvals) runs in the kernel before the loop
-  (`VP_GUFUNC_CHECK_FINITE`), no sync. `qr` (its `qr_r_raw` writes its
+  (`NX_GUFUNC_CHECK_FINITE`), no sync. `qr` (its `qr_r_raw` writes its
   input), `lstsq` (data-dependent residual shape), `pinv`, `matrix_rank`,
   `cond` and `matrix_power` still fall back. Linalg
   loops call LAPACK, which OpenBLAS threads itself for larger matrices:
   matrices of >= 64 x 64 elements run one loop call at a time
-  (`VP_GUFUNC_SERIAL`, a process-wide mutex; `_linalg.SERIAL_FROM`).
+  (`NX_GUFUNC_SERIAL`, a process-wide mutex; `_linalg.SERIAL_FROM`).
   Several threaded OpenBLAS calls at once oversubscribe its threads: 8
   concurrent 300 x 300 `inv` took 20 ms to 1.1 s (NumPy ~22 ms), serialized
   17–47 ms. Small ready inputs (at most `sync_below` elements) run NumPy's
@@ -812,7 +812,7 @@ Rules:
 - **BLAS threads decide BLAS results.** OpenBLAS (NumPy's wheels, 0.3.34)
   splits large products differently with 1, 2 or 4 threads, and the values
   differ (`a @ b` of 513 x 513 float64: three different results for
-  `OPENBLAS_NUM_THREADS` 1, 2, 4). So viproc must not change BLAS
+  `OPENBLAS_NUM_THREADS` 1, 2, 4). So numpy2x must not change BLAS
   threading (no "1 BLAS thread per worker"): bit-identity with NumPy means
   the same BLAS configuration. Concurrent calls from several threads give
   the values of the same calls made one after the other (checked: 4 threads,
@@ -823,8 +823,8 @@ Rules:
   overlap well. **Open:** concurrent threaded OpenBLAS calls have a heavy
   tail (8 independent 128 x 128 `a @ a`: median 2x NumPy's time, p90 25x;
   with `OPENBLAS_NUM_THREADS=1` 2.7x faster than NumPy): the matmul
-  kernel may need linalg's `VP_GUFUNC_SERIAL`.
-- **`matmul`** (`src/kernels/numpy_matmul.*`, `vp_matmul`): NumPy's matmul
+  kernel may need linalg's `NX_GUFUNC_SERIAL`.
+- **`matmul`** (`src/kernels/numpy_matmul.*`, `nx_matmul`): NumPy's matmul
   gufunc loop `(m?,n),(n,p?)->(m?,p?)`, called as
   `PyUFunc_GeneralizedFunctionInternal` calls it: no buffering, one call
   per inner batch row with `dims = {count, m, n, p}` and the core strides
@@ -853,14 +853,14 @@ Rules:
   `fct` (computed on the main thread as NumPy computes it),
   `rfft_n_even`/`rfft_n_odd` by the parity of n, the gufunc called as
   `ufunc(a, fct, axes=[(axis,), (), (axis,)], out=out)` through
-  `vp_gufunc` (the loop pads/truncates to n itself; the output label's
+  `nx_gufunc` (the loop pads/truncates to n itself; the output label's
   size passed in). The loop is NumPy's for (a, fct, out): a Python int
   `fct` (norm "backward") makes NumPy pick the **double** loop also for
-  float32/complex64 data and cast into the single-precision `out`; viproc
+  float32/complex64 data and cast into the single-precision `out`; numpy2x
   runs that loop and casts the result (an `astype` task), bit-identical.
   NumPy allocates `out` with `empty_like(a, shape=...)` (order K:
-  `PyArray_NewLikeArrayWithShape`); viproc gives the result that layout
-  (`vp_gufunc`'s `out_order`). pocketfft makes its plan per call
+  `PyArray_NewLikeArrayWithShape`); numpy2x gives the result that layout
+  (`nx_gufunc`'s `out_order`). pocketfft makes its plan per call
   (`POCKETFFT_CACHE_SIZE` 0 in NumPy's build): thread-safe. n-d transforms
   with `out=` and the deprecated `s`/`axes` forms fall back. A call
   without `out=` is planned once per (dtype, shape, strides, n, axis,
@@ -871,7 +871,7 @@ Rules:
   `abs(ifft(fft(A)))`) ran at 0.65x of NumPy for n = 100; with the plans
   an issue takes ~30 µs (2.7x at n = 100, 4.4-5.7x from n = 200 on 4
   cores). Fuzzed in `python/tests/test_fft.py`.
-- **Sort** (`src/kernels/numpy_sort.*`, `vp_sort`): `np.sort`,
+- **Sort** (`src/kernels/numpy_sort.*`, `nx_sort`): `np.sort`,
   `np.argsort`, `a.sort()`, `a.argsort()` on NumPy's per-dtype sort
   functions (`PyDataType_GetArrFuncs(descr)->sort[kind]` /
   `->argsort[kind]`: the introsort, timsort and radix sort instances
@@ -884,7 +884,7 @@ Rules:
   NaNs and signed zeros. Kinds: quicksort and heapsort are table index 0
   (NumPy 2 maps heapsort to its introsort), mergesort/stable/`stable=True`
   2. `np.sort` is NumPy's `copy(order="K")` sorted in place: the result has
-  `empty_like(a)`'s layout (order K, computed in `vp_sort`); a dense input
+  `empty_like(a)`'s layout (order K, computed in `nx_sort`); a dense input
   is copied in one pass first, as NumPy does, then each row sorted in
   place. argsort's result is C-ordered intp. `axis=None` sorts the
   C-ordered flat copy (a reshape view where there is one). The common
@@ -910,7 +910,7 @@ Rules:
 ## Python bridge
 
 - **Decision: a wrapper class using NumPy's array protocols, not an
-  `ndarray` subclass.** `viproc.ndarray` implements `__array_ufunc__`
+  `ndarray` subclass.** `numpy2x.ndarray` implements `__array_ufunc__`
   (NEP 13) and `__array_function__` (NEP 18) plus the operators. Bohrium's npbackend subclasses `ndarray` and
   protects memory (mprotect + signal handler) to sync when NumPy C code
   touches the data; with the protocols every NumPy entry point either is
@@ -930,11 +930,11 @@ Rules:
   makes a view, else an async copy first, `atleast_*d`, `fliplr`/`flipud`,
   `matrix_transpose`). **No ndarray is built for a view:** NumPy has no
   public function that computes view metadata (`get_view_from_index`,
-  `_attempt_nocopy_reshape` are internal), so viproc computes the layout
+  `_attempt_nocopy_reshape` are internal), so numpy2x computes the layout
   itself, after NumPy's rules (as ILNumerics does): basic keys in C
-  (`_viproc.basic_view`, slices through CPython's `PySlice_Unpack` /
-  `PySlice_AdjustIndices`, as NumPy), `_viproc.transpose`,
-  `vp_array_reshape` (`reshape_view` in `layout.cpp`, a port of
+  (`_numpy2x.basic_view`, slices through CPython's `PySlice_Unpack` /
+  `PySlice_AdjustIndices`, as NumPy), `_numpy2x.transpose`,
+  `nx_array_reshape` (`reshape_view` in `layout.cpp`, a port of
   `_attempt_nocopy_reshape`; NULL where NumPy copies), `broadcast_to`,
   `PyArray_Diagonal` in Python. Invalid arguments raise NumPy's own error
   from the same call on a zero-stride probe (`np.broadcast_to` of one
@@ -946,7 +946,7 @@ Rules:
   ~4,700 with `__getitem__` in Python), `a.T` ~1,410 / 0.11 µs;
   **advanced indexing** as gather / scatter
   tasks (`src/runtime/index.*`, element copies, so the element order does
-  not matter): integer arrays (viproc arrays may be pending), lists, ints
+  not matter): integer arrays (numpy2x arrays may be pending), lists, ints
   next to arrays, boolean masks (they sync: `nonzero()` gives the shape),
   `x[mask] = scalar` without a sync (masked assignment); NumPy's
   placement of the broadcast index dimensions (adjacent in the key or
@@ -965,7 +965,7 @@ Rules:
   maximum, fmin, fmax, logical and/or/xor, bitwise and/or/xor) and
   `np.sum/prod/min/max/amin/amax/any/all` (also as methods) without
   `out=` and `where=`, with casts and `initial=`; `any`/`all` of non-bool data as `a != 0` first;
-  `mean`, `var`, `std` of every viproc dtype composed exactly as NumPy's
+  `mean`, `var`, `std` of every numpy2x dtype composed exactly as NumPy's
   `_methods.py` (sum, in float64 for bool and integers; divide by the
   count in the promoted dtype and cast back; squared deviations, for
   complex data through NumPy's float view of the deviations);
@@ -974,7 +974,7 @@ Rules:
   preparation is cached per (ufunc, dtype, ndim, axis, keepdims)
   (`_reduce_plans`). In C, the fast path's reduce kernel (plan, loop,
   identity bytes) is shared per (ufunc, input layout without offset,
-  reduced axes, identity) (`vp_runtime::reduce_kernels`; identities that are
+  reduced axes, identity) (`nx_runtime::reduce_kernels`; identities that are
   exact Python bools, ints and floats, keyed by value): a loop of
   `np.sum(a[:, i], axis=0)` converted the identity into an ndarray and
   built a kernel per op (~2,700 instructions; `x.sum(axis=0)` of 100
@@ -985,86 +985,86 @@ Rules:
   matching `np.*` functions (`setup_reductions`: entries with their
   Python fallbacks); every other function goes to `_ndarray.py`. Per
   call, in order: (1) sum/prod/max/min/any(bool)/all(bool) with an axis
-  or keepdims and no other arguments: `vp_reduce` (run directly for small
+  or keepdims and no other arguments: `nx_reduce` (run directly for small
   ready data, async otherwise); (2) **small ready data** (≤ `sync_below`
-  elements, no viproc `out=`/`where=`): NumPy computes it on a borrowed
-  view of the buffer (`vp_array_borrow`, design doc D7): NumPy's method
+  elements, no numpy2x `out=`/`where=`): NumPy computes it on a borrowed
+  view of the buffer (`nx_array_borrow`, design doc D7): NumPy's method
   (`view.sum(...)`) or `np.sum._implementation`, with the caller's
   arguments, so results, errors and warnings are NumPy's; a fresh ndarray
   result is adopted, a view NumPy keeps is pinned as a read-only export
-  (`vp_array_pin`); (3) full reductions of larger or pending data:
-  `vp_reduce`; (4) the Python handlers. A full reduction of small ready
-  data costs NumPy's call plus ~0.15 µs (the borrow); `vp_reduce`'s
+  (`nx_array_pin`); (3) full reductions of larger or pending data:
+  `nx_reduce`; (4) the Python handlers. A full reduction of small ready
+  data costs NumPy's call plus ~0.15 µs (the borrow); `nx_reduce`'s
   direct path would cost ~0.9 µs. `reshape(shape)` / `swapaxes(i, j)` with
   exact ints are C methods too (views, `reshape_view`); orders, copies
   and other argument types go to `_reshape_py` / `_swapaxes_py`.
 - **Index assignment in C** (`_Array.mp_ass_subscript`, `a[key] = value`):
-  every array involved (target, viproc arrays in the key, the value)
-  ready, nothing reading the target's buffer (`vp_array_host_writable`)
+  every array involved (target, numpy2x arrays in the key, the value)
+  ready, nothing reading the target's buffer (`nx_array_host_writable`)
   and the target (or the written view of a basic key) at most `sync_below`
   elements: NumPy's own slot (`PyArray_Type.tp_as_mapping->
   mp_ass_subscript`) runs on a borrowed writable view, key arrays and the
   value borrowed too (design doc D7), so values, casts and errors are
   NumPy's for every key kind. Otherwise basic keys issue an assignment:
-  the target is a view, the value a viproc array (`vp_assign` casts) or a
+  the target is a view, the value a numpy2x array (`nx_assign` casts) or a
   Python/NumPy scalar converted at issue with `PyArray_Pack`
-  (`vp_array_from_item`, NumPy's conversion and errors); the task only
-  copies. Advanced keys, sequences as values and errors of `vp_assign` go
+  (`nx_array_from_item`, NumPy's conversion and errors); the task only
+  copies. Advanced keys, sequences as values and errors of `nx_assign` go
   to the hook `_setitem` (scatter / masked assignment tasks, fallback).
   `out[3] = s` 0.22 µs (NumPy 0.16; it was 3.1 µs in Python). The written
   view of a basic key is a runtime view only (`basic_layout`, shared with
   `m_basic_view`): no Python object for it (`C[i] = pending 0-d` 5,180 →
   4,050 instructions).
 - **`np.where` in C** (`_Array.__array_function__`, `where_select` /
-  `where_delegate` in `_viproc.c`): a bool viproc condition with x and y
+  `where_delegate` in `_numpy2x.c`): a bool numpy2x condition with x and y
   of one dtype, or one of them a Python scalar NEP 50 promotes weakly to
   the other's dtype (converted with `PyArray_Pack`), is a select
-  (`vp_select`: direct for small ready data, else a task); other small
+  (`nx_select`: direct for small ready data, else a task); other small
   ready calls run NumPy's own `where` on borrowed views, its result
   adopted; the rest goes to `_where` in Python. 100 elements: ~12,000
   instructions (NumPy ~10,100; it was ~30,000 in Python).
-- **Module mode without NumPy's dispatch** (`import viproc as np`,
-  `python -m viproc`): `viproc.<ufunc>` for every element-wise NumPy ufunc
-  is a `_viproc.ufunc_proxy`: a call with a viproc argument goes straight
+- **Module mode without NumPy's dispatch** (`import numpy2x as np`,
+  `python -m numpy2x`): `numpy2x.<ufunc>` for every element-wise NumPy ufunc
+  is a `_numpy2x.ufunc_proxy`: a call with a numpy2x argument goes straight
   to `fast_ufunc`, skipping `PyUFunc_CheckOverride` (argument tuple,
   kwargs dict, `__array_ufunc__` call: ~2,000 instructions); other calls
   and every attribute (`reduce`, `outer`, `at`, `nin`, ...) are the
   ufunc's, `__class__` is `numpy.ufunc` (isinstance holds), equality and
-  hash are the ufunc's, pickling gives `numpy.<name>`. `viproc.where` is
+  hash are the ufunc's, pickling gives `numpy.<name>`. `numpy2x.where` is
   the same for `np.where`. The reductions of the C path (`sum`, `prod`,
   `max`, `min`, `amax`, `amin`, `any`, `all`, `mean`, `var`, `std`,
-  `argmax`, `argmin`) are `ufunc_proxy(func, True)`: a viproc array as the
+  `argmax`, `argmin`) are `ufunc_proxy(func, True)`: a numpy2x array as the
   first argument takes `Array_array_function`'s steps right away
   (`ReduceProxy_vectorcall`), skipping NumPy's `__array_function__`
   dispatch (`np.sum(x, axis=0)` 15,100 → 8,800 instructions); anything
   else is NumPy's function. `shape_map.py --module` measures this mode.
 - **0-d results and the scalar shortcut.** Where NumPy returns a scalar
-  (full reductions, `a[i, j]`, ufuncs on 0-d operands), viproc returns
+  (full reductions, `a[i, j]`, ufuncs on 0-d operands), numpy2x returns
   NumPy's scalar if the data is there already (the op ran directly), else
   a pending 0-d array marked `_scalar`: in-place operators on it rebind
   (as on NumPy's immutable scalars; a plain 0-d array keeps NumPy's
   in-place semantics). An operator or ufunc call whose operands are all
-  scalars (ready 0-d viproc arrays, Python and NumPy scalars) has nothing
+  scalars (ready 0-d numpy2x arrays, Python and NumPy scalars) has nothing
   to run asynchronously: the C hot path converts them to NumPy scalars
   and lets NumPy compute it right there (`scalars_of`; operators as NumPy
   scalar math, ufunc calls as NumPy's ufunc), returning NumPy's scalar,
   as the NumPy program would. Any n-d operand, even of one element, keeps
   the array path and NumPy's output shape. `float()`, `bool()`,
   `format()`, `round()` of a pending 0-d array sync.
-- **Fallback (sync + eager NumPy on viproc memory, `_Host`):** everything
+- **Fallback (sync + eager NumPy on numpy2x memory, `_Host`):** everything
   else (`nonzero`, `flatnonzero`, `argwhere`, `count_nonzero` sync on their
   argument and run in NumPy on a read-only export, without the general
   fallback's wait for readers): other reductions (`out=`, `where=`),
   `qr`/`lstsq`/`pinv` and other linalg functions not in `LINALG`, `np.dot` of n-d
   operands, empty advanced-index results, 0-d boolean indices,
   `ufunc.at`, other NumPy functions. NumPy's semantics exactly (design doc
-  D7, "Eager fallbacks"): each viproc argument becomes a writable NumPy
-  view after `vp_array_prepare_write` (wait for producer and task
+  D7, "Eager fallbacks"): each numpy2x argument becomes a writable NumPy
+  view after `nx_array_prepare_write` (wait for producer and task
   readers; live exports alias it), so `out=`, mutating
   functions (`np.put`, `np.place`, …) and overlap work in place. Results
-  are mapped back: an argument returned as is → that viproc array; a view
-  of an argument (by memory overlap) → a viproc view of its alias group
-  (`vp_array_view`, dtype views, read-only if NumPy made it read-only); a
+  are mapped back: an argument returned as is → that numpy2x array; a view
+  of an argument (by memory overlap) → a numpy2x view of its alias group
+  (`nx_array_view`, dtype views, read-only if NumPy made it read-only); a
   NumPy argument → unchanged; fresh memory → adopted; else copied.
   `np.copyto(dst, src)` maps to assignment.
 - **Compositions** (`_compose.py`, `COMPOSITIONS`, looked up by
@@ -1087,10 +1087,10 @@ Rules:
   compositions): NumPy builds `concatenate`, `stack`, `hstack`, `vstack`,
   `dstack`, `column_stack`, `append`, `tile`, `repeat` (one count),
   `pad` (constant mode), `roll`, `delete` and `insert` (one index) by
-  assigning its inputs into views of a new array (`new[sl] = arr`). viproc
+  assigning its inputs into views of a new array (`new[sl] = arr`). numpy2x
   ports that code onto `_Placer`, which records each assignment as a part
   (shape, byte strides and offset, computed on a one-element probe with the
-  result's layout) and issues all of them as **one task** (`vp_place`,
+  result's layout) and issues all of them as **one task** (`nx_place`,
   `make_place_kernel`: element copies in NumPy's order, later parts
   overwrite earlier ones, as pad's corners). The result gets NumPy's layout
   (`concatenate`: `PyArray_CreateMultiSortedStridePerm` over the inputs;
@@ -1115,35 +1115,35 @@ Rules:
   fall back. Fuzzed in `python/tests/test_indexing_functions.py`.
 - **ufunc calls beyond the fast path** (`_ufuncs.call`, from
   `_fallback_ufunc`): ufuncs with several outputs (`divmod`, `modf`,
-  `frexp`; `vp_ufunc_multi`: NumPy never takes its trivial loop for them,
+  `frexp`; `nx_ufunc_multi`: NumPy never takes its trivial loop for them,
   so the loop runs on NumPy's iterator, which allocates the results in
   order K; `out=` for them falls back), `dtype=`, `signature=`, `casting=`
-  and an `out=` array of another dtype (`ufunc_typed`: `vp_ufunc_loop` for
+  and an `out=` array of another dtype (`ufunc_typed`: `nx_ufunc_loop` for
   exactly the dtypes `ufunc.resolve_dtypes` gives, with the out dtype in
   the request as NumPy's dispatch has it; NumPy's casting errors come from
-  that call and leave the call to NumPy; `vp_ufunc_issue` casts into `out`
+  that call and leave the call to NumPy; `nx_ufunc_issue` casts into `out`
   in the iterator's buffers). Small 0-d/1-d inputs of another dtype are
   cast into copies first for any ufunc (`check_for_trivial_loop` runs for
   every one). Python scalars are converted to their loop dtype (NEP 50).
   NumPy's `ComplexWarning` comes once per complex-to-real cast and call:
-  viproc warns in Python and silences the iterator template, which is made
+  numpy2x warns in Python and silences the iterator template, which is made
   once. The remaining keywords fall back. Fuzzed in
   `python/tests/test_ufunc_calls.py`.
 - **`where=`, `ufunc.at`, `ufunc.reduceat`, reductions into `out=`**
   (`_ufuncs.py`, `python/tests/test_ufunc_methods.py`):
-  - `where=` (`vp_ufunc_issue_masked`): NumPy's masked iterator (mask
+  - `where=` (`nx_ufunc_issue_masked`): NumPy's masked iterator (mask
     operand `READONLY | ARRAYMASK`, output `WRITEMASKED`), the loop called
     once per run of True values as `generic_masked_strided_loop` calls it
     (`IterElementwiseKernel::masked_call`); no trivial loop and no small
     input copies (NumPy skips `check_for_trivial_loop` with a mask).
     `writes_all` is false: a partial write keeps the old values
-    (copy-on-write copies). Without `out=` viproc gives NumPy's
+    (copy-on-write copies). Without `out=` numpy2x gives NumPy's
     `UserWarning`; masked-off elements are undefined, as in NumPy.
     **NumPy bug:** `NpyIter_Copy` of a buffered masked iterator double-frees
     its transfer data at shutdown, so masked templates build each iterator
     fresh (`IterTemplate::fresh`, `NpyIter_AdvancedNew` with the stored
     operands) instead of copying.
-  - `ufunc.at` (`vp_ufunc_at`, `make_at_kernel`): NumPy's `fast_iter` path,
+  - `ufunc.at` (`nx_ufunc_at`, `make_at_kernel`): NumPy's `fast_iter` path,
     one loop call per index and subspace element, args `{a, b, a}`; all
     indices are checked before the first write (an out-of-bounds index
     raises `AsyncIndexError` and changes nothing). Only where the loop's
@@ -1151,20 +1151,20 @@ Rules:
     NumPy computes `float32 + 2.5` in float64) and not for 1-d `a` with
     NumPy's indexed loops (add, subtract, multiply, divides, max/min,
     fmax/fmin: a loop call per element was 4-5x slower): those run in NumPy.
-  - `ufunc.reduceat` (`vp_reduceat`, `make_reduceat_kernel`): per lane and
+  - `ufunc.reduceat` (`nx_reduceat`, `make_reduceat_kernel`): per lane and
     segment the first element copied, then one call with strides
     `{0, sin, 0}` over the rest, as `PyUFunc_Reduceat`. Indices are host
     data (int64 bytes, validated with NumPy's min/max). The result layout is
     the iterator's (`npyiter_find_best_axis_ordering` over the input with
     stride 0 along the axis and the indices along it only), ported to
     `_reduceat_strides`: not order K.
-  - Reductions with `out=` (`vp_reduce_out`): `out` of exactly the dtype
+  - Reductions with `out=` (`nx_reduce_out`): `out` of exactly the dtype
     and layout NumPy would allocate is written as the task's in/out
     (also a view of the input: copy-on-write); others fall back.
 - **Accumulation and outer** (`_ufuncs.py`): `ufunc.accumulate`,
   `cumsum`/`cumprod` (`axis=None`: the C-ordered `ravel`) and
   `nancumsum`/`nancumprod` (NaNs replaced by a `where` first) as one task
-  (`vp_accumulate`, `make_accumulate_kernel`), called as
+  (`nx_accumulate`, `make_accumulate_kernel`), called as
   `PyUFunc_Accumulate` calls the reduction loop: per row along the axis
   the first element copied, then one call with args `{out, in + 1,
   out + 1}` over the rest. The accumulator dtype is NumPy's, taken once per
@@ -1179,10 +1179,10 @@ Rules:
   where a reshape could view (a strided 1-d array): the copy's strides
   decide later loop calls (complex64 `np.outer`). Fuzzed in
   `python/tests/test_accumulate.py`.
-- **Generalized ufuncs** (`_ufuncs.gufunc`, `vp_gufunc`,
+- **Generalized ufuncs** (`_ufuncs.gufunc`, `nx_gufunc`,
   `src/kernels/numpy_gufunc.*`): a call of a ufunc with a core signature
   (`vecdot`, `matvec`, `vecmat`; `matmul` with casts, `dtype=`, `out=` or
-  `axes=`, which `vp_matmul` leaves out) runs NumPy's gufunc loop as
+  `axes=`, which `nx_matmul` leaves out) runs NumPy's gufunc loop as
   `PyUFunc_GeneralizedFunctionInternal` does: dtypes from
   `ufunc.resolve_dtypes`; inputs of another dtype cast first (a task, with
   the layout `npyiter_new_temp_array` gives the copy); outputs allocated as
@@ -1201,14 +1201,14 @@ Rules:
   among the inputs are imported per call). Fuzzed in `python/tests/test_gufunc.py`.
 - **ndarray methods:** every method and attribute of `numpy.ndarray`
   except `ctypes` (a raw pointer would bypass the runtime). `base`: views
-  made in C (`set_base` in `_viproc.c`: basic indexing, transpose, reshape
-  views, `_viproc.view`) hold the array they were made from, collapsed to
+  made in C (`set_base` in `_numpy2x.c`: basic indexing, transpose, reshape
+  views, `_numpy2x.view`) hold the array they were made from, collapsed to
   the first array of a chain of views (`PyArray_SetBaseObject`); ravel and
-  flatten copies own their data (`_viproc.own`); `flags.owndata` is
+  flatten copies own their data (`_numpy2x.own`); `flags.owndata` is
   `base is None`. A view keeps its base alive, so a view of a temporary is
   not elided (NumPy's `can_elide_temp` needs OWNDATA too). The ones with a NumPy function
   form delegate to it (`a.clip(...)` is `np.clip(a, ...)`), so they take
-  the function's path; `sort` is a task (`vp_sort`, in place); the other
+  the function's path; `sort` is a task (`nx_sort`, in place); the other
   in-place ones without a function form (`partition`, `setfield`,
   `flat[...] = v`) run NumPy's method in the eager fallback; `fill` is an
   assignment; `resize` is NumPy's `PyArray_Resize`
@@ -1217,9 +1217,9 @@ Rules:
   from the installed NumPy once at import (their text changed in 2.5); the data step is a copy and a zero fill as tasks; the
   object keeps its identity, its runtime array is swapped); arrays take
   weak references, as NumPy's do; `flags` is NumPy's flags object ported
-  to C (`FlagsType` in `_viproc.c`: a snapshot per access, bits from the
+  to C (`FlagsType` in `_numpy2x.c`: a snapshot per access, bits from the
   layout as `_UpdateContiguousFlags`/`IsAligned` compute them, ALIGNED from
-  `vp_array_offset` and the strides; no probe array, ~70 ns, NumPy ~50 ns),
+  `nx_array_offset` and the strides; no probe array, ~70 ns, NumPy ~50 ns),
   `setflags` is `array_setflags` in C (`readonly`, `unaligned`), both
   without a sync (`python/tests/test_methods.py`). NumPy's WARN_ON_WRITE
   (`broadcast_arrays` views of writable arrays) is `_warn_on_write`: the
@@ -1228,29 +1228,29 @@ Rules:
   `setflags(write=...)`; it also sets `_readonly`, so every write takes the
   eager fallback, where NumPy warns on the export and clears the flag
   (`_Host.done` carries that back to the array and its base).
-- **Read-only viproc arrays** (`_readonly`, e.g. from `broadcast_to`):
+- **Read-only numpy2x arrays** (`_readonly`, e.g. from `broadcast_to`):
   writes raise NumPy's errors; never reused by temporary elision.
-- **Entry: `python -m viproc prog.py`** (`__main__.py`, also `-m mod`, `-c
-  code`, console) **or `VIPROC=1`** (pip installs `viproc.pth`, which calls
-  `_viproc_hook.autoload()` at every interpreter start; light: NumPy and
-  viproc are imported on first use). `_viproc_hook` replaces
+- **Entry: `python -m numpy2x prog.py`** (`__main__.py`, also `-m mod`, `-c
+  code`, console) **or `NUMPY2X=1`** (pip installs `numpy2x.pth`, which calls
+  `_numpy2x_hook.autoload()` at every interpreter start; light: NumPy and
+  numpy2x are imported on first use). `_numpy2x_hook` replaces
   `builtins.__import__`: `import numpy` / `numpy.<sub>` from *user code*
-  gives viproc (`viproc.random` for `numpy.random`, NumPy's submodules
-  otherwise); the standard library, site-/dist-packages, NumPy and viproc
-  keep the real NumPy (libraries use NumPy internals; viproc arrays reach
+  gives numpy2x (`numpy2x.random` for `numpy.random`, NumPy's submodules
+  otherwise); the standard library, site-/dist-packages, NumPy and numpy2x
+  keep the real NumPy (libraries use NumPy internals; numpy2x arrays reach
   them through the protocols). User code = a file outside those
   directories, or `__main__` without a file. Creation functions
-  (`zeros`, `arange`, `loadtxt`, `frombuffer`, …, `viproc.random.*` and
-  generators from `default_rng`/`RandomState`/`Generator`) return viproc
+  (`zeros`, `arange`, `loadtxt`, `frombuffer`, …, `numpy2x.random.*` and
+  generators from `default_rng`/`RandomState`/`Generator`) return numpy2x
   arrays: fresh memory adopted, views of other memory copied, `out=`
   arguments and unsupported dtypes returned as NumPy made them.
   `asarray`/`array` take NumPy's signatures; unsupported dtypes give
-  NumPy arrays (no TypeError). **`viproc.enable(False)` /
-  `with viproc.disabled():`** make all of these return NumPy's arrays:
-  the same code runs as plain NumPy (benchmarking); existing viproc
-  arrays stay viproc arrays.
+  NumPy arrays (no TypeError). **`numpy2x.enable(False)` /
+  `with numpy2x.disabled():`** make all of these return NumPy's arrays:
+  the same code runs as plain NumPy (benchmarking); existing numpy2x
+  arrays stay numpy2x arrays.
 - **Sync points:** `np.asarray(x)`, `x.numpy()`, printing, `float(x)`,
-  `bool(x)`, scalar indexing, iteration, `x.wait()`, `viproc.wait_all()`.
+  `bool(x)`, scalar indexing, iteration, `x.wait()`, `numpy2x.wait_all()`.
 - **Conversions (design doc D7):** exports (`np.asarray(x)`, `x.numpy()`,
   `__array__`) are copy-free NumPy views of the same memory, writable
   (read-only only for read-only arrays): aliases, as `np.asarray` of an
@@ -1263,26 +1263,26 @@ Rules:
   or, for operators, they are temporaries; fresh memory (creation
   functions, fallback results that own their data and are no argument) is
   adopted without a copy.
-- **Hot path in C** (`_viproc._Array`): everything that runs once per op —
+- **Hot path in C** (`_numpy2x._Array`): everything that runs once per op —
   `__array_ufunc__` for element-wise calls, `a[key]` for ready integer and
   basic keys, all Python operators (number
   protocol and rich comparisons, with NDArrayOperatorsMixin semantics,
   incl. deferring to `__array_ufunc__ = None`), dtype resolution via
   NumPy's `ufunc.resolve_dtypes` cached per (ufunc, input kinds; Python
-  scalars as weak NEP 50 kinds), scalar conversion (`vp_array_from_scalar`,
+  scalars as weak NEP 50 kinds), scalar conversion (`nx_array_from_scalar`,
   NumPy's conversion rules; cached per (object, dtype) in a direct-mapped
   table of 64 ready 0-d arrays, `scalar_operand`: a loop's constants are
   converted once, not ~2,700 instructions per op), broadcasting and the
   issue site. Whatever it
   does not handle goes to the Python fallback, so NumPy semantics (errors
   included) stay NumPy's.
-- The issue site is the first stack frame outside viproc and NumPy. It is
+- The issue site is the first stack frame outside numpy2x and NumPy. It is
   cached per (code object address, bytecode offset), formatted only on a
-  miss and interned once with `vp_intern`; tasks keep that pointer. Never
+  miss and interned once with `nx_intern`; tasks keep that pointer. Never
   key dicts by code object: hashing one hashes its whole bytecode
   (~3000 instructions per lookup; it was 20% of the per-op cost).
-- Loops are resolved once per (ufunc, input kinds) into a `vp_loop`
-  handle (`vp_ufunc_loop`); ops are issued with `vp_ufunc_issue` without
+- Loops are resolved once per (ufunc, input kinds) into a `nx_loop`
+  handle (`nx_ufunc_loop`); ops are issued with `nx_ufunc_issue` without
   any lookup. Per-op caches (issue sites, code flags, signatures) are small
   open-addressing C tables keyed by (pointer, int), not dicts: building key
   tuples/ints and two dict lookups cost ~1,700 instructions per op, the
@@ -1291,22 +1291,22 @@ Rules:
   sites belong to it).
 - **Temporary elision** (design doc D5): an operator whose operand is a
   temporary (dtype/shape of the output, buffer reusable per
-  `vp_array_reusable_bytes`, object only on the interpreter stack) writes
+  `nx_array_reusable_bytes`, object only on the interpreter stack) writes
   into that operand. Temporaries are detected exactly on CPython ≥ 3.14;
   on 3.12/3.13 (glibc, Windows) by refcount 1 plus the C stack, which
   must start with a calibrated chain reaching the interpreter's call
   site (≥ 256 KiB only); off elsewhere. The chain is the common prefix of
   two calibration runs, not a fixed frame count: how many frames
   CPython's operator entry has depends on its build.
-- Evaluated and rejected: caching/reusing `viproc.ndarray` objects. Their
+- Evaluated and rejected: caching/reusing `numpy2x.ndarray` objects. Their
   allocation and deallocation is ~1% of the per-op instructions.
 - One Python thread only: the thread that initialized the runtime.
 - Per-op cost (`x * y`, 8 elements, Release, callgrind, op run inline,
   `OPENBLAS_NUM_THREADS=1` so idle BLAS threads do not blur the counts):
-  viproc ~5,400 instructions, ~0.65 µs; NumPy ~4,650, ~0.4 µs. History:
+  numpy2x ~5,400 instructions, ~0.65 µs; NumPy ~4,650, ~0.4 µs. History:
   ~10,500 → ~7,100 (C lookup tables instead of dicts, flat loop calls)
   → ~6,600 (array and its alias group in one block, intrusive non-atomic refs,
-  `vp_array*` is the `Array*`, small element memory inline in the Buffer)
+  `nx_array*` is the `Array*`, small element memory inline in the Buffer)
   → ~5,800 (operands built in place in the task, no lock to read the
   upstream error, inline `itemsize`) → ~5,400 (pooled Task/Buffer/block
   memory). The bridge front end (~900) is cheaper than NumPy's own dispatch
@@ -1431,14 +1431,14 @@ Rules:
   legal because only the main thread creates, copies and releases them. An
   `ArrayBlock` holds a base array and its group; each object is destroyed
   with its last reference, the block when both are gone (views get a block
-  of their own). The C ABI hands out `Array*` as `vp_array*`, one reference
+  of their own). The C ABI hands out `Array*` as `nx_array*`, one reference
   each.
 - Pools (`FixedPool`): per-thread free lists without atomics for the
   allocating thread; other threads return blocks through a lock-free stack
   that an allocating thread takes over whole (exchange, so no ABA). Pools
   only grow, to the peak number of live objects. Their thread-locals use
-  the initial-exec TLS model on ELF targets (`VIPROC_TLS_INITIAL_EXEC`):
-  as a dlopen'ed module viproc otherwise paid a `__tls_get_addr` call per
+  the initial-exec TLS model on ELF targets (`NUMPY2X_TLS_INITIAL_EXEC`):
+  as a dlopen'ed module numpy2x otherwise paid a `__tls_get_addr` call per
   access (~100 instructions per op).
 - Copy-on-write copy tasks are counted as active but do not wait on the
   look-ahead limit: the op needing the copy already holds its slot.
@@ -1458,15 +1458,15 @@ Rules:
 
 ## Conventions
 
-- **viproc is a semantic drop-in for NumPy, without surprises.** Every
+- **numpy2x is a semantic drop-in for NumPy, without surprises.** Every
   function, method and attribute behaves exactly as NumPy's: values,
   dtypes, shapes, strides, flags, `base`, identity (`is`), in-place
   effects, warnings, and errors (type and message). Where NumPy's own
-  code cannot run on viproc memory, port it; never replace NumPy's
-  behavior with a viproc-specific error, a "not supported" or a different
+  code cannot run on numpy2x memory, port it; never replace NumPy's
+  behavior with a numpy2x-specific error, a "not supported" or a different
   result. Test every case against NumPy running the same code.
 - Language for code, comments, docs and commit messages: **English**.
-- C ABI symbols use the `vp_` prefix; C++ code lives in `namespace viproc`.
+- C ABI symbols use the `nx_` prefix; C++ code lives in `namespace numpy2x`.
 - C++: RAII, no raw `new`/`delete`, no exceptions across the C ABI (convert
   to error codes at the boundary).
 - Thread safety is part of every runtime API. Document which thread may
@@ -1523,7 +1523,7 @@ Rules:
   (including `bridge/npbackend/src/*`) say LGPLv3+. Clarify which applies
   before copying Bohrium code into this repo, and keep its copyright
   headers intact.
-- viproc itself has no license file yet.
+- numpy2x itself has no license file yet.
 
 ## MVP scope (decided)
 
@@ -1557,8 +1557,8 @@ functions.
 ## Status and next steps
 
 Where development stands: one PR per session, merged into `main` (PR
-hokb/viproc#1: phase 1 core; hokb/viproc#2: pip build, dev.cmd/dev.sh, CI;
-then `python -m viproc`). The maintainer writes in German; answer in German, keep
+hokb/numpy2x#1: phase 1 core; hokb/numpy2x#2: pip build, dev.cmd/dev.sh, CI;
+then `python -m numpy2x`). The maintainer writes in German; answer in German, keep
 code, comments, docs and commit messages in English.
 
 - Done in phase 1: runtime (tasks, stage events, trampoline, pools,
@@ -1604,7 +1604,7 @@ code, comments, docs and commit messages in English.
 - [x] `matmul`/`dot` asynchronously (NumPy's matmul loop; `matmul_batch`
       has no fallbacks left).
 - [ ] The remaining linalg functions (`qr`, `lstsq`,
-      `pinv`, ...; the generic gufunc path exists: `vp_gufunc`).
+      `pinv`, ...; the generic gufunc path exists: `nx_gufunc`).
 - [ ] Scaling beyond 4 cores: on a 20-core i7-12700K (8 P + 4 E cores,
       HT) the suite scores 22 with medium/large at 11 (`chains_wide`
       medium 6.2x of ideal 20x, large 1.2–3.9x): find out whether memory
@@ -1626,7 +1626,7 @@ code, comments, docs and commit messages in English.
 - [x] Per-op overhead of the bridge: hot path moved to C (~35 µs → ~3–7 µs).
 - [ ] Evaluate a generic path under free-threaded CPython: workers call the
       regular NumPy entry (no reimplementation of NumPy semantics).
-- [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and viproc's own license.
+- [ ] Bohrium license (Apache-2.0 vs. LGPLv3, see above) and numpy2x's own license.
 - [ ] Run `docker/windows` (MSVC) on a Windows host; so far the Windows
       code paths are verified with the Wine image (llvm-mingw build).
 - [ ] MSVC warning level: `-Wall -Wextra -Wpedantic -Werror` apply to

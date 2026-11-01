@@ -5,8 +5,8 @@
 #define NPY_NO_DEPRECATED_API NPY_2_0_API_VERSION
 // NumPy >= 2.0 is required anyway; 2.0 adds PyArray_Pack to the C API.
 #define NPY_TARGET_VERSION NPY_2_0_API_VERSION
-#define PY_ARRAY_UNIQUE_SYMBOL viproc_ARRAY_API
-#define PY_UFUNC_UNIQUE_SYMBOL viproc_UFUNC_API
+#define PY_ARRAY_UNIQUE_SYMBOL numpy2x_ARRAY_API
+#define PY_UFUNC_UNIQUE_SYMBOL numpy2x_UFUNC_API
 #include <numpy/arrayobject.h>
 #include <numpy/dtype_api.h>
 #include <numpy/ufuncobject.h>
@@ -18,7 +18,7 @@
 #include <mutex>
 #include <thread>
 
-namespace viproc::numpy {
+namespace numpy2x::numpy {
 
 namespace {
 
@@ -88,7 +88,7 @@ bool dtype_of(int type_num, DType& out) {
     return false;
 }
 
-// NumPy's descriptor `type_num` is viproc's `dtype` (NPY_INT and NPY_LONG
+// NumPy's descriptor `type_num` is numpy2x's `dtype` (NPY_INT and NPY_LONG
 // are both int32 on Windows: NumPy may resolve either, e.g. frexp's `d->di`).
 bool same_dtype(int type_num, DType dtype) {
     DType d{};
@@ -291,7 +291,7 @@ thread_local std::string t_loop_error;
 // loop's npy_gil_error() takes (PyGILState_Ensure) finds it, and the error
 // stays on it after PyGILState_Release (a temporary thread state would be
 // deleted, and the error with it). Deleted when the worker exits; the
-// runtime is destroyed with the GIL released (vp_runtime_destroy), so the
+// runtime is destroyed with the GIL released (nx_runtime_destroy), so the
 // worker can take it then.
 struct WorkerThreadState {
     PyThreadState* ts = nullptr;
@@ -1090,9 +1090,9 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
         NpyIter* templ = nullptr;
         // Templates over a dummy address: nothing is read or written before
         // a kernel resets the base pointers, and without COPY_IF_OVERLAP the
-        // iterator never compares addresses (viproc's copy-on-write already
+        // iterator never compares addresses (numpy2x's copy-on-write already
         // separated outputs from overlapping inputs). Alignment is the only
-        // property of the address it uses: element-aligned, as viproc
+        // property of the address it uses: element-aligned, as numpy2x
         // buffers.
         char* const dummy = template_address();
         PyArrayObject* op[kMaxOps] = {};
@@ -1131,7 +1131,7 @@ std::shared_ptr<Kernel> LoopCache::iter_elementwise(const UfuncLoop* loop,
         // execute_ufunc_loop's flags, without COPY_IF_OVERLAP (see
         // above). An output NumPy allocates is never reversed (no
         // negative strides): DONT_NEGATE_STRIDES keeps it that way with
-        // viproc's output.
+        // numpy2x's output.
         const npy_uint32 flags = uflags | NPY_ITER_EXTERNAL_LOOP | NPY_ITER_REFS_OK |
                                  NPY_ITER_ZEROSIZE_OK | NPY_ITER_BUFFERED | NPY_ITER_GROWINNER |
                                  NPY_ITER_DELAY_BUFALLOC |
@@ -1295,7 +1295,7 @@ namespace {
 // host_views count on it until the last NumPy view is gone (D7: ops touching
 // the buffer then run as NumPy runs them). Created and released with the GIL
 // (main thread).
-constexpr const char* kExportCapsule = "viproc.export";
+constexpr const char* kExportCapsule = "numpy2x.export";
 
 struct ExportHold {
     std::shared_ptr<CountableArray> buffer;
@@ -1370,4 +1370,4 @@ bool pin_borrowed(const Array& a, PyObject* view) {
     return attach_export(a, view, false);
 }
 
-} // namespace viproc::numpy
+} // namespace numpy2x::numpy

@@ -1,4 +1,4 @@
-"""Asynchronous reductions: NumPy's own reduction loops, called by viproc in
+"""Asynchronous reductions: NumPy's own reduction loops, called by numpy2x in
 the blocks NumPy would use. Every result must be bit-identical to NumPy (also
 the sign of zeros and NaNs), for all shapes, axes and memory layouts."""
 
@@ -7,7 +7,7 @@ import warnings
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 
 ASYNC = np.lib.NumpyVersion(np.__version__) >= "2.3.0"
 UFUNCS = {
@@ -26,16 +26,16 @@ def schedule(request):
     as a task (sync_below=0), so the asynchronous kernels see small data
     too."""
     if request.param == "async":
-        viproc.init(sync_below=0, adaptive=False)
+        numpy2x.init(sync_below=0, adaptive=False)
     try:
         yield request.param
     finally:
         if request.param == "async":
-            viproc.init()
+            numpy2x.init()
 
 
 def fallbacks():
-    return viproc._ndarray.fallback_calls
+    return numpy2x._ndarray.fallback_calls
 
 
 def same(got, expected):
@@ -67,7 +67,7 @@ def sensitive(rng, shape, dtype):
 
 
 def view_ops(rng, nd):
-    """Transpose / reverse / step, applied identically to NumPy and viproc."""
+    """Transpose / reverse / step, applied identically to NumPy and numpy2x."""
     ops = []
     for _ in range(int(rng.integers(0, 3))):
         k = int(rng.integers(0, 3))
@@ -107,7 +107,7 @@ def test_ufunc_reduce_is_bit_identical_for_random_shapes_axes_and_layouts(seed):
                 base = np.asfortranarray(base)
             ops = view_ops(rng, nd)
             x = apply(base, ops)
-            v = apply(viproc.asarray(base), ops)
+            v = apply(numpy2x.asarray(base), ops)
             assert np.asarray(v).strides == x.strides
             for uf in UFUNCS[np.dtype(dtype).kind]:
                 if x.size == 0:
@@ -127,11 +127,11 @@ def test_ufunc_reduce_is_bit_identical_for_random_shapes_axes_and_layouts(seed):
 def test_long_strided_and_reversed_reductions(dtype):
     rng = np.random.default_rng(1)
     b = sensitive(rng, 300_007, dtype)
-    vb = viproc.asarray(b)
+    vb = numpy2x.asarray(b)
     m = sensitive(rng, (1200, 997), dtype)
-    vm = viproc.asarray(m)
+    vm = numpy2x.asarray(m)
     f = np.asfortranarray(m)
-    vf = viproc.asarray(f)
+    vf = numpy2x.asarray(f)
     cases = [(b, vb), (b[::2], vb[::2]), (b[::-3], vb[::-3]), (m, vm), (f, vf),
              (m[:, ::2], vm[:, ::2]), (m[::-1], vm[::-1]), (m.T, np.transpose(vm))]
     with np.errstate(all="ignore"):
@@ -145,7 +145,7 @@ def test_long_strided_and_reversed_reductions(dtype):
 def test_reductions_run_asynchronously_without_syncs():
     rng = np.random.default_rng(2)
     x = rng.standard_normal((400, 300))
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     f0 = fallbacks()
     results = [
         (np.sum(v), np.sum(x)), (v.sum(axis=0), x.sum(axis=0)),
@@ -163,7 +163,7 @@ def test_reductions_run_asynchronously_without_syncs():
     for got, expected in results:
         # 0-d results: NumPy's scalar if the data was there already, else a
         # pending 0-d array that behaves as one
-        assert isinstance(got, viproc.ndarray if np.ndim(expected) else (viproc.ndarray,
+        assert isinstance(got, numpy2x.ndarray if np.ndim(expected) else (numpy2x.ndarray,
                                                                          np.generic))
         assert same(got, expected)
 
@@ -173,7 +173,7 @@ def test_reductions_of_computed_fortran_and_transposed_arrays():
     # reduction visits the elements in NumPy's order.
     rng = np.random.default_rng(3)
     x = np.asfortranarray(rng.standard_normal((300, 200)) * 10.0 ** rng.integers(-8, 8, (300, 200)))
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     y, w = np.sin(x) * 1e3, np.sin(v) * 1e3
     assert w.strides == y.strides
     t, u = x.T * 2.0 + x.T, np.transpose(v) * 2.0 + np.transpose(v)
@@ -183,13 +183,13 @@ def test_reductions_of_computed_fortran_and_transposed_arrays():
                           (np.std(u, axis=1), np.std(t, axis=1))]:
         assert same(got, expected)
     c = rng.standard_normal((300, 200))
-    assert (viproc.asarray(c) + v).strides == (c + x).strides  # mixed: C order
+    assert (numpy2x.asarray(c) + v).strides == (c + x).strides  # mixed: C order
 
 
 def test_copy_on_write_keeps_the_layout():
     rng = np.random.default_rng(4)
     x = np.asfortranarray(rng.standard_normal((200, 100)) * 10.0 ** rng.integers(-8, 8, (200, 100)))
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     pending = np.sin(v)  # a reader of v
     v += 1.0  # copy-on-write: v moves to a new buffer
     x += 1.0
@@ -201,7 +201,7 @@ def test_copy_on_write_keeps_the_layout():
 def test_reduction_functions_match_numpy_for_every_dtype(dtype):
     rng = np.random.default_rng(5)
     x = sensitive(rng, (60, 70), dtype)
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     funcs = [np.sum, np.prod, np.max, np.min, np.any, np.all, np.mean, np.var, np.std]
     with np.errstate(all="ignore"):
         for fn in funcs:
@@ -215,23 +215,23 @@ def test_reduction_functions_match_numpy_for_every_dtype(dtype):
 
 def test_reduction_arguments_and_errors_follow_numpy():
     x = np.arange(12.0).reshape(3, 4)
-    v = viproc.asarray(x)
+    v = numpy2x.asarray(x)
     assert same(np.sum(v, axis=-1), np.sum(x, axis=-1))
     assert same(np.sum(v, dtype=np.float32), np.sum(x, dtype=np.float32))  # casts
     assert same(np.sum(v, initial=5.0), np.sum(x, initial=5.0))
     assert same(np.sum(v, where=x > 3), np.sum(x, where=x > 3))
     i = np.arange(10, dtype=np.int32)
-    assert same(np.sum(viproc.asarray(i)), np.sum(i))  # int32 sums in int64
+    assert same(np.sum(numpy2x.asarray(i)), np.sum(i))  # int32 sums in int64
     with pytest.raises(np.exceptions.AxisError):
         np.sum(v, axis=2)
     with pytest.raises(ValueError):
-        np.max(viproc.asarray(np.zeros((0, 3))))
-    assert same(np.sum(viproc.asarray(np.zeros((0, 3)))), 0.0)
+        np.max(numpy2x.asarray(np.zeros((0, 3))))
+    assert same(np.sum(numpy2x.asarray(np.zeros((0, 3)))), 0.0)
 
 
 def test_scalar_results_behave_like_numpy_scalars():
     x = np.array([0.5, 1.25, 3.0])
-    s = np.sum(viproc.asarray(x))
+    s = np.sum(numpy2x.asarray(x))
     assert f"{s:.3f}" == f"{np.sum(x):.3f}"
     assert round(s, 1) == round(np.sum(x), 1)
     assert float(s) == np.sum(x) and int(s) == 4 and s == np.sum(x)
@@ -252,7 +252,7 @@ def test_casting_reductions_run_asynchronously_on_numpys_iterator(seed):
             dtype = str(rng.choice(["f4", "f8", "c8", "i4", "i8", "b1"]))
             base = sensitive(rng, shape, dtype)
             ops = view_ops(rng, nd)
-            x, v = apply(base, ops), apply(viproc.asarray(base), ops)
+            x, v = apply(base, ops), apply(numpy2x.asarray(base), ops)
             to = rng.choice([None, "f4", "f8", "i8", "c16"])
             axis = tuple(i for i in range(nd) if rng.random() < 0.5) or None
             for fn in (np.sum, np.prod):
@@ -277,7 +277,7 @@ def test_mean_var_std_of_every_dtype_run_asynchronously(dtype):
         for shape in [(37,), (13, 29), (5, 7, 9)]:
             x = sensitive(rng, shape, dtype)
             for base in (x, np.asfortranarray(x)):
-                v = viproc.asarray(base)
+                v = numpy2x.asarray(base)
                 for fn in (np.mean, np.var, np.std):
                     axes = [{"axis": (0, len(shape) - 1)}] if len(shape) > 1 else []
                     for kw in [{}, {"axis": 0}, {"axis": -1, "keepdims": True},
@@ -296,11 +296,11 @@ def test_argmin_argmax_run_asynchronously(dtype):
         x = sensitive(rng, shape, dtype)
         if dtype[0] in "fc" and x.size > 1:
             x.flat[int(rng.integers(x.size))] = np.nan  # NumPy: the first NaN wins
-        for a, v in [(x, viproc.asarray(x)), (x.T, viproc.asarray(x).T)]:
+        for a, v in [(x, numpy2x.asarray(x)), (x.T, numpy2x.asarray(x).T)]:
             for fn in (np.argmax, np.argmin):
                 for kw in [{}, {"keepdims": True}] + [{"axis": i} for i in range(-a.ndim, a.ndim)]:
                     got = fn(v, **kw)
-                    assert isinstance(got, (viproc.ndarray, np.generic))
+                    assert isinstance(got, (numpy2x.ndarray, np.generic))
                     assert same(got, fn(a, **kw)), (fn.__name__, shape, kw)
     assert fallbacks() == f0
 
@@ -311,24 +311,24 @@ def test_shared_reduce_kernels_keep_each_identity():
     dtype must not reuse another one's, and every column of a loop gets its
     own result."""
     a = np.arange(1.0, 401.0).reshape(20, 20).T.copy() - 200.0
-    v = viproc.asarray(a)
+    v = numpy2x.asarray(a)
     for i in range(a.shape[1]):
         assert same(np.sum(v[:, i], axis=0), np.sum(a[:, i], axis=0))
     z = np.full(5000, -0.0)
-    vz = viproc.asarray(z)
+    vz = numpy2x.asarray(z)
     for initial in [0.0, -0.0, 1.5, 0, 2, True, -1.0, -0.0, 0.0]:
         assert same(np.add.reduce(vz, initial=initial), np.add.reduce(z, initial=initial)), initial
         assert same(np.add.reduce(vz, axis=0, initial=initial),
                     np.add.reduce(z, axis=0, initial=initial)), initial
     for dt in [np.int32, np.int64, np.float32, np.complex128]:
         x = np.arange(3000).astype(dt)
-        vx = viproc.asarray(x)
+        vx = numpy2x.asarray(x)
         for initial in [None, 0, 7, -3]:
             kw = {} if initial is None else {"initial": initial}
             assert same(np.add.reduce(vx, **kw), np.add.reduce(x, **kw)), (dt, initial)
             assert same(np.multiply.reduce(vx[:5], **kw), np.multiply.reduce(x[:5], **kw))
     b = np.ones(3000, bool)
-    vb = viproc.asarray(b)
+    vb = numpy2x.asarray(b)
     for initial in [True, False]:
         assert same(np.logical_and.reduce(vb, initial=initial),
                     np.logical_and.reduce(b, initial=initial))
@@ -336,7 +336,7 @@ def test_shared_reduce_kernels_keep_each_identity():
         x = np.zeros(3000, dt)
         with pytest.raises(OverflowError) as want:  # its text depends on the platform
             f.reduce(x, initial=initial)
-        vx = viproc.asarray(x)
+        vx = numpy2x.asarray(x)
         for _ in range(2):  # NumPy's conversion error, every time
             with pytest.raises(OverflowError) as got:
                 f.reduce(vx, initial=initial)

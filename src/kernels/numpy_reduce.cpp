@@ -1,8 +1,8 @@
 #include "kernels/numpy_reduce.hpp"
 
 #define NPY_NO_DEPRECATED_API NPY_2_0_API_VERSION
-#define PY_ARRAY_UNIQUE_SYMBOL viproc_ARRAY_API
-#define PY_UFUNC_UNIQUE_SYMBOL viproc_UFUNC_API
+#define PY_ARRAY_UNIQUE_SYMBOL numpy2x_ARRAY_API
+#define PY_UFUNC_UNIQUE_SYMBOL numpy2x_UFUNC_API
 #define NO_IMPORT_ARRAY
 #define NO_IMPORT_UFUNC
 #include <numpy/arrayobject.h>
@@ -15,7 +15,7 @@
 #include <string>
 #include <utility>
 
-namespace viproc::numpy {
+namespace numpy2x::numpy {
 
 std::array<std::intptr_t, 3> ReducePlan::inner_strides() const {
     const ReduceAxis& in = axes.back();
@@ -386,7 +386,7 @@ constexpr int reduction_axis(int axis) { return axis + (1 << (NPY_BITSOF_INT - 2
 
 // Reduction templates kept per LoopCache (all dropped when full).
 constexpr std::size_t kMaxReduceTemplates = 1024;
-// Largest itemsize of a viproc dtype (complex128).
+// Largest itemsize of a numpy2x dtype (complex128).
 constexpr std::size_t kMaxItemsize = 16;
 
 // Start values converted once per object: immutable ones only (a 0-d array
@@ -584,8 +584,8 @@ std::shared_ptr<ReduceTemplate> build_reduce_template(PyObject* ufunc, const Lay
 
     // The iterator, as PyUFunc_ReduceWrapper sets it up, without
     // COPY_IF_OVERLAP: the template's operands live at a dummy address, and
-    // viproc's result never overlaps the input. NumPy allocates the
-    // template's result; its layout is the one viproc gives its result.
+    // numpy2x's result never overlaps the input. NumPy allocates the
+    // template's result; its layout is the one numpy2x gives its result.
     int result_axes[NPY_MAXDIMS];
     int curr = 0;
     for (int i = 0; i < nd; ++i) {
@@ -806,4 +806,4 @@ std::shared_ptr<Kernel> make_arg_reduce_kernel(DType dtype, bool argmax, std::st
     return std::make_shared<ArgReduceKernel>(fn, argmax);
 }
 
-} // namespace viproc::numpy
+} // namespace numpy2x::numpy

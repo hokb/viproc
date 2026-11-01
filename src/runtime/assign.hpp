@@ -7,7 +7,7 @@
 #include <memory>
 #include <vector>
 
-namespace viproc {
+namespace numpy2x {
 
 // Kernel operands: inputs = [src, dst (as in/out)], outputs = [dst].
 std::shared_ptr<Kernel> make_assign_kernel();
@@ -26,4 +26,4 @@ struct Part {
 // part, outputs = [out]. The parts must lie within out's elements.
 std::shared_ptr<Kernel> make_place_kernel(std::vector<Part> parts);
 
-} // namespace viproc
+} // namespace numpy2x

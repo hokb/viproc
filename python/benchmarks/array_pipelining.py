@@ -1,4 +1,4 @@
-"""Array pipelining: ILNumerics' loop-parallelization benchmark on viproc.
+"""Array pipelining: ILNumerics' loop-parallelization benchmark on numpy2x.
 
 The program of ILNumerics' "array pipelining" demo (getting-started part IV,
 https://ilnumerics.net/accelerator-array-pipelining.html; code in
@@ -14,11 +14,11 @@ Appendix "Part 2a/2b Loop Parallelization"), as plain NumPy code:
 
 A is ILNumerics' counter(1.0, 1.0, n, n): 1, 2, 3, ... in column-major
 order, so A[:, i] is a contiguous column. The program runs unchanged on
-NumPy and on viproc: its functions take the module as `np`, and the viproc
-runs pass the viproc module, which is what `python -m viproc prog.py`
-(`import numpy` gives viproc) and `import viproc as np` give a program.
+NumPy and on numpy2x: its functions take the module as `np`, and the numpy2x
+runs pass the numpy2x module, which is what `python -m numpy2x prog.py`
+(`import numpy` gives numpy2x) and `import numpy2x as np` give a program.
 
-Nothing in the loop is annotated or split by hand: viproc issues the
+Nothing in the loop is annotated or split by hand: numpy2x issues the
 4 x n array instructions of the loop from the main thread and runs them on
 its workers as soon as their inputs are ready (array instruction-level
 parallelism). The loop's iterations are independent in `loop`; in
@@ -42,7 +42,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy
 
-import viproc
+import numpy2x
 
 
 def counter(np, n):
@@ -111,29 +111,29 @@ def measure(n, reps, workers, samples, threads):
         rows["loop", "numpy_threads"] = (median(t), numpy.array_equal(C, expected["loop"]), 0)
 
     for w in workers:
-        viproc.init()  # its fixed 2 workers
-        vA = counter(viproc, n)
+        numpy2x.init()  # its fixed 2 workers
+        vA = counter(numpy2x, n)
         for name, prog in PROGRAMS.items():
-            vC = viproc.zeros(n)
-            viproc.wait_all()
-            f0 = viproc._ndarray.fallback_calls
-            s0 = viproc.offload_stats()
-            prog(viproc, vA, vC)  # warm-up and check
+            vC = numpy2x.zeros(n)
+            numpy2x.wait_all()
+            f0 = numpy2x._ndarray.fallback_calls
+            s0 = numpy2x.offload_stats()
+            prog(numpy2x, vA, vC)  # warm-up and check
             same = numpy.array_equal(numpy.asarray(vC), expected[name])
-            fallbacks = viproc._ndarray.fallback_calls - f0
-            syncs = viproc.offload_stats()["syncs"] - s0["syncs"] - 1  # the check's own
-            t = [sample(lambda: prog(viproc, vA, vC), reps, vC.wait) for _ in range(samples)]
+            fallbacks = numpy2x._ndarray.fallback_calls - f0
+            syncs = numpy2x.offload_stats()["syncs"] - s0["syncs"] - 1  # the check's own
+            t = [sample(lambda: prog(numpy2x, vA, vC), reps, vC.wait) for _ in range(samples)]
             same = same and numpy.array_equal(numpy.asarray(vC), expected[name])
-            rows[name, f"viproc w={w}"] = (median(t), same, fallbacks + max(syncs, 0))
+            rows[name, f"numpy2x w={w}"] = (median(t), same, fallbacks + max(syncs, 0))
         del vA, vC
-        viproc.shutdown()
+        numpy2x.shutdown()
     return rows
 
 
 def report(n, reps, rows, workers, threads):
     lines = [f"\nA: float64 [{n}, {n}], {reps} runs per sample, median of the samples "
              f"(ms per run; speedup vs. NumPy)", ""]
-    cols = ["numpy", "numpy_threads"] + [f"viproc w={w}" for w in workers]
+    cols = ["numpy", "numpy_threads"] + [f"numpy2x w={w}" for w in workers]
     head = ["program"] + [c if c != "numpy_threads" else f"NumPy {threads} threads"
                           for c in cols]
     lines.append("| " + " | ".join(head) + " |")
@@ -164,14 +164,14 @@ def main():
                    help="threads of the NumPy Parallel.For (default: cores)")
     p.add_argument("--samples", type=int, default=7)
     args = p.parse_args()
-    cores = viproc.physical_cores()
-    workers = [2]  # viproc's fixed worker count
+    cores = numpy2x.physical_cores()
+    workers = [2]  # numpy2x's fixed worker count
     threads = args.threads or cores
-    viproc.init()
-    budget = viproc._viproc.direct_budget_ns() / 1e3
-    viproc.shutdown()
+    numpy2x.init()
+    budget = numpy2x._numpy2x.direct_budget_ns() / 1e3
+    numpy2x.shutdown()
     print(f"array pipelining, {os.cpu_count()} CPUs, {cores} physical cores, "
-          f"NumPy {numpy.__version__}, viproc {viproc.__version__}, Python {sys.version.split()[0]}, "
+          f"NumPy {numpy.__version__}, numpy2x {numpy2x.__version__}, Python {sys.version.split()[0]}, "
           f"direct-path budget {budget:.1f} us")
     for spec in args.sizes.split(","):
         n, reps = (int(x) for x in spec.split(":"))

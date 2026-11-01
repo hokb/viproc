@@ -1,4 +1,4 @@
-# Cross-compiles viproc for Windows x64 with llvm-mingw (clang, UCRT) and runs
+# Cross-compiles numpy2x for Windows x64 with llvm-mingw (clang, UCRT) and runs
 # the resulting executables under Wine (docker/wine/Dockerfile).
 set(CMAKE_SYSTEM_NAME Windows)
 set(CMAKE_SYSTEM_PROCESSOR AMD64)

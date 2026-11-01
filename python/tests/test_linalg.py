@@ -1,11 +1,11 @@
-"""numpy.linalg on NumPy's _umath_linalg gufuncs (hokb/viproc#25 step 6b):
+"""numpy.linalg on NumPy's _umath_linalg gufuncs (hokb/numpy2x#25 step 6b):
 bit-identical to NumPy (values, dtypes, layouts, errors) and on the
 asynchronous path; LinAlgError from a loop raised asynchronously."""
 
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 from async_path import assert_async, pending
 from test_compositions import DTYPES, det, same  # noqa: F401 (det: fixture)
 from test_compositions import check as _check
@@ -20,7 +20,7 @@ def check(fn, *arrays):
     inside the call (wait_all), where NumPy raises them."""
     def waited(*args):
         r = fn(*args)
-        viproc.wait_all()
+        numpy2x.wait_all()
         return r
     _check(waited, *arrays)
 
@@ -125,7 +125,7 @@ def test_async(call, shape, ops, dtype, det):
             pytest.skip("the dtype is the case's")
         shape, dtype = shape[:-1], shape[-1]
     a = matrices(shape, dtype)
-    v = pending(viproc.asarray(a))
+    v = pending(numpy2x.asarray(a))
     if isinstance(ops, dict):
         ops = ops[np.dtype(dtype).kind]
     got = assert_async(call, v, ops=ops)
@@ -136,14 +136,14 @@ def test_async_singular(det):
     """A singular matrix fails the task on a worker: no fallback, no sync at
     the call; AsyncLinAlgError (a LinAlgError) at the next check or the sync
     point, whichever comes first."""
-    v = pending(viproc.asarray(np.ones((60, 10, 10))))
-    before = viproc.offload_stats()["tasks"], viproc._ndarray.fallback_calls
+    v = pending(numpy2x.asarray(np.ones((60, 10, 10))))
+    before = numpy2x.offload_stats()["tasks"], numpy2x._ndarray.fallback_calls
     after = caught = None
     try:
         r = L.inv(v)
-        after = viproc.offload_stats()["tasks"], viproc._ndarray.fallback_calls
+        after = numpy2x.offload_stats()["tasks"], numpy2x._ndarray.fallback_calls
         r.numpy()
-    except viproc.AsyncLinAlgError as e:
+    except numpy2x.AsyncLinAlgError as e:
         caught = e
     assert isinstance(caught, L.LinAlgError) and "Singular matrix" in str(caught)
     assert after is None or (after[0] - before[0] == 1 and after[1] == before[1])

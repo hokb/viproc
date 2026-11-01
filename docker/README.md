@@ -1,13 +1,13 @@
 # Docker images
 
-Three images build viproc from this checkout, run all test suites by
-default, and double as a command line for viproc programs.
+Three images build numpy2x from this checkout, run all test suites by
+default, and double as a command line for numpy2x programs.
 
 | Image | Dockerfile | Host | Build |
 |-------|------------|------|-------|
-| `viproc:linux` | `docker/linux/Dockerfile` | Linux (or Docker Desktop, Linux containers) | GCC, CPython from `python:<ver>-bookworm` |
-| `viproc:windows` | `docker/windows/Dockerfile` | Windows with Windows containers | MSVC (Visual Studio Build Tools), Windows CPython (NuGet) |
-| `viproc:wine` | `docker/wine/Dockerfile` | Linux | Windows x64 build (llvm-mingw, UCRT) run under Wine 10 with the Windows CPython (NuGet) and NumPy's Windows wheels |
+| `numpy2x:linux` | `docker/linux/Dockerfile` | Linux (or Docker Desktop, Linux containers) | GCC, CPython from `python:<ver>-bookworm` |
+| `numpy2x:windows` | `docker/windows/Dockerfile` | Windows with Windows containers | MSVC (Visual Studio Build Tools), Windows CPython (NuGet) |
+| `numpy2x:wine` | `docker/wine/Dockerfile` | Linux | Windows x64 build (llvm-mingw, UCRT) run under Wine 10 with the Windows CPython (NuGet) and NumPy's Windows wheels |
 
 The Wine image runs the Windows binaries on a Linux host, so the Windows
 code paths (stack capture with `RtlCaptureStackBackTrace`, `VirtualAlloc`,
@@ -26,9 +26,9 @@ on CPython 3.12/3.13, `exact` on 3.14.
 From the repository root (the build context is the checkout):
 
 ```bash
-docker build -f docker/linux/Dockerfile -t viproc:linux .
-docker build -f docker/wine/Dockerfile  -t viproc:wine  .
-docker build -f docker/windows/Dockerfile -t viproc:windows .   # on Windows
+docker build -f docker/linux/Dockerfile -t numpy2x:linux .
+docker build -f docker/wine/Dockerfile  -t numpy2x:wine  .
+docker build -f docker/windows/Dockerfile -t numpy2x:windows .   # on Windows
 ```
 
 Build arguments:
@@ -51,7 +51,7 @@ the image): `--secret id=ca,src=/path/to/ca.pem`.
 One call runs the whole suite (python/benchmarks/suite.py) on Linux and on
 the Windows build (Wine image), first (re)builds both images from this
 checkout (Docker's cache makes that quick when nothing changed;
-`VIPROC_NO_BUILD=1` skips it), and writes a comparison. Old report files
+`NUMPY2X_NO_BUILD=1` skips it), and writes a comparison. Old report files
 in the output directory are deleted before the new ones are copied, so a
 report there is always from this run; its header names the build
 (`build <time> #<fingerprint>`). `docker run IMAGE` without a command
@@ -66,7 +66,7 @@ The reports are copied out of the containers (`docker cp`, no bind mount
 needed, also with a remote Docker daemon) into `reports/` in the current
 directory: `reports/report.html` (comparison of the platforms) and
 `reports/<image>/report.html` (details; also `report.md` and
-`results.json`). `VIPROC_BENCH_OUT` picks another directory.
+`results.json`). `NUMPY2X_BENCH_OUT` picks another directory.
 
 A single image writes to `/work/reports/<platform>` (`linux`,
 `windows-wine`, `windows`). Mount the current directory on `/work` to get
@@ -74,9 +74,9 @@ them into `./reports/<platform>`; the syntax for the current directory
 depends on the shell:
 
 ```
-docker run --rm -v "$PWD:/work" viproc:linux benchmark      # bash, zsh
-docker run --rm -v "${PWD}:/work" viproc:linux benchmark    # PowerShell
-docker run --rm -v "%cd%:/work" viproc:linux benchmark      # cmd.exe
+docker run --rm -v "$PWD:/work" numpy2x:linux benchmark      # bash, zsh
+docker run --rm -v "${PWD}:/work" numpy2x:linux benchmark    # PowerShell
+docker run --rm -v "%cd%:/work" numpy2x:linux benchmark      # cmd.exe
 ```
 
 Without a mount the reports stay inside the container; the command then
@@ -88,7 +88,7 @@ without it, an existing `./reports` gets the copy one level deeper
 (`./reports/reports/...`) and the old report stays where it was. Each
 report shows the build it measured (`build` in its header: build time of
 the extension module and a fingerprint of the package). Native Windows
-image: `docker run --rm -v "${PWD}:C:\work" viproc:windows benchmark`
+image: `docker run --rm -v "${PWD}:C:\work" numpy2x:windows benchmark`
 (writes `.\reports\windows`), then merge its `results.json` with others:
 `suite.py --merge A/results.json B/results.json --out DIR`.
 
@@ -96,9 +96,9 @@ The suite runs ~100 configurations (element-wise chains, basic and advanced
 indexing, reductions, algorithms such as k-means, Black-Scholes, Mandelbrot,
 n-body; scalar to large data; vector, row/column-major, strided, (n,1)/(1,n)
 layouts; float64, float32, int32, int16, complex128, float16 and mixed
-types) as plain NumPy and on viproc (1 worker, one worker per core), checks
+types) as plain NumPy and on numpy2x (1 worker, one worker per core), checks
 that every result is bit-identical, and reports the **parallel efficiency
-score** (0-100, normalized to viproc's 2 workers and the machine's RAM; how
+score** (0-100, normalized to numpy2x's 2 workers and the machine's RAM; how
 it is computed is in the report). Full run: ~4 minutes per platform on 4 cores
 (wider machines get wider programs, so somewhat longer); `--quick`: about
 half. `--filter REGEX` selects configurations.
@@ -113,7 +113,7 @@ docker run [--rm -it] [-v DIR:/work] IMAGE [COMMAND [ARGS...]]
 |---------|--------|
 | `test [CTEST_ARGS...]` | all test suites with `ctest` (default) |
 | `pytest [PYTEST_ARGS...]` | the Python bridge tests |
-| `python [ARGS...]` | Python with viproc importable; interactive with `-it` |
+| `python [ARGS...]` | Python with numpy2x importable; interactive with `-it` |
 | `benchmark [NAME] [ARGS]` | `python/benchmarks/NAME.py`; default `suite`, the benchmark suite (below), reports to `/work/reports/<platform>` |
 | `build` | bring the build up to date |
 | `info` | platform, Python, NumPy, build type, temporary elision mode |
@@ -124,16 +124,16 @@ The working directory is `/work` (`C:\work` on Windows): mount a directory
 there to run your own programs.
 
 ```bash
-docker run --rm viproc:linux                                  # all tests
-docker run --rm viproc:wine pytest -q -k elision              # some bridge tests
-docker run --rm -it viproc:linux python                       # REPL with viproc
-docker run --rm -v "$PWD:/work" viproc:wine python prog.py    # a program, on Windows
-docker run --rm viproc:linux benchmark strong_scaling
+docker run --rm numpy2x:linux                                  # all tests
+docker run --rm numpy2x:wine pytest -q -k elision              # some bridge tests
+docker run --rm -it numpy2x:linux python                       # REPL with numpy2x
+docker run --rm -v "$PWD:/work" numpy2x:wine python prog.py    # a program, on Windows
+docker run --rm numpy2x:linux benchmark strong_scaling
 ```
 
 ```powershell
-docker run --rm viproc:windows
-docker run --rm -v "${PWD}:C:\work" viproc:windows python prog.py
+docker run --rm numpy2x:windows
+docker run --rm -v "${PWD}:C:\work" numpy2x:windows python prog.py
 ```
 
 **Testing a checkout without rebuilding the image.** The sources live in
@@ -142,8 +142,8 @@ command first brings the build up to date, so mounting a checkout over the
 sources rebuilds only what changed:
 
 ```bash
-docker run --rm -v "$PWD:/src" viproc:linux
-docker run --rm -v "$PWD:/src" viproc:wine
+docker run --rm -v "$PWD:/src" numpy2x:linux
+docker run --rm -v "$PWD:/src" numpy2x:wine
 ```
 
 Notes:
@@ -162,6 +162,6 @@ Notes:
   prints nothing extra (`WINEDEBUG=-all`); the first start of a container
   takes a few seconds for `wineserver`.
 - Thread counts: `OPENBLAS_NUM_THREADS=1` is set, so BLAS does not compete
-  with viproc's workers (CLAUDE.md, "Linalg").
+  with numpy2x's workers (CLAUDE.md, "Linalg").
 - The Windows image cannot be built or run on a Linux host: Windows
   containers need a Windows kernel. Use the Wine image there.

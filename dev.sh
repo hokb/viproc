@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-click development loop (Linux/macOS): pull, build and install viproc into
+# One-click development loop (Linux/macOS): pull, build and install numpy2x into
 # .venv (pip + scikit-build-core, incremental build in build/pip-<tag>), test.
 # Usage: ./dev.sh [--no-pull] [--no-test]; PYTHON=python3.13 ./dev.sh picks the
 # interpreter for a new .venv. Windows: dev.cmd.
@@ -25,8 +25,8 @@ fi
 py=.venv/bin/python
 step 'install build requirements'
 "$py" -m pip install -q --upgrade pip scikit-build-core 'numpy>=2.0' pytest 'cmake>=3.24' ninja
-step 'build and install viproc (Release)'
+step 'build and install numpy2x (Release)'
 "$py" -m pip install --no-build-isolation --no-deps .
-"$py" -c 'import viproc, numpy; print("viproc", viproc.__version__, "numpy", numpy.__version__, viproc.__file__)'
+"$py" -c 'import numpy2x, numpy; print("numpy2x", numpy2x.__version__, "numpy", numpy.__version__, numpy2x.__file__)'
 if [ "$test" = 1 ]; then step 'pytest'; "$py" -m pytest -q python/tests; fi
 printf '\nDone. Run programs with: .venv/bin/python prog.py\n'

@@ -20,7 +20,7 @@
 #include <string>
 #include <thread>
 
-using namespace viproc;
+using namespace numpy2x;
 using namespace std::chrono_literals;
 
 namespace {

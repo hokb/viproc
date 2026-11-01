@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1
-# viproc on Windows, run under Wine on a Linux host: the Windows build
+# numpy2x on Windows, run under Wine on a Linux host: the Windows build
 # (llvm-mingw, x64, UCRT) of the runtime and the Python bridge, tested with
 # the official Windows CPython and NumPy's Windows wheels. Runs the test
 # suites by default and doubles as a command line (docker/README.md).
 #
-#   docker build -f docker/wine/Dockerfile -t viproc:wine .
-#   docker run --rm viproc:wine                 # all test suites (ctest)
-#   docker run --rm -it viproc:wine python      # Windows Python with viproc
+#   docker build -f docker/wine/Dockerfile -t numpy2x:wine .
+#   docker run --rm numpy2x:wine                 # all test suites (ctest)
+#   docker run --rm -it numpy2x:wine python      # Windows Python with numpy2x
 #
 # For a native Windows build with MSVC, see docker/windows/Dockerfile.
 FROM ubuntu:26.04
@@ -72,8 +72,8 @@ RUN --mount=type=secret,id=ca,required=false \
 COPY . /src
 # The command line, with LF line endings even from a Windows checkout made
 # before .gitattributes (CRLF breaks the "#!/bin/bash" line).
-RUN sed 's/\r$//' /src/docker/entrypoint.sh > /usr/local/bin/viproc \
-    && chmod 755 /usr/local/bin/viproc
+RUN sed 's/\r$//' /src/docker/entrypoint.sh > /usr/local/bin/numpy2x \
+    && chmod 755 /usr/local/bin/numpy2x
 RUN cmake -S /src -B /build -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
        -DCMAKE_TOOLCHAIN_FILE=/src/docker/wine/mingw-toolchain.cmake \
        -DPython3_EXECUTABLE=/usr/local/bin/python \
@@ -83,12 +83,12 @@ RUN cmake -S /src -B /build -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
     && cmake --build /build \
     && wineserver --wait
 
-ENV VIPROC_PLATFORM=windows-wine \
-    VIPROC_SRC=/src \
-    VIPROC_BUILD=/build \
+ENV NUMPY2X_PLATFORM=windows-wine \
+    NUMPY2X_SRC=/src \
+    NUMPY2X_BUILD=/build \
     PYTHONPATH=/build/python \
     PYTHONPYCACHEPREFIX=/tmp/pycache \
     OPENBLAS_NUM_THREADS=1
 WORKDIR /work
-ENTRYPOINT ["/usr/local/bin/viproc"]
+ENTRYPOINT ["/usr/local/bin/numpy2x"]
 CMD ["test"]

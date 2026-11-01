@@ -1,8 +1,8 @@
-# viproc shape map
+# numpy2x shape map
 
 12th Gen Intel(R) Core(TM) i7-12700K, 20 cores, 20 workers, NumPy 2.5.4, build 2026-10-15T13:44:33 #756d13ec, Python 3.13.2, 2026-10-15T21:00:06.
 
-Median speedup of viproc vs. NumPy over all cases (NumPy time / viproc time; > 1: viproc faster), and in brackets the interquartile range (25th..75th percentile) over the 19 cases. Rows down, columns across.
+Median speedup of numpy2x vs. NumPy over all cases (NumPy time / numpy2x time; > 1: numpy2x faster), and in brackets the interquartile range (25th..75th percentile) over the 19 cases. Rows down, columns across.
 
 | rows \ cols | 1 | 10 | 100 | 1,000 |
 |---:|---:|---:|---:|---:|

@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-namespace viproc {
+namespace numpy2x {
 
 template <class T, std::size_t N> class SmallVector {
     static_assert(std::is_trivially_copyable_v<T>, "SmallVector holds trivially copyable values");
@@ -233,4 +233,4 @@ template <class T, std::size_t N> class InlineVector {
     std::size_t size_ = 0;
 };
 
-} // namespace viproc
+} // namespace numpy2x

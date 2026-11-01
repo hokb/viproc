@@ -14,7 +14,7 @@
 #endif
 #include <cstring>
 
-namespace viproc {
+namespace numpy2x {
 
 namespace {
 
@@ -871,4 +871,4 @@ void Runtime::worker_loop(std::size_t id) {
     }
 }
 
-} // namespace viproc
+} // namespace numpy2x

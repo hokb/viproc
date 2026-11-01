@@ -1,4 +1,4 @@
-"""numpy.fft on NumPy's pocketfft gufuncs (hokb/viproc#25, step 6c): fft,
+"""numpy.fft on NumPy's pocketfft gufuncs (hokb/numpy2x#25, step 6c): fft,
 ifft, rfft, irfft, hfft, ihfft and the n-d transforms built on them (fftn,
 ifftn, fft2, ifft2, rfftn, irfftn, rfft2, irfft2).
 
@@ -7,8 +7,8 @@ checks and errors, the same normalization factor `fct` (computed on the
 main thread as NumPy computes it), the same gufunc (rfft_n_even/odd by the
 parity of n), called as `ufunc(a, fct, axes=[(axis,), (), (axis,)],
 out=out)`. The loop pads or truncates the input to n itself. NumPy
-allocates `out` with empty_like(a, shape=...), order K; viproc gives the
-result that layout (vp_gufunc's out_order). pocketfft makes its plan per
+allocates `out` with empty_like(a, shape=...), order K; numpy2x gives the
+result that layout (nx_gufunc's out_order). pocketfft makes its plan per
 call (POCKETFFT_CACHE_SIZE 0 in NumPy's build), so its loops run on any
 thread. A handler returns _NOPE for arguments it does not cover: NumPy then
 runs the call in the eager fallback.
@@ -131,7 +131,7 @@ def _raw_fft(a, n, axis, is_real, is_forward, norm, out=None):
     elif key is not None:
         # fct as a NumPy 0-d array of the loop's dtype (the value NumPy
         # converts the scalar to), so the gufunc's own plan covers the call
-        # too; no viproc array in the plan: it would outlive its runtime.
+        # too; no numpy2x array in the plan: it would outlive its runtime.
         fct = np.asarray(fct, dtype=signature[1])
         if len(_fft_plans) >= 256:
             _fft_plans.clear()

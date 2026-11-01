@@ -1,4 +1,4 @@
-"""ufunc calls and methods the C fast path does not take (hokb/viproc#25,
+"""ufunc calls and methods the C fast path does not take (hokb/numpy2x#25,
 step 5): ufuncs with several outputs, dtype=, signature=, casting=, out= of
 another dtype; ufunc.accumulate (np.cumsum, np.cumprod, np.nancumsum,
 np.nancumprod), ufunc.reduceat, ufunc.at and ufunc.outer.
@@ -7,7 +7,7 @@ accumulate follows NumPy's PyUFunc_Accumulate (ufunc_object.c,
 BSD-3-Clause): the accumulator dtype is NumPy's (taken from NumPy itself,
 once per ufunc and dtypes, on a 2-element probe), the input is cast to it
 first (NumPy's iterator copies a cast input), and the loop runs as NumPy
-runs it, one call per row (vp_accumulate). outer is NumPy's reshape of the
+runs it, one call per row (nx_accumulate). outer is NumPy's reshape of the
 first operand (trailing axes of extent 1) followed by a normal ufunc call.
 A handler returns _NOPE for arguments it does not cover: NumPy then runs
 the call in the eager fallback, with its own errors.
@@ -22,7 +22,7 @@ from numpy.lib.array_utils import normalize_axis_index
 
 from . import _join
 from . import _ndarray as _nd
-from . import _viproc
+from . import _numpy2x
 
 _NOPE = _nd._NOPE
 ndarray = _nd.ndarray
@@ -67,7 +67,7 @@ _PY_SCALARS = (bool, int, float, complex)
 def _typed_inputs(ufunc, inputs, out, kwargs):
     """NumPy's loop dtypes for ufunc(*inputs, out=out, **kwargs)
     (ufunc.resolve_dtypes with dtype=, signature=, casting=) and the inputs
-    as viproc arrays (weak Python scalars converted to their loop dtype, as
+    as numpy2x arrays (weak Python scalars converted to their loop dtype, as
     NumPy converts them): (dtypes, dtype codes, inputs), or _NOPE."""
     nin, nout = ufunc.nin, ufunc.nout
     spec = []
@@ -112,7 +112,7 @@ def _typed_inputs(ufunc, inputs, out, kwargs):
 
 def _complex_warnings(ins, dtypes, out_casts):
     """NumPy warns once per cast of complex to real values it sets up (each
-    call); viproc's iterator templates are made once: warn here (the caller
+    call); numpy2x's iterator templates are made once: warn here (the caller
     silences the cast's own warning). Returns the number of warnings."""
     discards = sum(a.kind == "c" and b.kind in "iuf" for a, b in
                    [(x.dtype, d) for x, d in zip(ins, dtypes)] + out_casts)
@@ -125,12 +125,12 @@ def _complex_warnings(ins, dtypes, out_casts):
 def call(ufunc, inputs, kwargs):
     """ufunc(*inputs, **kwargs) for what the C fast path leaves out: several
     outputs (divmod, modf, frexp), dtype=, signature=, casting=, where= (a
-    bool mask: NumPy's masked loop, vp_ufunc_issue_masked) and an out=
+    bool mask: NumPy's masked loop, nx_ufunc_issue_masked) and an out=
     array of another dtype (NumPy casts into it in its iterator's buffers;
-    so does viproc's kernel). The dtypes are NumPy's (ufunc.resolve_dtypes,
+    so does numpy2x's kernel). The dtypes are NumPy's (ufunc.resolve_dtypes,
     which also raises NumPy's casting errors: then NumPy runs the call);
-    inputs of another dtype are cast as NumPy casts them (vp_ufunc_issue,
-    vp_ufunc_multi). Returns _NOPE where NumPy has to run it."""
+    inputs of another dtype are cast as NumPy casts them (nx_ufunc_issue,
+    nx_ufunc_multi). Returns _NOPE where NumPy has to run it."""
     nin, nout = ufunc.nin, ufunc.nout
     if (ufunc.signature is not None or len(inputs) != nin or not kwargs.keys() <= _CALL_KEYWORDS
             or nin > 3):
@@ -167,10 +167,10 @@ def call(ufunc, inputs, kwargs):
         if discards:
             warnings.simplefilter("ignore", np.exceptions.ComplexWarning)
         if nout == 1:
-            r = _viproc.ufunc_typed(ufunc, tuple(ins), codes, None if out is None else out[0],
+            r = _numpy2x.ufunc_typed(ufunc, tuple(ins), codes, None if out is None else out[0],
                                     None if where is True else where)
         else:
-            r = _viproc.ufunc_multi(ufunc, tuple(ins), codes)
+            r = _numpy2x.ufunc_multi(ufunc, tuple(ins), codes)
     return _NOPE if r is None else r
 
 
@@ -201,8 +201,8 @@ def _core_signature(ufunc):
 
 
 # (ufunc, signature, axes, axis, invalid, flags, out_order, label_sizes,
-# given_work, (dtype, shape) per input) -> the arguments of _viproc.gufunc
-# and the operands' axis remaps for a call on viproc arrays without keywords
+# given_work, (dtype, shape) per input) -> the arguments of _numpy2x.gufunc
+# and the operands' axis remaps for a call on numpy2x arrays without keywords
 # other than a signature tuple, axes= and axis= (all of them depend only on
 # the key). numpy.fft passes axes= on every call: without the plan each call
 # planned again (~70 us on the main thread, more than an FFT of 100 points).
@@ -217,7 +217,7 @@ def _plan_key(ufunc, inputs, kwargs, label_sizes, invalid, flags, given_work, ou
     sig = kwargs.get("signature")
     if sig is not None and type(sig) is not tuple:
         return None
-    # viproc arrays, and NumPy arrays or scalars (imported per call, as
+    # numpy2x arrays, and NumPy arrays or scalars (imported per call, as
     # _typed_inputs imports them); not Python scalars (NEP 50: weak)
     if any(type(x) is not ndarray and not isinstance(x, (np.ndarray, np.generic))
            for x in inputs):
@@ -272,7 +272,7 @@ def _remaps(ufunc, ops, ncore, axes, axis, bcast):
 def gufunc(ufunc, inputs, kwargs, label_sizes=None, invalid=None, flags=0,
            given_work=None, out_order=()):
     """A generalized ufunc call (ufunc.signature set: matmul with casts or
-    out=, vecdot, matvec, vecmat, ...) on NumPy's gufunc loop (vp_gufunc):
+    out=, vecdot, matvec, vecmat, ...) on NumPy's gufunc loop (nx_gufunc):
     NumPy's dtypes (ufunc.resolve_dtypes), inputs of another dtype cast as
     NumPy's iterator copies them, missing flexible dimensions (matmul's 1-d
     operands), axes=/axis= as views moving the core axes last, out= of the
@@ -281,8 +281,8 @@ def gufunc(ufunc, inputs, kwargs, label_sizes=None, invalid=None, flags=0,
 
     For numpy.linalg's wrappers (_linalg.py): `label_sizes` gives the sizes
     of labels only outputs have (svd's `p`), `invalid` the LinAlgError
-    message for the loop's FP invalid flag, `flags` VP_GUFUNC_CHECK_FINITE
-    (NumPy's _assert_finite of the first input) and VP_GUFUNC_SERIAL,
+    message for the loop's FP invalid flag, `flags` NX_GUFUNC_CHECK_FINITE
+    (NumPy's _assert_finite of the first input) and NX_GUFUNC_SERIAL,
     `out_order` the outputs' axis order (numpy.fft: empty_like's order K),
     `given_work` the
     op's cost for the dispatch policy."""
@@ -300,10 +300,10 @@ def gufunc(ufunc, inputs, kwargs, label_sizes=None, invalid=None, flags=0,
         if discards:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", np.exceptions.ComplexWarning)
-                r = _viproc.gufunc(ufunc, tuple(inputs), None, codes, core_n, core_axes, sizes,
+                r = _numpy2x.gufunc(ufunc, tuple(inputs), None, codes, core_n, core_axes, sizes,
                                    flags, out_order, invalid, work)
         else:
-            r = _viproc.gufunc(ufunc, tuple(inputs), None, codes, core_n, core_axes, sizes,
+            r = _numpy2x.gufunc(ufunc, tuple(inputs), None, codes, core_n, core_axes, sizes,
                                flags, out_order, invalid, work)
         if r is None:
             return _NOPE
@@ -363,7 +363,7 @@ def gufunc(ufunc, inputs, kwargs, label_sizes=None, invalid=None, flags=0,
     core_axes = tuple(-1 - label if label in missing else label for c in core for label in c)
     # rough cost for the dispatch policy: the loop's index space per batch
     # element (vecdot: n multiply-adds; matmul: n*k*m, which BLAS runs about
-    # 16x faster per element, as vp_matmul counts it)
+    # 16x faster per element, as nx_matmul counts it)
     batch = 1
     for x, n in zip(ops, ncore):
         if x is not None:
@@ -380,7 +380,7 @@ def gufunc(ufunc, inputs, kwargs, label_sizes=None, invalid=None, flags=0,
     with warnings.catch_warnings():
         if discards:
             warnings.simplefilter("ignore", np.exceptions.ComplexWarning)
-        r = _viproc.gufunc(ufunc, tuple(ops[:nin]), None if out is None else tuple(ops[nin:]),
+        r = _numpy2x.gufunc(ufunc, tuple(ops[:nin]), None if out is None else tuple(ops[nin:]),
                            codes, core_n, core_axes, tuple(sizes), flags, out_order, invalid,
                            work)
     if r is None:
@@ -413,12 +413,12 @@ def _accumulate(ufunc, a, axis=0, dtype=None, out=None):
         return _NOPE
     if a.dtype != rd:
         a = a.astype(rd)  # order K, as NumPy's iterator copies
-    r = _viproc.accumulate(ufunc, a, axis)
+    r = _numpy2x.accumulate(ufunc, a, axis)
     return _NOPE if r is None else r
 
 
 def accumulate(ufunc, inputs, kwargs):
-    """ufunc.accumulate(...) of a viproc array, or _NOPE."""
+    """ufunc.accumulate(...) of a numpy2x array, or _NOPE."""
     if len(inputs) != 1:
         return _NOPE
     try:
@@ -437,7 +437,7 @@ def outer(ufunc, inputs, kwargs):
 
 # ufuncs with NumPy indexed loops (generate_umath.py, indexed=): NumPy's
 # trivial_at_loop runs a 1-d ufunc.at with them several times faster than
-# one loop call per element, which is all viproc can do with NumPy's public
+# one loop call per element, which is all numpy2x can do with NumPy's public
 # loops: those stay NumPy's (G3).
 _INDEXED = frozenset((np.add, np.subtract, np.multiply, np.floor_divide, np.true_divide,
                       np.maximum, np.minimum, np.fmax, np.fmin))
@@ -447,7 +447,7 @@ def at(ufunc, inputs, kwargs):
     """ufunc.at(a, indices[, b]) with one integer index array (or an int) into
     a's first axis and b of a's dtype (a Python scalar counts as int64,
     float64, ... as in NumPy's ufunc_at): one task in place on a
-    (vp_ufunc_at). Returns None, as NumPy, or _NOPE."""
+    (nx_ufunc_at). Returns None, as NumPy, or _NOPE."""
     nin = ufunc.nin
     if kwargs or len(inputs) != nin + 1 or ufunc.nout != 1 or ufunc.signature is not None:
         return _NOPE
@@ -489,12 +489,12 @@ def at(ufunc, inputs, kwargs):
             if not isinstance(b, ndarray):
                 return _NOPE
         values = b
-    return None if _viproc.ufunc_at(ufunc, a, idx, values) else _NOPE
+    return None if _numpy2x.ufunc_at(ufunc, a, idx, values) else _NOPE
 
 
 def reduceat(ufunc, inputs, kwargs):
     """ufunc.reduceat(a, indices, axis=0, dtype=None) with host indices: one
-    task (vp_reduceat), the input cast first to NumPy's accumulator dtype.
+    task (nx_reduceat), the input cast first to NumPy's accumulator dtype.
     NumPy raises its errors (indices out of range) in the fallback."""
     if len(inputs) != 2 or not kwargs.keys() <= {"axis", "dtype"}:
         return _NOPE
@@ -521,7 +521,7 @@ def reduceat(ufunc, inputs, kwargs):
         return _NOPE
     if a.dtype != rd:
         a = a.astype(rd)
-    r = _viproc.reduceat(ufunc, a, axis, ind, _reduceat_strides(a, axis, len(ind) // 8))
+    r = _numpy2x.reduceat(ufunc, a, axis, ind, _reduceat_strides(a, axis, len(ind) // 8))
     return _NOPE if r is None else r
 
 

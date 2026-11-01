@@ -1,6 +1,6 @@
-# viproc: goals and non-goals
+# numpy2x: goals and non-goals
 
-What viproc is for, what it promises, and what it deliberately does not do.
+What numpy2x is for, what it promises, and what it deliberately does not do.
 This is the reference for design decisions and for judging changes; other
 documents (`CLAUDE.md`, `README.md`, `docs/benchmarks.md`, the other design
 documents) point here instead of repeating it. Change it only by decision
@@ -8,15 +8,15 @@ of the maintainer.
 
 ## G1 — Main goal (central claim)
 
-**viproc automatically identifies the parallel potential within and
+**numpy2x automatically identifies the parallel potential within and
 throughout large sections of regular, un-annotated NumPy programs and uses it
 to feed parallel hardware efficiently.**
 
 - The program stays a regular, sequentially written NumPy program
   (`c = a + b`, `m = max(c)`, `s = sum(c, axis=0)`, …). It is not rewritten
-  for parallelism and carries no annotations; viproc is switched on from
-  outside (`python -m viproc prog.py`, `VIPROC=1`) or by the import
-  (`import viproc as np`).
+  for parallelism and carries no annotations; numpy2x is switched on from
+  outside (`python -m numpy2x prog.py`, `NUMPY2X=1`) or by the import
+  (`import numpy2x as np`).
 - The parallelism is **instruction-level parallelism for array
   instructions (array ILP)**: independent array instructions run
   concurrently, dependent ones keep only the local order needed for correct
@@ -35,13 +35,13 @@ to feed parallel hardware efficiently.**
 
 The question is not whether single operations run as fast as, or faster
 than, NumPy; it is whether **whole programs scale strongly**. A program of
-one operation does not get faster with viproc: there is nothing to overlap
-it with, and viproc does not split single operations (see "Non-goals").
+one operation does not get faster with numpy2x: there is nothing to overlap
+it with, and numpy2x does not split single operations (see "Non-goals").
 Real programs compute several quantities, branch into independent
 sub-expressions, mix reductions with element-wise work and loop over
 arrays across functions and modules. In practice, **complexity always
-comes with parallel potential**, and viproc turns that potential into
-parallelism: **viproc turns complexity into performance.** This is the
+comes with parallel potential**, and numpy2x turns that potential into
+parallelism: **numpy2x turns complexity into performance.** This is the
 story `README.md` and the other documents tell; benchmarks follow it by
 measuring whole programs of growing complexity rather than single
 operations in isolation.
@@ -67,22 +67,22 @@ bit-identical values, NumPy's dtypes, shapes, layouts where they decide
 results (e.g. the rounding of pairwise sums), errors and warnings. The
 final computation of every instruction is delegated to NumPy's own inner
 loops, including their SIMD paths, called exactly as NumPy calls them.
-Anything viproc cannot run with NumPy's semantics falls back to eager NumPy.
+Anything numpy2x cannot run with NumPy's semantics falls back to eager NumPy.
 Errors keep NumPy's type (as a subclass) and message; run-time errors of
 asynchronous ops are raised in the main thread as soon as the op failed,
 a little after its call returned, by design
 (`error-handling.md`, E7).
 Every benchmark case and every test must stay bit-identical.
 
-G2 covers the whole interface, not only computed values: viproc is a
+G2 covers the whole interface, not only computed values: numpy2x is a
 semantic drop-in for NumPy, without surprises. Every function, method and
 attribute behaves as NumPy's (flags, `base`, identity, in-place effects,
-warnings, errors). Where NumPy's own code cannot run on viproc memory
-(`ndarray.resize`: NumPy reallocates memory it owns), viproc ports it;
-a viproc-specific error or a different result is a defect.
+warnings, errors). Where NumPy's own code cannot run on numpy2x memory
+(`ndarray.resize`: NumPy reallocates memory it owns), numpy2x ports it;
+a numpy2x-specific error or a different result is a defect.
 
 The price of G2 is a small overhead on small computations: NumPy's own
-loops and operators do the work, and viproc's layer (tasks, arrays,
+loops and operators do the work, and numpy2x's layer (tasks, arrays,
 dispatch) comes on top. G2 holds without exception. G2 has priority over G3:
 "never slower than NumPy" is the target of the bit-identical mode, not
 its guarantee (G3).
@@ -91,15 +91,15 @@ its guarantee (G3).
 
 **G2 comes first.** Bit-identical results and "never slower than NumPy"
 cannot always hold together: when NumPy's own loops do every computation,
-viproc's layer (issue, task, arrays, dispatch) comes on top of NumPy's own
+numpy2x's layer (issue, task, arrays, dispatch) comes on top of NumPy's own
 work, and an operation on small data without parallel potential has
-nothing to hide that cost behind. viproc therefore does not guarantee
+nothing to hide that cost behind. numpy2x therefore does not guarantee
 "never slower". Where the two conflict, G2 wins: exactness is never
 traded for speed.
 
-Within G2, viproc must be as fast as it can be:
+Within G2, numpy2x must be as fast as it can be:
 
-- **Rule, no avoidable cost:** viproc adds nothing that G2 does not need.
+- **Rule, no avoidable cost:** numpy2x adds nothing that G2 does not need.
   No pass over the data (scan, check, copy) to catch a rare condition, no
   eager fallback for a supported op, the fewest main-thread instructions
   per op. Data-sized costs are a defect: on data large enough that the
@@ -123,7 +123,7 @@ expected to be faster than NumPy; the target is NumPy's speed. The same
 expression in a loop may or may not run faster than NumPy, depending on
 whether consecutive iterations can overlap.
 
-Judging a change against G3: compare viproc with NumPy on the same machine,
+Judging a change against G3: compare numpy2x with NumPy on the same machine,
 same build and options (`docs/benchmarks.md`, "How to measure"); single
 configurations vary by ±25–30% between runs on noisy machines, so repeat
 before calling a result a violation or a fix. A slow-down that comes from

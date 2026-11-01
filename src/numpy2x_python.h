@@ -6,8 +6,8 @@
  * debug ABI (Py_DEBUG). Regular Python installations ship neither, and an
  * extension built that way would not load into a release interpreter. So
  * _DEBUG is hidden while Python.h is processed (same approach as pybind11). */
-#ifndef VIPROC_PYTHON_H
-#define VIPROC_PYTHON_H
+#ifndef NUMPY2X_PYTHON_H
+#define NUMPY2X_PYTHON_H
 
 #ifndef PY_SSIZE_T_CLEAN
 #define PY_SSIZE_T_CLEAN
@@ -18,15 +18,15 @@
 /* Fix the C++ standard library's debug settings before _DEBUG goes away. */
 #include <yvals.h>
 #endif
-#define VIPROC_RESTORE_DEBUG
+#define NUMPY2X_RESTORE_DEBUG
 #undef _DEBUG
 #endif
 
 #include <Python.h>
 
-#ifdef VIPROC_RESTORE_DEBUG
+#ifdef NUMPY2X_RESTORE_DEBUG
 #define _DEBUG 1
-#undef VIPROC_RESTORE_DEBUG
+#undef NUMPY2X_RESTORE_DEBUG
 #endif
 
-#endif /* VIPROC_PYTHON_H */
+#endif /* NUMPY2X_PYTHON_H */

@@ -1,7 +1,7 @@
 // Kernel adapter: reductions (sum, prod, min, max, any, all, ...) with NumPy's
 // own reduction loops.
 //
-// viproc does not compute anything itself: it calls the binary loop NumPy
+// numpy2x does not compute anything itself: it calls the binary loop NumPy
 // resolves for the reduction (ufunc._resolve_dtypes_and_context(...,
 // reduction=True)) with args {acc, in, acc}, in exactly the blocks NumPy's
 // reduction passes to it. That keeps results bit-identical, also for
@@ -36,7 +36,7 @@
 #include <span>
 #include <vector>
 
-namespace viproc::numpy {
+namespace numpy2x::numpy {
 
 struct ReduceAxis {
     std::int64_t shape;
@@ -103,4 +103,4 @@ std::shared_ptr<Kernel> make_reduceat_kernel(const UfuncLoop* loop, int axis,
 // with the GIL; nullptr if NumPy has no such function for `dtype`.
 std::shared_ptr<Kernel> make_arg_reduce_kernel(DType dtype, bool argmax, std::string& error);
 
-} // namespace viproc::numpy
+} // namespace numpy2x::numpy

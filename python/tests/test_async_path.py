@@ -1,13 +1,13 @@
-"""The ops viproc runs asynchronously today take the asynchronous path:
+"""The ops numpy2x runs asynchronously today take the asynchronous path:
 tasks on worker threads, no fallback to NumPy, no sync point (async_path.py,
-hokb/viproc#25). Each test also compares the result with NumPy."""
+hokb/numpy2x#25). Each test also compares the result with NumPy."""
 
 import operator
 
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 from async_path import SIZE, assert_async, deterministic, pending
 
 rng = np.random.default_rng(25)
@@ -20,9 +20,9 @@ def _deterministic():
 
 
 def data(shape=(SIZE,), dtype=np.float64):
-    """NumPy's array and a pending viproc array of the same values."""
+    """NumPy's array and a pending numpy2x array of the same values."""
     x = (rng.random(shape) + 0.5).astype(dtype)
-    return x, pending(viproc.asarray(x))
+    return x, pending(numpy2x.asarray(x))
 
 
 def same(r, expected):
@@ -34,19 +34,19 @@ def same(r, expected):
 
 def test_counters_count_tasks_on_pending_inputs_and_blocking_syncs():
     x, v = data()
-    before = viproc.offload_stats()
+    before = numpy2x.offload_stats()
     for _ in range(10):
         v = np.sin(v)  # each on the pending result of the one before
-    viproc.wait_all()
-    after = viproc.offload_stats()
+    numpy2x.wait_all()
+    after = numpy2x.offload_stats()
     assert after["tasks"] - before["tasks"] == 10
     assert after["syncs"] == before["syncs"]  # wait_all() is not counted
     v.wait()  # ready: no sync that blocks
-    assert viproc.offload_stats()["syncs"] == after["syncs"]
-    big = viproc.asarray(rng.random(1_000_000))
+    assert numpy2x.offload_stats()["syncs"] == after["syncs"]
+    big = numpy2x.asarray(rng.random(1_000_000))
     w = pending(big, steps=50)  # milliseconds of work
     w.wait()
-    assert viproc.offload_stats()["syncs"] == after["syncs"] + 1
+    assert numpy2x.offload_stats()["syncs"] == after["syncs"] + 1
 
 
 @pytest.mark.parametrize("name", ["sin", "exp", "sqrt", "negative", "isnan", "floor"])
@@ -72,7 +72,7 @@ def test_ternary_ufunc_clip():
 
 def test_scalar_operands_are_cached_per_object_and_dtype():
     # Scalar operands are converted once per (object, dtype) into a small
-    # direct-mapped cache (hokb/viproc#47). Many distinct scalars, two per op,
+    # direct-mapped cache (hokb/numpy2x#47). Many distinct scalars, two per op,
     # replace slots while an earlier operand of the same op still uses one.
     from numpy._core import umath
     x, v = data()
@@ -121,9 +121,9 @@ def test_reduction(call, ops):
 
 
 @pytest.mark.xfail(strict=True, reason="argmin/argmax decide the direct path by their output "
-                   "size (vp_arg_reduce passes no work size, vp_reduce passes the input's): an "
+                   "size (nx_arg_reduce passes no work size, nx_reduce passes the input's): an "
                    "argmax of ready data with a small result runs on the main thread "
-                   "(hokb/viproc#25)")
+                   "(hokb/numpy2x#25)")
 @pytest.mark.parametrize("call", [lambda a: a.argmax(), lambda a: np.argmin(a),
                                   lambda a: a.argmax(axis=1)])
 def test_argmax_of_ready_data(call):
@@ -154,10 +154,10 @@ def test_where():
 def test_gather_scatter_and_masked_assignment():
     x, v = data()
     idx = rng.integers(0, SIZE, SIZE)
-    iv = pending(viproc.asarray(idx))
+    iv = pending(numpy2x.asarray(idx))
     same(assert_async(operator.getitem, v, iv), x[idx])
     small = rng.integers(0, SIZE, 100)
-    assert_async(operator.setitem, v, viproc.asarray(small), 2.0)
+    assert_async(operator.setitem, v, numpy2x.asarray(small), 2.0)
     x[small] = 2.0
     same(v, x)
     mask, mask_v = x > 1, v > 1
@@ -195,14 +195,14 @@ def test_direct_budget_is_scaled_to_the_machine():
     """The direct-path budget stands for main-thread costs: the bridge sets
     it to what the task path costs the main thread more than the direct
     path, measured once per process (clamped to 0.3-50 us)."""
-    viproc.init(sync_below=2048, adaptive=True)
+    numpy2x.init(sync_below=2048, adaptive=True)
     try:
-        budget = viproc._viproc.direct_budget_ns()
+        budget = numpy2x._numpy2x.direct_budget_ns()
         assert 300 <= budget <= 50000
-        viproc.init(sync_below=2048, adaptive=True)
-        assert viproc._viproc.direct_budget_ns() == budget
+        numpy2x.init(sync_below=2048, adaptive=True)
+        assert numpy2x._numpy2x.direct_budget_ns() == budget
     finally:
-        viproc.shutdown()
+        numpy2x.shutdown()
 
 
 def test_expensive_small_op_becomes_a_task():
@@ -210,49 +210,49 @@ def test_expensive_small_op_becomes_a_task():
     loop is expensive: the direct path times the loop (DirectCost) and ops
     worth more than ~10 us of NumPy time become tasks, as large ones.
     Adaptive mode only: deterministic mode keeps the fixed threshold."""
-    viproc.init(sync_below=2048, adaptive=True)
+    numpy2x.init(sync_below=2048, adaptive=True)
     try:
         data = np.exp(1j * np.arange(1500.0))
-        x = viproc.asarray(data)
-        viproc.wait_all()
-        before = viproc.offload_stats()
+        x = numpy2x.asarray(data)
+        numpy2x.wait_all()
+        before = numpy2x.offload_stats()
         results = [np.power(x, 1.5 + 0.5j) for _ in range(6)]  # ~100 ns per element
-        viproc.wait_all()
-        after = viproc.offload_stats()
+        numpy2x.wait_all()
+        after = numpy2x.offload_stats()
         assert after["direct"] - before["direct"] == 2  # the two timed runs
         assert after["tasks"] - before["tasks"] == 4
         expected = np.power(data, 1.5 + 0.5j)
         assert all(np.array_equal(np.asarray(r), expected) for r in results)
         # Every 32nd promoted op re-tests the loop, as a task timed on its
         # worker: none runs on the main thread.
-        before = viproc.offload_stats()
+        before = numpy2x.offload_stats()
         results = [np.power(x, 1.5 + 0.5j) for _ in range(70)]
-        viproc.wait_all()
-        after = viproc.offload_stats()
+        numpy2x.wait_all()
+        after = numpy2x.offload_stats()
         assert after["direct"] == before["direct"]
         assert after["tasks"] - before["tasks"] == 70
         assert all(np.array_equal(np.asarray(r), expected) for r in results)
         # Another size of the same loop is estimated from the measured one
         # (per size class, inter- and extrapolated): no direct run first.
-        before = viproc.offload_stats()
+        before = numpy2x.offload_stats()
         small = np.power(x[:200], 1.5 + 0.5j)
-        viproc.wait_all()
-        after = viproc.offload_stats()
+        numpy2x.wait_all()
+        after = numpy2x.offload_stats()
         assert after["direct"] == before["direct"]
         assert after["tasks"] - before["tasks"] == 1
         assert np.array_equal(np.asarray(small), expected[:200])
         # A cheap loop stays on the direct path.
-        y = viproc.asarray(np.arange(1500.0))
-        before = viproc.offload_stats()
+        y = numpy2x.asarray(np.arange(1500.0))
+        before = numpy2x.offload_stats()
         for _ in range(6):
             np.add(y, y)
-        assert viproc.offload_stats()["direct"] - before["direct"] == 6
+        assert numpy2x.offload_stats()["direct"] - before["direct"] == 6
     finally:
-        viproc.init()
+        numpy2x.init()
     with deterministic():
-        x = viproc.asarray(data)
-        viproc.wait_all()
-        before = viproc.offload_stats()
+        x = numpy2x.asarray(data)
+        numpy2x.wait_all()
+        before = numpy2x.offload_stats()
         for _ in range(6):
             np.power(x, 1.5 + 0.5j)
-        assert viproc.offload_stats()["direct"] - before["direct"] == 6
+        assert numpy2x.offload_stats()["direct"] - before["direct"] == 6

@@ -1,9 +1,9 @@
 """Cases of the shape map benchmark (shape_map.py).
 
 Every case is plain, sequential NumPy code on 2-d data of shape
-(rows, cols); it runs unchanged on NumPy and on viproc arrays. The map
+(rows, cols); it runs unchanged on NumPy and on numpy2x arrays. The map
 measures every case at every grid point, so together they should span the
-range viproc meets in practice:
+range numpy2x meets in practice:
 
 - **dependent**: one dependency chain of 1, 2 or 3 unary ops per step
   (no parallelism at all: pure per-op overhead vs. NumPy).
@@ -25,7 +25,7 @@ range viproc meets in practice:
   A[:, i])))`), order-dependent writes (ILNumerics' "Part 2b":
   `out[:i+1] = ...`, later iterations overwrite earlier ones), a recurrence
   over rows (`x[i]` from `x[i-1]`), a scalar accumulator over independent
-  row reductions, and disjoint `out=` blocks of one result array (viproc
+  row reductions, and disjoint `out=` blocks of one result array (numpy2x
   orders writes to one storage, even to disjoint regions). P is the number
   of independent iterations (1 for the recurrence).
 - **control**: conditionals in Python: branches on the loop index (no
@@ -35,12 +35,12 @@ range viproc meets in practice:
 `run(data, reps)` repeats the program `reps` times along its dependency
 chains: every step reads the previous step's result (`x = f(x)`). The
 step functions are chosen to keep values bounded and away from zero
-(no overflow, no subnormal numbers, which would slow down NumPy and viproc
+(no overflow, no subnormal numbers, which would slow down NumPy and numpy2x
 alike and measure the FPU instead of the executor).
 
 `width` is the parallel width P; `mem` the peak number of (rows, cols)
 arrays a run keeps alive when its whole program is issued at once (inputs,
-viproc copies and temporaries in flight, rounded up); shape_map.py skips
+numpy2x copies and temporaries in flight, rounded up); shape_map.py skips
 grid points that would not fit into RAM.
 """
 

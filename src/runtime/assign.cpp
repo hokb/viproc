@@ -2,7 +2,7 @@
 
 #include <cstring>
 
-namespace viproc {
+namespace numpy2x {
 
 namespace {
 
@@ -61,4 +61,4 @@ std::shared_ptr<Kernel> make_place_kernel(std::vector<Part> parts) {
     return std::make_shared<PlaceKernel>(std::move(parts));
 }
 
-} // namespace viproc
+} // namespace numpy2x

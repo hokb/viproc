@@ -1,4 +1,4 @@
-"""Checks that an op takes viproc's asynchronous path (hokb/viproc#25).
+"""Checks that an op takes numpy2x's asynchronous path (hokb/numpy2x#25).
 
 A bit-identity test alone also passes when an op falls back to NumPy, syncs
 its inputs or runs on the main thread. assert_async() reads the runtime's
@@ -12,9 +12,9 @@ import contextlib
 
 import numpy as np
 
-import viproc
+import numpy2x
 
-SYNC_BELOW = 2048  # the default threshold, set explicitly (VIPROC_SYNC_BELOW)
+SYNC_BELOW = 2048  # the default threshold, set explicitly (NUMPY2X_SYNC_BELOW)
 SIZE = 5000  # elements: above SYNC_BELOW
 
 
@@ -22,11 +22,11 @@ SIZE = 5000  # elements: above SYNC_BELOW
 def deterministic():
     """The default threshold without the adaptive policy, which could switch
     an issue site to inline execution."""
-    viproc.init(sync_below=SYNC_BELOW, adaptive=False)
+    numpy2x.init(sync_below=SYNC_BELOW, adaptive=False)
     try:
         yield
     finally:
-        viproc.init()
+        numpy2x.init()
 
 
 def pending(v, steps=20):
@@ -39,8 +39,8 @@ def pending(v, steps=20):
 
 
 def counters():
-    s = viproc.offload_stats()
-    s["fallbacks"] = viproc._ndarray.fallback_calls
+    s = numpy2x.offload_stats()
+    s["fallbacks"] = numpy2x._ndarray.fallback_calls
     return s
 
 
@@ -63,12 +63,12 @@ def assert_async(fn, *args, ops=1, small_steps=False, syncs=0, min_tasks=1, **kw
     (0 where the op itself may run directly once its inputs are ready)."""
     before = counters()  # the inputs may be pending: a sync on them counts
     r = fn(*args, **kwargs)
-    viproc.wait_all()  # not a sync point of its own (not counted)
+    numpy2x.wait_all()  # not a sync point of its own (not counted)
     after = counters()
     delta = {k: after[k] - before[k] for k in before}
     results = r if isinstance(r, tuple) else () if r is None else (r,)  # None: a statement
-    # Arrays are viproc arrays, never an np.ndarray (that would be a sync
-    # through __array__). Where NumPy returns a scalar, viproc returns NumPy's
+    # Arrays are numpy2x arrays, never an np.ndarray (that would be a sync
+    # through __array__). Where NumPy returns a scalar, numpy2x returns NumPy's
     # scalar if the data happened to be there already, else a pending 0-d
     # array; metadata (flags, device) are plain Python values.
     assert not any(isinstance(x, np.ndarray) for x in results), [type(x) for x in results]

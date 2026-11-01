@@ -23,7 +23,7 @@
 #include <unordered_map>
 #include <utility>
 
-namespace viproc {
+namespace numpy2x {
 
 // NumPy time of a kernel that many ops share (one per resolved loop), per
 // log2 size class of the op, measured on the direct path: the dispatch policy
@@ -59,7 +59,7 @@ struct OffloadOptions {
     // this: what the task path costs the main thread more than the direct
     // path, for the op and for the cheap ops consuming it (a promoted op makes
     // them tasks too). The Python bridge measures it per machine at start
-    // (`_scale_budget` in _ndarray.py, vp_set_direct_budget_ns): a direct op,
+    // (`_scale_budget` in _ndarray.py, nx_set_direct_budget_ns): a direct op,
     // a task of ready inputs and a task of a pending input, the budget is the
     // surcharge of the task plus two consumers' surcharges. The default is a
     // 4-vCPU VM's time.
@@ -72,7 +72,7 @@ struct OffloadOptions {
     std::int64_t time_from = 64;
     // What a small op costs the main thread more as a task of a pending input
     // than directly (a promoted op's follower, ChainScore); measured by the
-    // bridge (vp_set_task_costs).
+    // bridge (nx_set_task_costs).
     double chain_ns = 0;
     // Ops after an issue whose readers count as its followers.
     std::uint64_t chain_window = 32;
@@ -269,4 +269,4 @@ class OffloadPolicy {
     std::uint64_t offload_count_ = 0;
 };
 
-} // namespace viproc
+} // namespace numpy2x

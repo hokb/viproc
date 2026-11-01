@@ -1,7 +1,7 @@
 #include "workers.hpp"
 
-namespace viproc {
+namespace numpy2x {
 
 std::size_t worker_threads() { return 2; }
 
-} // namespace viproc
+} // namespace numpy2x

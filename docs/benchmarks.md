@@ -1,12 +1,12 @@
 # Benchmarks
 
-Results of viproc's benchmarks over its development: the current
+Results of numpy2x's benchmarks over its development: the current
 breakdown, the progress per change and runs on other machines. Update
 this file with every change that is judged by a benchmark (see "Adding a
 run" at the end).
 
 **What the numbers are for** (`docs/design/goals.md`, G1, "Complexity
-becomes performance"): viproc is judged by whole programs, not single
+becomes performance"): numpy2x is judged by whole programs, not single
 operations. A case of one or two operations has nothing to overlap and
 measures the per-op layer; programs of growing complexity measure how much
 of their parallel potential becomes parallelism. Current goal: every
@@ -15,13 +15,13 @@ program at 0.8x of NumPy or faster, complex programs clearly faster.
 ## How to measure
 
 - **Benchmark suite** (`python/benchmarks/suite.py`): ~100 configurations
-  of plain NumPy programs, each run as NumPy and on viproc with 1 worker
+  of plain NumPy programs, each run as NumPy and on numpy2x with 1 worker
   and with one worker per core; every result must be bit-identical.
   efficiency = speedup vs. NumPy / ideal; ideal = min(cores, P) for
   medium and large data (P: the program's independent instruction
   streams), 1 (parity) for scalar, tiny and small data. Score = 100 x
   geomean over categories of geomean(efficiency). 100 = ideal scaling on
-  the machine; above 100 is possible (e.g. viproc's element pool avoids
+  the machine; above 100 is possible (e.g. numpy2x's element pool avoids
   page faults NumPy pays for its temporaries).
 - Sizes: scalar (0-d), tiny (8 elements), small (1,000), medium
   (100,000), large (RAM per core, ~3-4 million elements on these
@@ -35,7 +35,7 @@ program at 0.8x of NumPy or faster, complex programs clearly faster.
   `bench_win/` is ignored too), so `git pull` never conflicts with them.
   The scripts refuse an `--out` directory that holds files tracked by git;
   committed reference results (`docs/benchmarks/`, e.g.
-  `docs/benchmarks/windows/`: shape maps of viproc on the i7-12700K,
+  `docs/benchmarks/windows/`: shape maps of numpy2x on the i7-12700K,
   Windows) are replaced only on purpose, with `--reference`.
 
 **Comparability.** Compare scores only between runs on the same machine
@@ -85,13 +85,13 @@ Category x size (score of the configurations in the cell):
 - **Large data scales.** Element-wise chains, reductions, stencils and
   the algorithm kernels reach 4-7x on 4 cores (`dtype_chains` complex128
   6.9x, `black_scholes` 6.2x, `stencil_1d` 5.8x, `chains_wide` 4.7x,
-  `softmax_rows` 4.2x). Above the ideal of 4: viproc's element pool and
+  `softmax_rows` 4.2x). Above the ideal of 4: numpy2x's element pool and
   temporary elision avoid the page faults of NumPy's fresh temporaries.
 - **Medium data (100,000 elements) is the weak class (48).** An op takes
   only ~50-100 µs there, so per-op costs and synchronisation weigh more:
   - indexing 36: `boolean_mask` 0.65x (a read through a mask syncs on the
     mask for its size), `scatter` 0.75x, `gather` 1.35x;
-  - dtypes 39: int16 and float16 are not viproc dtypes (they stay NumPy
+  - dtypes 39: int16 and float16 are not numpy2x dtypes (they stay NumPy
     arrays, efficiency 0.25 = parity), `dtype_promote` with them falls
     back (312 / 132 fallbacks);
   - algorithms 42: `kmeans_points` 0.67x (one `nonzero` sync per cluster
@@ -110,7 +110,7 @@ Category x size (score of the configurations in the cell):
 
 ### All configurations
 
-| case | size | layout | dtype | P | NumPy ms | viproc w=1 ms | viproc w=4 ms | speedup | ideal | eff. | fallbacks |
+| case | size | layout | dtype | P | NumPy ms | numpy2x w=1 ms | numpy2x w=4 ms | speedup | ideal | eff. | fallbacks |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | **chains** | | | | | | | | | | | |
 | chains_wide | small | vec | float64 | 4 | 36.25 | 39.31 | 39.15 | 0.93x | 1x | 0.93 | 0 |
@@ -376,8 +376,8 @@ float64 18.8 → 0.001 ms (`e0732f4`); ILNumerics' k-means program
 
 ## Shape map
 
-`python/benchmarks/shape_map.py` maps viproc's speedup vs. NumPy (NumPy
-time / viproc time, one worker per core) over the 2-d problem size: rows
+`python/benchmarks/shape_map.py` maps numpy2x's speedup vs. NumPy (NumPy
+time / numpy2x time, one worker per core) over the 2-d problem size: rows
 x columns, both log-spaced in half decades from 1 to 10,000 (rows stop at
 5,000 when 10,000 x 10,000 does not fit into RAM with the largest case),
 plus 0-d scalars. Each grid point runs 19 plain NumPy programs
@@ -403,7 +403,7 @@ million elements.
 
 ![median speedup per case group](benchmarks/shape_map_groups.png)
 
-- **Below ~30,000 elements viproc is slower than NumPy:** median
+- **Below ~30,000 elements numpy2x is slower than NumPy:** median
   0.55-0.9x (scalar-like 1 x 1 to 32 x 32: ~0.55-0.65x). 0-d scalars run
   at parity (0.98x, scalar shortcut). Per-op overhead of the task and
   bridge, not parallelism, decides this region.
@@ -501,7 +501,7 @@ elements unless noted, ready):
 `x * y`: callgrind 5,250 → 4,000 instructions (operator and result
 release, without the interpreter). `np.abs(x)` stays at ~0.8 µs (NumPy
 0.4): NumPy's override dispatch (`PyUFunc_CheckOverride`, ~1,800
-instructions) runs before viproc sees the call.
+instructions) runs before numpy2x sees the call.
 
 Suite `--quick`, 4 workers, back to back (`#fcebb840` main, `#bd9f3351`
 this change): score 69 → 73; tiny 60 → 80, small 76 → 82, reductions 81 →
@@ -559,7 +559,7 @@ same change.
 `2026-10-16T11:39:22 #f5e952ad`, same VM, all results bit-identical):
 small ready assignments run in NumPy's own slot on a borrowed view, the
 rest as assign tasks with the value converted at issue. Micro (10 x 10,
-ready, µs incl. call overhead, NumPy / viproc): `out[3] = s` 0.16 / 0.22
+ready, µs incl. call overhead, NumPy / numpy2x): `out[3] = s` 0.16 / 0.22
 (was 3.1), `out[:4] = s` 0.65 / 0.51, `x[3] = r` 0.41 / 0.38,
 `x[m] = 0.6` 0.77 / 0.96 (was 5.2), loop body
 `out[3] = np.sum(np.abs(np.sin(a[:, 3])))` 2.3 / 3.9 (was 8.5). Map
@@ -571,18 +571,18 @@ copy-on-write of `loop_scan` (0.02x at 1000 x 1000).
 
 **`np.where` in C, ufunc proxies, shorter single-call check**
 (callgrind, instructions per call incl. the Python loop around it, 10 x 10
-float64, ready, `OPENBLAS_NUM_THREADS=1`; NumPy / viproc before / after):
+float64, ready, `OPENBLAS_NUM_THREADS=1`; NumPy / numpy2x before / after):
 
 | call | NumPy | before | after |
 |---|---:|---:|---:|
 | `np.where(m, x, y)` | 10,100 | 30,300 | 12,000 |
 | `np.where(m, x, 0.0)` | 11,300 | 47,300 | 12,700 |
-| `viproc.where(m, x, y)` (module mode) | 9,800 | - | 10,500 |
-| `viproc.where(m, x, 0.0)` (module mode) | 11,500 | - | 11,100 |
-| `viproc.abs(c)` (module mode) | 4,500 | 7,900 | 5,400 |
-| `viproc.add(c, y)` (module mode) | 5,500 | 8,200 | 6,200 |
-| `viproc.sin(c)` (module mode) | 12,500 | 15,900 | 13,000 |
-| `viproc.maximum(c, 0.5)` (module mode) | 7,600 | 11,400 | 9,300 |
+| `numpy2x.where(m, x, y)` (module mode) | 9,800 | - | 10,500 |
+| `numpy2x.where(m, x, 0.0)` (module mode) | 11,500 | - | 11,100 |
+| `numpy2x.abs(c)` (module mode) | 4,500 | 7,900 | 5,400 |
+| `numpy2x.add(c, y)` (module mode) | 5,500 | 8,200 | 6,200 |
+| `numpy2x.sin(c)` (module mode) | 12,500 | 15,900 | 13,000 |
+| `numpy2x.maximum(c, 0.5)` (module mode) | 7,600 | 11,400 | 9,300 |
 | `c * y` | 4,900 | 5,750 | 5,600 |
 
 "before" for module mode is the same call through NumPy's ufunc (the
@@ -701,7 +701,7 @@ sync-heavy cases in 3 alternating targeted runs 0.95-1.02.
 ILNumerics' array-pipelining demo (getting-started part IV; code in
 ILNumerics/decentralized-array-execution-artifacts2026, Appendix "Part
 2a/2b Loop Parallelization") as plain NumPy code, run in module mode (the
-`np` of `python -m viproc`): `loop` is `C[i] = np.sum(np.abs(np.sin(A[:,
+`np` of `python -m numpy2x`): `loop` is `C[i] = np.sum(np.abs(np.sin(A[:,
 i])), axis=0)` over the n columns of A (ILNumerics' `counter`, columns
 contiguous), `loop_dep` writes `C[0:i+1]` instead (every iteration
 overwrites all earlier results: only the original order is right),
@@ -709,7 +709,7 @@ overwrites all earlier results: only the original order is right),
 the Parallel.For of the demo: a thread pool over column blocks of `loop`.
 Same 4-vCPU VM, median of 5-7 samples, every result bit-identical.
 
-| A | program | NumPy ms | NumPy 4 threads | viproc w=1 | w=2 | w=3 | w=4 |
+| A | program | NumPy ms | NumPy 4 threads | numpy2x w=1 | w=2 | w=3 | w=4 |
 |---|---|---:|---:|---:|---:|---:|---:|
 | 200 x 200 | `loop` | 0.88 | 0.50x | 1.00x | 0.91x | 0.97x | 1.03x |
 | | `loop_dep` | 0.97 | – | 0.89x | 0.93x | 0.92x | 1.00x |
@@ -747,7 +747,7 @@ Same 4-vCPU VM, median of 5-7 samples, every result bit-identical.
 - **Two changes made it scale:** (1) the direct path times each shared
   loop kernel (ns per element) and sends an op estimated above 10 µs of
   NumPy time to the task path even below `sync_below` (adaptive mode
-  only); (2) in module mode `np.sum`, `np.max`, ... of a viproc array skip
+  only); (2) in module mode `np.sum`, `np.max`, ... of a numpy2x array skip
   NumPy's `__array_function__` dispatch (`np.sum(x, axis=0)`: 15,100 →
   8,800 instructions).
 
@@ -781,7 +781,7 @@ of 5 samples, `main` (`464ae7a`) → this change:
   the 1,500 x 1,500 loops (2.74x vs. 2.30x: with 4 workers the issuing
   main thread shares a core), but costs data-parallel programs whose main
   thread idles: `vectorized` 4.29x → 3.14x at 1,500 x 1,500, and the
-  3,000 x 3,000 loops 3.5x → 3.0x. `viproc.init(workers=n)` sets it per
+  3,000 x 3,000 loops 3.5x → 3.0x. `numpy2x.init(workers=n)` sets it per
   program.
 
 Budget of the direct path, quick shape map `--module` (each run twice,
@@ -808,7 +808,7 @@ There the fixed 10 µs left the loop on the main thread: a column's `sin`
 worker count; `vectorized` 5.7x at 12 workers. The bridge now sets the
 budget to 9 direct `a * b` of 8 doubles (330 ns there, 525 ns on the VM).
 `array_pipelining.py --sizes 200:500,1000:20,1500:10 --workers 1,4,11`
-with fixed budgets (`VIPROC_DIRECT_BUDGET_NS`), speedup vs. NumPy at
+with fixed budgets (`NUMPY2X_DIRECT_BUDGET_NS`), speedup vs. NumPy at
 1/4/11 workers:
 
 | budget | 200² `loop` | 1000² `loop` | 1000² `loop_dep` | 1500² `loop` | 1500² `loop_dep` |

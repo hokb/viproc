@@ -1,7 +1,7 @@
 #include "kernels/numpy_sort.hpp"
 
 #define NPY_NO_DEPRECATED_API NPY_2_0_API_VERSION
-#define PY_ARRAY_UNIQUE_SYMBOL viproc_ARRAY_API
+#define PY_ARRAY_UNIQUE_SYMBOL numpy2x_ARRAY_API
 #define NO_IMPORT_ARRAY
 #include <numpy/arrayobject.h>
 
@@ -9,7 +9,7 @@
 #include <cstring>
 #include <vector>
 
-namespace viproc::numpy {
+namespace numpy2x::numpy {
 
 namespace {
 
@@ -196,4 +196,4 @@ std::shared_ptr<Kernel> make_sort_kernel(DType dtype, int kind, bool arg, int ax
     return std::make_shared<SortKernel>(sort, argsort, dtype, axis);
 }
 
-} // namespace viproc::numpy
+} // namespace numpy2x::numpy

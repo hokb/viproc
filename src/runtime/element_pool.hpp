@@ -26,7 +26,7 @@
 #include <cstdint>
 #include <mutex>
 
-namespace viproc {
+namespace numpy2x {
 
 class ElementPool {
   public:
@@ -44,7 +44,7 @@ class ElementPool {
     void trim();
 
     // Upper bound for cached bytes (default: half the physical memory, or
-    // VIPROC_POOL_LIMIT; 0 disables caching).
+    // NUMPY2X_POOL_LIMIT; 0 disables caching).
     std::size_t limit() const { return limit_.load(std::memory_order_relaxed); }
     void set_limit(std::size_t bytes);
 
@@ -85,4 +85,4 @@ class ElementPool {
     std::atomic<std::uint64_t> dropped_{0};
 };
 
-} // namespace viproc
+} // namespace numpy2x

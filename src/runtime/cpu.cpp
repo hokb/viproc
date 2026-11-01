@@ -24,7 +24,7 @@
 #include <sys/types.h>
 #endif
 
-namespace viproc {
+namespace numpy2x {
 
 namespace {
 
@@ -129,4 +129,4 @@ std::size_t physical_core_count() {
     return cores == 0 ? logical : std::min(cores, logical);
 }
 
-} // namespace viproc
+} // namespace numpy2x

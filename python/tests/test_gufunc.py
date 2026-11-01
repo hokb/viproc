@@ -1,5 +1,5 @@
 """Generalized ufuncs (vecdot, matvec, vecmat; matmul with casts, dtype=,
-out=, axes=) on NumPy's gufunc loops (hokb/viproc#25 step 6a): bit-identical
+out=, axes=) on NumPy's gufunc loops (hokb/numpy2x#25 step 6a): bit-identical
 to NumPy (values, dtypes, layouts, errors) and on the asynchronous path."""
 
 import warnings
@@ -7,7 +7,7 @@ import warnings
 import numpy as np
 import pytest
 
-import viproc
+import numpy2x
 from async_path import assert_async, pending
 from test_compositions import DTYPES, check, det, same, sample  # noqa: F401 (det: fixture)
 from test_joining import path  # noqa: F401 (fixture)
@@ -60,28 +60,28 @@ def test_out(dtype, path):
         shape = want.shape if shape is None else shape
         for order in ("C", "F"):
             o = np.zeros(shape, want.dtype, order=order)
-            vo = viproc.asarray(o)
+            vo = numpy2x.asarray(o)
             r = f(*args, out=o)
-            vr = f(*[viproc.asarray(x) for x in args], out=vo)
+            vr = f(*[numpy2x.asarray(x) for x in args], out=vo)
             assert r is o and vr is vo
             same(vo, o)
-            vr = f(*[viproc.asarray(x) for x in args], out=(vo,))
+            vr = f(*[numpy2x.asarray(x) for x in args], out=(vo,))
             assert vr is vo
             same(vo, o)
     # out= aliasing an input, of another dtype, through axes=
-    x = viproc.asarray(a)
+    x = numpy2x.asarray(a)
     o = np.vecdot(a, a)
     vo = np.vecdot(x, x)
     np.vecdot(o[:, :, None], o[:, :, None], out=o)
     np.vecdot(vo[:, :, None], vo[:, :, None], out=vo)
     same(vo, o)
     o32 = np.zeros((5, 4), np.complex128)
-    vo32 = viproc.asarray(o32)
+    vo32 = numpy2x.asarray(o32)
     np.vecdot(a, a, out=o32)
     np.vecdot(x, x, out=vo32)
     same(vo32, o32)
     o = np.zeros((4, 5), a.dtype)
-    vo = viproc.asarray(o)
+    vo = numpy2x.asarray(o)
     np.vecdot(a, a, axes=[(2,), (2,), ()], out=o.T)
     np.vecdot(x, x, axes=[(2,), (2,), ()], out=vo.T)
     same(vo, o)
@@ -109,7 +109,7 @@ ASYNC = [  # name, call, inputs
 @pytest.mark.parametrize("name,call,shapes", ASYNC, ids=[c[0] for c in ASYNC])
 def test_async(name, call, shapes, det):
     xs = [sample(s, np.float64, special=False) for s in shapes]
-    vs = [pending(viproc.asarray(x)) for x in xs]
+    vs = [pending(numpy2x.asarray(x)) for x in xs]
     want = call(*xs)
     # inputs cast to the loop dtype first (matmul_dtype): one task each
     ops = 1 + (len(xs) if name == "matmul_dtype" else 0)
@@ -120,7 +120,7 @@ def test_async(name, call, shapes, det):
 def test_async_mixed_matmul(det):
     x = sample((60, 70), np.float64, special=False)
     y = sample((70, 80), np.float32, special=False)
-    vx, vy = pending(viproc.asarray(x)), pending(viproc.asarray(y))
+    vx, vy = pending(numpy2x.asarray(x)), pending(numpy2x.asarray(y))
     got = assert_async(np.matmul, vx, vy, ops=2)  # the cast of y, the matmul
     same(got, np.matmul(x, y))
 
@@ -128,7 +128,7 @@ def test_async_mixed_matmul(det):
 def test_async_out(det):
     x = sample((100, 50), np.float64, special=False)
     o = np.zeros(100)
-    vx, vo = pending(viproc.asarray(x)), pending(viproc.asarray(o))
+    vx, vo = pending(numpy2x.asarray(x)), pending(numpy2x.asarray(o))
     got = assert_async(lambda: np.vecdot(vx, vx, out=vo), ops=1)
     assert got is vo
     same(vo, np.vecdot(x, x, out=o))
