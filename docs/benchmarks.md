@@ -35,8 +35,8 @@ program at 0.8x of NumPy or faster, complex programs clearly faster.
   `bench_win/` is ignored too), so `git pull` never conflicts with them.
   The scripts refuse an `--out` directory that holds files tracked by git;
   committed reference results (`docs/benchmarks/`, e.g.
-  `docs/benchmarks/windows/`: shape maps of viproc and ILNumerics on the
-  i7-12700K, Windows) are replaced only on purpose, with `--reference`.
+  `docs/benchmarks/windows/`: shape maps of viproc on the i7-12700K,
+  Windows) are replaced only on purpose, with `--reference`.
 
 **Comparability.** Compare scores only between runs on the same machine
 and with the same options. The cloud VM of the development sessions

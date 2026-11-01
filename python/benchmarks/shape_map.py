@@ -227,7 +227,7 @@ def run_map(args):
 def labels(run):
     """What a run compares: `subject` vs. `baseline`, speedup = baseline time /
     subject time. Runs of this script compare viproc with NumPy; other
-    comparisons (shape_map_ilnumerics.py) store their own labels in the run."""
+    comparisons store their own labels in the run."""
     out = {"subject": "viproc", "baseline": "NumPy", "title": "viproc shape map",
            "prefix": "shape_map", "check": "Bit-identical to NumPy", "header": None,
            "note": None}
