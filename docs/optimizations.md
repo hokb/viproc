@@ -2,7 +2,7 @@
 
 Every optimization of viproc with the case it covers, how it is
 implemented, its state and its measured effect. All implemented
-optimizations keep results bit-identical to NumPy (optimization level O1,
+optimizations keep results bit-identical to NumPy (G2,
 `docs/design/goals.md`). Keep this list up to date with every change that
 affects performance; the measurements behind it live in
 `docs/benchmarks.md`.
@@ -142,9 +142,9 @@ ideas were measured and rejected.
 | Wake sleepers for local tasks | Local queue | Wake-up on every local push | Rejected | Undid the `expr_where` gain, `sum_cores` stayed |
 | Main thread runs a queued task itself | Sync on a task not started yet | Take it from the queue at the sync point | Rejected | No sync found its task queued (1,278 continuations vs. 336 pops) |
 | Memory at issue on the main thread (D10) | Every op | Allocation at issue | Replaced by D11 | Dependent chains 2-4x slower than NumPy |
-| One BLAS thread per worker | Concurrent matrix products | `OPENBLAS_NUM_THREADS=1` | Rejected | Changes the results (O1) |
+| One BLAS thread per worker | Concurrent matrix products | `OPENBLAS_NUM_THREADS=1` | Rejected | Changes the results (G2) |
 | Pre-scan of integer exponents | `power` with a negative exponent | Pass over the data before the kernel | Rejected | 3-10% slower; a watched call instead (E6) |
-| Dense copy of strided ndarrays | Strided NumPy views as inputs | Import by copy | Rejected | Other strides may round differently (O1) and cost a pass on the main thread |
+| Dense copy of strided ndarrays | Strided NumPy views as inputs | Import by copy | Rejected | Other strides may round differently (G2) and cost a pass on the main thread |
 | Caching `ndarray` objects | Every op | Reuse of the Python objects | Rejected | Only ~1% of the instructions per op |
 
 ## Open and next
@@ -161,4 +161,3 @@ cases and the Python loops at once.
 | Python loops over rows | `loop_accum`, `loop_cols*`, `loop_rows`, `loop_scan` | Follows from the direct-path overhead; `loop_scan` also copy-on-write per row (D8) | Open | Below 0.95x at every size, also 1000 x 1000 |
 | Hook for Python paths | Python parts, bypassing NumPy parts | The hook used selectively instead of as an input switch | Later | Not investigated yet |
 | Scaling beyond 4 cores | i7-12700K, 12 cores | Find whether memory bandwidth, the issue rate or wake-ups limit it | Open | Suite 22 there (against ideal 20 cores, not comparable) |
-| Stage pipelining (O2) | Pending sizes, early allocation | Six stages, tasks advance on stage events | Planned (`docs/design/pipelining.md`) | Fewer syncs for data-dependent sizes |

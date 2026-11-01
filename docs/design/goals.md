@@ -83,11 +83,7 @@ a viproc-specific error or a different result is a defect.
 
 The price of G2 is a small overhead on small computations: NumPy's own
 loops and operators do the work, and viproc's layer (tasks, arrays,
-dispatch) comes on top. **Planned:** bit-identity becomes a property of
-the optimization level ("Optimization levels" below): it holds at O1,
-today's only level; higher levels compute correct results that may
-deviate from NumPy's, faster. Until they exist, G2 holds without
-exception, and O1 stays available afterwards. G2 has priority over G3:
+dispatch) comes on top. G2 holds without exception. G2 has priority over G3:
 "never slower than NumPy" is the target of the bit-identical mode, not
 its guarantee (G3).
 
@@ -98,10 +94,8 @@ cannot always hold together: when NumPy's own loops do every computation,
 viproc's layer (issue, task, arrays, dispatch) comes on top of NumPy's own
 work, and an operation on small data without parallel potential has
 nothing to hide that cost behind. viproc therefore does not guarantee
-"never slower" in the bit-identical mode (today's only mode). Where the
-two conflict, G2 wins; trading exactness for speed is left to the planned
-optimization levels above O1 ("Optimization levels"), which may deviate
-from NumPy's results.
+"never slower". Where the two conflict, G2 wins: exactness is never
+traded for speed.
 
 Within G2, viproc must be as fast as it can be:
 
@@ -137,28 +131,6 @@ before calling a result a violation or a fix. A slow-down that comes from
 the per-op layer on small data misses the target; one that a change could
 avoid without giving up G2 is a defect.
 
-## Optimization levels (planned)
-
-viproc is to become configurable through one multi-stage optimization
-setting. Each level adds optimizations to the one below; bit-identity is
-a property of a level, not a fixed promise of viproc.
-
-| Level | Adds | Results |
-|-------|------|---------|
-| **O1** (current implementation) | array ILP only: independent array instructions overlap; NumPy itself executes every function (its loops, operators and BLAS, called exactly as NumPy calls them) | bit-identical to NumPy (G2) |
-| **O2** | stage pipelining (`pipelining.md`: tasks advance through size, device, allocation and completion on their inputs' stage events; partial results start their consumers); BLAS threading removed (viproc's workers parallelize, each BLAS call runs on one thread) | correct; may deviate from NumPy's (OpenBLAS splits products by its thread count, and the values depend on that split) |
-| **O3** | micro kernels: viproc's own kernels where NumPy's calling pattern costs (fusion of element-wise chains, splitting single ops, other summation orders, re-implemented NumPy internals) | correct; may deviate in rounding |
-| **O4** | automatic device offloading: cost-based device selection per array instruction (GPUs and other accelerators) | correct; may deviate (device kernels and their rounding) |
-
-"Correct" means a result NumPy's semantics allow: the same dtypes,
-shapes, errors and warnings, values within the floating-point error of a
-valid evaluation order. O1 stays available at every stage, as the
-reference and for programs that need NumPy's exact bits.
-G3 changes with the level: at O1 "never slower than NumPy" is a target
-(G3); at higher levels viproc may compute differently, so the per-op
-overhead on small data can be removed (own micro kernels, fused ops) and
-the target can become a firm rule.
-
 ## Non-goals
 
 - **Weak scaling.** Bigger problems on more cores are not the yardstick;
@@ -169,8 +141,7 @@ the target can become a firm rule.
 - **Global program analysis:** no dependency graph (DAG) of the program, no
   ahead-of-time (AOT) analysis. Every decision is local.
 - **Changing what NumPy computes** to gain speed: no other summation order,
-  no other BLAS threading, no approximations (G2; only the planned
-  optimization levels above O1 may deviate, see "Optimization levels").
+  no other BLAS threading, no approximations (G2).
 - **Dedicated array types or scopes in user code** (temporary/return types,
   scope APIs as on .NET): they would rule out running unchanged NumPy
   programs (`docs/design/memory-management.md`, D1).
@@ -178,11 +149,8 @@ the target can become a firm rule.
 
 ## Not goals yet
 
-- **Any optimization besides array ILP (levels O2-O4):** stage pipelining,
-  own SIMD code, kernel fusion, JIT code generation, GPU offloading. SIMD
-  comes from NumPy's loops. Do not add these yet, but do not make design
-  decisions that rule them out (keep device and memory handling behind an
-  interface).
+- **Any optimization besides array ILP:** own SIMD code, kernel fusion,
+  JIT code generation. SIMD comes from NumPy's loops.
 - **Phase 1 is CPUs only:** autonomous, asynchronous execution of array
   instructions on multicore CPUs, with NumPy's kernels taken from the
   installed NumPy at runtime. Out of scope for phase 1: .NET/ILNumerics
@@ -190,18 +158,5 @@ the target can become a firm rule.
 
 ## Roadmap
 
-- **Instruction pipelining** (known from the ILNumerics Accelerator):
-  overlapping consecutive iterations of a loop, so that even a loop body
-  without sufficient parallel potential of its own (`x = a[x + 1]` repeated) can run
-  faster than NumPy.
-- **Stage pipelining** (the full scheme of the ILNumerics Accelerator,
-  `docs/design/pipelining.md`): the main thread only creates tasks and
-  arrays; tasks advance their outputs through the stages (size completed,
-  device selected, allocated, completed) on the stage events of their
-  inputs. Sizes propagate before data, allocation and device decisions
-  happen in tasks, and an unknown size forces a sync only where a branch
-  depends on it. First step: creators with pending size arguments issue a
-  task instead of syncing.
-- Scaling beyond 4 cores, the remaining gufuncs (linalg, fft), per-op
-  overhead on small data (G3): see `CLAUDE.md`, "Status and next steps"
-  and "Open questions".
+- The remaining gufuncs (linalg, fft) and per-op overhead on small data
+  (G3): see `CLAUDE.md`, "Status and next steps" and "Open questions".

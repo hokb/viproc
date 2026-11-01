@@ -284,15 +284,7 @@ dtypes, shapes, strides, warnings, errors), as the drop-in rule demands
 (see "Conventions"). Never trade bit-identity for speed: no own kernels, no
 reordered sums, no fusion or splitting of an op that changes rounding. The
 small per-op overhead on small data that this costs is accepted; work it
-down, never at G2's expense. Bit-identity is the property of optimization
-level **O1**, the current implementation (array ILP only, NumPy executes
-every function). Planned levels (goals.md, "Optimization levels"), not
-started, each adding to the one below and computing correct but possibly
-deviating results: **O2** stage pipelining and BLAS threading removed,
-**O3** micro kernels (own, fused or split kernels, re-implemented NumPy
-internals), **O4** automatic device offloading. O1 stays available. Until
-a level is decided and built, every change is O1 and must stay
-bit-identical.
+down, never at G2's expense.
 
 ### Phase 1 (current): MVP on CPUs
 
