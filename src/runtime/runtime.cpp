@@ -1,7 +1,7 @@
 #include "runtime.hpp"
 
-#include "workers.hpp"
 #include "pool.hpp"
+#include "workers.hpp"
 
 #include <algorithm>
 #include <cfenv>
