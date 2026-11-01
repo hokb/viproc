@@ -121,8 +121,7 @@ Within G2, viproc must be as fast as it can be:
 Example: `x = a[x + 1]` on a scalar `x` has nothing to overlap and is not
 expected to be faster than NumPy; the target is NumPy's speed. The same
 expression in a loop may or may not run faster than NumPy, depending on
-whether consecutive iterations can overlap (instruction pipelining, see
-"Roadmap").
+whether consecutive iterations can overlap.
 
 Judging a change against G3: compare viproc with NumPy on the same machine,
 same build and options (`docs/benchmarks.md`, "How to measure"); single

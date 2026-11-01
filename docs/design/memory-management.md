@@ -14,7 +14,7 @@ Status labels:
 Object names follow `array-data-model.md`: an `Array` holds its `Metadata`
 (size descriptor) and its `AliasGroup` (shared by a base and its views:
 current data version, last writer); a data version is a `CountableArray`
-(element memory, one handle per device).
+(element memory).
 - **Proposed** — worked out, waiting for a decision.
 
 ## Summary
@@ -665,10 +665,6 @@ memory, D3; runtime objects, D4):
   the pool. It then allocates from the system allocator; the block enters
   the pool on release like any other (releases are allowed on any thread).
   The main thread stays the only thread that ever takes from the pool.
-- **Devices (future).** Device selection precedes allocation in the task
-  stages; with allocation on the main thread, device selection for an op
-  must happen at issue time as well, or device memory gets pools of its
-  own with the same access model.
 
 **Why.**
 
@@ -766,9 +762,6 @@ buffer as aligned (pool blocks are at least 64-byte aligned).
 - Data-dependent output sizes (`nonzero`, boolean indexing, `unique`) fit
   without a special case: the task learns its size and takes its memory
   when it runs, from the same pool.
-- Devices (future): the stages `size_completed → device_selected →
-  allocated` can now all happen in the task, so the device can be chosen
-  when the task runs, from where its inputs are.
 - Versus D10: D10 kept the allocating side single-threaded (no atomics on
   the hot path). D11 pays one uncontended CAS per release and an exchange
   per allocation, and gains cache-hot memory, lower peak memory and in-place

@@ -56,7 +56,7 @@ to plain sequential NumPy execution.
   its `Metadata` (size descriptor + the task configuring it, one per array
   and view, atomic count, referenced by task operands) and its
   `AliasGroup`; the group holds the current data version, a
-  `CountableArray` (one handle per device, `async_reads`, `host_views`).
+  `CountableArray` (element memory, `async_reads`, `host_views`).
 - **Views share an alias group.** A base array and all its views refer to
   one shared *AliasGroup* (main thread only), which holds the current data
   version and the last task writing it. Readiness and the producer belong
@@ -80,23 +80,15 @@ to plain sequential NumPy execution.
 - Exactly **one task per array op** (per op invocation). It represents and
   communicates the op's progress.
 - Task states, in this order:
-  `created → size_completed → (device_selected, future) → allocated → completed`
+  `created → size_completed → allocated → completed`
   - `size_completed`: output shape (and dtype) is known.
   - `allocated`: output element memory exists.
   - `completed`: output data is computed; the outputs become `ready`.
-- A task passes through each state **exactly once, in increasing order**
-  (`docs/design/pipelining.md`, S1): a stage with nothing to do is still
-  reached and signalled; handlers may rely on it, and a skipped stage can
-  deadlock its waiters. Today's code still skips `DeviceSelected` (no
-  callbacks on it yet) and the direct path creates ready outputs without
-  a task.
-- Full stage pipelining (Accelerator; `docs/design/pipelining.md`, not
-  implemented yet): six array stages (created, size completed, device
-  selected, allocated, completed, disposed), each reached exactly once, in
-  increasing order; the main thread guarantees only
-  `created`, tasks advance the rest on their inputs' stage events. Today
-  every task reaches `size_completed` at issue; pending size arguments
-  (`np.zeros(n)` with pending `n`) are to issue a task instead of syncing.
+- A task passes through each state **exactly once, in increasing order**:
+  a stage with nothing to do is still reached and signalled; handlers may
+  rely on it, and a skipped stage can deadlock its waiters. The direct
+  path creates ready outputs without a task. Every task reaches
+  `size_completed` at issue.
 - The task holds references to its input arrays, its output arrays and the
   resolved NumPy loop.
 - Tasks, CountableArrays, Metadata objects and array blocks come from per-thread memory pools
@@ -332,7 +324,6 @@ docs/design/           Design documents (decisions with rationale)
   goals.md             goals, non-goals, G2 (bit-identical) before G3 (speed), roadmap
   error-handling.md    run-time errors on any thread, asynchronous reporting
   memory-management.md ownership, release, pools, NumPy interop, COW
-  pipelining.md        array stages, partial completion, pending sizes (roadmap)
   array-data-model.md  array data model: Array, Metadata (SD + task),
                        AliasGroup, CountableArray; lifecycle, checks per op,
                        figure (array-data-model.svg), evaluation
@@ -355,7 +346,7 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
                        option, environment variable or API argument)
   element_pool.*       ElementPool: process-wide pool for element memory
                        (quantized bins, LIFO, bound, huge pages)
-  countable_array.*    CountableArray: one data version, one handle per device
+  countable_array.*    CountableArray: one data version
                        (inline ≤ 128 B, else pool, deferred until the
                        producing task runs); async_reads, host_views
   task.*               Task: stages, consumer callbacks, execute(); Kernel

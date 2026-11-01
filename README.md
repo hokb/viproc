@@ -149,8 +149,7 @@ Programs that spend their time in algorithms or loops over **scalar** data, one 
 at a time, offer little array-level parallelism and gain little from viproc today (the
 target is NumPy's speed for them; the per-op overhead can make them slightly slower). For
 them the manual options remain: vectorizing the loop into array operations, or parallelizing it explicitly (`multiprocessing`, `concurrent.futures`, Numba's
-`prange`, ...). Overlapping consecutive loop iterations automatically (instruction
-pipelining) is on the roadmap.
+`prange`, ...).
 
 ## Install
 

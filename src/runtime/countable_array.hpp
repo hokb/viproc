@@ -1,4 +1,4 @@
-// Element memory of arrays: one data version, one handle per device.
+// Element memory of arrays: one data version.
 #pragma once
 
 #include <atomic>
@@ -8,11 +8,7 @@
 
 namespace viproc {
 
-// Devices a CountableArray can hold a copy on. Phase 1: the host only.
-enum Device : std::uint8_t { kHost = 0, kDeviceCount };
-
-// One version of an array's data (docs/design/array-data-model.md, A1): one handle
-// per device, each empty or a valid copy of the same values. Host memory is up
+// One version of an array's data (docs/design/array-data-model.md, A1). Its memory is up
 // to kInlineBytes inside the object, larger blocks come from the element pool
 // (docs/design/memory-management.md, D3, D10, D11). CountableArrays are
 // created by the main thread only (at issue); the last reference may go on
@@ -46,11 +42,11 @@ class CountableArray {
     CountableArray& operator=(const CountableArray&) = delete;
 
     // Null for a deferred buffer whose memory was not taken yet.
-    std::byte* data() const { return handles_[kHost].data.load(std::memory_order_acquire); }
+    std::byte* data() const { return host_.data.load(std::memory_order_acquire); }
     bool allocated() const { return data() != nullptr; }
     // Element memory from the element pool (now or, deferred, later): a block
     // of capacity_for(nbytes) bytes, reusable by another buffer of the bin.
-    bool pooled() const { return handles_[kHost].capacity != 0; }
+    bool pooled() const { return host_.capacity != 0; }
 
     // Takes the memory of a deferred buffer from the pool if it has none yet
     // (any thread; concurrent calls agree on one block). Returns data().
@@ -63,7 +59,7 @@ class CountableArray {
     // Logical size: the bytes the arrays on this buffer cover.
     std::size_t nbytes() const { return nbytes_; }
     // Size of the pool block behind the buffer (0: inline or foreign memory).
-    std::size_t capacity() const { return handles_[kHost].capacity; }
+    std::size_t capacity() const { return host_.capacity; }
 
     // Number of issued, not yet completed tasks that read this buffer.
     // Incremented only by the main thread (at issue), decremented by the
@@ -110,12 +106,12 @@ class CountableArray {
   private:
     std::atomic<int> read_waiters_{0};
     alignas(64) std::byte inline_[kInlineBytes];
-    // Memory on one device; capacity > 0: data is (or will be) a pool block.
-    struct DeviceHandle {
+    // The element memory; capacity > 0: data is (or will be) a pool block.
+    struct Handle {
         std::atomic<std::byte*> data{nullptr};
         std::size_t capacity = 0;
     };
-    DeviceHandle handles_[kDeviceCount];
+    Handle host_;
     std::size_t nbytes_;
     std::shared_ptr<void> owner_;
 };

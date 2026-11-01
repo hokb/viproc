@@ -18,13 +18,11 @@
 
 namespace viproc {
 
-// Stages of a task, in order. The design (docs/design/pipelining.md, S1)
-// requires each stage to be reached exactly once, in increasing order. Today
-// a task still skips DeviceSelected, which nothing waits for yet.
+// Stages of a task, in order. Each stage is reached exactly once, in
+// increasing order.
 enum class TaskState : std::uint8_t {
     Created,
     SizeCompleted,
-    DeviceSelected,
     Allocated,
     Completed,
 };

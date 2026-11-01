@@ -4,8 +4,7 @@ This document defines the data model of a viproc array: which objects make
 up an array, who creates, reads, writes and releases them, and which checks
 keep the data consistent while the main thread only issues ops and workers
 compute them. It builds on the execution model in CLAUDE.md,
-`memory-management.md` (ownership, pools, copy-on-write, NumPy interop) and
-`pipelining.md` (stages, tasks advancing them).
+and `memory-management.md` (ownership, pools, copy-on-write, NumPy interop).
 
 Status labels as in `memory-management.md`: **Decided** (the design holds,
 the code may still lack parts of it) and **Implemented**.
@@ -14,7 +13,7 @@ the code may still lack parts of it) and **Implemented**.
 
 | # | Decision | Status |
 |---|----------|--------|
-| A1 | An array is four objects: Array, Metadata (size descriptor + task), AliasGroup (shared by a base and its views), CountableArray (one data version, one handle per device) | Implemented |
+| A1 | An array is four objects: Array, Metadata (size descriptor + task), AliasGroup (shared by a base and its views), CountableArray (one data version) | Implemented |
 | A2 | The size descriptor (SD) lives in its Metadata, pooled with it; operands reference it instead of copying it | Implemented |
 | A3 | One task per NumPy op (the Accelerator's *awaiter*); the main thread always creates the Array and an empty Metadata, the task configures the op's outputs | Decided (pipelining S2) |
 | A4 | Copy-on-write is register renaming: the AliasGroup switches to a new CountableArray; readers keep the version they captured | Implemented |
@@ -48,15 +47,12 @@ Task T ── operands: (Metadata, CountableArray captured at issue), …
   write through any view changes only G, so the base and all other views
   see it without viproc knowing the views. In register-renaming terms G is
   the architectural register.
-- **CountableArray** (V): one data version, the "memory": one handle per
-  device, each empty or a valid copy of the same values (the physical
+- **CountableArray** (V): one data version, the "memory" (the physical
   register). `async_reads` and `host_views` live here, because readers read
-  a version and all views share the version. Which device a reader uses is
-  decided by its task (phase 2: cost functions); a copy to another device
-  fills a handle of the *same* version and changes no values.
+  a version and all views share the version.
 - **Task** (T): one per op invocation, the Accelerator's *awaiter*. Each
   operand holds the Metadata (for the SD) and the CountableArray the op was
-  issued against (all device copies of that version). A task never reaches
+  issued against. A task never reaches
   its data through Metadata → AliasGroup: after a copy-on-write, G points to
   a newer version, the task must still read its own.
 
@@ -67,7 +63,7 @@ Task T ── operands: (Metadata, CountableArray captured at issue), …
 | Array | `Array` (`runtime.hpp`): `MetadataPtr`, `Ref<AliasGroup>` | `Ref<T>`, plain int (main thread) |
 | Metadata | `Metadata` (`task.hpp`): `Layout sd_`, `shared_ptr<Task> task_`; `make_metadata` from a per-thread pool | `MetadataPtr`, intrusive atomic |
 | AliasGroup | `AliasGroup` (`runtime.hpp`): `current_`, `last_writer_`, `last_error_` | `Ref<T>`, plain int (main thread) |
-| CountableArray | `CountableArray` (`countable_array.hpp`): `handles_[kDeviceCount]` (one `DeviceHandle {data, capacity}` per device; phase 1 has `kHost` only), `async_reads`, `host_views` | `shared_ptr`, atomic |
+| CountableArray | `CountableArray` (`countable_array.hpp`): `host_` (`Handle {data, capacity}`), `async_reads`, `host_views` | `shared_ptr`, atomic |
 | Task | `Task` (`task.hpp`): `Operand {buffer, meta, sd, counted_read}` | `shared_ptr`, atomic |
 
 A base array and its group share one pooled `ArrayBlock`; a view gets a
@@ -83,25 +79,23 @@ strides are inline vectors (rank ≤ 4 without a heap allocation), so a
 Metadata from the pool costs no allocation for the common ranks.
 
 - **Referenced, not copied, by operands.** An operand holds the Metadata
-  and reads the SD through it. With pipelining a copy at issue is
-  impossible anyway: an input that is only *created* has no SD yet, the
-  consumer reads it after the input's stage event.
+  and reads the SD through it.
 - **Strides in bytes**, as NumPy (`view(dtype)`, `real`/`imag`,
   `as_strided` give strides that are no multiple of the item size).
 - **Published by stage, without a lock.** The task writes the lengths
   (*size completed*) and the strides (*allocated*) with plain stores, then
   stores the stage with `memory_order_release`; a thread that read the
   stage with `memory_order_acquire` sees the fields complete. Before
-  *allocated* only the header and the lengths may be read or copied. Until
-  pipelining lands, the main thread writes the whole SD at issue and
-  `Metadata::task` stays null.
+  *allocated* only the header and the lengths may be read or copied. Today
+  the main thread writes the whole SD at issue and `Metadata::task` stays
+  null.
 
 ## A3: tasks configure their outputs
 
 The main thread **always** creates the Array and its Metadata (empty,
 stage *created*), and the AliasGroup and CountableArray of a new output
 (handles empty). The task of the op does everything else on its outputs:
-size, device, memory, strides, values (`pipelining.md`, S2). An in-place
+size, memory, strides, values. An in-place
 write creates no new Metadata: the writing task becomes `G.last_writer`.
 
 ## Python assignments
@@ -126,7 +120,7 @@ Notation: `M` the argument's Metadata, `G` its AliasGroup, `V = G.current`.
 
 **Input only**
 1. SD not yet at the stage the op needs? Register on that stage of
-   `M.task` (pipelining).
+   `M.task`.
 2. `G.last_writer` pending? Register on its *completed*: the op becomes a
    continuation.
 3. **Always** (pending or ready) `V.async_reads++`; the operand holds V. A
@@ -141,7 +135,7 @@ Notation: `M` the argument's Metadata, `G` its AliasGroup, `V = G.current`.
 3. Yes: copy-on-write. No: in place.
 
 **New output**: Array, empty Metadata (task T), new G with an empty V. T
-fills the SD, picks the device, allocates (or takes over the block of a
+fills the SD, allocates (or takes over the block of a
 dying input), computes.
 
 ### A4: copy-on-write as register renaming
@@ -224,7 +218,7 @@ has a plain one.
 | Array A | main thread, at issue: op output, view, import, creation function | main thread only (Python object, GIL) | Python names and containers | main thread, when the Python refcount reaches 0; drops S and G |
 | Metadata M | main thread, with A, empty (*created*), from the pool; SD fixed to it | write: T in stage order (lengths at *size completed*, strides at *allocated*), the main thread where it knows the SD at issue; read: main thread and tasks holding S as an operand, after the stage signal | A; task operands (inputs and outputs); S holds its task until *completed* | any thread, with the last reference (atomic): A is dead and no operand holds S; back to the pool |
 | AliasGroup G | main thread, with the base array (output, import, copy); views share it | main thread only: sets and reads `current`, `last_writer` (whether the task completed: its atomic state) | A and all its views (Arrays, not Metadata objects) | main thread, when the last array of the group dies; drops `current` and `last_writer` (the latter as soon as it sees it completed) |
-| CountableArray V | main thread, for a new output or on copy-on-write; handles empty | handles: the writing task allocates right before its kernel, device copies fill further handles (atomic slots), on the task's thread; `async_reads`: main thread ++, reading task −−; `host_views`: main thread | G (`current`), operands of reading and writing tasks, NumPy exports | any thread, with the last reference (atomic): G points to a newer version or is dead, and no operand or export holds V; device memory to that device's pool, foreign memory (imported ndarray) through the main thread |
+| CountableArray V | main thread, for a new output or on copy-on-write; memory empty | memory: the writing task allocates right before its kernel, on the task's thread; `async_reads`: main thread ++, reading task −−; `host_views`: main thread | G (`current`), operands of reading and writing tasks, NumPy exports | any thread, with the last reference (atomic): G points to a newer version or is dead, and no operand or export holds V; pool memory to the pool, foreign memory (imported ndarray) through the main thread |
 | Task T | main thread, at issue, one per op, from the pool (the direct path for small ready data creates none) | main thread: issue, callback registration, waits at sync points; workers (or the main thread inline): advance stages, run the kernel | callbacks of its inputs (as consumer), the Metadata objects of its outputs, G as `last_writer`, the thread running it | any thread, with the last reference; on *completed* T releases its operands (`async_reads` −−) and callbacks, S and G drop T once they see it completed; back to the pool |
 
 **Cycles.** M ↔ T (T holds M as an output, M holds T as its task) breaks
@@ -261,7 +255,7 @@ release.
 Each of these rules it out:
 
 1. An `ndarray` needs a shape, strides and a data pointer when it is
-   created: no stage *created* (pipelining S1/S4), and element memory
+   created: no stage *created*, and element memory
    taken at issue on the main thread (D10, superseded because dependent
    chains got 2-4x slower than NumPy).
 2. Workers cannot touch it: its references are Python refcounts (GIL).
@@ -271,7 +265,7 @@ Each of these rules it out:
 4. Handing the `ndarray` to the user is not effortless but unsafe: NumPy
    calls on it bypass viproc and race with the workers (D7, and the
    decision against an `ndarray` subclass, D9).
-5. One host pointer, no device copies.
+5. One host pointer.
 
 Handing data to NumPy is copy-free already (D7: aliasing exports counted
 as host views, adoption of fresh memory). NumPy's custom allocator (NEP 49,
@@ -300,8 +294,7 @@ object, referenced by tasks, published by stage), with three differences:
   one length field per vector and a stored element count, worth a few
   dozen instructions per op at most; it is a separate change, worth making
   only if callgrind shows the gain (G3).
-- Tasks reference the SD instead of copying it: required by pipelining S2,
-  where an input's SD does not exist yet at issue.
+- Tasks reference the SD instead of copying it.
 
 **2. One object per data version.** The first refinement put the SD, the
 task and the CountableArray into one object per data version (then called
@@ -326,13 +319,9 @@ thread creates every Array and (empty) Metadata (A3). Operands capture
 (Metadata, CountableArray), never the AliasGroup, so copy-on-write is plain
 register renaming (A4). The Array, not the Metadata, holds the AliasGroup,
 so a dying Array releases the current version and the next op can take
-over its block (A5). Device handles sit in the CountableArray, not the
-Metadata: a reader captured a version, and a handle added later belongs to
-that same version.
+over its block (A5).
 
-**Follow-ups, each measured on its own (G3):** stage-wise SD publication
-and `Metadata::task` with pipelining S2/S4; further device handles with the
-first non-CPU device (phase 2); a flat SD block if callgrind shows a gain;
+**Follow-ups, each measured on its own (G3):** a flat SD block if callgrind shows a gain;
 a NEP 49 allocator for large fallback results if measurements call for it.
 
 **Naming.** The object holding the SD and its task was first called

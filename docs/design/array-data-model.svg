@@ -58,7 +58,7 @@ text { font-family: "IBM Plex Sans", "Segoe UI", Helvetica, Arial, sans-serif; f
   <text x="557" y="202" class="small">ref count</text>
   <text x="557" y="222" class="small">main thread only</text>
 
-  <!-- version: countable array of device handles -->
+  <!-- version: countable array -->
   <rect x="735" y="40" width="120" height="250" rx="5" fill="#fbf0e1" stroke="#b0670c"/>
   <text x="746" y="62" class="ttl">CountableArray</text>
   <text x="746" y="79" class="ttl">V1</text>
@@ -78,7 +78,7 @@ text { font-family: "IBM Plex Sans", "Segoe UI", Helvetica, Arial, sans-serif; f
   <rect x="300" y="352" width="405" height="70" rx="5" fill="#f1e9fa" stroke="#7a3fb0"/>
   <text x="312" y="374" class="ttl">Task T = awaiter, one per NumPy op</text>
   <text x="312" y="393" class="small">operand = (Metadata → SD, CountableArray of the version at issue)</text>
-  <text x="312" y="410" class="small">configures the Metadata of its outputs: size, device, memory, strides</text>
+  <text x="312" y="410" class="small">configures the Metadata of its outputs: size, memory, strides</text>
 
   <!-- references -->
   <path class="arr" d="M74,89 L108,89" marker-end="url(#ah)"/>
