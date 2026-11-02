@@ -2700,6 +2700,40 @@ static PyObject* m_create_deferred(PyObject* self, PyObject* args) {
     return wrap_array(res);
 }
 
+/* mask_select(x, mask) / flatnonzero(a): O2 data-dependent sizes (S4). */
+static PyObject* m_mask_select(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *x, *mask;
+    if (!PyArg_ParseTuple(args, "OO", &x, &mask) || check_runtime() < 0) {
+        return NULL;
+    }
+    if (!is_array(x) || !is_array(mask)) {
+        Py_RETURN_NONE;
+    }
+    vp_array* res = NULL;
+    char err[ERRLEN] = "";
+    const int st = vp_mask_select(g_rt, ((ArrayObject*)x)->a, ((ArrayObject*)mask)->a, &res,
+                                  issue_site(), err, sizeof err);
+    if (st == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    return raise_status(st, err) < 0 ? NULL : wrap_array(res);
+}
+
+static PyObject* m_flatnonzero(PyObject* self, PyObject* a) {
+    (void)self;
+    if (check_runtime() < 0) {
+        return NULL;
+    }
+    if (!is_array(a)) {
+        Py_RETURN_NONE;
+    }
+    vp_array* res = NULL;
+    char err[ERRLEN] = "";
+    const int st = vp_flatnonzero(g_rt, ((ArrayObject*)a)->a, &res, issue_site(), err, sizeof err);
+    return raise_status(st, err) < 0 ? NULL : wrap_array(res);
+}
+
 static PyObject* m_opt_level(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
@@ -5206,6 +5240,8 @@ static PyMethodDef methods[] = {
     {"initialized", m_initialized, METH_NOARGS, NULL},
     {"opt_level", m_opt_level, METH_NOARGS, NULL},
     {"create_deferred", m_create_deferred, METH_VARARGS, NULL},
+    {"mask_select", m_mask_select, METH_VARARGS, NULL},
+    {"flatnonzero", m_flatnonzero, METH_O, NULL},
     {"offload_counts", m_offload_counts, METH_NOARGS,
      "{'inline': n, 'offloaded': m}: ops run inline / handed to workers"},
     {"pool_stats", m_pool_stats, METH_NOARGS, "Element memory pool counters."},

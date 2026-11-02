@@ -47,4 +47,16 @@ std::shared_ptr<Kernel> make_mask_assign_kernel();
 // {cond, x, y}, outputs = {out}.
 std::shared_ptr<Kernel> make_select_kernel();
 
+// Data-dependent result sizes (pipelining.md, S4; O2): sized from the input
+// data when the task runs (Kernel::sizes_from_data), then filled.
+// x[mask] with a bool mask over x's leading axes (NumPy's boolean indexing;
+// its IndexError if the shapes do not match): the elements (subarrays) at
+// the True positions in C order, a C-ordered result of shape (count,) +
+// x.shape[mask.ndim:]. Operands: inputs = {x, mask}, outputs = {result}.
+std::shared_ptr<Kernel> make_mask_select_kernel();
+// np.flatnonzero(a): the flat C-order indices (int64) of a's nonzero
+// elements (NaN is nonzero, -0.0 is not; complex: either part). Operands:
+// inputs = {a}, outputs = {indices}.
+std::shared_ptr<Kernel> make_flatnonzero_kernel();
+
 } // namespace viproc

@@ -100,7 +100,8 @@ def _pending_size(kind, args, kwargs):
     pending = False
     for d in dims:
         if isinstance(d, ndarray):
-            if d.dtype not in (_np.int32, _np.int64) or d.ndim != 0:
+            # (a pending 0-d result is marked a scalar: no wait for its size)
+            if d.dtype not in (_np.int32, _np.int64) or not (d._scalar or d.ndim == 0):
                 return None
             pending = pending or not d.ready()
         elif not isinstance(d, int) or isinstance(d, bool):

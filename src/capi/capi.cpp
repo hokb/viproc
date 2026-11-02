@@ -761,6 +761,36 @@ int vp_create_deferred(vp_runtime* rt, int kind, int ndim, const int64_t* dims,
     return VP_OK;
 }
 
+int vp_mask_select(vp_runtime* rt, vp_array* x, vp_array* mask, vp_array** result, const char* site,
+                   char* err, size_t errlen) {
+    if (arr(mask).meta()->sd().dtype != DType::Bool) {
+        set_error(err, errlen, "the mask must be bool");
+        return VP_UNSUPPORTED;
+    }
+    rt->graveyard->drain();
+    const ArrayPtr ins[] = {ref(x), ref(mask)};
+    const DType dt = arr(x).meta()->sd().dtype;
+    ArrayPtr res;
+    rt->rt->issue_deferred(make_mask_select_kernel(), ins, std::span(&dt, 1), site,
+                           std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
+int vp_flatnonzero(vp_runtime* rt, vp_array* a, vp_array** result, const char* site, char* err,
+                   size_t errlen) {
+    (void)err;
+    (void)errlen;
+    rt->graveyard->drain();
+    const ArrayPtr ins[] = {ref(a)};
+    const DType dt = DType::Int64;
+    ArrayPtr res;
+    rt->rt->issue_deferred(make_flatnonzero_kernel(), ins, std::span(&dt, 1), site,
+                           std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
 int vp_ufunc_issue_masked(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
                           vp_array* mask, int out_ndim, const int64_t* out_shape, vp_array* out,
                           vp_array** result, const char* site, char* err, size_t errlen) {

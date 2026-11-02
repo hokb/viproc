@@ -325,6 +325,15 @@ int vp_create_deferred(vp_runtime* rt, int kind, int ndim, const int64_t* dims,
                        const void* fill, vp_array** result, const char* site, char* err,
                        size_t errlen);
 
+/* Optimization level O2, data-dependent result sizes (pipelining.md, S4):
+ * x[mask] (a bool mask over x's leading axes; NumPy's IndexError
+ * asynchronously) and np.flatnonzero(a) as tasks that size their results
+ * from the data when it is computed: no sync on the mask. */
+int vp_mask_select(vp_runtime* rt, vp_array* x, vp_array* mask, vp_array** result, const char* site,
+                   char* err, size_t errlen);
+int vp_flatnonzero(vp_runtime* rt, vp_array* a, vp_array** result, const char* site, char* err,
+                   size_t errlen);
+
 /* Issues a cast of `in` to `dtype` (NumPy's a.astype(dtype, order)) with
  * NumPy's cast functions. `order` 'K' gives the result NumPy's layout for
  * astype (PyArray_NewLikeArray: C or F if `in` is, else its axis order),

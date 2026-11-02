@@ -164,7 +164,8 @@ sizes, a broadcasting error is raised asynchronously, and strided
 operands are computed per row (NumPy's iterator needs the GIL to plan;
 values may round differently from NumPy's SIMD/scalar choice);
 `zeros`/`ones`/`empty`/`full`/`arange` with a pending size issue a task
-(S4) instead of a sync. The stage
+(S4) instead of a sync, and so do `x[mask]`, `flatnonzero` and 1-d
+`nonzero` of pending data (their size is the data). The stage
 signals exist at every level (they change no result). O2 is not strict: NumPy functions taken as a
 whole may still run where nothing better exists; such ops give their three
 stage signals in quick succession. Measured (4 vCPUs,

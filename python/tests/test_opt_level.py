@@ -169,7 +169,7 @@ def test_o2_broadcast_error_is_asynchronous(level2):
 
 
 def test_o2_zero_d_results_are_scalars(level2):
-    x = pending(viproc.asarray(np.arange(5000.0)))
+    x = _pending(np.arange(5000.0))
     s = x.sum()  # a pending 0-d result, NumPy's scalar
     t = np.sqrt(s) * 2.0  # sized by its task: still known to be 0-d
     assert t._scalar and t.ndim == 0
@@ -215,6 +215,46 @@ def test_o2_pending_negative_size(level2):
         z = viproc.zeros((n, 2))  # issued: the task finds the size negative
         z.shape
     assert np.arange(-1).size == 0 and viproc.arange(_pending_int(-1)).shape == (0,)
+
+
+def _pending(a):
+    """`a` as a viproc array behind a slow computation (pending for a while)."""
+    slow = np.sin(np.sin(viproc.asarray(np.ones(2_000_000))))
+    return (slow[:1] * 0).astype(a.dtype) + viproc.asarray(a)
+
+
+@pytest.mark.parametrize("dtype", [np.float64, np.int32, np.complex64, np.bool_])
+@pytest.mark.parametrize("order", ["C", "F"])
+def test_o2_data_dependent_sizes(level2, dtype, order):
+    """S4: x[mask], np.flatnonzero and np.nonzero (1-d) of pending data are
+    tasks that size their results from the data, without a sync."""
+    rng = np.random.default_rng(5)
+    a = np.asarray(rng.integers(-2, 3, (300, 40)), dtype=dtype, order=order)
+    if dtype is np.complex64:
+        a = a + 1j * np.asarray(rng.integers(0, 2, a.shape), dtype=np.float32)
+    x = _pending(a)
+    want = np.zeros(1, a.dtype) + a  # the same arithmetic, in NumPy
+    m = x != 0
+    before = _stats()
+    r = x[m]  # full mask
+    rows = x[(x[:, 0] != 0)]  # mask over the leading axis
+    flat = np.flatnonzero(x)
+    nz = np.nonzero(x[:, 5])
+    assert _stats()[0] == before[0]  # no sync
+    for got, ref in ((r, want[want != 0]), (rows, want[want[:, 0] != 0]),
+                     (flat, np.flatnonzero(want)), (nz[0], np.nonzero(want[:, 5])[0])):
+        g = np.asarray(got)
+        assert g.dtype == ref.dtype and g.shape == ref.shape and g.strides == ref.strides
+        assert np.array_equal(g, ref)
+    assert isinstance(nz, tuple) and len(nz) == 1
+
+
+def test_o2_mask_mismatch(level2):
+    x = _pending(np.ones((30, 4)))
+    with pytest.raises(viproc.AsyncIndexError, match="boolean index did not match indexed array "
+                       "along axis 0; size of axis is 30 but size of corresponding boolean axis is 20"):
+        r = x[_pending(np.ones(20)) > 0]
+        r.shape
 
 
 def test_pending_sizes_sync_at_o1():

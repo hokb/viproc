@@ -91,8 +91,8 @@ to plain sequential NumPy execution.
   in `Task::execute`, the CPU; `Task::advance` asserts the next state in
   debug builds); only the direct path creates ready outputs without a
   task.
-- Full stage pipelining (Accelerator; `docs/design/pipelining.md`, not
-  implemented yet): six array stages (created, size completed, device
+- Full stage pipelining (Accelerator; `docs/design/pipelining.md`, started
+  at O2: element-wise ufuncs, creators, masks): six array stages (created, size completed, device
   selected, allocated, completed, disposed), each reached exactly once, in
   increasing order; the main thread guarantees only
   `created`, tasks advance the rest on their inputs' stage events. Today
@@ -189,7 +189,8 @@ reported with that issue site and the NumPy function it runs
   metadata (`x.shape`, `x.dtype`) waits for `size_completed` only. Because
   shape is a stage of its own, ops with data-dependent result shapes
   (`nonzero`, boolean indexing, `unique`) fit the model too; in the MVP
-  they still fall back to eager NumPy.
+  they still fall back to eager NumPy (O2: `x[mask]`, `flatnonzero`
+  and 1-d `nonzero` are tasks that size their results from the data).
 
 ### Thread rules
 
@@ -303,8 +304,9 @@ stage pipelining and BLAS threading removed (started: one BLAS thread,
 LAPACK calls no longer serialized; element-wise ufuncs without casts on
 pending or large inputs are issued unsized, `vp_ufunc_issue_deferred`, and
 size themselves in the task, pipelining.md S2; `zeros`/`ones`/`empty`/
-`full`/`arange` with pending size arrays are tasks, S4; NumPy functions
-may still run as a whole), **O3** micro kernels (own, fused or split kernels, re-implemented
+`full`/`arange` with pending size arrays and `x[mask]`, `flatnonzero`,
+1-d `nonzero` of pending data are tasks sizing from the data, S4; NumPy
+functions may still run as a whole), **O3** micro kernels (own, fused or split kernels, re-implemented
 NumPy internals), **O4** automatic device offloading, **O5** reserved.
 The level is chosen per process: `viproc.init(level=n)`,
 `VIPROC_OPT=n` (or `On`), `python -m viproc -On prog.py`; `opt_level()`

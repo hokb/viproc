@@ -15,7 +15,7 @@ Status labels as in `memory-management.md`: **Decided**, **Implemented**,
 | S1 | Six stages per array, each reached exactly once, in increasing order | Implemented for tasks (`TaskState`, stages 1-5; the direct path has no task) |
 | S2 | The main thread guarantees only `Created`; tasks advance the rest | Implemented for element-wise ufuncs at O2 (`Runtime::issue_deferred`, size and layout steps in the task); other ops and O1: `SizeCompleted` at issue |
 | S3 | Tasks react to every stage of their inputs, not only `Completed` | Signals implemented (three per registration, `Task::add_consumer`); no task reacts to SizeCompleted/Allocated yet |
-| S4 | Pending size inputs make a task, whatever the size | Implemented at O2 for `zeros`, `ones`, `empty`, `full`, `arange(stop)` (module functions); O1 and other creators: sync |
+| S4 | Pending size inputs make a task, whatever the size | Implemented at O2 for `zeros`, `ones`, `empty`, `full`, `arange(stop)` (module functions) and data-dependent sizes (`x[mask]`, `flatnonzero`, 1-d `nonzero`); O1 and the rest: sync |
 | S5 | An array in stage S gives access to the properties of stages 1..S; handlers run only on their stage signal (no locks) | Decided, not implemented |
 | S6 | `Disposed` is never observed; checked by sanitizer builds, debug assertions, counters and versions | Proposed |
 
@@ -224,6 +224,25 @@ A running configuring task finishes its steps before its kernel and hands
 the steps they make due to the pool right away (`Runtime::configure_now`):
 otherwise a consumer's layout step would wait in the worker's list until
 the kernel is done (a view of `np.sin(x)` of 8e6 elements waited 244 ms).
+
+**Data-dependent result sizes at O2.** The same mechanism serves ops whose
+result size is their input's *data*: `x[mask]` with a pending bool mask
+over x's leading axes (`vp_mask_select`: the True positions counted in the
+size step, the subarrays copied in C order in the run; NumPy's IndexError
+for mismatched shapes, asynchronously), `np.flatnonzero(a)` and
+`np.nonzero(a)` of a pending 1-d `a` (`vp_flatnonzero`). Their size step
+is one pass over the mask (count), the run a second one (copy): the size
+is signalled before the elements, and consumers issued meanwhile size
+themselves on it. At O1 they sync on the mask. n-d `nonzero` (NumPy's
+index arrays are column views of one array), `argwhere`, `unique` and
+boolean masks in tuples still sync.
+
+**Not yet:** reductions, matmul, gathers and the other regular-path ops
+read their inputs' layouts at issue, so one issued on an array a task
+still sizes (S2/S4) waits at its issue for that array's layout (for an
+S4 array: until its size input is computed). Making them deferred
+(`Kernel::size`/`layout` per kernel, the NumPy iterator templates planned
+without the GIL) is the next step.
 
 This is the first op with an output that is not size-completed at issue, so
 it needs S3 for every consumer: an op issued on such an array computes its

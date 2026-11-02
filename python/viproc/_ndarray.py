@@ -925,9 +925,32 @@ def _readonly_call(fn):
     return handler
 
 
+def _data_sized(fn, o2):
+    """At optimization level O2 a pending argument makes a task that sizes
+    its result from the data (pipelining.md, S4: `o2`, None where it does
+    not apply); else NumPy on a read-only export after a sync."""
+    sync = _readonly_call(fn)
+
+    def handler(a, *args, **kwargs):
+        if (not args and not kwargs and type(a) is ndarray and _viproc.opt_level() >= 2
+                and not _viproc.ready(a)):
+            r = o2(a)
+            if r is not None:
+                return r
+        return sync(a, *args, **kwargs)
+
+    return handler
+
+
+def _nonzero_o2(a):
+    if a.ndim != 1:
+        return None  # NumPy's index arrays are views of one (count, ndim) array
+    return (_viproc.flatnonzero(a),)
+
+
 _VIEW_HANDLERS.update({np.where: _where,
-                  np.nonzero: _readonly_call(np.nonzero),
-                  np.flatnonzero: _readonly_call(np.flatnonzero),
+                  np.nonzero: _data_sized(np.nonzero, _nonzero_o2),
+                  np.flatnonzero: _data_sized(np.flatnonzero, _viproc.flatnonzero),
                   np.argwhere: _readonly_call(np.argwhere),
                   np.count_nonzero: _readonly_call(np.count_nonzero)})
 
@@ -1789,6 +1812,11 @@ def _getitem(self, key):
             return _scalar_result(v.copy()) if not _viproc.ready(v) else _viproc.scalar(v)
         return v
     if type(self) is ndarray:
+        if (type(key) is ndarray and key.dtype == np.bool_ and not _viproc.ready(key)
+                and _viproc.opt_level() >= 2 and key.ndim > 0):
+            # O2: no sync on a pending mask; the task sizes the result from
+            # its data (pipelining.md, S4)
+            return _viproc.mask_select(self, key)
         if type(key) in (ndarray, tuple, np.ndarray):  # a[idx], a[:, idx]: fast path
             r = _gather_fast(self, key)
             if r is not None:
