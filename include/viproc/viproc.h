@@ -130,6 +130,9 @@ uint64_t vp_task_count(const vp_runtime* rt);
  * blocked (vp_array_wait, vp_array_prepare_write, ...; vp_wait_all is not
  * counted). Waits on ready arrays (to read their error) are no syncs. */
 uint64_t vp_sync_count(const vp_runtime* rt);
+/* Metadata queries so far that found an array's size or layout unknown (its
+ * task sizes it, O2), so the main thread blocked. */
+uint64_t vp_size_wait_count(const vp_runtime* rt);
 /* Sleeping workers woken by the thread that queued a task (mostly the main
  * thread issuing ready ops; a futex call each). */
 uint64_t vp_wake_count(const vp_runtime* rt);
@@ -180,7 +183,10 @@ vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, vp_dtype dtype, in
 /* [GIL] Releases the handle. Pending work continues. */
 void vp_array_release(vp_array* a);
 
-/* Metadata, available immediately (also for pending arrays). */
+/* [main thread] Metadata, available immediately for arrays sized at issue;
+ * for an array its task sizes (vp_ufunc_issue_deferred, optimization level
+ * O2) these wait until its layout is known (a metadata query; the dtype is
+ * known at once). */
 int vp_array_ndim(const vp_array* a);
 const int64_t* vp_array_shape(const vp_array* a);
 const int64_t* vp_array_strides(const vp_array* a);
@@ -189,6 +195,13 @@ vp_dtype vp_array_dtype(const vp_array* a);
 int64_t vp_array_offset(const vp_array* a);
 /* 1 if the data is final (no pending task writes it). */
 int vp_array_ready(vp_array* a);
+/* 1 if `a`'s size and layout are known (metadata queries do not wait). */
+int vp_array_sized(const vp_array* a);
+/* [main thread, GIL] Waits until `a`'s size is known (SizeCompleted, not
+ * its strides) and gives its shape. VP_ERROR (message in `err`, as at a
+ * sync point) if the op producing it could not size it. */
+int vp_array_wait_size(vp_runtime* rt, vp_array* a, int* ndim, const int64_t** shape, char* err,
+                       size_t errlen);
 /* 1 if both arrays share their storage (base and views). */
 int vp_array_same_storage(const vp_array* a, const vp_array* b);
 /* [main thread] Size in bytes if `a`'s buffer may be overwritten by an op
@@ -287,6 +300,17 @@ int vp_ufunc_loop(vp_runtime* rt, PyObject* ufunc, int nin, const vp_dtype* dtyp
 int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs, int out_ndim,
                    const int64_t* out_shape, vp_array* out, vp_array** result, const char* site,
                    char* err, size_t errlen);
+
+/* Optimization level O2 (docs/design/pipelining.md, S2): issues the
+ * element-wise op with the loop's dtypes as a task that sizes and lays out
+ * its result itself, on its inputs' stage signals; the main thread reads no
+ * input size. A broadcasting error becomes the op's asynchronous error
+ * (AsyncValueError). VP_UNSUPPORTED (nothing issued) where the regular path
+ * applies: an input of another dtype than the loop's (casts), a loop with
+ * several outputs, or every input ready and the result small enough for the
+ * direct path. */
+int vp_ufunc_issue_deferred(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
+                            vp_array** result, const char* site, char* err, size_t errlen);
 
 /* Issues a cast of `in` to `dtype` (NumPy's a.astype(dtype, order)) with
  * NumPy's cast functions. `order` 'K' gives the result NumPy's layout for

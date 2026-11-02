@@ -1072,6 +1072,8 @@ void test_deferred_sizes_run_ahead() {
     check(dt < 200ms, "deferred: sizes known before the first element (no wait for data)");
     check(!x->producer()->completed(), "deferred: elements still pending when the size is known");
     rt.wait_stage(*x, TaskState::Allocated);
+    check(!x->producer()->completed() && std::chrono::steady_clock::now() - t0 < 200ms,
+          "deferred: laid out before the first element (an input sized at issue has its layout)");
     check(x->layout().strides == Strides{8}, "deferred: layout set by the task");
     check(value(rt, x, 4) == 1.0, "deferred: elements computed");
     check(k->sized == 50, "deferred: each op sized once");

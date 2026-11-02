@@ -160,6 +160,7 @@ void Task::add_pending_inputs(std::size_t n) {
     pending_.fetch_add(k, std::memory_order_relaxed);
     sized_pending_.fetch_add(k, std::memory_order_relaxed);
     allocated_pending_.fetch_add(k, std::memory_order_relaxed);
+    layout_pending_.fetch_add(k, std::memory_order_relaxed);
 }
 
 void Task::add_consumer(const std::shared_ptr<Task>& consumer, std::size_t i) {
@@ -173,6 +174,9 @@ void Task::add_consumer(const std::shared_ptr<Task>& consumer, std::size_t i) {
         if (size_error_) {
             consumer->claim_size_error(size_error_);
         }
+    }
+    if (!configures_) {
+        ++consumer->prelaid_; // its layout is known (and unused unless the consumer configures)
     }
     std::uintptr_t h = consumers_.load(std::memory_order_acquire);
     if (!closed(h)) {
@@ -243,7 +247,9 @@ bool Task::receive(Signal s, const Task& producer, const std::shared_ptr<Task>& 
         }
         return false;
     case Signal::Allocated:
-        if (allocated_pending_.fetch_sub(1, std::memory_order_acq_rel) == 1 && configures_) {
+        allocated_pending_.fetch_sub(1, std::memory_order_acq_rel);
+        if (configures_ && producer.configures_ &&
+            layout_pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             step_due(self);
         }
         return false;
@@ -262,6 +268,12 @@ bool Task::release_issue_guard(const std::shared_ptr<Task>& self) {
         step_due(self); // the runtime hands it to the pool
     }
     allocated_pending_.fetch_sub(1, std::memory_order_acq_rel);
+    if (configures_) {
+        const int prelaid = std::exchange(prelaid_, 0);
+        if (layout_pending_.fetch_sub(1 + prelaid, std::memory_order_acq_rel) == 1 + prelaid) {
+            step_due(self); // inputs laid out (the size may still be due: then nothing)
+        }
+    }
     return input_done(nullptr);
 }
 
@@ -283,9 +295,9 @@ Task::Job Task::take_job() {
 }
 
 void Task::run_due_steps() {
-    const int due = sized_pending_.load(std::memory_order_acquire) != 0      ? 0
-                    : allocated_pending_.load(std::memory_order_acquire) != 0 ? 1
-                                                                               : 2;
+    const int due = sized_pending_.load(std::memory_order_acquire) != 0    ? 0
+                    : layout_pending_.load(std::memory_order_acquire) != 0 ? 1
+                                                                           : 2;
     if (due > 0) {
         run_steps(due);
     }
@@ -415,7 +427,7 @@ bool Task::input_done(const Task* producer) {
         return false;
     }
     if (configures_) {
-        add_job(Job::Run); // see take_job()
+        (void)add_job(Job::Run); // see take_job(); runs once
     }
     return true;
 }

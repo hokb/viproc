@@ -1957,8 +1957,11 @@ def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None, level=No
     level: optimization level (docs/design/goals.md; default 1, env
         VIPROC_OPT=2 or O2, python -m viproc -O2). 1: results bit-identical
         to NumPy. 2: results correct but possibly deviating from NumPy's:
-        every BLAS call runs on one thread (process-wide while the runtime
-        runs; viproc's workers parallelize), LAPACK calls are no longer
+        stage pipelining (element-wise ufuncs size their results in their
+        tasks; the main thread does not wait for pending sizes, and a
+        broadcasting error is raised asynchronously, AsyncValueError), every
+        BLAS call runs on one thread (process-wide while the runtime runs;
+        viproc's workers parallelize), LAPACK calls are no longer
         serialized. 3-5: not implemented yet, run as 2.
     """
     env_sync, env_adaptive = _env_policy()
@@ -1979,13 +1982,15 @@ def opt_level():
 
 def offload_stats():
     """{'inline': n, 'offloaded': m, 'direct': d, 'tasks': t, 'syncs': s,
-    'wakes': w}:
+    'wakes': w, 'size_waits': z}:
     ready ops run inline as a task / handed to workers / run directly without
     a task (small, inputs ready); t counts every task issued, whether its
     inputs were ready or pending (inline and offloaded count only the ready
     ones); s counts sync points that found their array pending (the main
     thread blocked; wait_all() not counted); w counts sleeping workers woken
-    by the thread queuing a task (mostly the issuing main thread)."""
+    by the thread queuing a task (mostly the issuing main thread); z counts
+    metadata queries that found a size or layout still unknown (O2: a task
+    sizes the array) and blocked."""
     _ensure_runtime()
     return _viproc.offload_counts()
 

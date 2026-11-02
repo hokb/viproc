@@ -156,8 +156,14 @@ a property of a level, not a fixed promise of viproc.
 1-5 are accepted, O1 is the default, 3-5 run as O2 until they are built.
 **O2 so far:** every BLAS call runs on one thread (OpenBLAS's process-wide
 setting, through `_blas.py`, restored at shutdown) and LAPACK calls are no
-longer serialized; the stage signals of `pipelining.md` exist at every
-level (they change no result). O2 is not strict: NumPy functions taken as a
+longer serialized; element-wise ufuncs (no casts, one output) on pending
+or large inputs are issued without their size: the task computes it on
+its inputs' size signals and its strides on their layouts
+(`pipelining.md`, S2), so the main thread does not wait for pending
+sizes, a broadcasting error is raised asynchronously, and strided
+operands are computed per row (NumPy's iterator needs the GIL to plan;
+values may round differently from NumPy's SIMD/scalar choice). The stage
+signals exist at every level (they change no result). O2 is not strict: NumPy functions taken as a
 whole may still run where nothing better exists; such ops give their three
 stage signals in quick succession. Measured (4 vCPUs,
 `python/benchmarks/opt_levels.py`): 8 independent `inv` of 64 x 64 2.35x

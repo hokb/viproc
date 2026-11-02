@@ -56,7 +56,22 @@ template <class Done> bool spin_until(Done done) {
 
 } // namespace
 
+namespace {
+// The runtime metadata queries of arrays wait on (Array::layout): the one
+// the main thread created last.
+Runtime* g_configuring_runtime = nullptr;
+} // namespace
+
+void Array::wait_configured() const {
+    if (g_configuring_runtime != nullptr) {
+        g_configuring_runtime->wait_stage(const_cast<Array&>(*this), TaskState::Allocated);
+    } else { // no runtime left: its tasks completed
+        meta_->set_task(nullptr);
+    }
+}
+
 Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_(options_.offload) {
+    g_configuring_runtime = this;
     std::size_t n = options_.workers;
     if (n == 0) {
         n = default_worker_count();
@@ -80,6 +95,9 @@ Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_
 
 Runtime::~Runtime() {
     wait_all();
+    if (g_configuring_runtime == this) {
+        g_configuring_runtime = nullptr;
+    }
     {
         std::lock_guard lock(sleep_mutex_);
         stopping_.store(true, std::memory_order_seq_cst);
@@ -705,15 +723,16 @@ ErrorRef Runtime::wait_stage(Array& a, TaskState s) {
         return {};
     }
     if (t->state() < s) {
+        ++size_waits_;
         const Blocking blocking(options_);
         if (!spin_until([&] { return t->state() >= s; })) {
             t->wait_state(s);
         }
     }
     ErrorRef e = t->size_error();
-    if (t->state() >= TaskState::Allocated) {
+    if (t->state() >= TaskState::Allocated && !e) {
         a.meta_->set_task(nullptr); // its SD is complete for good
-    }
+    } // else no size: every metadata query raises the op's error again
     return e;
 }
 
@@ -732,8 +751,7 @@ void Runtime::due_steps(bool here) {
         for (std::shared_ptr<Task>& t : due) {
             if (here) {
                 t->run_due_steps(); // may make more steps due: loop
-            } else {
-                t->add_job(Task::Job::Steps);
+            } else if (t->add_job(Task::Job::Steps)) {
                 enqueue(std::move(t));
             }
         }

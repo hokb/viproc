@@ -13,7 +13,7 @@ Status labels as in `memory-management.md`: **Decided**, **Implemented**,
 | # | Decision | Status |
 |---|----------|--------|
 | S1 | Six stages per array, each reached exactly once, in increasing order | Implemented for tasks (`TaskState`, stages 1-5; the direct path has no task) |
-| S2 | The main thread guarantees only `Created`; tasks advance the rest | Runtime implemented (`Runtime::issue_deferred`, size and layout steps in the task); no bridge op uses it yet (today: `SizeCompleted` at issue) |
+| S2 | The main thread guarantees only `Created`; tasks advance the rest | Implemented for element-wise ufuncs at O2 (`Runtime::issue_deferred`, size and layout steps in the task); other ops and O1: `SizeCompleted` at issue |
 | S3 | Tasks react to every stage of their inputs, not only `Completed` | Signals implemented (three per registration, `Task::add_consumer`); no task reacts to SizeCompleted/Allocated yet |
 | S4 | Pending size inputs make a task, whatever the size | Decided, not implemented (today: sync) |
 | S5 | An array in stage S gives access to the properties of stages 1..S; handlers run only on their stage signal (no locks) | Decided, not implemented |
@@ -160,12 +160,35 @@ precedence). The steps of one task are serialized by a combining word
 (`Task::run_steps`), and `execute` finishes any step not yet run before the
 kernel. Metadata queries of the main thread wait for the stage they need
 (`Runtime::wait_stage`: shape at size completed, strides at allocated);
-an op issued on an unsized input still waits for its allocated stage (the
-regular issue path needs the layout). A chain of 50 deferred ops is sized
+an op issued on an unsized input on the regular path still waits for its
+allocated stage (it needs the layout; `Array::layout` waits, so the main
+thread never reads an incomplete one). The layout step needs the inputs'
+strides, not their memory: an input sized at issue counts as laid out at
+registration, so a deferred op behind regular ones is laid out at once,
+not when they run (else a regular op's allocated signal, right before its
+kernel, would hold the main thread at the next metadata query). A chain of 50 deferred ops is sized
 while its first producer still runs (`test_deferred_sizes_run_ahead`).
 Cost at O1 (callgrind, chains and fan-outs of 1e4 elements, 1 worker):
 main thread unchanged within noise, worker +25 to +44 instructions per
 task over the signals alone (one more check per run).
+
+**Element-wise ufuncs at O2 (implemented).** The bridge's ufunc fast path
+issues an element-wise ufunc with one output and no casts through
+`vp_ufunc_issue_deferred` when an input is pending or the result is larger
+than the direct path's threshold: the main thread reads no input size. The
+shared element-wise kernel sizes (NumPy's broadcasting and message) and
+lays out (NumPy's result layout, `numpy::elementwise_layout`) the result;
+it runs NumPy's loop in one call where NumPy makes one (dense operands:
+identical results), else per row (strided, broadcast, reversed: NumPy's
+iterator would need the GIL to plan; values may round differently). A
+0-d result is known to be NumPy's scalar without its size: its inputs were
+all 0-d (unsized ones marked so). `x.shape`, `x.ndim`, `x.size` wait for
+the size only and raise the op's error if it could not size the array (as
+a sync point, every time); `offload_stats()["size_waits"]` counts the
+metadata queries that blocked. Casts, `out=`, several outputs and the
+other ops take the regular path. Cost at O1 (callgrind, 1 worker): main
+thread +10 to +30 instructions per op (the layout check of every
+`Array::layout` call), direct path +12.
 
 **Today.** Every asynchronous op is a NumPy function taken as a whole: its
 result shape is computed on the main thread at issue, so every task reaches

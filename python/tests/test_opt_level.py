@@ -11,6 +11,22 @@ from viproc import _blas, _linalg, _ufuncs
 from async_path import SYNC_BELOW, assert_async, pending
 
 
+@pytest.fixture(autouse=True, scope="module")
+def default_env():
+    """These tests start from the default level, whatever VIPROC_OPT the
+    suite runs with; the runtime of that level is restored after them."""
+    import os
+
+    saved = os.environ.pop("VIPROC_OPT", None)
+    viproc.init()
+    try:
+        yield
+    finally:
+        if saved is not None:
+            os.environ["VIPROC_OPT"] = saved
+        viproc.init()
+
+
 @pytest.fixture
 def level2():
     viproc.init(sync_below=SYNC_BELOW, adaptive=False, level=2)
@@ -102,6 +118,64 @@ def test_o2_async(level2):
     va = pending(viproc.asarray(a))
     r = assert_async(np.linalg.inv, va)
     np.testing.assert_allclose(np.asarray(r), np.linalg.inv(a), rtol=1e-12)
+
+
+def _stats():
+    st = viproc.offload_stats()
+    return st["syncs"], st["size_waits"]
+
+
+def test_o2_sizes_in_tasks(level2):
+    """O2 (pipelining.md, S2): element-wise ufuncs on pending inputs are
+    issued without their size; the tasks size them on their inputs' signals,
+    while the main thread runs ahead."""
+    rng = np.random.default_rng(3)
+    a, b = rng.random((2000, 300)), rng.random(300)
+    x, y = viproc.asarray(a), viproc.asarray(b)
+    slow = np.sin(np.sin(viproc.asarray(np.ones(4_000_000))))[:1]  # keeps the rest pending
+    before = _stats()
+    z, r = x + slow, a + np.sin(np.sin(np.ones(1)))
+    for _ in range(20):
+        z = np.cos(z) * y + 1.5
+        r = np.cos(r) * b + 1.5
+    assert _stats() == before  # no sync, no wait for a size
+    assert z.shape == r.shape and z.dtype == r.dtype  # metadata query: waits for the size only
+    got = np.asarray(z)
+    assert got.strides == r.strides and np.array_equal(got, r)  # dense: NumPy's single call
+
+
+def test_o2_layouts(level2):
+    rng = np.random.default_rng(4)
+    for a in (np.asfortranarray(rng.random((300, 40))), rng.random((40, 600)).T,
+              rng.random((90, 80))[::-1, ::2]):
+        x = pending(viproc.asarray(a))
+        z, r = np.exp(x) * 2.0, np.exp(a) * 2.0
+        got = np.asarray(z)
+        assert got.strides == r.strides  # NumPy's result layout (order K)
+        np.testing.assert_allclose(got, r, rtol=1e-15)  # strided: rows, may round differently
+
+
+def test_o2_broadcast_error_is_asynchronous(level2):
+    x = pending(viproc.asarray(np.ones((3000, 3))))
+    y = pending(viproc.asarray(np.ones(400)))
+    msg = "operands could not be broadcast together with shapes \\(3000,3\\) \\(400,\\)"
+    with pytest.raises(viproc.AsyncValueError, match=msg) as e:
+        w = x + y  # issued: the task finds the shapes do not broadcast
+        w.shape  # a metadata query raises the op's error (as a sync point)
+    assert isinstance(e.value, ValueError) and "in numpy.add" in str(e.value)
+    with pytest.raises(ValueError, match=msg):
+        np.asarray(w * 2.0)  # inherited by its consumers
+    viproc.wait_all()  # raised once
+
+
+def test_o2_zero_d_results_are_scalars(level2):
+    x = pending(viproc.asarray(np.arange(5000.0)))
+    s = x.sum()  # a pending 0-d result, NumPy's scalar
+    t = np.sqrt(s) * 2.0  # sized by its task: still known to be 0-d
+    assert t._scalar and t.ndim == 0
+    t2 = t
+    t2 += 1.0  # rebinds, as on NumPy's scalars
+    assert t2 is not t and float(t2) == float(np.sqrt(np.arange(5000.0).sum()) * 2.0 + 1.0)
 
 
 @pytest.mark.parametrize("args, level", [

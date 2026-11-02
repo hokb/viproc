@@ -91,7 +91,15 @@ class Array : public MainThreadCounted {
     Array(MetadataPtr meta, Ref<AliasGroup> group, ArrayBlock* block)
         : meta_(std::move(meta)), group_(std::move(group)), block_(block) {}
 
-    const Layout& layout() const { return meta_->sd(); }
+    // The array's size descriptor. An array sized by its task (S2,
+    // Runtime::issue_deferred) is waited for until its layout is known (a
+    // metadata query, S5): the main thread never reads an incomplete one.
+    const Layout& layout() const {
+        if (meta_->task()) [[unlikely]] {
+            wait_configured();
+        }
+        return meta_->sd();
+    }
     const MetadataPtr& meta() const { return meta_; }
     const Ref<AliasGroup>& group() const { return group_; }
     // The current data version.
@@ -103,6 +111,7 @@ class Array : public MainThreadCounted {
 
   private:
     friend class Runtime;
+    [[gnu::noinline]] void wait_configured() const;
 
     MetadataPtr meta_;
     Ref<AliasGroup> group_;
@@ -242,6 +251,9 @@ class Runtime {
     // Sync points so far that found their array pending (wait() blocked; main
     // thread; wait_all() not counted).
     std::uint64_t sync_count() const { return syncs_; }
+    // Metadata queries (wait_stage) that found the size or layout unknown, so
+    // the main thread blocked (main thread only).
+    std::uint64_t size_wait_count() const { return size_waits_; }
     // Sleeping workers enqueue() woke (any thread; relaxed).
     std::uint64_t wake_count() const { return wakes_.load(std::memory_order_relaxed); }
     // Main thread, before issuing ops: replaces the dispatch policy.
@@ -289,7 +301,8 @@ class Runtime {
     std::uint64_t seq_ = 0;    // ops issued so far (main thread only)
     FpMode fp_mode_;           // errstate of the ops issued now (main thread only)
     std::uint64_t direct_ = 0; // ... of which ran directly, without a task
-    std::uint64_t syncs_ = 0;  // waits that found the array pending (main thread only)
+    std::uint64_t syncs_ = 0;
+    std::uint64_t size_waits_ = 0; // waits that found the array pending (main thread only)
     std::atomic<std::size_t> active_{0};
     // Threads waiting in wait_active_below(): run() notifies only if > 0.
     std::atomic<int> active_waiters_{0};

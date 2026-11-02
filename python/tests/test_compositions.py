@@ -88,6 +88,7 @@ def messages(caught):
 SHAPES = [(37,), (6, 7), (3000,), (60, 50)]
 
 
+@pytest.mark.o1
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_elementwise(shape, dtype):

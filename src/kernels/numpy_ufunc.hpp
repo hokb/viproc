@@ -200,7 +200,19 @@ class LoopCache {
 // Operand order follows Runtime::issue(). The bridge uses it only where
 // single_call() holds; everything else goes through
 // LoopCache::iter_elementwise().
+// At optimization level O2 the same kernel also sizes and lays out its
+// output in the task (Kernel::size: NumPy's broadcasting and its error;
+// Kernel::layout: elementwise_layout), for Runtime::issue_deferred.
 std::shared_ptr<Kernel> make_elementwise_kernel(const UfuncLoop* loop);
+
+// NumPy's result layout of an element-wise ufunc with one output (order='K'):
+// sets the strides and offset of `out`, which comes with its dtype and the
+// broadcast shape. C order unless an input is not; F order when NumPy's
+// trivial loop allocates it (every input 0-d or F- and not C-contiguous with
+// the result's shape and the loop's dtype `in_dtypes`), else
+// Layout::keep_order over the inputs.
+void elementwise_layout(Layout& out, std::span<const Layout* const> inputs,
+                        std::span<const DType> in_dtypes);
 
 // ufunc.at(a, idx, b) for a 1-d int32/int64 index along a's first axis, as
 // NumPy's ufunc_at runs it without casts: every index checked first (an

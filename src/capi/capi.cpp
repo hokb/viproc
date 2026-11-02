@@ -351,6 +351,7 @@ uint64_t vp_direct_count(const vp_runtime* rt) { return rt->rt->direct_count(); 
 uint64_t vp_task_count(const vp_runtime* rt) { return rt->rt->task_count(); }
 
 uint64_t vp_sync_count(const vp_runtime* rt) { return rt->rt->sync_count(); }
+uint64_t vp_size_wait_count(const vp_runtime* rt) { return rt->rt->size_wait_count(); }
 
 uint64_t vp_wake_count(const vp_runtime* rt) { return rt->rt->wake_count(); }
 
@@ -439,7 +440,8 @@ void vp_array_release(vp_array* a) { ArrayPtr::adopt(&arr(a)).reset(); }
 int vp_array_ndim(const vp_array* a) { return static_cast<int>(arr(a).layout().shape.size()); }
 const int64_t* vp_array_shape(const vp_array* a) { return arr(a).layout().shape.data(); }
 const int64_t* vp_array_strides(const vp_array* a) { return arr(a).layout().strides.data(); }
-vp_dtype vp_array_dtype(const vp_array* a) { return to_vp(arr(a).layout().dtype); }
+vp_dtype vp_array_dtype(const vp_array* a) { return to_vp(arr(a).meta()->sd().dtype); }
+int vp_array_sized(const vp_array* a) { return Runtime::unsized(arr(a)) ? 0 : 1; }
 int64_t vp_array_offset(const vp_array* a) { return arr(a).layout().offset; }
 int vp_array_ready(vp_array* a) { return arr(a).ready() ? 1 : 0; }
 int vp_array_same_storage(const vp_array* a, const vp_array* b) {
@@ -454,6 +456,20 @@ size_t vp_array_reusable_bytes(const vp_array* a) {
                     !b.has_readers() && l.offset == 0 && l.c_contiguous() &&
                     l.nbytes() == b.nbytes();
     return ok ? b.nbytes() : 0;
+}
+
+int vp_array_wait_size(vp_runtime* rt, vp_array* a, int* ndim, const int64_t** shape, char* err,
+                       size_t errlen) {
+    Array& x = arr(a);
+    ErrorRef e = rt->rt->wait_stage(x, TaskState::SizeCompleted);
+    if (e) {
+        set_error(err, errlen, describe(rt->rt->errors().raise_at_sync_point(e)));
+        return VP_ERROR;
+    }
+    const Layout& l = x.meta()->sd(); // the shape is final at SizeCompleted
+    *ndim = static_cast<int>(l.shape.size());
+    *shape = l.shape.data();
+    return VP_OK;
 }
 
 int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
@@ -643,47 +659,62 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
         *result = nullptr;
         return VP_OK;
     }
-    // NumPy's result layout (order='K'); C order unless an input is not.
-    bool all_c = true;
+    // NumPy's result layout (order='K')
+    const Layout* in_layouts[3];
     for (int i = 0; i < nin; ++i) {
-        const Layout& il = ins[i]->layout();
-        all_c = all_c && (il.c_contiguous() || il.size() <= 1);
-    }
-    // NumPy's trivial loop allocates F order when every input is a 0-d array
-    // or F- (and not C-) contiguous with the result's shape, without a cast; that fixes the
-    // strides of extent-1 dimensions too, which keep_order() would not.
-    bool all_f = !all_c && out_ndim > 1;
-    for (int i = 0; i < nin && all_f; ++i) {
-        const Layout& il = ins[i]->layout();
-        all_f = il.shape.empty() || (il.shape == shape && f_contiguous(il) && !il.c_contiguous() &&
-                                     il.dtype == loop->dtypes[i]);
+        in_layouts[i] = &ins[i]->layout();
     }
     Layout l;
-    if (all_c) {
-        l = Layout::contiguous(out_dtype, std::move(shape));
-    } else if (all_f) {
-        l.dtype = out_dtype;
-        l.strides.resize(shape.size());
-        std::int64_t step = static_cast<std::int64_t>(itemsize(out_dtype));
-        for (std::size_t i = 0; i < shape.size(); ++i) {
-            l.strides[i] = step;
-            step *= shape[i];
-        }
-        l.shape = std::move(shape);
-    } else {
-        Layout in_layouts[3];
-        for (int i = 0; i < nin; ++i) {
-            in_layouts[i] = ins[i]->layout();
-        }
-        l = Layout::keep_order(out_dtype, std::move(shape),
-                               std::span<const Layout>(in_layouts, static_cast<std::size_t>(nin)));
-    }
+    l.dtype = out_dtype;
+    l.shape = std::move(shape);
+    numpy::elementwise_layout(l, std::span(in_layouts, static_cast<std::size_t>(nin)),
+                              std::span(loop->dtypes.data(), static_cast<std::size_t>(nin)));
     std::shared_ptr<Kernel> k = elementwise_kernel(rt, *loop, in_span, l, false, err, errlen);
     if (!k) {
         return VP_UNSUPPORTED;
     }
     ArrayPtr res;
     rt->rt->issue(k, in_span, {}, std::span(&l, 1), site, std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
+int vp_ufunc_issue_deferred(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
+                            vp_array** result, const char* site, char* err, size_t errlen) {
+    const int nin = loop->loop->nin();
+    if (nin > 3 || loop->loop->nout() != 1) {
+        set_error(err, errlen, "unsupported deferred ufunc");
+        return VP_UNSUPPORTED;
+    }
+    bool all_ready = true;
+    std::int64_t elements = 0;
+    for (int i = 0; i < nin; ++i) {
+        Array& a = arr(inputs[i]);
+        if (a.meta()->sd().dtype != loop->dtypes[static_cast<std::size_t>(i)]) {
+            return VP_UNSUPPORTED; // casts: the regular path
+        }
+        if (all_ready && a.ready() && Runtime::unsized(a)) {
+            rt->rt->wait_stage(a, TaskState::Allocated); // done: no wait; sized unless it failed
+        }
+        if (all_ready && a.ready() && !Runtime::unsized(a)) {
+            elements = std::max(elements, a.layout().size()); // ready: no wait
+        } else {
+            all_ready = false;
+        }
+    }
+    if (all_ready && elements < rt->rt->offload_policy().options().sync_below) {
+        return VP_UNSUPPORTED; // the direct path, sized on the main thread
+    }
+    rt->graveyard->drain();
+    ArrayPtr ins[3];
+    for (int i = 0; i < nin; ++i) {
+        ins[i] = ref(inputs[i]);
+    }
+    const DType out = loop->dtypes[static_cast<std::size_t>(nin)];
+    ArrayPtr res;
+    rt->rt->issue_deferred(loop->loop->elementwise_kernel(),
+                           std::span<const ArrayPtr>(ins, static_cast<std::size_t>(nin)),
+                           std::span(&out, 1), site, std::span(&res, 1));
     *result = hand_out(std::move(res));
     return VP_OK;
 }

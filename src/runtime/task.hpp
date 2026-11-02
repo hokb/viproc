@@ -432,7 +432,12 @@ class Task {
     // The pool's queue may hold a configuring task twice: as a step job and
     // to run. take_job() tells which entry this is (one bit per entry).
     enum class Job : std::uint8_t { Run = 1, Steps = 2 };
-    void add_job(Job j) { jobs_.fetch_or(static_cast<std::uint8_t>(j), std::memory_order_acq_rel); }
+    // True if the bit was not set: queue an entry (else one is queued and
+    // will do this job too: steps run whatever is due when it runs).
+    bool add_job(Job j) {
+        const auto b = static_cast<std::uint8_t>(j);
+        return (jobs_.fetch_or(b, std::memory_order_acq_rel) & b) == 0;
+    }
     Job take_job();
 
     const char* issue_site() const { return issue_site_; }
@@ -551,6 +556,7 @@ class Task {
     // current signal delivery (a worklist per thread, no nesting), or hand
     // it to the runtime (main thread: step_due_).
     void step_due(const std::shared_ptr<Task>& self);
+
   public:
     // An input that cannot be sized (failed): this op is not sized either.
     void claim_size_error(const ErrorRef& e) {
@@ -591,6 +597,13 @@ class Task {
     // SizeCompleted signals add_consumer() delivered before publishing the
     // node (main thread, while issuing): dropped with the issue guard.
     int presized_ = 0;
+    // Configuring tasks: inputs whose layout is still unknown, plus the issue
+    // guard. Their layout step needs the inputs' strides, not their memory:
+    // an input sized at issue (its producer does not configure) has them
+    // already and counts as laid out at registration (prelaid_, dropped with
+    // the guard); a configuring producer's Allocated signal brings them.
+    std::atomic<int> layout_pending_{1};
+    int prelaid_ = 0;
     // Configuring tasks (set_configures): their steps, combined as the
     // signals of a ConsumerNode (high nibble requested, low nibble done;
     // 1 size, 2 layout), the size error, an input's size error (first one,

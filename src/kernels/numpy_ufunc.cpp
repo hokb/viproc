@@ -576,7 +576,54 @@ class ElementwiseKernel : public Kernel {
 
     DirectCost* direct_cost() override { return &cost_; }
 
+    // O2 (Runtime::issue_deferred): the broadcast shape, as NumPy's ufunc
+    // call computes it, with its error.
+    KernelResult size(std::span<const Layout* const> inputs, std::span<Layout> outputs) override {
+        Shape shape;
+        for (const Layout* l : inputs.first(static_cast<std::size_t>(loop_->nin()))) {
+            if (l->shape.size() > shape.size()) { // prepend extent-1 axes
+                const std::size_t add = l->shape.size() - shape.size();
+                Shape wider(l->shape.size(), 1);
+                std::copy(shape.begin(), shape.end(), wider.begin() + add);
+                shape = std::move(wider);
+            }
+            const std::size_t skip = shape.size() - l->shape.size();
+            for (std::size_t i = 0; i < l->shape.size(); ++i) {
+                std::int64_t& d = shape[skip + i];
+                if (d == 1) {
+                    d = l->shape[i];
+                } else if (l->shape[i] != 1 && l->shape[i] != d) {
+                    return KernelResult{1, broadcast_error(inputs), 0};
+                }
+            }
+        }
+        outputs[0].shape = std::move(shape);
+        return {};
+    }
+    void layout(std::span<const Layout* const> inputs, std::span<Layout> outputs) override {
+        const auto nin = static_cast<std::size_t>(loop_->nin());
+        DType dts[kMaxFlat];
+        for (std::size_t i = 0; i < nin; ++i) {
+            dts[i] = inputs[i]->dtype; // issue_deferred: no casts
+        }
+        elementwise_layout(outputs[0], inputs.first(nin), std::span(dts, nin));
+    }
+
   private:
+    static std::string broadcast_error(std::span<const Layout* const> inputs) {
+        std::string m = "ValueError: operands could not be broadcast together with shapes ";
+        for (const Layout* l : inputs) {
+            m += '(';
+            for (std::size_t i = 0; i < l->shape.size(); ++i) {
+                m += std::to_string(l->shape[i]);
+                if (i + 1 < l->shape.size() || l->shape.size() == 1) {
+                    m += ',';
+                }
+            }
+            m += ") ";
+        }
+        return m;
+    }
     static constexpr std::size_t kMaxFlat = 8;
     const UfuncLoop* loop_;
     DirectCost cost_; // one kernel per loop: learned across its ops
@@ -832,6 +879,48 @@ char* template_address() {
 
 std::shared_ptr<Kernel> make_at_kernel(const UfuncLoop* loop) {
     return std::make_shared<AtKernel>(loop);
+}
+
+void elementwise_layout(Layout& out, std::span<const Layout* const> inputs,
+                        std::span<const DType> in_dtypes) {
+    const Shape& shape = out.shape;
+    out.offset = 0;
+    out.strides.resize(shape.size());
+    bool all_c = true;
+    for (const Layout* il : inputs) {
+        all_c = all_c && (il->c_contiguous() || il->size() <= 1);
+    }
+    std::int64_t step = static_cast<std::int64_t>(itemsize(out.dtype));
+    if (all_c) {
+        for (std::size_t i = shape.size(); i-- > 0;) {
+            out.strides[i] = step;
+            step *= shape[i];
+        }
+        return;
+    }
+    // NumPy's trivial loop allocates F order when every input is a 0-d array
+    // or F- (and not C-) contiguous with the result's shape, without a cast;
+    // that fixes the strides of extent-1 dimensions too, which keep_order()
+    // would not.
+    bool all_f = shape.size() > 1;
+    for (std::size_t i = 0; i < inputs.size() && all_f; ++i) {
+        const Layout& il = *inputs[i];
+        all_f = il.shape.empty() || (il.shape == shape && il.f_contiguous() && !il.c_contiguous() &&
+                                     il.dtype == in_dtypes[i]);
+    }
+    if (all_f) {
+        for (std::size_t i = 0; i < shape.size(); ++i) {
+            out.strides[i] = step;
+            step *= shape[i];
+        }
+        return;
+    }
+    Layout in_layouts[8];
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        in_layouts[i] = *inputs[i];
+    }
+    out = Layout::keep_order(out.dtype, std::move(out.shape),
+                             std::span<const Layout>(in_layouts, inputs.size()));
 }
 
 std::shared_ptr<Kernel> make_elementwise_kernel(const UfuncLoop* loop) {

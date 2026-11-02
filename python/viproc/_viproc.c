@@ -47,11 +47,12 @@
 static vp_runtime* g_rt = NULL;
 static unsigned long g_main_thread = 0;
 static PyObject* AsyncError = NULL;
-static PyObject* AsyncIndexError = NULL;  /* AsyncError and IndexError */
-static PyObject* AsyncValueError = NULL;  /* AsyncError and ValueError */
-static PyObject* AsyncLinAlgError = NULL; /* AsyncError and numpy.linalg.LinAlgError */
+static PyObject* AsyncIndexError = NULL;         /* AsyncError and IndexError */
+static PyObject* AsyncValueError = NULL;         /* AsyncError and ValueError */
+static PyObject* AsyncLinAlgError = NULL;        /* AsyncError and numpy.linalg.LinAlgError */
 static PyObject* AsyncFloatingPointError = NULL; /* AsyncError and FloatingPointError */
 static long long g_small = 2048; /* the runtime's sync_below: ops this small run directly */
+static int g_opt = 1;            /* the optimization level (vp_opt_level) */
 
 /* Registered by _ndarray.py via _viproc.setup(). */
 static PyTypeObject* g_array_cls = NULL; /* viproc.ndarray */
@@ -273,19 +274,47 @@ static PyObject* dims_tuple(int n, const int64_t* d) {
     return t;
 }
 
+static int raise_status(int status, const char* err);
+
+/* The shape of `a`; for an array its task sizes (O2) the metadata query
+ * waits for its size only and raises the op's error if it could not size
+ * it (pipelining.md, S5). Returns ndim, or -1 with a Python error. */
+static int shape_of(vp_array* a, const int64_t** shape) {
+    if (vp_array_sized(a)) {
+        *shape = vp_array_shape(a);
+        return vp_array_ndim(a);
+    }
+    int nd = 0;
+    char err[ERRLEN] = "";
+    /* the runtime releases the GIL while it blocks */
+    if (vp_array_wait_size(g_rt, a, &nd, shape, err, sizeof err) != VP_OK) {
+        raise_status(VP_ERROR, err);
+        return -1;
+    }
+    return nd;
+}
+
 static PyObject* Array_get_shape(ArrayObject* self, void* c) {
     (void)c;
-    return dims_tuple(vp_array_ndim(self->a), vp_array_shape(self->a));
+    const int64_t* shape;
+    const int nd = shape_of(self->a, &shape);
+    return nd < 0 ? NULL : dims_tuple(nd, shape);
 }
 
 static PyObject* Array_get_strides(ArrayObject* self, void* c) {
     (void)c;
+    const int64_t* shape;
+    if (shape_of(self->a, &shape) < 0) {
+        return NULL;
+    }
     return dims_tuple(vp_array_ndim(self->a), vp_array_strides(self->a));
 }
 
 static PyObject* Array_get_ndim(ArrayObject* self, void* c) {
     (void)c;
-    return PyLong_FromLong(vp_array_ndim(self->a));
+    const int64_t* shape;
+    const int nd = shape_of(self->a, &shape);
+    return nd < 0 ? NULL : PyLong_FromLong(nd);
 }
 
 static PyObject* Array_get_dtype(ArrayObject* self, void* c) {
@@ -356,8 +385,11 @@ static int c_contiguous(const vp_array* a);
 
 static PyObject* Array_get_size(ArrayObject* self, void* c) {
     (void)c;
-    const int nd = vp_array_ndim(self->a);
-    const int64_t* shape = vp_array_shape(self->a);
+    const int64_t* shape;
+    const int nd = shape_of(self->a, &shape);
+    if (nd < 0) {
+        return NULL;
+    }
     long long n = 1;
     for (int i = 0; i < nd; ++i) {
         n *= (long long)shape[i];
@@ -383,7 +415,7 @@ static PyObject* Array_get_base(ArrayObject* self, void* c) {
  * array's setflags(). */
 enum {
     FL_WARN_ON_WRITE = INT_MIN, /* NPY_ARRAY_WARN_ON_WRITE, bit 31 */
-    FL_C = 0x1, /* NumPy's NPY_ARRAY_* values: `num` is NumPy's */
+    FL_C = 0x1,                 /* NumPy's NPY_ARRAY_* values: `num` is NumPy's */
     FL_F = 0x2,
     FL_OWNDATA = 0x4,
     FL_ALIGNED = 0x100,
@@ -480,7 +512,7 @@ FLAGS_GET(writeable_no_warn, FL_WRITEABLE)
         if ((self->flags & FL_WARN_ON_WRITE) &&                                                    \
             PyErr_WarnEx(PyExc_FutureWarning,                                                      \
                          "future versions will not create a writeable array from "                 \
-                         "broadcast_array. Set the writable flag explicitly to avoid this "       \
+                         "broadcast_array. Set the writable flag explicitly to avoid this "        \
                          "warning.",                                                               \
                          1) < 0) {                                                                 \
             return NULL;                                                                           \
@@ -1478,7 +1510,7 @@ static int scalars_of(PyObject* const* inputs, Py_ssize_t n, PyObject** out, Py_
         PyObject* x = inputs[i];
         if (is_array(x)) {
             vp_array* a = ((ArrayObject*)x)->a;
-            if (vp_array_ndim(a) != 0 || !vp_array_ready(a)) {
+            if (!vp_array_ready(a) || !vp_array_sized(a) || vp_array_ndim(a) != 0) {
                 return 0;
             }
         } else if (!(PyFloat_CheckExact(x) || PyLong_CheckExact(x) || PyBool_Check(x) ||
@@ -1748,6 +1780,7 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
     int nevicted = 0, nkeep = 0, status = 0;
     int64_t shape[MAXDIMS];
     int ndim = 0;
+    const int deferred = g_opt >= 2 && out == NULL;
     for (Py_ssize_t i = 0; i < n && status == 0; ++i) {
         PyObject* x = inputs[i];
         if (is_array(x)) {
@@ -1768,9 +1801,45 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             nevicted += evicted[nevicted] != NULL;
         }
         /* Folds input i into the broadcast shape of inputs 0..i-1: after the
-         * loop, shape/ndim is the output shape. */
-        if (broadcast_into(shape, &ndim, vp_array_ndim(ins[i]), vp_array_shape(ins[i])) < 0) {
+         * loop, shape/ndim is the output shape. At O2 the task sizes it. */
+        if (!deferred &&
+            broadcast_into(shape, &ndim, vp_array_ndim(ins[i]), vp_array_shape(ins[i])) < 0) {
             status = 1; /* not broadcastable: the fallback raises NumPy's error */
+        }
+    }
+    int handled = 0;
+    if (status == 0 && deferred) {
+        /* O2 (pipelining.md, S2): no input size read here. */
+        char err[ERRLEN] = "";
+        vp_array* res = NULL;
+        int st = vp_ufunc_issue_deferred(g_rt, loop, ins, &res, issue_site(), err, sizeof err);
+        if (st == VP_OK) {
+            /* NumPy returns a scalar for a 0-d result, i.e. 0-d inputs only;
+             * an unsized input is 0-d if marked so (it is the result of such
+             * an op). */
+            int zero_d = 1;
+            for (Py_ssize_t i = 0; i < n && zero_d; ++i) {
+                zero_d = vp_array_sized(ins[i])
+                             ? vp_array_ndim(ins[i]) == 0
+                             : is_array(inputs[i]) && ((ArrayObject*)inputs[i])->scalar;
+            }
+            *result = wrap_array(res);
+            if (*result != NULL && zero_d) {
+                ((ArrayObject*)*result)->scalar = 1;
+            }
+            handled = *result != NULL ? 1 : -1;
+            status = 2; /* done */
+        } else if (st != VP_UNSUPPORTED) {
+            raise_status(st, err);
+            handled = -1;
+            status = 2;
+        } else {
+            for (Py_ssize_t i = 0; i < n && status == 0; ++i) {
+                if (broadcast_into(shape, &ndim, vp_array_ndim(ins[i]), vp_array_shape(ins[i])) <
+                    0) {
+                    status = 1;
+                }
+            }
         }
     }
     if (status == 0 && out != NULL) {
@@ -1788,7 +1857,6 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
             ++g_elided;
         }
     }
-    int handled = 0;
     if (status == 0) {
         char err[ERRLEN] = "";
         vp_array* res = NULL;
@@ -2464,8 +2532,7 @@ static PyObject* m_init(PyObject* self, PyObject* args) {
     long long sync_below = -1; /* -1: runtime default */
     int adaptive = 1;
     int level = 1;
-    if (!PyArg_ParseTuple(args, "|nnLpi", &workers, &max_active, &sync_below, &adaptive,
-                          &level)) {
+    if (!PyArg_ParseTuple(args, "|nnLpi", &workers, &max_active, &sync_below, &adaptive, &level)) {
         return NULL;
     }
     if (g_rt != NULL) {
@@ -2481,6 +2548,7 @@ static PyObject* m_init(PyObject* self, PyObject* args) {
     }
     g_main_thread = PyThread_get_thread_ident();
     vp_set_opt_level(g_rt, level);
+    g_opt = vp_opt_level(g_rt);
     vp_set_error_notify(g_rt, error_recorded, NULL);
     g_small = sync_below >= 0 ? sync_below : 2048;
     if (sync_below >= 0 || !adaptive) {
@@ -2498,10 +2566,11 @@ static PyObject* m_offload_counts(PyObject* self, PyObject* noargs) {
     uint64_t inl = 0, off = 0;
     vp_offload_counts(g_rt, &inl, &off);
     return Py_BuildValue(
-        "{s:K,s:K,s:K,s:K,s:K,s:K}", "inline", (unsigned long long)inl, "offloaded",
+        "{s:K,s:K,s:K,s:K,s:K,s:K,s:K}", "inline", (unsigned long long)inl, "offloaded",
         (unsigned long long)off, "direct", (unsigned long long)vp_direct_count(g_rt), "tasks",
         (unsigned long long)vp_task_count(g_rt), "syncs", (unsigned long long)vp_sync_count(g_rt),
-        "wakes", (unsigned long long)vp_wake_count(g_rt));
+        "wakes", (unsigned long long)vp_wake_count(g_rt), "size_waits",
+        (unsigned long long)vp_size_wait_count(g_rt));
 }
 
 static PyObject* m_pool_stats(PyObject* self, PyObject* noargs) {
