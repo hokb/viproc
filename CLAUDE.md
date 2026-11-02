@@ -179,7 +179,10 @@ reported with that issue site and the NumPy function it runs
   state at registration: one signal word per node; the producer walking
   its list and the registering thread combine on it with CAS (whoever
   finds nothing being delivered delivers; pipelining.md, "Signals").
-  Only completed triggers anything yet.
+  Tasks issued with `Runtime::issue_deferred` (S2, no bridge op yet) size
+  and lay out their outputs on the size completed and allocated signals
+  (pipelining.md, "Deferred sizing"); for all others only completed
+  triggers anything.
 - **Sync points** (reading data, `print`, `float(x)`, handing memory back to
   plain NumPy) wait for `completed` of the array's producer. Querying only
   metadata (`x.shape`, `x.dtype`) waits for `size_completed` only. Because

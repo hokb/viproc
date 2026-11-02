@@ -4,6 +4,7 @@
 #include "countable_array.hpp"
 #include "layout.hpp"
 #include "offload.hpp"
+#include "pool.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -17,6 +18,12 @@
 #include <vector>
 
 namespace viproc {
+
+namespace detail {
+// The thread has steps due (Task::step_due): a trivial thread-local, checked
+// after every task.
+VIPROC_TLS_INITIAL_EXEC extern thread_local bool t_any_due;
+} // namespace detail
 
 // Stages of a task, in order. The design (docs/design/pipelining.md, S1)
 // requires each stage to be reached exactly once, in increasing order:
@@ -103,6 +110,12 @@ class Metadata {
     const Layout& sd() const { return sd_; }
     // The op configuring the SD, while it is incomplete; null otherwise.
     const std::shared_ptr<Task>& task() const { return task_; }
+    // Main thread: sets / drops the configuring task (Runtime::issue_deferred,
+    // Runtime::wait_stage).
+    void set_task(std::shared_ptr<Task> t) const { task_ = std::move(t); }
+    // The configuring task only, in its size and layout steps (before it
+    // signals SizeCompleted / Allocated): the SD it fills in.
+    Layout& sd_for_task() const { return const_cast<Layout&>(sd_); }
 
   private:
     friend class MetadataPtr;
@@ -117,7 +130,7 @@ class Metadata {
     // operands). Main thread only, like AliasGroup::last_writer: it registers
     // on the task's stages and drops the task once it sees it completed
     // (docs/design/array-data-model.md, "Cycles"). Workers never read it.
-    std::shared_ptr<Task> task_;
+    mutable std::shared_ptr<Task> task_;
     mutable std::atomic<int> refs_{1}; // the creating reference
 };
 
@@ -224,6 +237,27 @@ class Kernel {
     // The cost estimate of a kernel shared by many ops, or null (kernels made
     // per op learn nothing across ops). Main thread only.
     virtual DirectCost* direct_cost() { return nullptr; }
+
+    // --- Ops that configure their outputs in the task (pipelining.md, S2;
+    // Runtime::issue_deferred). Called by the task, never on the main thread.
+    // The output sizes, once every input reached SizeCompleted: inputs give
+    // dtype, shape and offset only (S5: not their strides); outputs come with
+    // their dtype, the kernel sets their shape. A non-zero status fails the
+    // op (its message as in run(): "ValueError: ...").
+    virtual KernelResult size(std::span<const Layout* const> inputs, std::span<Layout> outputs) {
+        (void)inputs;
+        (void)outputs;
+        return KernelResult{1, "RuntimeError: the op cannot size its outputs", 0};
+    }
+    // The output strides (and offset), once every input reached Allocated
+    // (their strides are known now); the shapes stay as size() set them.
+    // Default: C order.
+    virtual void layout(std::span<const Layout* const> inputs, std::span<Layout> outputs) {
+        (void)inputs;
+        for (Layout& o : outputs) {
+            o = Layout::contiguous(o.dtype, std::move(o.shape));
+        }
+    }
 };
 
 // NumPy's floating-point error modes (np.errstate), captured at issue: three
@@ -271,7 +305,11 @@ class ErrorRef {
     ErrorRef(ErrorRef&& o) noexcept : table_(std::move(o.table_)), id_(std::exchange(o.id_, 0)) {}
     ErrorRef& operator=(const ErrorRef& o);
     ErrorRef& operator=(ErrorRef&& o) noexcept;
-    ~ErrorRef() { reset(); }
+    ~ErrorRef() {
+        if (table_) {
+            reset();
+        }
+    }
 
     explicit operator bool() const { return table_ != nullptr; }
     // The failed op's issue number (0 if empty).
@@ -372,17 +410,44 @@ class Task {
     bool completed() const { return state() == TaskState::Completed; }
     // Blocks until the task is completed.
     void wait_completed() const;
+    // Blocks until the task reached `s` (or completed).
+    void wait_state(TaskState s) const;
+
+    // Configures its outputs itself (Runtime::issue_deferred): sizes on its
+    // inputs' SizeCompleted signals, strides on their Allocated signals, on
+    // the thread delivering the last one (or a pool job, never the main
+    // thread). Set at issue, before launch; `errors` records a size error.
+    void set_configures(ErrorTable* errors) {
+        configures_ = true;
+        errors_ = errors;
+    }
+    bool configures() const { return configures_; }
+    // A size step failed (or an input's did): the op's error, valid once the
+    // task reached SizeCompleted (acquire through state()).
+    const ErrorRef& size_error() const { return size_error_; }
+    // Runs the steps (size, then layout) whose inputs' signals all arrived
+    // and that nobody ran yet; a step another thread runs is left to it.
+    // Any thread but the main thread.
+    void run_due_steps();
+    // The pool's queue may hold a configuring task twice: as a step job and
+    // to run. take_job() tells which entry this is (one bit per entry).
+    enum class Job : std::uint8_t { Run = 1, Steps = 2 };
+    void add_job(Job j) { jobs_.fetch_or(static_cast<std::uint8_t>(j), std::memory_order_acq_rel); }
+    Job take_job();
 
     const char* issue_site() const { return issue_site_; }
     // The op's issue number (set by the runtime when it launches the task).
     void set_id(std::uint64_t id) { id_ = id; }
     // The op's size: the most elements of any operand (a reduction's work
     // is its input, not its result). Decides where an unblocked task runs
-    // (Runtime::worker_loop). Any thread once the task is launched.
+    // (Runtime::worker_loop). Any thread once the task is runnable (its
+    // inputs completed; a configuring task's outputs may still be sized
+    // concurrently, so only its inputs count).
     std::int64_t work() const {
         std::int64_t n = 0;
-        for (const Operand& op : operands_) {
-            n = std::max(n, op.layout().size());
+        const std::size_t count = configures_ ? ninputs_ : operands_.size();
+        for (std::size_t i = 0; i < count; ++i) {
+            n = std::max(n, operands_[i].layout().size());
         }
         return n;
     }
@@ -414,8 +479,14 @@ class Task {
     // is held). Lock-free; the main thread only.
     void add_consumer(const std::shared_ptr<Task>& consumer, std::size_t i);
     // Drops the issue guard (see pending_). Returns true if the task is
-    // runnable now, i.e. all producers it waits on have completed.
-    bool release_issue_guard();
+    // runnable now, i.e. all producers it waits on have completed. A
+    // configuring task's size step may become due (take_due_steps()).
+    bool release_issue_guard(const std::shared_ptr<Task>& self);
+    // The configuring tasks whose steps became due on this thread since the
+    // last call (signals delivered here): a worker runs them
+    // (run_due_steps()), the main thread hands them to the pool.
+    static std::vector<std::shared_ptr<Task>> take_due_steps();
+    static bool due_steps_empty() { return !detail::t_any_due; }
     // Producers whose `stage` signal has not arrived yet, plus the issue
     // guard while it is held (tests; any thread, relaxed).
     int inputs_pending(Signal stage) const;
@@ -471,10 +542,28 @@ class Task {
     // delivers the due ones unless another thread is delivering (see
     // ConsumerNode::signals). Returns true if a Completed signal delivered
     // here made `consumer` runnable.
-    bool signal(ConsumerNode& n, Task& consumer, Signal upto) const;
+    bool signal(ConsumerNode& n, const std::shared_ptr<Task>& consumer, Signal upto) const;
     // One signal of `producer` arriving (exactly once per producer and
-    // stage). Returns true if it made this task runnable.
-    bool receive(Signal s, const Task& producer);
+    // stage) at `self` (this task). Returns true if it made this task
+    // runnable.
+    bool receive(Signal s, const Task& producer, const std::shared_ptr<Task>& self);
+    // A step (1 size, 2 layout) became due: run it on this thread, after the
+    // current signal delivery (a worklist per thread, no nesting), or hand
+    // it to the runtime (main thread: step_due_).
+    void step_due(const std::shared_ptr<Task>& self);
+  public:
+    // An input that cannot be sized (failed): this op is not sized either.
+    void claim_size_error(const ErrorRef& e) {
+        if (!size_upstream_claimed_.exchange(true, std::memory_order_relaxed)) {
+            size_upstream_ = e;
+        }
+    }
+
+  private:
+    // The size and layout steps (S2), each once, in order (steps_).
+    void size_step();
+    void layout_step();
+    void run_steps(int upto);
     // Delivers `s` to every registered consumer (SizeCompleted, Allocated;
     // Completed closes the list in execute()). The task's state is `s`'s.
     void signal_consumers(Signal s);
@@ -502,6 +591,18 @@ class Task {
     // SizeCompleted signals add_consumer() delivered before publishing the
     // node (main thread, while issuing): dropped with the issue guard.
     int presized_ = 0;
+    // Configuring tasks (set_configures): their steps, combined as the
+    // signals of a ConsumerNode (high nibble requested, low nibble done;
+    // 1 size, 2 layout), the size error, an input's size error (first one,
+    // written before the sized_pending_ decrement), and the jobs queued for
+    // them (take_job).
+    bool configures_ = false;
+    ErrorTable* errors_ = nullptr;
+    std::atomic<std::uint8_t> steps_{0};
+    std::atomic<std::uint8_t> jobs_{0};
+    std::atomic<bool> size_upstream_claimed_{false};
+    ErrorRef size_upstream_;
+    ErrorRef size_error_;
 
     std::shared_ptr<Kernel> kernel_;
     Operands operands_; // inputs, then outputs

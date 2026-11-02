@@ -1,5 +1,7 @@
 #include "task.hpp"
 
+#include <thread>
+
 #include "pool.hpp"
 
 #include <algorithm>
@@ -62,6 +64,46 @@ void Task::wait_completed() const {
     }
 }
 
+void Task::wait_state(TaskState s) const {
+    if (state() >= s) {
+        return;
+    }
+    // seq_cst with advance(): it stores the state, then loads the word with
+    // the waiter bit; this sets the bit, then loads the state.
+    if (closed(consumers_.fetch_or(kWaiter, std::memory_order_seq_cst))) {
+        return; // completed
+    }
+    for (TaskState c = state_.load(std::memory_order_seq_cst); c < s; c = state()) {
+        state_.wait(c, std::memory_order_acquire);
+    }
+}
+
+namespace {
+
+// Steps (size, layout) of configuring tasks that became due on this thread,
+// run (worker) or handed to the pool (main thread) by the runtime after the
+// signal delivery that made them due: no nesting along chains of sizes.
+thread_local std::vector<std::shared_ptr<Task>> t_due_steps;
+
+} // namespace
+
+VIPROC_TLS_INITIAL_EXEC thread_local bool detail::t_any_due = false;
+using detail::t_any_due;
+
+std::vector<std::shared_ptr<Task>> Task::take_due_steps() {
+    std::vector<std::shared_ptr<Task>> v;
+    if (t_any_due) {
+        v.swap(t_due_steps);
+        t_any_due = false;
+    }
+    return v;
+}
+
+void Task::step_due(const std::shared_ptr<Task>& self) {
+    t_due_steps.push_back(self);
+    t_any_due = true;
+}
+
 void Task::advance(TaskState next) {
     [[maybe_unused]] const TaskState prev = state_.load(std::memory_order_relaxed);
     assert(static_cast<int>(next) == static_cast<int>(prev) + 1 &&
@@ -84,6 +126,9 @@ void Task::signal_consumers(Signal s) {
     if (closed(h)) {
         return;
     }
+    if ((h & kWaiter) != 0) {
+        state_.notify_all(); // the main thread waits for this stage (wait_state)
+    }
     // Nodes stay in the list (and alive: each holds its consumer) until
     // execute() closes it; pushes after this load see the new state.
     for (auto* n = reinterpret_cast<ConsumerNode*>(h & ~kWaiter); n != nullptr; n = n->next) {
@@ -94,7 +139,7 @@ void Task::signal_consumers(Signal s) {
             std::uint8_t idle = 1 << 4 | 1;
             if (n->signals.compare_exchange_strong(idle, 2 << 4 | 1, std::memory_order_acq_rel,
                                                    std::memory_order_acquire)) {
-                n->task->allocated_pending_.fetch_sub(1, std::memory_order_acq_rel);
+                n->task->receive(Signal::Allocated, *this, n->task);
                 n->signals.store(2 << 4 | 2, std::memory_order_release);
                 continue;
             }
@@ -102,7 +147,7 @@ void Task::signal_consumers(Signal s) {
                 continue; // the registering thread delivers (or delivered) it
             }
         }
-        [[maybe_unused]] const bool runnable = signal(*n, *n->task, s);
+        [[maybe_unused]] const bool runnable = signal(*n, n->task, s);
         assert(!runnable && "only Completed makes a consumer runnable");
     }
 }
@@ -125,6 +170,9 @@ void Task::add_consumer(const std::shared_ptr<Task>& consumer, std::size_t i) {
     if (signal_of(state_.load(std::memory_order_acquire)) >= Signal::SizeCompleted) {
         n.signals.store(1 << 4 | 1, std::memory_order_relaxed);
         ++consumer->presized_;
+        if (size_error_) {
+            consumer->claim_size_error(size_error_);
+        }
     }
     std::uintptr_t h = consumers_.load(std::memory_order_acquire);
     if (!closed(h)) {
@@ -144,12 +192,12 @@ void Task::add_consumer(const std::shared_ptr<Task>& consumer, std::size_t i) {
     // seq_cst: see advance(). Acquire: Completed makes error_ visible.
     const Signal upto = signal_of(state_.load(std::memory_order_seq_cst));
     if (static_cast<int>(upto) > (n.signals.load(std::memory_order_relaxed) >> 4)) {
-        [[maybe_unused]] const bool runnable = signal(n, *consumer, upto);
+        [[maybe_unused]] const bool runnable = signal(n, consumer, upto);
         assert(!runnable && "the issue guard is held");
     }
 }
 
-bool Task::signal(ConsumerNode& n, Task& consumer, Signal upto) const {
+bool Task::signal(ConsumerNode& n, const std::shared_ptr<Task>& consumer, Signal upto) const {
     const int want = static_cast<int>(upto);
     std::uint8_t w = n.signals.load(std::memory_order_acquire);
     for (;;) {
@@ -172,7 +220,7 @@ bool Task::signal(ConsumerNode& n, Task& consumer, Signal upto) const {
     for (;;) {
         while (done < target) {
             ++done;
-            runnable = consumer.receive(static_cast<Signal>(done), *this) || runnable;
+            runnable = consumer->receive(static_cast<Signal>(done), *this, consumer) || runnable;
         }
         std::uint8_t expected = static_cast<std::uint8_t>(target << 4 | done0);
         if (n.signals.compare_exchange_strong(
@@ -184,13 +232,20 @@ bool Task::signal(ConsumerNode& n, Task& consumer, Signal upto) const {
     }
 }
 
-bool Task::receive(Signal s, const Task& producer) {
+bool Task::receive(Signal s, const Task& producer, const std::shared_ptr<Task>& self) {
     switch (s) {
     case Signal::SizeCompleted:
-        sized_pending_.fetch_sub(1, std::memory_order_acq_rel);
+        if (producer.size_error_) {
+            claim_size_error(producer.size_error_);
+        }
+        if (sized_pending_.fetch_sub(1, std::memory_order_acq_rel) == 1 && configures_) {
+            step_due(self);
+        }
         return false;
     case Signal::Allocated:
-        allocated_pending_.fetch_sub(1, std::memory_order_acq_rel);
+        if (allocated_pending_.fetch_sub(1, std::memory_order_acq_rel) == 1 && configures_) {
+            step_due(self);
+        }
         return false;
     case Signal::Completed:
         return input_done(&producer);
@@ -200,10 +255,142 @@ bool Task::receive(Signal s, const Task& producer) {
     return false;
 }
 
-bool Task::release_issue_guard() {
-    sized_pending_.fetch_sub(1 + std::exchange(presized_, 0), std::memory_order_acq_rel);
+bool Task::release_issue_guard(const std::shared_ptr<Task>& self) {
+    const int presized = std::exchange(presized_, 0);
+    if (sized_pending_.fetch_sub(1 + presized, std::memory_order_acq_rel) == 1 + presized &&
+        configures_) {
+        step_due(self); // the runtime hands it to the pool
+    }
     allocated_pending_.fetch_sub(1, std::memory_order_acq_rel);
     return input_done(nullptr);
+}
+
+Task::Job Task::take_job() {
+    std::uint8_t j = jobs_.load(std::memory_order_acquire);
+    for (;;) {
+        // A run entry wins: execute() runs the steps first anyway.
+        const std::uint8_t take = (j & static_cast<std::uint8_t>(Job::Run)) != 0
+                                      ? static_cast<std::uint8_t>(Job::Run)
+                                      : static_cast<std::uint8_t>(Job::Steps);
+        if ((j & take) == 0) {
+            return Job::Run; // no bit: a run that was not queued as a job
+        }
+        if (jobs_.compare_exchange_weak(j, static_cast<std::uint8_t>(j & ~take),
+                                        std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return static_cast<Job>(take);
+        }
+    }
+}
+
+void Task::run_due_steps() {
+    const int due = sized_pending_.load(std::memory_order_acquire) != 0      ? 0
+                    : allocated_pending_.load(std::memory_order_acquire) != 0 ? 1
+                                                                               : 2;
+    if (due > 0) {
+        run_steps(due);
+    }
+}
+
+void Task::run_steps(int upto) {
+    // As signal(): whoever raises the request while no step runs runs the
+    // steps, up to whatever is requested by the time it is done.
+    std::uint8_t w = steps_.load(std::memory_order_acquire);
+    for (;;) {
+        if (upto <= (w >> 4)) {
+            return;
+        }
+        if (steps_.compare_exchange_weak(w, static_cast<std::uint8_t>(upto << 4 | (w & 15)),
+                                         std::memory_order_acq_rel, std::memory_order_acquire)) {
+            break;
+        }
+    }
+    const int done0 = w & 15;
+    if (done0 < (w >> 4)) {
+        return;
+    }
+    int done = done0, target = upto;
+    for (;;) {
+        while (done < target) {
+            ++done;
+            if (done == 1) {
+                size_step();
+            } else {
+                layout_step();
+            }
+        }
+        std::uint8_t expected = static_cast<std::uint8_t>(target << 4 | done0);
+        if (steps_.compare_exchange_strong(expected,
+                                           static_cast<std::uint8_t>(target << 4 | target),
+                                           std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return;
+        }
+        target = expected >> 4;
+    }
+}
+
+void Task::size_step() {
+    InlineVector<const Layout*, 4> in;
+    for (std::size_t i = 0; i < ninputs_; ++i) {
+        in.push_back(&operands_[i].layout());
+    }
+    InlineVector<Layout, 2> out;
+    for (std::size_t o = ninputs_; o < operands_.size(); ++o) {
+        Layout l;
+        l.dtype = operands_[o].layout().dtype;
+        out.push_back(std::move(l));
+    }
+    if (size_upstream_claimed_.load(std::memory_order_acquire)) {
+        size_error_ = size_upstream_; // an input could not be sized: neither can this op
+    } else {
+        KernelResult r;
+        try {
+            r = kernel_->size(std::span<const Layout* const>(in.data(), in.size()),
+                              std::span<Layout>(out.data(), out.size()));
+        } catch (const std::exception& e) {
+            r = KernelResult{1, e.what(), 0};
+        }
+        if (r.status != 0 && errors_ != nullptr) {
+            size_error_ =
+                errors_->record(TaskError{std::move(r.message), issue_site_, kernel_->name(), id_});
+        }
+    }
+    for (std::size_t k = 0; k < out.size(); ++k) {
+        Layout& sd = operands_[ninputs_ + k].meta->sd_for_task();
+        sd.shape = size_error_ ? Shape{} : std::move(out.data()[k].shape);
+        sd.offset = 0;
+    }
+    advance(TaskState::SizeCompleted);
+}
+
+void Task::layout_step() {
+    InlineVector<const Layout*, 4> in;
+    for (std::size_t i = 0; i < ninputs_; ++i) {
+        in.push_back(&operands_[i].layout());
+    }
+    InlineVector<Layout, 2> out;
+    for (std::size_t o = ninputs_; o < operands_.size(); ++o) {
+        out.emplace_back(operands_[o].layout());
+    }
+    if (!size_error_) {
+        kernel_->layout(std::span<const Layout* const>(in.data(), in.size()),
+                        std::span<Layout>(out.data(), out.size()));
+    } else {
+        for (Layout& l : std::span<Layout>(out.data(), out.size())) {
+            l = Layout::contiguous(l.dtype, Shape{});
+        }
+    }
+    for (std::size_t k = 0; k < out.size(); ++k) {
+        Operand& op = operands_[ninputs_ + k];
+        op.buffer->set_size(out.data()[k].nbytes());
+        // Strides and offset only: the shape is published already (readers
+        // may read it since SizeCompleted, S5).
+        Layout& sd = op.meta->sd_for_task();
+        assert(out.data()[k].shape == sd.shape && "Kernel::layout keeps the shape");
+        sd.strides = std::move(out.data()[k].strides);
+        sd.offset = out.data()[k].offset;
+    }
+    advance(TaskState::DeviceSelected);
+    advance(TaskState::Allocated);
 }
 
 int Task::inputs_pending(Signal stage) const {
@@ -224,7 +411,13 @@ bool Task::input_done(const Task* producer) {
     if (producer != nullptr && producer->error_) {
         set_upstream_error(producer->error_);
     }
-    return pending_.fetch_sub(1, std::memory_order_acq_rel) == 1;
+    if (pending_.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+        return false;
+    }
+    if (configures_) {
+        add_job(Job::Run); // see take_job()
+    }
+    return true;
 }
 
 namespace {
@@ -514,13 +707,27 @@ TaskList Task::execute(ErrorTable* errors) {
     // output never see a buffer without memory.
     // Device selection: always the CPU in phase 1, a stage of its own all the
     // same (pipelining.md, S1: none skipped).
-    assert(state_.load(std::memory_order_relaxed) == TaskState::SizeCompleted);
-    state_.store(TaskState::DeviceSelected, std::memory_order_release);
-    copy_on_write();
-    allocate_outputs();
-    // As advance(Allocated), without its checks (seq_cst: see advance()).
-    state_.store(TaskState::Allocated, std::memory_order_seq_cst);
-    signal_consumers(Signal::Allocated);
+    if (configures_) {
+        // Its size and layout steps are due (every input completed); run
+        // them here if nobody did, or wait for the thread running them.
+        run_steps(2);
+        while ((steps_.load(std::memory_order_acquire) & 15) != 2) {
+            std::this_thread::yield();
+        }
+        if (!error_ && size_error_) {
+            error_ = size_error_;
+        }
+        copy_on_write();
+        allocate_outputs();
+    } else {
+        assert(state_.load(std::memory_order_relaxed) == TaskState::SizeCompleted);
+        state_.store(TaskState::DeviceSelected, std::memory_order_release);
+        copy_on_write();
+        allocate_outputs();
+        // As advance(Allocated), without its checks (seq_cst: see advance()).
+        state_.store(TaskState::Allocated, std::memory_order_seq_cst);
+        signal_consumers(Signal::Allocated);
+    }
     if (!error_) {
         const std::span<const Operand> inputs(operands_.data(), ninputs_);
         const std::span<Operand> outputs(operands_.data() + ninputs_, operands_.size() - ninputs_);
@@ -602,7 +809,7 @@ TaskList Task::execute(ErrorTable* errors) {
             list->signals.compare_exchange_strong(idle, 3 << 4 | 3, std::memory_order_acq_rel,
                                                   std::memory_order_acquire)
                 ? c->input_done(this)
-                : signal(*list, *c, Signal::Completed);
+                : signal(*list, c, Signal::Completed);
         if (ready) {
             runnable.push_back(std::move(c));
         }

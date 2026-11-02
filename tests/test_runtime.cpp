@@ -518,7 +518,7 @@ void test_consumer_registration_races() {
                 }
                 producers[p]->add_consumer(c, p);
             }
-            if (c->release_issue_guard()) {
+            if (c->release_issue_guard(c)) {
                 runnable.push_back(c);
             }
         }
@@ -589,7 +589,7 @@ void test_three_signals() {
         // + the issue guard; a size known at registration is counted with it
         const P expect = at <= 1 ? P{2, 2, 2} : P{2, 1, 1};
         check(pending(*c) == expect, "signals of passed stages come at registration");
-        const bool runnable = c->release_issue_guard();
+        const bool runnable = c->release_issue_guard(c);
         check(runnable == (at == 2), "runnable once the producer completed");
         const P after = at == 0 ? P{1, 1, 1} : at == 1 ? P{0, 1, 1} : P{0, 0, 0};
         check(pending(*c) == after, "the issue guard dropped");
@@ -1000,6 +1000,114 @@ void test_default_workers() {
           "default runtime has one worker per physical core but one");
 }
 
+// --- Ops that size their outputs in the task (pipelining.md, S2) ---
+
+// Element-wise sum of its 1-d inputs; sizes them by broadcasting in the task
+// and records the threads its size steps ran on.
+class DeferredAdd : public Kernel {
+  public:
+    explicit DeferredAdd(std::chrono::milliseconds delay = 0ms) : delay_(delay) {}
+    KernelResult size(std::span<const Layout* const> in, std::span<Layout> out) override {
+        {
+            std::lock_guard lock(mutex);
+            threads.insert(std::this_thread::get_id());
+        }
+        ++sized;
+        Shape s = in[0]->shape;
+        for (std::size_t k = 1; k < in.size(); ++k) {
+            Shape b;
+            if (!broadcast_shapes(s, in[k]->shape, b)) {
+                return KernelResult{1, "ValueError: operands could not be broadcast together", 0};
+            }
+            s = b;
+        }
+        out[0].shape = s;
+        return {};
+    }
+    KernelResult run(std::span<const Operand> in, std::span<const Operand> out) override {
+        std::this_thread::sleep_for(delay_);
+        const std::int64_t n = out[0].layout().size();
+        for (std::int64_t i = 0; i < n; ++i) {
+            double s = 0;
+            for (const Operand& op : in) {
+                s += at(op, op.layout().shape[0] == 1 ? 0 : i);
+            }
+            at(out[0], i) = s;
+        }
+        return {};
+    }
+    std::mutex mutex;
+    std::set<std::thread::id> threads;
+    std::atomic<int> sized{0};
+
+  private:
+    std::chrono::milliseconds delay_;
+};
+
+ArrayPtr issue_deferred1(Runtime& rt, const std::shared_ptr<Kernel>& k,
+                         std::initializer_list<ArrayPtr> in) {
+    std::vector<ArrayPtr> ins(in);
+    const DType dt = DType::Float64;
+    ArrayPtr r;
+    rt.issue_deferred(k, ins, std::span<const DType>(&dt, 1), "deferred",
+                      std::span<ArrayPtr>(&r, 1));
+    return r;
+}
+
+// Sizes run ahead of the elements: a chain of ops sized in their tasks knows
+// its last size long before the first element is computed, without the main
+// thread computing any size.
+void test_deferred_sizes_run_ahead() {
+    Runtime rt(opts(2));
+    auto k = std::make_shared<DeferredAdd>();
+    ArrayPtr x = issue1(rt, add_const(1.0, 300ms), {make_ready(rt, 5, 0.0)}, 5); // slow, sized
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 50; ++i) {
+        x = issue_deferred1(rt, k, {x});
+    }
+    check(Runtime::unsized(*x), "deferred: issued without a size");
+    const bool sized_ok = !rt.wait_stage(*x, TaskState::SizeCompleted);
+    const auto dt = std::chrono::steady_clock::now() - t0;
+    check(sized_ok && x->layout().shape == Shape{5}, "deferred: size known through 50 ops");
+    check(dt < 200ms, "deferred: sizes known before the first element (no wait for data)");
+    check(!x->producer()->completed(), "deferred: elements still pending when the size is known");
+    rt.wait_stage(*x, TaskState::Allocated);
+    check(x->layout().strides == Strides{8}, "deferred: layout set by the task");
+    check(value(rt, x, 4) == 1.0, "deferred: elements computed");
+    check(k->sized == 50, "deferred: each op sized once");
+    check(!k->threads.contains(std::this_thread::get_id()), "deferred: no size on the main thread");
+}
+
+// Ready inputs: the task sizes its outputs in a pool job (or when it runs),
+// never on the main thread; ops sized at issue may read deferred outputs.
+void test_deferred_ready_inputs() {
+    Runtime rt(opts(2));
+    auto k = std::make_shared<DeferredAdd>(20ms);
+    ArrayPtr a = make_ready(rt, 4, 2.0);
+    ArrayPtr b = make_ready(rt, 1, 3.0);
+    ArrayPtr c = issue_deferred1(rt, k, {a, b}); // (4) + (1) -> (4)
+    rt.wait_stage(*c, TaskState::SizeCompleted);
+    check(c->layout().shape == Shape{4}, "deferred, ready inputs: broadcast size");
+    ArrayPtr d = issue1(rt, add_const(1.0), {c}, 4); // waits for c's layout at issue
+    check(value(rt, d, 3) == 6.0 && value(rt, c, 0) == 5.0, "deferred, ready inputs: values");
+    check(!k->threads.contains(std::this_thread::get_id()),
+          "deferred, ready inputs: no size on the main thread");
+}
+
+// A size error fails the op and every op sized from it, with one record.
+void test_deferred_size_error() {
+    Runtime rt(opts(2));
+    auto k = std::make_shared<DeferredAdd>();
+    ArrayPtr slow = issue1(rt, add_const(1.0, 50ms), {make_ready(rt, 3, 0.0)}, 3);
+    ArrayPtr bad = issue_deferred1(rt, k, {slow, make_ready(rt, 4, 0.0)}); // (3) + (4)
+    ArrayPtr next = issue_deferred1(rt, k, {bad});
+    ErrorRef e1 = rt.wait_stage(*bad, TaskState::SizeCompleted);
+    ErrorRef e2 = rt.wait_stage(*next, TaskState::SizeCompleted);
+    check(e1 && e2 && e1.id() == e2.id(), "deferred: a size error passes to its consumers");
+    check(rt.wait(*next) && rt.wait(*bad), "deferred: a failed size fails the op");
+    check(rt.wait(*slow) == ErrorRef{}, "deferred: the input is unaffected");
+}
+
 int main() {
     test_default_workers();
     test_element_pool();
@@ -1023,6 +1131,9 @@ int main() {
     test_error_reports();
     test_consumer_registration_races();
     test_three_signals();
+    test_deferred_sizes_run_ahead();
+    test_deferred_ready_inputs();
+    test_deferred_size_error();
     test_active_limit();
     test_random_programs(3, false);
     test_random_programs(64, false);

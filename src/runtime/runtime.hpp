@@ -201,6 +201,22 @@ class Runtime {
                                 std::span<const ArrayPtr> inputs, std::span<const ArrayPtr> inouts,
                                 std::span<const Layout> new_outputs, const char* issue_site);
 
+    // Issues an op whose output sizes and layouts its task computes
+    // (pipelining.md, S2; Kernel::size, Kernel::layout): the outputs are
+    // created with their dtype only, no size, no memory. The task sizes them
+    // when every input reached SizeCompleted and lays them out when every
+    // input reached Allocated, on the thread delivering the last signal or
+    // in a pool job, never on the main thread. Inputs only (no in/outs).
+    void issue_deferred(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
+                        std::span<const DType> outputs, const char* issue_site,
+                        std::span<ArrayPtr> results);
+    // Metadata query: waits until `a`'s size (SizeCompleted) or layout
+    // (Allocated: strides, offset) is known. No wait for arrays sized at
+    // issue. Returns the error of an op that could not size it.
+    ErrorRef wait_stage(Array& a, TaskState s);
+    // True if `a`'s size or layout may still be unknown (cheap; main thread).
+    static bool unsized(const Array& a) { return static_cast<bool>(a.meta()->task()); }
+
     // Sync point: waits until `a` is ready. Returns the error of the task that
     // produced it, if any.
     ErrorRef wait(Array& a);
@@ -247,6 +263,10 @@ class Runtime {
   private:
     // Executes `task` on the current thread and returns its runnable consumers.
     TaskList run(const std::shared_ptr<Task>& task);
+    // The configuring tasks whose steps became due on this thread: run them
+    // (a worker) or queue them as step jobs (the main thread).
+    [[gnu::noinline]] void due_steps(bool here);
+    [[gnu::noinline]] TaskList step_job(Task& task);
     void enqueue(std::shared_ptr<Task> task);
     void trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t elements);
     // The direct path of issue(): see there.
@@ -262,6 +282,7 @@ class Runtime {
     // the old data (issued as its own task); views keep their layouts.
     void issue_group_copy(AliasGroup& g);
 
+    std::thread::id main_thread_ = std::this_thread::get_id(); // created there
     RuntimeOptions options_;
     std::shared_ptr<ErrorTable> errors_ = std::make_shared<ErrorTable>();
     OffloadPolicy policy_;     // main thread only

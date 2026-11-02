@@ -13,7 +13,7 @@ Status labels as in `memory-management.md`: **Decided**, **Implemented**,
 | # | Decision | Status |
 |---|----------|--------|
 | S1 | Six stages per array, each reached exactly once, in increasing order | Implemented for tasks (`TaskState`, stages 1-5; the direct path has no task) |
-| S2 | The main thread guarantees only `Created`; tasks advance the rest | Decided, not implemented (today: `SizeCompleted` at issue) |
+| S2 | The main thread guarantees only `Created`; tasks advance the rest | Runtime implemented (`Runtime::issue_deferred`, size and layout steps in the task); no bridge op uses it yet (today: `SizeCompleted` at issue) |
 | S3 | Tasks react to every stage of their inputs, not only `Completed` | Signals implemented (three per registration, `Task::add_consumer`); no task reacts to SizeCompleted/Allocated yet |
 | S4 | Pending size inputs make a task, whatever the size | Decided, not implemented (today: sync) |
 | S5 | An array in stage S gives access to the properties of stages 1..S; handlers run only on their stage signal (no locks) | Decided, not implemented |
@@ -124,11 +124,48 @@ runnable, and the thread that delivered it runs it as a continuation or
 hands it to the pool's queue (small ones stay local, large ones go to
 the pool, as before). Reactions to the size completed and allocated
 signals of all inputs are the place for S2/S4 (a task computing its own
-size, allocating early); nothing reacts to them yet. Debug builds assert
+size, allocating early); deferred tasks react to them (below). Debug builds assert
 that a task's states advance one at a time and that a task runs only after
 every input's three signals. Cost (callgrind, 1e4-element chains and
 fan-outs): main thread unchanged within noise, worker +46 to +50
 instructions per task (two CAS per consumer for allocated).
+
+**Deferred sizing (runtime, implemented).** `Runtime::issue_deferred`
+issues a task whose outputs the main thread creates without a size: dtype
+only, a buffer without size or memory (`CountableArray::unsized`), the
+metadata pointing to the task. The task then takes the stages itself
+(`Task::configures`):
+
+- **Size step:** when the last input's size completed signal arrives, the
+  task calls `Kernel::size` (output shapes from the input layouts), writes
+  the shapes and signals size completed. An error there (shapes that do not
+  broadcast) is recorded as the op's error (`size_error`, an
+  `ErrorRef` in the runtime's table) and inherited by every consumer, as a
+  run-time error: issue-time errors of deferred ops become asynchronous.
+  An input's size error is taken over without calling the kernel.
+- **Layout step:** when the last input's allocated signal arrives (and the
+  task's own size is set), `Kernel::layout` fixes the strides (the shapes
+  stay; the main thread may read them since size completed), the buffers
+  get their sizes, and the task signals device selected and allocated. The
+  physical block is still taken when the kernel runs (D11: the dying
+  input's block or the pool's).
+- **Run:** completed signals of all inputs, as before.
+
+Steps never nest: a signal that makes a step due only records the task on
+the delivering thread's worklist (`Task::step_due`); a worker runs the list
+after its task (`Runtime::due_steps`), the main thread hands it to the pool
+as step jobs (a task in the pool's queue with the `Job::Steps` bit; the
+same task may also sit there for its run, `Job::Run`, which takes
+precedence). The steps of one task are serialized by a combining word
+(`Task::run_steps`), and `execute` finishes any step not yet run before the
+kernel. Metadata queries of the main thread wait for the stage they need
+(`Runtime::wait_stage`: shape at size completed, strides at allocated);
+an op issued on an unsized input still waits for its allocated stage (the
+regular issue path needs the layout). A chain of 50 deferred ops is sized
+while its first producer still runs (`test_deferred_sizes_run_ahead`).
+Cost at O1 (callgrind, chains and fan-outs of 1e4 elements, 1 worker):
+main thread unchanged within noise, worker +25 to +44 instructions per
+task over the signals alone (one more check per run).
 
 **Today.** Every asynchronous op is a NumPy function taken as a whole: its
 result shape is computed on the main thread at issue, so every task reaches
