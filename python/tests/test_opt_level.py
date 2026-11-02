@@ -178,6 +178,52 @@ def test_o2_zero_d_results_are_scalars(level2):
     assert t2 is not t and float(t2) == float(np.sqrt(np.arange(5000.0).sum()) * 2.0 + 1.0)
 
 
+def _pending_int(value, dtype=np.int64):
+    """A 0-d integer viproc array that is still pending: value + 0 * (a
+    slow computation)."""
+    slow = np.sin(np.sin(viproc.asarray(np.ones(2_000_000))))
+    return (slow[:4] * 0).astype(dtype).sum() + value
+
+
+@pytest.mark.parametrize("call", [
+    lambda n, m: viproc.zeros((n, m)),
+    lambda n, m: viproc.zeros(n, dtype=np.int32),
+    lambda n, m: viproc.ones((m, n, 2), np.float32, "F"),
+    lambda n, m: viproc.empty((n,)) * 0.0,
+    lambda n, m: viproc.full((2, m), 2.5),
+    lambda n, m: viproc.full(n, 7, dtype=np.complex64),
+    lambda n, m: viproc.arange(n),
+])
+def test_o2_pending_sizes(level2, call):
+    """S4: a creator whose size is a pending array issues a task that sizes
+    its result when the size is computed; the main thread does not sync."""
+    n, m = _pending_int(5), _pending_int(3, np.int32)
+    assert not n.ready() and not m.ready()
+    before = _stats()
+    r = call(n, m)
+    w = r + r  # a deferred consumer of it
+    assert _stats() == before  # no sync, no size wait
+    want = call(5, 3)
+    got = np.asarray(r)
+    assert got.dtype == want.dtype and got.strides == want.strides
+    assert np.array_equal(got, want) and np.array_equal(np.asarray(w), want + want)
+
+
+def test_o2_pending_negative_size(level2):
+    n = _pending_int(-1)
+    with pytest.raises(viproc.AsyncValueError, match="negative dimensions are not allowed"):
+        z = viproc.zeros((n, 2))  # issued: the task finds the size negative
+        z.shape
+    assert np.arange(-1).size == 0 and viproc.arange(_pending_int(-1)).shape == (0,)
+
+
+def test_pending_sizes_sync_at_o1():
+    viproc.init()
+    n = _pending_int(4)
+    z = viproc.zeros(n)  # NumPy's zeros: operator.index syncs on n
+    assert z.shape == (4,) and viproc.offload_stats()["size_waits"] == 0
+
+
 @pytest.mark.parametrize("args, level", [
     ([], "1"), (["-O2"], "2"), (["-O", "3"], "3"), (["--opt=O5"], "5"), (["--opt", "2"], "2"),
 ])

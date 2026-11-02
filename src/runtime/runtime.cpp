@@ -736,6 +736,15 @@ ErrorRef Runtime::wait_stage(Array& a, TaskState s) {
     return e;
 }
 
+void Runtime::configure_now(Task& task) {
+    // Its steps before its kernel; steps they make due go to the pool now,
+    // not after the kernel (a consumer's layout would wait for this run).
+    task.finish_steps();
+    if (!Task::due_steps_empty()) {
+        due_steps(false);
+    }
+}
+
 TaskList Runtime::step_job(Task& task) {
     task.run_due_steps(); // a step job, no run: not counted as active
     due_steps(std::this_thread::get_id() != main_thread_);
@@ -799,6 +808,9 @@ void Runtime::wait_all() {
 TaskList Runtime::run(const std::shared_ptr<Task>& task) {
     // One named result and one return: NRVO, no move of the inline list.
     const bool steps = task->configures() && task->take_job() == Task::Job::Steps;
+    if (task->configures() && !steps) [[unlikely]] {
+        configure_now(*task);
+    }
     TaskList runnable = steps ? step_job(*task) : task->execute(errors_.get());
     if (!steps) [[likely]] {
         if (!Task::due_steps_empty()) [[unlikely]] { // its signals made steps due

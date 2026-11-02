@@ -719,6 +719,48 @@ int vp_ufunc_issue_deferred(vp_runtime* rt, const vp_loop* loop, vp_array* const
     return VP_OK;
 }
 
+int vp_create_deferred(vp_runtime* rt, int kind, int ndim, const int64_t* dims,
+                       vp_array* const* sizes, int nsizes, vp_dtype dtype, char order,
+                       const void* fill, vp_array** result, const char* site, char* err,
+                       size_t errlen) {
+    static const char* const names[] = {"numpy.zeros", "numpy.ones", "numpy.empty", "numpy.full",
+                                        "numpy.arange"};
+    if (kind < 0 || kind > 4 || ndim < 0 || nsizes < 1 || (order != 'C' && order != 'F')) {
+        set_error(err, errlen, "invalid creator");
+        return VP_INVALID;
+    }
+    rt->graveyard->drain();
+    const DType dt = to_dtype(dtype);
+    std::vector<std::int64_t> d(dims, dims + ndim);
+    int taken = 0;
+    for (const std::int64_t x : d) {
+        taken += x < 0 ? 1 : 0;
+    }
+    std::vector<ArrayPtr> ins;
+    for (int i = 0; i < nsizes; ++i) {
+        const DType sdt = arr(sizes[i]).meta()->sd().dtype;
+        if (sdt != DType::Int32 && sdt != DType::Int64) {
+            set_error(err, errlen, "size arrays must be int32 or int64");
+            return VP_UNSUPPORTED;
+        }
+        ins.push_back(ref(sizes[i]));
+    }
+    if (taken != nsizes || (kind == 4 && (ndim != 1 || dt != DType::Int64))) {
+        set_error(err, errlen, "invalid creator");
+        return VP_INVALID;
+    }
+    std::vector<std::byte> f(itemsize(dt));
+    if ((kind == 1 || kind == 3) && fill != nullptr) {
+        std::memcpy(f.data(), fill, f.size());
+    }
+    ArrayPtr res;
+    rt->rt->issue_deferred(
+        make_create_kernel(std::move(d), order, std::move(f), kind == 4, names[kind]), ins,
+        std::span(&dt, 1), site, std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
 int vp_ufunc_issue_masked(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
                           vp_array* mask, int out_ndim, const int64_t* out_shape, vp_array* out,
                           vp_array** result, const char* site, char* err, size_t errlen) {

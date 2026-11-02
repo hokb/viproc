@@ -97,7 +97,8 @@ to plain sequential NumPy execution.
   increasing order; the main thread guarantees only
   `created`, tasks advance the rest on their inputs' stage events. Today
   every task reaches `size_completed` at issue; pending size arguments
-  (`np.zeros(n)` with pending `n`) are to issue a task instead of syncing.
+  (`np.zeros(n)` with pending `n`) issue a task instead of syncing at O2
+  (S4, module functions `zeros`/`ones`/`empty`/`full`/`arange`).
 - The task holds references to its input arrays, its output arrays and the
   resolved NumPy loop.
 - Tasks, CountableArrays, Metadata objects and array blocks come from per-thread memory pools
@@ -301,8 +302,9 @@ the one below and compute correct but possibly deviating results: **O2**
 stage pipelining and BLAS threading removed (started: one BLAS thread,
 LAPACK calls no longer serialized; element-wise ufuncs without casts on
 pending or large inputs are issued unsized, `vp_ufunc_issue_deferred`, and
-size themselves in the task, pipelining.md S2; NumPy functions may still
-run as a whole), **O3** micro kernels (own, fused or split kernels, re-implemented
+size themselves in the task, pipelining.md S2; `zeros`/`ones`/`empty`/
+`full`/`arange` with pending size arrays are tasks, S4; NumPy functions
+may still run as a whole), **O3** micro kernels (own, fused or split kernels, re-implemented
 NumPy internals), **O4** automatic device offloading, **O5** reserved.
 The level is chosen per process: `viproc.init(level=n)`,
 `VIPROC_OPT=n` (or `On`), `python -m viproc -On prog.py`; `opt_level()`

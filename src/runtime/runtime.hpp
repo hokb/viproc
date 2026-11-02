@@ -279,6 +279,7 @@ class Runtime {
     // (a worker) or queue them as step jobs (the main thread).
     [[gnu::noinline]] void due_steps(bool here);
     [[gnu::noinline]] TaskList step_job(Task& task);
+    [[gnu::noinline]] void configure_now(Task& task);
     void enqueue(std::shared_ptr<Task> task);
     void trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t elements);
     // The direct path of issue(): see there.

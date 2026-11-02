@@ -15,7 +15,7 @@ Status labels as in `memory-management.md`: **Decided**, **Implemented**,
 | S1 | Six stages per array, each reached exactly once, in increasing order | Implemented for tasks (`TaskState`, stages 1-5; the direct path has no task) |
 | S2 | The main thread guarantees only `Created`; tasks advance the rest | Implemented for element-wise ufuncs at O2 (`Runtime::issue_deferred`, size and layout steps in the task); other ops and O1: `SizeCompleted` at issue |
 | S3 | Tasks react to every stage of their inputs, not only `Completed` | Signals implemented (three per registration, `Task::add_consumer`); no task reacts to SizeCompleted/Allocated yet |
-| S4 | Pending size inputs make a task, whatever the size | Decided, not implemented (today: sync) |
+| S4 | Pending size inputs make a task, whatever the size | Implemented at O2 for `zeros`, `ones`, `empty`, `full`, `arange(stop)` (module functions); O1 and other creators: sync |
 | S5 | An array in stage S gives access to the properties of stages 1..S; handlers run only on their stage signal (no locks) | Decided, not implemented |
 | S6 | `Disposed` is never observed; checked by sanitizer builds, debug assertions, counters and versions | Proposed |
 
@@ -204,7 +204,26 @@ A creator whose size argument is a pending viproc array (`np.zeros(n)`,
 the size will be. Its output is created empty (stage 1 only). The task waits
 for the size input's **completed** (the size is that input's *data*),
 computes the shape, advances its output to **size completed**, allocates and
-fills. Today such calls sync on the size argument.
+fills. At O1 such calls sync on the size argument.
+
+**Implemented at O2** for `viproc.zeros`, `ones`, `empty`, `full` (a
+scalar fill value; order C or F) and `arange(stop)`, with sizes that are
+pending 0-d int32/int64 viproc arrays (in a shape tuple next to ints):
+`vp_create_deferred` issues the task through `Runtime::issue_deferred`
+with a kernel that sizes from data (`Kernel::sizes_from_data`,
+`size_from_data`): its size step does not run on its inputs' size signals
+but in its run, once the sizes are computed; the three signals then
+follow each other. A negative extent fails the op with NumPy's ValueError
+(`AsyncValueError` at the next metadata query or sync point); `arange` of
+a negative stop is empty, as NumPy's. Consumers issued on the result are
+deferred too (element-wise ufuncs) or wait at their issue for its layout
+(the others). Ready sizes and NumPy's own `np.zeros` (which takes the size
+through `operator.index`) still sync.
+
+A running configuring task finishes its steps before its kernel and hands
+the steps they make due to the pool right away (`Runtime::configure_now`):
+otherwise a consumer's layout step would wait in the worker's list until
+the kernel is done (a view of `np.sin(x)` of 8e6 elements waited 244 ms).
 
 This is the first op with an output that is not size-completed at issue, so
 it needs S3 for every consumer: an op issued on such an array computes its

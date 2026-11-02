@@ -2650,6 +2650,56 @@ static PyObject* m_initialized(PyObject* self, PyObject* noargs) {
     return PyBool_FromLong(g_rt != NULL);
 }
 
+/* create_deferred(kind, dims, dtype_code, order, fill) -> array or None:
+ * vp_create_deferred (O2, S4). `dims`: a tuple of ints and 0-d int32/int64
+ * viproc arrays; `fill`: the fill value's element bytes or None. */
+static PyObject* m_create_deferred(PyObject* self, PyObject* args) {
+    (void)self;
+    int kind, code, order;
+    PyObject *dims, *fill;
+    if (!PyArg_ParseTuple(args, "iO!iCO", &kind, &PyTuple_Type, &dims, &code, &order, &fill) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    const Py_ssize_t nd = PyTuple_GET_SIZE(dims);
+    if (nd > MAXDIMS || code < 0 || code > 6 || (fill != Py_None && !PyBytes_Check(fill))) {
+        Py_RETURN_NONE;
+    }
+    int64_t d[MAXDIMS];
+    vp_array* sizes[MAXDIMS];
+    int nsizes = 0;
+    for (Py_ssize_t i = 0; i < nd; ++i) {
+        PyObject* x = PyTuple_GET_ITEM(dims, i);
+        if (is_array(x)) {
+            d[i] = -1;
+            sizes[nsizes++] = ((ArrayObject*)x)->a;
+        } else {
+            d[i] = PyLong_AsLongLong(x);
+            if (d[i] < 0) {
+                if (PyErr_Occurred()) {
+                    return NULL;
+                }
+                Py_RETURN_NONE; /* NumPy raises its error */
+            }
+        }
+    }
+    if (nsizes == 0) {
+        Py_RETURN_NONE;
+    }
+    vp_array* res = NULL;
+    char err[ERRLEN] = "";
+    const int st = vp_create_deferred(g_rt, kind, (int)nd, d, sizes, nsizes, (vp_dtype)code,
+                                      (char)order, fill != Py_None ? PyBytes_AS_STRING(fill) : NULL,
+                                      &res, issue_site(), err, sizeof err);
+    if (st == VP_UNSUPPORTED || st == VP_INVALID) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(st, err) < 0) {
+        return NULL;
+    }
+    return wrap_array(res);
+}
+
 static PyObject* m_opt_level(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
@@ -5155,6 +5205,7 @@ static PyMethodDef methods[] = {
     {"shutdown", m_shutdown, METH_NOARGS, "Wait for all tasks and destroy the runtime."},
     {"initialized", m_initialized, METH_NOARGS, NULL},
     {"opt_level", m_opt_level, METH_NOARGS, NULL},
+    {"create_deferred", m_create_deferred, METH_VARARGS, NULL},
     {"offload_counts", m_offload_counts, METH_NOARGS,
      "{'inline': n, 'offloaded': m}: ops run inline / handed to workers"},
     {"pool_stats", m_pool_stats, METH_NOARGS, "Element memory pool counters."},

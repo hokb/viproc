@@ -312,6 +312,19 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
 int vp_ufunc_issue_deferred(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
                             vp_array** result, const char* site, char* err, size_t errlen);
 
+/* Optimization level O2, pending sizes (docs/design/pipelining.md, S4):
+ * creates np.zeros / ones / empty / full (`kind` 0-3) of `ndim` extents
+ * `dims`, each >= 0 or -1 for the value of the next of `sizes` (0-d int32 or
+ * int64 arrays, typically pending), or np.arange(stop) (`kind` 4: ndim 1,
+ * dims {-1}, int64) as a task: the main thread does not wait for the sizes;
+ * the task sizes its result when they are computed (a negative extent fails
+ * it with NumPy's ValueError, asynchronously). `order` 'C' or 'F'. `fill`:
+ * the element bytes of the fill value (kinds 1 and 3). */
+int vp_create_deferred(vp_runtime* rt, int kind, int ndim, const int64_t* dims,
+                       vp_array* const* sizes, int nsizes, vp_dtype dtype, char order,
+                       const void* fill, vp_array** result, const char* site, char* err,
+                       size_t errlen);
+
 /* Issues a cast of `in` to `dtype` (NumPy's a.astype(dtype, order)) with
  * NumPy's cast functions. `order` 'K' gives the result NumPy's layout for
  * astype (PyArray_NewLikeArray: C or F if `in` is, else its axis order),

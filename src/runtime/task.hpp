@@ -249,6 +249,17 @@ class Kernel {
         (void)outputs;
         return KernelResult{1, "RuntimeError: the op cannot size its outputs", 0};
     }
+    // S4 (pipelining.md): the output sizes depend on the inputs' data
+    // (np.zeros(n) with a pending n). Such a task sizes its outputs when it
+    // runs, every input completed (size_from_data() instead of size()); its
+    // three signals follow each other.
+    virtual bool sizes_from_data() const { return false; }
+    virtual KernelResult size_from_data(std::span<const Operand> inputs,
+                                        std::span<Layout> outputs) {
+        (void)inputs;
+        (void)outputs;
+        return KernelResult{1, "RuntimeError: the op cannot size its outputs", 0};
+    }
     // The output strides (and offset), once every input reached Allocated
     // (their strides are known now); the shapes stay as size() set them.
     // Default: C order.
@@ -429,6 +440,9 @@ class Task {
     // and that nobody ran yet; a step another thread runs is left to it.
     // Any thread but the main thread.
     void run_due_steps();
+    // Runs the size and layout steps if nobody did, or waits for the thread
+    // running them (every input completed: both are due).
+    void finish_steps();
     // The pool's queue may hold a configuring task twice: as a step job and
     // to run. take_job() tells which entry this is (one bit per entry).
     enum class Job : std::uint8_t { Run = 1, Steps = 2 };

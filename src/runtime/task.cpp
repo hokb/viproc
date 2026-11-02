@@ -100,6 +100,9 @@ std::vector<std::shared_ptr<Task>> Task::take_due_steps() {
 }
 
 void Task::step_due(const std::shared_ptr<Task>& self) {
+    if (kernel_->sizes_from_data()) {
+        return; // its steps run in execute(), when the data is there (S4)
+    }
     t_due_steps.push_back(self);
     t_any_due = true;
 }
@@ -303,6 +306,13 @@ void Task::run_due_steps() {
     }
 }
 
+void Task::finish_steps() {
+    run_steps(2);
+    while ((steps_.load(std::memory_order_acquire) & 15) != 2) {
+        std::this_thread::yield();
+    }
+}
+
 void Task::run_steps(int upto) {
     // As signal(): whoever raises the request while no step runs runs the
     // steps, up to whatever is requested by the time it is done.
@@ -351,13 +361,19 @@ void Task::size_step() {
         l.dtype = operands_[o].layout().dtype;
         out.push_back(std::move(l));
     }
+    const bool from_data = kernel_->sizes_from_data(); // in execute(): error_ is this thread's
     if (size_upstream_claimed_.load(std::memory_order_acquire)) {
         size_error_ = size_upstream_; // an input could not be sized: neither can this op
+    } else if (from_data && error_) {
+        size_error_ = error_; // an input's data failed: no size from it
     } else {
         KernelResult r;
         try {
-            r = kernel_->size(std::span<const Layout* const>(in.data(), in.size()),
-                              std::span<Layout>(out.data(), out.size()));
+            r = from_data
+                    ? kernel_->size_from_data(std::span<const Operand>(operands_.data(), ninputs_),
+                                              std::span<Layout>(out.data(), out.size()))
+                    : kernel_->size(std::span<const Layout* const>(in.data(), in.size()),
+                                    std::span<Layout>(out.data(), out.size()));
         } catch (const std::exception& e) {
             r = KernelResult{1, e.what(), 0};
         }
@@ -722,10 +738,7 @@ TaskList Task::execute(ErrorTable* errors) {
     if (configures_) {
         // Its size and layout steps are due (every input completed); run
         // them here if nobody did, or wait for the thread running them.
-        run_steps(2);
-        while ((steps_.load(std::memory_order_acquire) & 15) != 2) {
-            std::this_thread::yield();
-        }
+        finish_steps(); // usually done: Runtime::run calls it first
         if (!error_ && size_error_) {
             error_ = size_error_;
         }
