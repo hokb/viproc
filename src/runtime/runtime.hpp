@@ -144,6 +144,12 @@ struct RuntimeOptions {
     // to the shared queue. A spinning (idle) worker takes local tasks over from busy ones. 0: all
     // go to the shared queue.
     std::int64_t local_below = 65536;
+    // Optimization level (docs/design/goals.md, "Optimization levels"): 1 (O1,
+    // default) keeps results bit-identical to NumPy; 2 (O2) allows stage
+    // pipelining and single-threaded BLAS calls, results correct but possibly
+    // deviating from NumPy's. 3-5 are accepted and act as 2 until they are
+    // implemented.
+    int opt_level = 1;
 };
 
 class Runtime {
@@ -228,6 +234,10 @@ class Runtime {
         policy_.set_workers(workers_.size());
     }
     std::size_t worker_count() const { return workers_.size(); }
+    // Main thread: the optimization level (RuntimeOptions::opt_level), set
+    // before the first op is issued.
+    int opt_level() const { return options_.opt_level; }
+    void set_opt_level(int level) { options_.opt_level = level; }
     // The one store of failed ops' errors (see ErrorTable). Any thread.
     ErrorTable& errors() { return *errors_; }
     // Main thread: NumPy's errstate for the ops issued from now on (the

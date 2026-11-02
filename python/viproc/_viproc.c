@@ -2463,7 +2463,9 @@ static PyObject* m_init(PyObject* self, PyObject* args) {
     Py_ssize_t workers = 0, max_active = 0;
     long long sync_below = -1; /* -1: runtime default */
     int adaptive = 1;
-    if (!PyArg_ParseTuple(args, "|nnLp", &workers, &max_active, &sync_below, &adaptive)) {
+    int level = 1;
+    if (!PyArg_ParseTuple(args, "|nnLpi", &workers, &max_active, &sync_below, &adaptive,
+                          &level)) {
         return NULL;
     }
     if (g_rt != NULL) {
@@ -2478,6 +2480,7 @@ static PyObject* m_init(PyObject* self, PyObject* args) {
         return NULL;
     }
     g_main_thread = PyThread_get_thread_ident();
+    vp_set_opt_level(g_rt, level);
     vp_set_error_notify(g_rt, error_recorded, NULL);
     g_small = sync_below >= 0 ? sync_below : 2048;
     if (sync_below >= 0 || !adaptive) {
@@ -2576,6 +2579,15 @@ static PyObject* m_initialized(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
     return PyBool_FromLong(g_rt != NULL);
+}
+
+static PyObject* m_opt_level(PyObject* self, PyObject* noargs) {
+    (void)self;
+    (void)noargs;
+    if (check_runtime() < 0) {
+        return NULL;
+    }
+    return PyLong_FromLong(vp_opt_level(g_rt));
 }
 
 static PyObject* m_workers(PyObject* self, PyObject* noargs) {
@@ -5070,9 +5082,10 @@ static PyMethodDef methods[] = {
     {"setup", m_setup, METH_VARARGS,
      "setup(cls, dtypes, fallback, asarray, internal_dirs, ops, ndarray, generic)"},
     {"init", m_init, METH_VARARGS,
-     "init(workers=0, max_active_tasks=0, sync_below=-1, adaptive=True)"},
+     "init(workers=0, max_active_tasks=0, sync_below=-1, adaptive=True, level=1)"},
     {"shutdown", m_shutdown, METH_NOARGS, "Wait for all tasks and destroy the runtime."},
     {"initialized", m_initialized, METH_NOARGS, NULL},
+    {"opt_level", m_opt_level, METH_NOARGS, NULL},
     {"offload_counts", m_offload_counts, METH_NOARGS,
      "{'inline': n, 'offloaded': m}: ops run inline / handed to workers"},
     {"pool_stats", m_pool_stats, METH_NOARGS, "Element memory pool counters."},

@@ -250,9 +250,7 @@ void Runtime::launch(const std::shared_ptr<Task>& task, const TaskList& producer
     }
     task->add_pending_inputs(producers.size());
     for (std::size_t i = 0; i < producers.size(); ++i) {
-        if (!producers[i]->add_consumer(task, i)) {
-            task->producer_already_done(*producers[i]); // cannot reach 0: issue guard held
-        }
+        producers[i]->add_consumer(task, i); // its passed stages signalled here
     }
     if (task->release_issue_guard()) {
         trigger_from_main(task, elements);

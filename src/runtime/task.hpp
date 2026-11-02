@@ -19,8 +19,10 @@
 namespace viproc {
 
 // Stages of a task, in order. The design (docs/design/pipelining.md, S1)
-// requires each stage to be reached exactly once, in increasing order. Today
-// a task still skips DeviceSelected, which nothing waits for yet.
+// requires each stage to be reached exactly once, in increasing order:
+// SizeCompleted at issue (phase 1), DeviceSelected (the CPU) and Allocated in
+// execute() right before the kernel, Completed after it. Only the direct
+// path (Runtime::issue_direct) has no task and no stages.
 enum class TaskState : std::uint8_t {
     Created,
     SizeCompleted,
@@ -35,6 +37,34 @@ class Task;
 // the common one or two (no heap allocation per task), else on the heap.
 using TaskList = InlineVector<std::shared_ptr<Task>, 2>;
 
+// The stage signals a consumer receives from each producer it registered
+// with (Task::add_consumer): exactly these three, each exactly once, in this
+// order, whatever the producer's state at registration
+// (docs/design/pipelining.md, S3). DeviceSelected is a state of its own (S1)
+// but not signalled while the CPU is the only device.
+enum class Signal : std::uint8_t {
+    None = 0,
+    SizeCompleted = 1,
+    Allocated = 2,
+    Completed = 3,
+};
+
+// The last signal a task in state `s` has given.
+constexpr Signal signal_of(TaskState s) {
+    switch (s) {
+    case TaskState::Created:
+        return Signal::None;
+    case TaskState::SizeCompleted:
+    case TaskState::DeviceSelected:
+        return Signal::SizeCompleted;
+    case TaskState::Allocated:
+        return Signal::Allocated;
+    case TaskState::Completed:
+        return Signal::Completed;
+    }
+    return Signal::None;
+}
+
 // A task's registration with one of its producers: an entry in the producer's
 // lock-free consumer list (Task::add_consumer). The node lives in the consumer
 // task (inline, one per producer it waits on) and holds a reference to it
@@ -43,6 +73,14 @@ using TaskList = InlineVector<std::shared_ptr<Task>, 2>;
 struct ConsumerNode {
     ConsumerNode* next = nullptr;
     std::shared_ptr<Task> task;
+    // The signals of this registration (Task::signal): high nibble the last
+    // one requested, low nibble the last one delivered. A thread that raises
+    // the request while the two are equal delivers (up to whatever is
+    // requested by then); a raise while they differ leaves its signals to the
+    // thread delivering. So each is delivered once, in order, by one thread
+    // at a time, without a lock: the producer advancing and the main thread
+    // registering may both find a signal due.
+    std::atomic<std::uint8_t> signals{0};
 };
 
 // The layout of one array or view (docs/design/array-data-model.md, A1, A2): its
@@ -367,16 +405,20 @@ class Task {
     // Announces `n` pending producers before registering on them, and makes
     // room for their consumer nodes (inline up to kInlineNodes).
     void add_pending_inputs(std::size_t n);
-    // Registers `consumer` for this task's completion, with the consumer's
-    // node `i` (one per producer, i < the n of add_pending_inputs). Returns
-    // false if this task has already completed; the caller then accounts for
-    // it itself. Lock-free; the main thread only.
-    bool add_consumer(const std::shared_ptr<Task>& consumer, std::size_t i);
+    // Registers `consumer` for this task's stage signals, with the consumer's
+    // node `i` (one per producer, i < the n of add_pending_inputs): it
+    // receives SizeCompleted, Allocated and Completed exactly once each, in
+    // this order. Signals of stages this task has passed already are
+    // delivered here, by the calling thread; the others by the thread that
+    // advances this task. Cannot make `consumer` runnable (its issue guard
+    // is held). Lock-free; the main thread only.
+    void add_consumer(const std::shared_ptr<Task>& consumer, std::size_t i);
     // Drops the issue guard (see pending_). Returns true if the task is
     // runnable now, i.e. all producers it waits on have completed.
-    bool release_issue_guard() { return input_done(nullptr); }
-    // Accounts for a producer that turned out to be completed already.
-    bool producer_already_done(const Task& producer) { return input_done(&producer); }
+    bool release_issue_guard();
+    // Producers whose `stage` signal has not arrived yet, plus the issue
+    // guard while it is held (tests; any thread, relaxed).
+    int inputs_pending(Signal stage) const;
     // Marks an input as failed (its producer completed with an error before
     // this task was issued). The task then skips its kernel and fails too.
     void add_upstream_error(const ErrorRef& error) { set_upstream_error(error); }
@@ -425,6 +467,17 @@ class Task {
     // Called once per producer when it completes (and once for the issue
     // guard with nullptr). Returns true when the last one arrives.
     bool input_done(const Task* producer);
+    // Raises the signals requested for node `n` of `consumer` to `upto` and
+    // delivers the due ones unless another thread is delivering (see
+    // ConsumerNode::signals). Returns true if a Completed signal delivered
+    // here made `consumer` runnable.
+    bool signal(ConsumerNode& n, Task& consumer, Signal upto) const;
+    // One signal of `producer` arriving (exactly once per producer and
+    // stage). Returns true if it made this task runnable.
+    bool receive(Signal s, const Task& producer);
+    // Delivers `s` to every registered consumer (SizeCompleted, Allocated;
+    // Completed closes the list in execute()). The task's state is `s`'s.
+    void signal_consumers(Signal s);
     // The first upstream error wins (any thread, before its pending_
     // decrement; execute() reads it after the last one).
     void set_upstream_error(const ErrorRef& error) {
@@ -440,6 +493,15 @@ class Task {
     // Number of producers still to complete, plus one guard held by the main
     // thread while it registers the task, so it cannot start early.
     std::atomic<int> pending_{1};
+    // The same for the SizeCompleted and Allocated signals. When the last one
+    // arrives, all inputs' sizes (memory) are known. Phase 1 knows every
+    // size at issue and allocates right before the kernel, so nothing reacts
+    // yet; tasks with sizes from their inputs (pipelining.md, S2-S4) will.
+    std::atomic<int> sized_pending_{1};
+    std::atomic<int> allocated_pending_{1};
+    // SizeCompleted signals add_consumer() delivered before publishing the
+    // node (main thread, while issuing): dropped with the issue guard.
+    int presized_ = 0;
 
     std::shared_ptr<Kernel> kernel_;
     Operands operands_; // inputs, then outputs

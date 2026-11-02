@@ -37,6 +37,7 @@ from ._ndarray import (
     init,
     ndarray,
     offload_stats,
+    opt_level,
     physical_cores,
     pool_stats,
     set_pool_limit,

@@ -87,9 +87,10 @@ to plain sequential NumPy execution.
 - A task passes through each state **exactly once, in increasing order**
   (`docs/design/pipelining.md`, S1): a stage with nothing to do is still
   reached and signalled; handlers may rely on it, and a skipped stage can
-  deadlock its waiters. Today's code still skips `DeviceSelected` (no
-  callbacks on it yet) and the direct path creates ready outputs without
-  a task.
+  deadlock its waiters. Every task reaches each state (`DeviceSelected`
+  in `Task::execute`, the CPU; `Task::advance` asserts the next state in
+  debug builds); only the direct path creates ready outputs without a
+  task.
 - Full stage pipelining (Accelerator; `docs/design/pipelining.md`, not
   implemented yet): six array stages (created, size completed, device
   selected, allocated, completed, disposed), each reached exactly once, in
@@ -172,7 +173,13 @@ reported with that issue site and the NumPy function it runs
   producer, inline up to 3), pushed by the main thread with a CAS and
   closed by the completing thread with one exchange (`kClosed`: a later
   push fails, and the main thread accounts for the producer itself); a
-  bit in the same word marks a waiter in `wait_completed`.
+  bit in the same word marks a waiter in `wait_completed`. **Every
+  registration yields exactly three signals** (`Signal`: size completed,
+  allocated, completed), once each, in order, whatever the producer's
+  state at registration: one signal word per node; the producer walking
+  its list and the registering thread combine on it with CAS (whoever
+  finds nothing being delivered delivers; pipelining.md, "Signals").
+  Only completed triggers anything yet.
 - **Sync points** (reading data, `print`, `float(x)`, handing memory back to
   plain NumPy) wait for `completed` of the array's producer. Querying only
   metadata (`x.shape`, `x.dtype`) waits for `size_completed` only. Because
@@ -285,14 +292,19 @@ dtypes, shapes, strides, warnings, errors), as the drop-in rule demands
 reordered sums, no fusion or splitting of an op that changes rounding. The
 small per-op overhead on small data that this costs is accepted; work it
 down, never at G2's expense. Bit-identity is the property of optimization
-level **O1**, the current implementation (array ILP only, NumPy executes
-every function). Planned levels (goals.md, "Optimization levels"), not
-started, each adding to the one below and computing correct but possibly
-deviating results: **O2** stage pipelining and BLAS threading removed,
-**O3** micro kernels (own, fused or split kernels, re-implemented NumPy
-internals), **O4** automatic device offloading. O1 stays available. Until
-a level is decided and built, every change is O1 and must stay
-bit-identical.
+level **O1**, the default (array ILP only, NumPy executes every
+function). Higher levels (goals.md, "Optimization levels") each add to
+the one below and compute correct but possibly deviating results: **O2**
+stage pipelining and BLAS threading removed (started: one BLAS thread,
+LAPACK calls no longer serialized; NumPy functions may still run as a
+whole), **O3** micro kernels (own, fused or split kernels, re-implemented
+NumPy internals), **O4** automatic device offloading, **O5** reserved.
+The level is chosen per process: `viproc.init(level=n)`,
+`VIPROC_OPT=n` (or `On`), `python -m viproc -On prog.py`; `opt_level()`
+reads it (stored in the runtime, `RuntimeOptions::opt_level`); 3-5 run as
+O2 until built. O1 stays available and the default. Every change at O1
+must stay bit-identical; optimizations that may deviate are gated on the
+level.
 
 ### Phase 1 (current): MVP on CPUs
 
@@ -417,6 +429,8 @@ python/viproc/         Python package
                        irfft, hfft, n-d transforms)
   _sort.py             np.sort/np.argsort/a.sort beyond the C path (axis=None
                        copies, kinds, NumPy's errors)
+  _blas.py             BLAS thread count (OpenBLAS via ctypes): one thread
+                       from optimization level O2 on, restored at shutdown
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -435,6 +449,7 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
                        best/median/worst per point, outlier list
   shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync/
                        expressions/loops/control; --groups selects groups)
+  opt_levels.py        BLAS-heavy programs at O1 and O2 vs. NumPy
   array_pipelining.py  ILNumerics' array-pipelining demo (loop over columns,
                        dependent loop, vectorized): NumPy, NumPy threads,
                        viproc at 1..cores workers

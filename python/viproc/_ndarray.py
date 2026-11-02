@@ -20,7 +20,7 @@ import weakref
 import numpy as np  # imports the real NumPy, not viproc
 from numpy.lib.array_utils import normalize_axis_index, normalize_axis_tuple
 
-from . import _viproc
+from . import _blas, _viproc
 
 AsyncError = _viproc.AsyncError
 AsyncIndexError = _viproc.AsyncIndexError
@@ -50,13 +50,38 @@ def _env_policy():
     return sync_below, adaptive
 
 
+# Optimization levels (docs/design/goals.md): O1 is bit-identical to NumPy,
+# O2 adds optimizations whose results are correct but may deviate. O3-O5 are
+# accepted and run as O2 until they are implemented.
+OPT_LEVELS = (1, 2, 3, 4, 5)
+
+
+def _check_level(level):
+    if isinstance(level, bool) or not isinstance(level, int) or level not in OPT_LEVELS:
+        raise ValueError(f"optimization level must be one of {OPT_LEVELS}, got {level!r}")
+    return level
+
+
+def _env_level():
+    env = os.environ.get("VIPROC_OPT", "").strip().upper().removeprefix("O")
+    try:
+        return _check_level(int(env)) if env else 1
+    except ValueError:
+        raise ValueError(f"VIPROC_OPT must be one of {OPT_LEVELS}, got {env!r}") from None
+
+
+def _start(workers, max_active_tasks, sync_below, adaptive, level):
+    _viproc.init(workers, max_active_tasks, sync_below, adaptive, level)
+    _blas.apply_level(level)
+    _small_ops[0] = 2048 if sync_below < 0 else sync_below
+    _scale_budget(adaptive)
+
+
 def _ensure_runtime():
     if not _viproc.initialized():
         workers = int(os.environ.get("VIPROC_WORKERS", "0"))
         sync_below, adaptive = _env_policy()
-        _viproc.init(workers, 0, sync_below, adaptive)
-        _small_ops[0] = 2048 if sync_below < 0 else sync_below
-        _scale_budget(adaptive)
+        _start(workers, 0, sync_below, adaptive, _env_level())
 
 
 # The direct-path budget (OffloadOptions::direct_budget_ns, chain_ns): what
@@ -1918,7 +1943,7 @@ def wait_all():
         _viproc.wait_all()
 
 
-def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
+def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None, level=None):
     """(Re)starts the runtime.
 
     workers: worker threads (0: one per physical core but one, the main
@@ -1929,16 +1954,27 @@ def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
         are usually needed right after issuing (default True; False, or env
         VIPROC_DETERMINISTIC=1, gives a deterministic schedule). Results are
         identical either way; only where ops run changes.
+    level: optimization level (docs/design/goals.md; default 1, env
+        VIPROC_OPT=2 or O2, python -m viproc -O2). 1: results bit-identical
+        to NumPy. 2: results correct but possibly deviating from NumPy's:
+        every BLAS call runs on one thread (process-wide while the runtime
+        runs; viproc's workers parallelize), LAPACK calls are no longer
+        serialized. 3-5: not implemented yet, run as 2.
     """
     env_sync, env_adaptive = _env_policy()
     sync_below = env_sync if sync_below is None else sync_below
+    level = _env_level() if level is None else _check_level(level)
     try:
         shutdown()  # raises an error of the old runtime nothing reported yet
     finally:
         adaptive = env_adaptive if adaptive is None else adaptive
-        _viproc.init(workers, max_active_tasks, sync_below, adaptive)
-        _small_ops[0] = 2048 if sync_below < 0 else sync_below
-        _scale_budget(adaptive)
+        _start(workers, max_active_tasks, sync_below, adaptive, level)
+
+
+def opt_level():
+    """The runtime's optimization level (see init())."""
+    _ensure_runtime()
+    return _viproc.opt_level()
 
 
 def offload_stats():
@@ -1977,7 +2013,10 @@ def shutdown():
     """Waits for all ops and stops the runtime. Raises the error of a failed op
     that was not reported yet (at exit Python prints it)."""
     if _viproc.initialized():
-        _viproc.shutdown()
+        try:
+            _viproc.shutdown()
+        finally:
+            _blas.apply_level(1)  # the BLAS thread count from before O2
 
 
 def workers():

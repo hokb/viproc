@@ -64,36 +64,160 @@ void Task::wait_completed() const {
 
 void Task::advance(TaskState next) {
     [[maybe_unused]] const TaskState prev = state_.load(std::memory_order_relaxed);
-    assert(next > prev && "task states only move forward");
-    state_.store(next, std::memory_order_release);
+    assert(static_cast<int>(next) == static_cast<int>(prev) + 1 &&
+           "task states move to the next one, none skipped (pipelining.md, S1)");
+    assert(next != TaskState::Completed && "execute() completes");
+    const Signal s = signal_of(next);
+    if (s == signal_of(prev)) { // DeviceSelected: no signal of its own
+        state_.store(next, std::memory_order_release);
+        return;
+    }
+    // seq_cst, with signal_consumers()'s load of the list: a registration
+    // either is in the list this thread walks or sees the new state in
+    // add_consumer() (it pushes, then loads the state, both seq_cst).
+    state_.store(next, std::memory_order_seq_cst);
+    signal_consumers(s);
+}
+
+void Task::signal_consumers(Signal s) {
+    const std::uintptr_t h = consumers_.load(std::memory_order_seq_cst);
+    if (closed(h)) {
+        return;
+    }
+    // Nodes stay in the list (and alive: each holds its consumer) until
+    // execute() closes it; pushes after this load see the new state.
+    for (auto* n = reinterpret_cast<ConsumerNode*>(h & ~kWaiter); n != nullptr; n = n->next) {
+        if (s == Signal::Allocated) {
+            // The common case: the size signal delivered, nobody delivering.
+            // Only this thread completes this task, so while it delivers,
+            // nobody requests more than Allocated: no raise to wait for.
+            std::uint8_t idle = 1 << 4 | 1;
+            if (n->signals.compare_exchange_strong(idle, 2 << 4 | 1, std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
+                n->task->allocated_pending_.fetch_sub(1, std::memory_order_acq_rel);
+                n->signals.store(2 << 4 | 2, std::memory_order_release);
+                continue;
+            }
+            if ((idle >> 4) >= 2) {
+                continue; // the registering thread delivers (or delivered) it
+            }
+        }
+        [[maybe_unused]] const bool runnable = signal(*n, *n->task, s);
+        assert(!runnable && "only Completed makes a consumer runnable");
+    }
 }
 
 void Task::add_pending_inputs(std::size_t n) {
     if (n > kInlineNodes) {
         more_nodes_ = std::make_unique<ConsumerNode[]>(n - kInlineNodes);
     }
-    pending_.fetch_add(static_cast<int>(n), std::memory_order_relaxed);
+    const int k = static_cast<int>(n);
+    pending_.fetch_add(k, std::memory_order_relaxed);
+    sized_pending_.fetch_add(k, std::memory_order_relaxed);
+    allocated_pending_.fetch_add(k, std::memory_order_relaxed);
 }
 
-bool Task::add_consumer(const std::shared_ptr<Task>& consumer, std::size_t i) {
-    // Acquire: on kClosed, the caller reads this task's error_ (written before
-    // the release exchange in execute()).
-    std::uintptr_t h = consumers_.load(std::memory_order_acquire);
-    if (closed(h)) {
-        return false;
-    }
+void Task::add_consumer(const std::shared_ptr<Task>& consumer, std::size_t i) {
     ConsumerNode& n = consumer->node(i);
-    n.task = consumer; // the list's reference, taken over by execute()
-    do {
-        if (closed(h)) {
-            n.task.reset();
-            return false;
+    // A size known already (phase 1: always) is signalled before the node is
+    // published, so no other thread can deliver it: one count for the issue
+    // guard to drop (presized_), no atomic per registration.
+    if (signal_of(state_.load(std::memory_order_acquire)) >= Signal::SizeCompleted) {
+        n.signals.store(1 << 4 | 1, std::memory_order_relaxed);
+        ++consumer->presized_;
+    }
+    std::uintptr_t h = consumers_.load(std::memory_order_acquire);
+    if (!closed(h)) {
+        n.task = consumer; // the list's reference, taken over by execute()
+        do {
+            if (closed(h)) {
+                n.task.reset();
+                break;
+            }
+            n.next = reinterpret_cast<ConsumerNode*>(h & ~kWaiter);
+        } while (!consumers_.compare_exchange_weak(
+            h, reinterpret_cast<std::uintptr_t>(&n) | (h & kWaiter), std::memory_order_seq_cst,
+            std::memory_order_acquire));
+    }
+    // The signals this task gave before it could see the node (all three if
+    // the list was closed: execute() stores Completed before it closes it).
+    // seq_cst: see advance(). Acquire: Completed makes error_ visible.
+    const Signal upto = signal_of(state_.load(std::memory_order_seq_cst));
+    if (static_cast<int>(upto) > (n.signals.load(std::memory_order_relaxed) >> 4)) {
+        [[maybe_unused]] const bool runnable = signal(n, *consumer, upto);
+        assert(!runnable && "the issue guard is held");
+    }
+}
+
+bool Task::signal(ConsumerNode& n, Task& consumer, Signal upto) const {
+    const int want = static_cast<int>(upto);
+    std::uint8_t w = n.signals.load(std::memory_order_acquire);
+    for (;;) {
+        if (want <= (w >> 4)) {
+            return false; // requested already: delivered or being delivered
         }
-        n.next = reinterpret_cast<ConsumerNode*>(h & ~kWaiter);
-    } while (
-        !consumers_.compare_exchange_weak(h, reinterpret_cast<std::uintptr_t>(&n) | (h & kWaiter),
-                                          std::memory_order_release, std::memory_order_acquire));
-    return true;
+        // acq_rel: the delivering thread sees what the requester saw (this
+        // task's error_ for Completed).
+        if (n.signals.compare_exchange_weak(w, static_cast<std::uint8_t>(want << 4 | (w & 15)),
+                                            std::memory_order_acq_rel, std::memory_order_acquire)) {
+            break;
+        }
+    }
+    const int done0 = w & 15;
+    if (done0 < (w >> 4)) {
+        return false; // another thread is delivering; it delivers ours too
+    }
+    bool runnable = false;
+    int done = done0, target = want;
+    for (;;) {
+        while (done < target) {
+            ++done;
+            runnable = consumer.receive(static_cast<Signal>(done), *this) || runnable;
+        }
+        std::uint8_t expected = static_cast<std::uint8_t>(target << 4 | done0);
+        if (n.signals.compare_exchange_strong(
+                expected, static_cast<std::uint8_t>(target << 4 | target),
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return runnable;
+        }
+        target = expected >> 4; // raised meanwhile: deliver those too
+    }
+}
+
+bool Task::receive(Signal s, const Task& producer) {
+    switch (s) {
+    case Signal::SizeCompleted:
+        sized_pending_.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
+    case Signal::Allocated:
+        allocated_pending_.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
+    case Signal::Completed:
+        return input_done(&producer);
+    case Signal::None:
+        break;
+    }
+    return false;
+}
+
+bool Task::release_issue_guard() {
+    sized_pending_.fetch_sub(1 + std::exchange(presized_, 0), std::memory_order_acq_rel);
+    allocated_pending_.fetch_sub(1, std::memory_order_acq_rel);
+    return input_done(nullptr);
+}
+
+int Task::inputs_pending(Signal stage) const {
+    switch (stage) {
+    case Signal::SizeCompleted:
+        return sized_pending_.load(std::memory_order_relaxed);
+    case Signal::Allocated:
+        return allocated_pending_.load(std::memory_order_relaxed);
+    case Signal::Completed:
+        return pending_.load(std::memory_order_relaxed);
+    case Signal::None:
+        break;
+    }
+    return 0;
 }
 
 bool Task::input_done(const Task* producer) {
@@ -375,15 +499,28 @@ TaskList Task::execute(ErrorTable* errors) {
     // No lock: every write of upstream_error_ happens before the release
     // decrement of pending_ by its writer, and this thread observed the final
     // decrement (or got the task from the thread that did).
+    // Every input signalled its size and memory before its completion
+    // (ConsumerNode::signals delivers in order). Equal to pending_, not 0:
+    // tests run tasks without releasing the issue guard.
+    assert(sized_pending_.load(std::memory_order_relaxed) ==
+               pending_.load(std::memory_order_relaxed) &&
+           allocated_pending_.load(std::memory_order_relaxed) ==
+               pending_.load(std::memory_order_relaxed));
     if (upstream_error_) {
         error_ = std::move(upstream_error_);
     }
     // Output memory as late as possible (design doc D11): here, right before
     // the kernel, on the thread that runs it. Also on errors: readers of an
     // output never see a buffer without memory.
+    // Device selection: always the CPU in phase 1, a stage of its own all the
+    // same (pipelining.md, S1: none skipped).
+    assert(state_.load(std::memory_order_relaxed) == TaskState::SizeCompleted);
+    state_.store(TaskState::DeviceSelected, std::memory_order_release);
     copy_on_write();
     allocate_outputs();
-    advance(TaskState::Allocated);
+    // As advance(Allocated), without its checks (seq_cst: see advance()).
+    state_.store(TaskState::Allocated, std::memory_order_seq_cst);
+    signal_consumers(Signal::Allocated);
     if (!error_) {
         const std::span<const Operand> inputs(operands_.data(), ninputs_);
         const std::span<Operand> outputs(operands_.data() + ninputs_, operands_.size() - ninputs_);
@@ -431,6 +568,7 @@ TaskList Task::execute(ErrorTable* errors) {
     operands_.clear();
     kernel_.reset();
 
+    assert(state_.load(std::memory_order_relaxed) == TaskState::Allocated);
     state_.store(TaskState::Completed, std::memory_order_release);
     // Close the list: registrations from now on fail and account for this
     // task themselves. Release: they see error_ and the state; acquire: we see
@@ -456,7 +594,16 @@ TaskList Task::execute(ErrorTable* errors) {
         // it, another producer may run the consumer (whose node this is).
         ConsumerNode* next = list->next;
         std::shared_ptr<Task> c = std::move(list->task);
-        if (c->input_done(this)) {
+        // The common case, all but Completed delivered and nobody delivering:
+        // mark it delivered first (no signal follows it, so no other thread
+        // can deliver anything after), then deliver.
+        std::uint8_t idle = 2 << 4 | 2;
+        const bool ready =
+            list->signals.compare_exchange_strong(idle, 3 << 4 | 3, std::memory_order_acq_rel,
+                                                  std::memory_order_acquire)
+                ? c->input_done(this)
+                : signal(*list, *c, Signal::Completed);
+        if (ready) {
             runnable.push_back(std::move(c));
         }
         list = next;

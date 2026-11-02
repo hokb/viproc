@@ -111,6 +111,13 @@ int vp_take_fp_events(vp_runtime* rt, PyObject** out);
  * execution while its results are usually waited on right after issuing.
  * adaptive == 0 gives a deterministic schedule. */
 void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive);
+/* [main thread] Optimization level (docs/design/goals.md): 1 (default)
+ * gives results bit-identical to NumPy; 2 allows optimizations whose results
+ * are correct but may deviate from NumPy's (stage pipelining,
+ * single-threaded BLAS calls); 3-5 act as 2 until implemented. Set it
+ * before issuing ops. */
+void vp_set_opt_level(vp_runtime* rt, int level);
+int vp_opt_level(const vp_runtime* rt);
 /* Number of ops the policy ran inline / handed to workers so far. */
 void vp_offload_counts(const vp_runtime* rt, uint64_t* inline_ops, uint64_t* offloaded_ops);
 /* Ops that ran directly on the main thread, without a task (small, all

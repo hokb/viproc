@@ -5,6 +5,7 @@
 #include "runtime/element_pool.hpp"
 #include "runtime/runtime.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -471,6 +472,7 @@ void test_consumer_registration_races() {
     constexpr int kConsumers = 6;
     std::mt19937 rng(7);
     bool exactly_once = true;
+    bool three_signals = true;
     bool errors_inherited = true;
     std::size_t registered = 0, late = 0;
     for (int round = 0; round < kRounds; ++round) {
@@ -480,10 +482,12 @@ void test_consumer_registration_races() {
         for (std::size_t p = 0; p < np; ++p) {
             producers.push_back(
                 std::make_shared<Task>(static_cast<int>(p) == failing ? fail : ok, "p"));
+            producers.back()->advance(TaskState::SizeCompleted); // as issue() does
         }
         std::vector<std::shared_ptr<Task>> consumers;
         for (int c = 0; c < kConsumers; ++c) {
             consumers.push_back(std::make_shared<Task>(ok, "c"));
+            consumers.back()->advance(TaskState::SizeCompleted);
         }
         std::atomic<bool> go{false};
         std::vector<std::vector<std::shared_ptr<Task>>> unblocked(np);
@@ -507,12 +511,12 @@ void test_consumer_registration_races() {
         for (auto& c : consumers) {
             c->add_pending_inputs(np);
             for (std::size_t p = 0; p < np; ++p) {
-                if (!producers[p]->add_consumer(c, p)) {
-                    c->producer_already_done(*producers[p]);
-                    ++late;
+                if (producers[p]->completed()) {
+                    ++late; // likely all three signals from add_consumer
                 } else {
                     ++registered;
                 }
+                producers[p]->add_consumer(c, p);
             }
             if (c->release_issue_guard()) {
                 runnable.push_back(c);
@@ -533,6 +537,12 @@ void test_consumer_registration_races() {
         }
         exactly_once = exactly_once && seen.size() == consumers.size();
         for (auto& c : consumers) {
+            // each producer's three signals arrived exactly once
+            three_signals = three_signals && c->inputs_pending(Signal::SizeCompleted) == 0 &&
+                            c->inputs_pending(Signal::Allocated) == 0 &&
+                            c->inputs_pending(Signal::Completed) == 0;
+        }
+        for (auto& c : consumers) {
             c->execute(errors.get());
             errors_inherited = errors_inherited &&
                                (static_cast<bool>(c->error()) == (failing < static_cast<int>(np)));
@@ -550,6 +560,51 @@ void test_consumer_registration_races() {
     check(exactly_once, "registration racing with completion: each consumer runs exactly once");
     check(errors_inherited,
           "registration racing with completion: failed producers' errors pass on");
+    check(three_signals, "registration racing with completion: exactly three signals per "
+                         "registration (size completed, allocated, completed)");
+}
+
+// The three signals of a registration (pipelining.md, S3) at each state the
+// producer may be in when the consumer registers: those it passed come from
+// add_consumer(), the others from the producer advancing.
+void test_three_signals() {
+    auto ok = std::make_shared<FnKernel>([](auto, auto) { return KernelResult{}; });
+    auto pending = [](const Task& t) {
+        return std::array<int, 3>{t.inputs_pending(Signal::SizeCompleted),
+                                  t.inputs_pending(Signal::Allocated),
+                                  t.inputs_pending(Signal::Completed)};
+    };
+    using P = std::array<int, 3>;
+    for (int at = 0; at < 3; ++at) { // registered while Created, SizeCompleted, Completed
+        auto p = std::make_shared<Task>(ok, "p");
+        auto c = std::make_shared<Task>(ok, "c");
+        if (at >= 1) {
+            p->advance(TaskState::SizeCompleted);
+        }
+        if (at >= 2) {
+            check(p->execute().empty(), "no consumers yet");
+        }
+        c->add_pending_inputs(1);
+        p->add_consumer(c, 0);
+        // + the issue guard; a size known at registration is counted with it
+        const P expect = at <= 1 ? P{2, 2, 2} : P{2, 1, 1};
+        check(pending(*c) == expect, "signals of passed stages come at registration");
+        const bool runnable = c->release_issue_guard();
+        check(runnable == (at == 2), "runnable once the producer completed");
+        const P after = at == 0 ? P{1, 1, 1} : at == 1 ? P{0, 1, 1} : P{0, 0, 0};
+        check(pending(*c) == after, "the issue guard dropped");
+        if (at == 0) {
+            p->advance(TaskState::SizeCompleted);
+            check(pending(*c) == P{0, 1, 1}, "size completed signalled on advance");
+        }
+        if (at <= 1) {
+            TaskList r = p->execute();
+            check(r.size() == 1 && r[0] == c, "completed makes the consumer runnable");
+        }
+        check(pending(*c) == P{0, 0, 0}, "exactly three signals");
+        c->advance(TaskState::SizeCompleted);
+        c->execute();
+    }
 }
 
 void test_active_limit() {
@@ -967,6 +1022,7 @@ int main() {
     test_error_propagation();
     test_error_reports();
     test_consumer_registration_races();
+    test_three_signals();
     test_active_limit();
     test_random_programs(3, false);
     test_random_programs(64, false);

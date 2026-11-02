@@ -12,9 +12,9 @@ Status labels as in `memory-management.md`: **Decided**, **Implemented**,
 
 | # | Decision | Status |
 |---|----------|--------|
-| S1 | Six stages per array, each reached exactly once, in increasing order | Decided; stages 1, 2, 4, 5 exist (`TaskState`) |
+| S1 | Six stages per array, each reached exactly once, in increasing order | Implemented for tasks (`TaskState`, stages 1-5; the direct path has no task) |
 | S2 | The main thread guarantees only `Created`; tasks advance the rest | Decided, not implemented (today: `SizeCompleted` at issue) |
-| S3 | Tasks react to every stage of their inputs, not only `Completed` | Decided, not implemented |
+| S3 | Tasks react to every stage of their inputs, not only `Completed` | Signals implemented (three per registration, `Task::add_consumer`); no task reacts to SizeCompleted/Allocated yet |
 | S4 | Pending size inputs make a task, whatever the size | Decided, not implemented (today: sync) |
 | S5 | An array in stage S gives access to the properties of stages 1..S; handlers run only on their stage signal (no locks) | Decided, not implemented |
 | S6 | `Disposed` is never observed; checked by sanitizer builds, debug assertions, counters and versions | Proposed |
@@ -48,8 +48,13 @@ that is skipped (or a handler run twice) can deadlock.
 `TaskState` (`src/runtime/task.hpp`) has `Created`, `SizeCompleted`,
 `DeviceSelected`, `Allocated` and `Completed`; `Disposed` is implicit today
 (reference counting releases the buffer, D2/D11 in `memory-management.md`).
-Today a task may skip states (`DeviceSelected` is unused, the direct path
-sets none); the scheme requires every stage to be reached.
+Every task reaches each of them in order: `SizeCompleted` at issue,
+`DeviceSelected` (the CPU) and `Allocated` in `Task::execute` right before
+the kernel, `Completed` after it; `Task::advance` asserts in debug builds
+that a state is the next one. The direct path has no task and sets none.
+Stage pipelining belongs to optimization level O2 (`goals.md`) where it
+can change results (partial results starting their consumers); stages
+that change nothing (S1, S4) hold at every level.
 
 ## S2, S3: who advances the stages
 
@@ -86,12 +91,51 @@ What it buys:
   (future devices, copies between them) happen when sizes are known, in the
   task, hidden behind other work.
 
+**Signals (implemented).** A consumer registered with a producer
+(`Task::add_consumer`) receives **exactly three signals** from it, each
+exactly once and in this order: **size completed**, **allocated**,
+**completed** (`Signal`). Device selected is a state of its own (S1) but
+not signalled while the CPU is the only device. The protocol is the same
+whatever the producer's state at registration, so the hybrid model below
+needs no special case:
+
+- Ops that know their size early (today: every op, at issue) signal size
+  completed long before their elements exist; allocated follows right
+  before the kernel, completed after it.
+- Ops that only know their size when they run (a NumPy function taken as a
+  whole, a data-dependent result; O2, not implemented yet) give all three
+  in quick succession on the thread that ran them.
+
+Each registration is a node in the producer's consumer list with one
+signal word (`ConsumerNode::signals`: the last signal requested, the last
+delivered). Two threads can find a signal due: the producer advancing
+(it stores its state, then walks the list, both seq_cst) and the main
+thread registering (it pushes the node, then loads the producer's state,
+both seq_cst), so at least one of them sees the other. Whoever raises the
+request while nothing is being delivered delivers, up to whatever is
+requested by the time it is done; the other one only raises the request.
+No lock, no signal lost, none twice, none out of order. Stages the
+producer passed before the node was published are delivered by the
+registering thread; a size known at registration is delivered before the
+node is published (no atomic: counted with the issue guard). The consumer
+counts outstanding signals per stage (`sized_pending_`,
+`allocated_pending_`, `pending_`); the last completed signal makes it
+runnable, and the thread that delivered it runs it as a continuation or
+hands it to the pool's queue (small ones stay local, large ones go to
+the pool, as before). Reactions to the size completed and allocated
+signals of all inputs are the place for S2/S4 (a task computing its own
+size, allocating early); nothing reacts to them yet. Debug builds assert
+that a task's states advance one at a time and that a task runs only after
+every input's three signals. Cost (callgrind, 1e4-element chains and
+fan-outs): main thread unchanged within noise, worker +46 to +50
+instructions per task (two CAS per consumer for allocated).
+
 **Today.** Every asynchronous op is a NumPy function taken as a whole: its
 result shape is computed on the main thread at issue, so every task reaches
-`SizeCompleted` at issue (`runtime.cpp`, `issue`), and consumers only
-register for `Completed`. Ops whose result size depends on data
-(`nonzero`, boolean indexing, `unique`) fall back to eager NumPy after a
-sync.
+`SizeCompleted` at issue (`runtime.cpp`, `issue`); consumers receive the
+three signals, but only completed triggers anything. Ops whose result size
+depends on data (`nonzero`, boolean indexing, `unique`) fall back to eager
+NumPy after a sync.
 
 ## S4: pending size inputs
 

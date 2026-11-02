@@ -343,6 +343,9 @@ void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive) {
     rt->rt->set_offload_options(o);
 }
 
+void vp_set_opt_level(vp_runtime* rt, int level) { rt->rt->set_opt_level(level); }
+int vp_opt_level(const vp_runtime* rt) { return rt->rt->opt_level(); }
+
 uint64_t vp_direct_count(const vp_runtime* rt) { return rt->rt->direct_count(); }
 
 uint64_t vp_task_count(const vp_runtime* rt) { return rt->rt->task_count(); }
