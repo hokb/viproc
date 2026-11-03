@@ -206,12 +206,13 @@ def test_o2_reductions_in_tasks(level2, order):
 
 
 def test_o2_reduction_errors_and_casts(level2):
-    e = _pending(np.zeros((0, 3)))
-    assert np.array_equal(np.asarray(e.sum(axis=0)), np.zeros(3))
-    assert np.asarray(e.max(axis=1)).shape == (0,)
+    def e():  # pending each time: a ready empty array would take NumPy's own call
+        return _pending(np.zeros((0, 3)))
+    assert np.array_equal(np.asarray(e().sum(axis=0)), np.zeros(3))
+    assert np.asarray(e().max(axis=1)).shape == (0,)
     with pytest.raises(viproc.AsyncValueError,
                        match="zero-size array to reduction operation maximum which has no identity"):
-        np.asarray(e.max(axis=0))
+        np.asarray(e().max(axis=0))
     i = _pending(np.arange(5000, dtype=np.int32))
     s = i.sum(axis=0)  # NumPy accumulates in int64: the regular path
     assert s.dtype == np.arange(3, dtype=np.int32).sum().dtype and int(s) == 4999 * 5000 // 2
@@ -299,6 +300,40 @@ def test_o2_mask_mismatch(level2):
                        "along axis 0; size of axis is 30 but size of corresponding boolean axis is 20"):
         r = x[_pending(np.ones(20)) > 0]
         r.shape
+
+
+@pytest.mark.parametrize("order", ["C", "F"])
+def test_o2_views_of_deferred_arrays(level2, order):
+    """O2: basic indexing and transposes of arrays whose task still sizes
+    them are views by a rule (pipelining.md, "Views at O2"): their shapes and
+    strides follow when the base's are known, without a wait."""
+    rng = np.random.default_rng(8)
+    a = rng.random((300, 200))
+    a = np.asfortranarray(a) if order == "F" else a
+    keys = [lambda t: t[:, 3], lambda t: t[1:-1:2, ::-3], lambda t: t[None, ..., 5],
+            lambda t: t.T, lambda t: t.T[2:5], lambda t: t[-1], lambda t: t[..., None, 1:4][3],
+            lambda t: np.transpose(t, (1, 0))[::2], lambda t: t[500:], lambda t: t[2][::-1]]
+    slow = _slow()[:1] * 0
+    before = _stats()
+    got = [np.cos(f(np.sin(viproc.asarray(a) + slow))).sum(axis=0) for f in keys]
+    views = [f(np.sin(viproc.asarray(a) + slow)) for f in keys]
+    assert _stats() == before  # neither a sync nor a size wait
+    w = np.sin(a + np.zeros(1))
+    for g, v, f in zip(got, views, keys):
+        want, r, rv = np.cos(f(w)).sum(axis=0), np.asarray(g), np.asarray(v)
+        assert r.shape == want.shape and np.array_equal(r, want)
+        assert rv.shape == f(w).shape and rv.strides == f(w).strides
+        assert np.array_equal(rv, f(w))
+
+
+def test_o2_view_index_error_is_asynchronous(level2):
+    x = _pending(np.ones((300, 4)))
+    with pytest.raises(viproc.AsyncIndexError,
+                       match="index 400 is out of bounds for axis 0 with size 300") as e:
+        r = x[400] + 1.0  # issued: the shape is not known yet
+        np.asarray(r)
+    assert isinstance(e.value, IndexError) and "in indexing" in str(e.value)
+    viproc.wait_all()  # raised once
 
 
 def test_pending_sizes_sync_at_o1():

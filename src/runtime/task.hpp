@@ -99,6 +99,7 @@ struct ConsumerNode {
 // The SD never changes once complete. Phase 1 knows every SD at issue: the
 // main thread fills it and `task` stays null.
 class MetadataPtr;
+class ViewRule;
 
 class Metadata {
   public:
@@ -121,6 +122,11 @@ class Metadata {
     // is launched, never changed; -1 for SDs complete at issue.
     int rank() const { return rank_; }
     void set_rank(int r) const { rank_ = r; }
+    // O2: the rule a view's SD follows from its base's, while the base's
+    // task still completes it (ViewRule); null otherwise. Set once by the
+    // main thread before the view is used.
+    const ViewRule* rule() const { return rule_.get(); }
+    void set_rule(std::shared_ptr<const ViewRule> r) const { rule_ = std::move(r); }
 
   private:
     friend class MetadataPtr;
@@ -137,6 +143,7 @@ class Metadata {
     // (docs/design/array-data-model.md, "Cycles"). Workers never read it.
     mutable std::shared_ptr<Task> task_;
     mutable int rank_ = -1;
+    mutable std::shared_ptr<const ViewRule> rule_;
     mutable std::atomic<int> refs_{1}; // the creating reference
 };
 
@@ -403,6 +410,47 @@ class ErrorTable : public std::enable_shared_from_this<ErrorTable> {
     static constexpr std::size_t kMaxFpEvents = 1024;
     std::size_t orphans_ = 0;
     std::size_t dropped_ = 0;
+};
+
+// One dimension of a basic-indexing view: the base dimension kept, sliced
+// (start/stop/step as PySlice_Unpack gives them, adjusted to the extent
+// when the base's shape is known), indexed (dropped), or a new axis.
+struct ViewStep {
+    enum Kind : std::uint8_t { Keep, Slice, Index, NewAxis };
+    Kind kind = Keep;
+    std::int64_t start = 0, stop = 0, step = 1; // Slice; Index: start
+};
+
+// O2: a view (basic indexing, transpose) of an array whose SD a task still
+// completes. Its SD follows from the base's by NumPy's rules
+// (get_view_from_index, PyArray_Transpose); the first thread that needs it
+// computes it, once per stage: the shape when the base is size completed,
+// strides and offset when it is allocated (a consumer task's size and
+// layout steps, or the main thread after waiting for the base,
+// Runtime::wait_stage). An index out of bounds is the view's error, recorded
+// once (NumPy's IndexError, raised at the call in NumPy).
+class ViewRule {
+  public:
+    // `steps` for a basic key (one per view dimension or consumed base
+    // dimension), else `perm` (a transpose: view axis i is base axis perm[i]).
+    ViewRule(MetadataPtr base, std::vector<ViewStep> steps, std::vector<int> perm, const char* site,
+             std::uint64_t id)
+        : base_(std::move(base)), steps_(std::move(steps)), perm_(std::move(perm)), site_(site),
+          id_(id) {}
+    // Any thread, once the base reached the stage: fills `view`'s shape
+    // (layout false) or its whole SD (layout true; the shape first).
+    ErrorRef derive(const Metadata& view, bool layout, ErrorTable* errors) const;
+
+  private:
+    ErrorRef compute(const Metadata& view, bool layout, ErrorTable* errors) const;
+
+    MetadataPtr base_;
+    std::vector<ViewStep> steps_;
+    std::vector<int> perm_;
+    const char* site_;
+    std::uint64_t id_;
+    mutable std::once_flag once_[2];
+    mutable ErrorRef error_; // written in the first stage's call_once only
 };
 
 // After a kernel ran with FP flags `fe_flags` (FE_*): NumPy's reporting of

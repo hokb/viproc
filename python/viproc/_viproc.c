@@ -2252,7 +2252,7 @@ static PyObject* Array_subscript(PyObject* self, PyObject* key) {
         return NULL;
     }
     if (r != Py_None) {
-        if (vp_array_ndim(((ArrayObject*)r)->a) > 0) {
+        if (vp_array_rank(((ArrayObject*)r)->a) > 0) {
             return r;
         }
         Py_ssize_t n = PyTuple_Check(key) ? PyTuple_GET_SIZE(key) : 1;
@@ -2964,6 +2964,99 @@ static int basic_layout(vp_array* x, PyObject* key, int* out_nd, int64_t* nshape
     return 1;
 }
 
+/* A view of `a` (deferred: its task still sizes it) by the runtime's view
+ * rule (vp_array_view_deferred), read-only and WARN_ON_WRITE as make_view. */
+static PyObject* make_deferred_view(PyObject* a, int n, const int* kinds, const int64_t* starts,
+                                    const int64_t* stops, const int64_t* steps, const int* perm) {
+    PyObject* v = wrap_array(vp_array_view_deferred(g_rt, array_of(a), n, kinds, starts, stops,
+                                                    steps, perm, issue_site()));
+    if (v != NULL) {
+        ((ArrayObject*)v)->readonly = ((ArrayObject*)a)->readonly;
+        ((ArrayObject*)v)->warn_on_write = ((ArrayObject*)a)->warn_on_write;
+    }
+    return set_base(v, a);
+}
+
+/* O2: a[key] for a basic key of an array whose task still sizes it (S2):
+ * the key as steps of a view rule, checked against the shape when it is
+ * known (pipelining.md, "Views at O2"): no wait for the shape. 0 for keys
+ * this does not cover (not basic, more indices than dimensions, a 0-d
+ * result: NumPy's scalar), which the caller leaves to the waiting path;
+ * 1 with *out set (new reference or NULL). */
+static int deferred_basic_view(PyObject* a, PyObject* key, PyObject** out) {
+    vp_array* x = array_of(a);
+    const int nd = vp_array_rank(x);
+    PyObject* const* items = PyTuple_Check(key) ? &PyTuple_GET_ITEM(key, 0) : &key;
+    const Py_ssize_t n = PyTuple_Check(key) ? PyTuple_GET_SIZE(key) : 1;
+    int consumed = 0, ellipses = 0, newaxes = 0;
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject* k = items[i];
+        if (k == Py_Ellipsis) {
+            ++ellipses;
+        } else if (k == Py_None) {
+            ++newaxes;
+        } else if (PySlice_Check(k) || (PyLong_Check(k) && !PyBool_Check(k)) ||
+                   (g_np_integer != NULL && PyObject_TypeCheck(k, (PyTypeObject*)g_np_integer))) {
+            ++consumed;
+        } else {
+            return 0;
+        }
+    }
+    if (ellipses > 1 || consumed > nd || nd + newaxes > MAXDIMS) {
+        return 0;
+    }
+    int kinds[2 * MAXDIMS];
+    int64_t starts[2 * MAXDIMS], stops[2 * MAXDIMS], steps[2 * MAXDIMS];
+    int m = 0, rank = 0;
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject* k = items[i];
+        if (k == Py_None) {
+            kinds[m] = 3;
+            starts[m] = stops[m] = steps[m] = 0;
+            ++m;
+            ++rank;
+        } else if (k == Py_Ellipsis) {
+            for (int j = 0; j < nd - consumed; ++j, ++m, ++rank) {
+                kinds[m] = 0;
+                starts[m] = stops[m] = steps[m] = 0;
+            }
+        } else if (PySlice_Check(k)) {
+            Py_ssize_t start, stop, step;
+            if (PySlice_Unpack(k, &start, &stop, &step) < 0) {
+                PyErr_Clear();
+                return 0; /* NumPy's error, on the waiting path */
+            }
+            kinds[m] = 1;
+            starts[m] = start;
+            stops[m] = stop;
+            steps[m] = step;
+            ++m;
+            ++rank;
+        } else {
+            const Py_ssize_t v = PyNumber_AsSsize_t(k, NULL);
+            if (v == -1 && PyErr_Occurred()) {
+                PyErr_Clear();
+                return 0;
+            }
+            kinds[m] = 2;
+            starts[m] = v;
+            stops[m] = steps[m] = 0;
+            ++m;
+        }
+    }
+    if (ellipses == 0) { /* implicit trailing Ellipsis */
+        for (int j = consumed; j < nd; ++j, ++m, ++rank) {
+            kinds[m] = 0;
+            starts[m] = stops[m] = steps[m] = 0;
+        }
+    }
+    if (rank == 0) {
+        return 0;
+    }
+    *out = make_deferred_view(a, m, kinds, starts, stops, steps, NULL);
+    return 1;
+}
+
 /* a[key] for a basic key as a view (basic_layout), or None. */
 static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
     (void)self;
@@ -2972,6 +3065,12 @@ static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t 
     }
     PyObject *a = args[0], *key = args[1];
     vp_array* x = array_of(a);
+    if (g_opt >= 2 && !vp_array_sized(x)) {
+        PyObject* v;
+        if (deferred_basic_view(a, key, &v)) {
+            return v;
+        }
+    }
     int64_t nshape[MAXDIMS], nstrides[MAXDIMS], offset = 0;
     int newnd = 0;
     if (!basic_layout(x, key, &newnd, nshape, nstrides, &offset)) {
@@ -2989,6 +3088,34 @@ static PyObject* m_transpose(PyObject* self, PyObject* const* args, Py_ssize_t n
     }
     PyObject *a = args[0], *axes = args[1];
     vp_array* x = array_of(a);
+    if (g_opt >= 2 && !vp_array_sized(x)) { /* a deferred view: the rank is known */
+        const int nd = vp_array_rank(x);
+        int64_t p[MAXDIMS];
+        int perm[MAXDIMS], seen[MAXDIMS] = {0}, ok = 1;
+        if (axes == Py_None) {
+            for (int i = 0; i < nd; ++i) {
+                p[i] = nd - 1 - i;
+            }
+        } else {
+            const int n = read_dims(axes, p);
+            if (n < 0) {
+                PyErr_Clear();
+                Py_RETURN_NONE;
+            }
+            ok = n == nd;
+        }
+        for (int i = 0; ok && i < nd; ++i) {
+            if (p[i] < 0) {
+                p[i] += nd;
+            }
+            ok = p[i] >= 0 && p[i] < nd && !seen[p[i]]++;
+            perm[i] = (int)p[i];
+        }
+        if (!ok) {
+            Py_RETURN_NONE;
+        }
+        return make_deferred_view(a, nd, NULL, NULL, NULL, NULL, perm);
+    }
     const int nd = vp_array_ndim(x);
     const int64_t* shape = vp_array_shape(x);
     const int64_t* strides = vp_array_strides(x);
@@ -3363,7 +3490,7 @@ static PyObject* m_item(PyObject* self, PyObject* const* args, Py_ssize_t nargs)
     }
     PyObject *a = args[0], *key = args[1];
     vp_array* x = array_of(a);
-    const int nd = vp_array_ndim(x);
+    const int nd = vp_array_rank(x);
     const Py_ssize_t nk = PyTuple_Check(key) ? PyTuple_GET_SIZE(key) : 1;
     if (nk != nd || nd == 0 || !vp_array_ready(x)) {
         Py_RETURN_NONE;
@@ -4121,12 +4248,12 @@ static int red_async(const RedSpec* sp, PyObject* self, PyObject* const* v, PyOb
     int st = VP_UNSUPPORTED;
     if (g_opt >= 2 && !(vp_array_sized(a) && vp_array_ready(a) && array_size(a) <= g_small)) {
         /* O2: the task sizes, lays out and plans it (pipelining.md, S2) */
-        st = vp_reduce_deferred(g_rt, sp->ufunc, a, flags, keepdims, sp->identity, &r,
-                                issue_site(), err, sizeof err);
+        st = vp_reduce_deferred(g_rt, sp->ufunc, a, flags, keepdims, sp->identity, &r, issue_site(),
+                                err, sizeof err);
     }
     if (st == VP_UNSUPPORTED) {
-        st = vp_reduce(g_rt, sp->ufunc, a, flags, keepdims, Py_None, sp->identity, &r,
-                       issue_site(), err, sizeof err);
+        st = vp_reduce(g_rt, sp->ufunc, a, flags, keepdims, Py_None, sp->identity, &r, issue_site(),
+                       err, sizeof err);
     }
     if (st == VP_UNSUPPORTED) {
         return 0;

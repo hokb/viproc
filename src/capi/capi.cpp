@@ -435,6 +435,30 @@ vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, vp_dtype dtype, in
     return hand_out(rt->rt->view(ref(base), std::move(l)));
 }
 
+vp_array* vp_array_view_deferred(vp_runtime* rt, const vp_array* base, int n, const int* kinds,
+                                 const int64_t* starts, const int64_t* stops, const int64_t* steps,
+                                 const int* perm, const char* site) {
+    std::vector<ViewStep> vs;
+    std::vector<int> p;
+    int rank = 0;
+    if (kinds != nullptr) {
+        for (int i = 0; i < n; ++i) {
+            ViewStep s;
+            s.kind = static_cast<ViewStep::Kind>(kinds[i]);
+            s.start = starts[i];
+            s.stop = stops[i];
+            s.step = steps[i];
+            rank += s.kind == ViewStep::Index ? 0 : 1;
+            vs.push_back(s);
+        }
+    } else {
+        p.assign(perm, perm + n);
+        rank = n;
+    }
+    return hand_out(rt->rt->view_deferred(ref(base), rank, std::move(vs), std::move(p),
+                                          site)); // interned by the bridge (issue_site)
+}
+
 void vp_array_release(vp_array* a) { ArrayPtr::adopt(&arr(a)).reset(); }
 
 int vp_array_ndim(const vp_array* a) { return static_cast<int>(arr(a).layout().shape.size()); }

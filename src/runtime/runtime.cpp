@@ -195,6 +195,22 @@ ArrayPtr Runtime::view(const ArrayPtr& base, Layout&& layout) {
     return ArrayPtr(&a);
 }
 
+ArrayPtr Runtime::view_deferred(const ArrayPtr& base, int rank, std::vector<ViewStep> steps,
+                                std::vector<int> perm, const char* issue_site) {
+    assert(unsized(*base));
+    Layout l;
+    l.dtype = base->meta_->sd().dtype;
+    MetadataPtr meta = make_metadata(std::move(l));
+    meta->set_rank(rank);
+    ++views_;
+    meta->set_rule(std::make_shared<const ViewRule>(base->meta_, std::move(steps), std::move(perm),
+                                                    issue_site, ++seq_));
+    meta->set_task(base->meta_->task()); // waited for as the base is (Array::layout)
+    ArrayBlock* block = new_block(1);
+    Array& a = block->array.emplace(std::move(meta), base->group_, block);
+    return ArrayPtr(&a);
+}
+
 namespace {
 
 // RuntimeOptions::block_enter / block_leave around a blocking wait.
@@ -737,7 +753,11 @@ ErrorRef Runtime::wait_stage(Array& a, TaskState s) {
         }
     }
     ErrorRef e = t->size_error();
-    if (t->state() >= TaskState::Allocated && !e) {
+    const bool laid_out = t->state() >= TaskState::Allocated;
+    if (const ViewRule* r = a.meta_->rule(); r != nullptr && !e) [[unlikely]] {
+        e = r->derive(*a.meta_, laid_out, errors_.get()); // a view: from its base
+    }
+    if (laid_out && !e) {
         a.meta_->set_task(nullptr); // its SD is complete for good
     } // else no size: every metadata query raises the op's error again
     return e;
@@ -764,11 +784,14 @@ void Runtime::help_steps() {
 }
 
 void Runtime::configure_now(Task& task) {
-    // Its steps before its kernel; steps they make due go to the pool now,
-    // not after the kernel (a consumer's layout would wait for this run).
+    // Its steps before its kernel, and on a worker the steps they make due
+    // too: they are its consumers', which cannot run before this kernel
+    // anyway, and in the pool they waited for a free worker while a waiting
+    // main thread could not help (help_steps knows only the steps it
+    // queued). The main thread hands them to the pool and keeps issuing.
     task.finish_steps();
     if (!Task::due_steps_empty()) {
-        due_steps(false);
+        due_steps(std::this_thread::get_id() != main_thread_);
     }
 }
 

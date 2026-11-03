@@ -258,10 +258,15 @@ deferred too (element-wise ufuncs) or wait at their issue for its layout
 (the others). Ready sizes and NumPy's own `np.zeros` (which takes the size
 through `operator.index`) still sync.
 
-A running configuring task finishes its steps before its kernel and hands
-the steps they make due to the pool right away (`Runtime::configure_now`):
-otherwise a consumer's layout step would wait in the worker's list until
-the kernel is done (a view of `np.sin(x)` of 8e6 elements waited 244 ms).
+A running configuring task finishes its steps before its kernel, and on a
+worker also the steps they make due (`Runtime::configure_now`): otherwise a
+consumer's layout step would wait in the worker's list until the kernel is
+done (a view of `np.sin(x)` of 8e6 elements waited 244 ms). They are its
+consumers' steps, whose kernels cannot run before this one anyway. Handed
+to the pool instead, they waited for a free worker: with one worker (2
+cores) a main thread waiting for a consumer's layout (`astype` of
+`sin(sin(x))[:4] * 0`) slept through both kernels, since `help_steps` runs
+only the step jobs the main thread queued itself.
 
 **Data-dependent result sizes at O2.** The same mechanism serves ops whose
 result size is their input's *data*: `x[mask]` with a pending bool mask
@@ -275,8 +280,30 @@ themselves on it. At O1 they sync on the mask. n-d `nonzero` (NumPy's
 index arrays are column views of one array), `argwhere`, `unique` and
 boolean masks in tuples still sync.
 
-**Not yet:** casts (ufuncs with cast inputs, `astype`), matmul, gathers,
-views and the other regular-path ops
+**Views at O2.** Basic indexing (`x[i]`, `x[a:b:c]`, `None`, `...`) and
+transposes (`x.T`, `x.transpose(...)`, `np.transpose`) of an array its task
+still sizes are views by a rule (`vp_array_view_deferred`,
+`Runtime::view_deferred`, `ViewRule` in `task.hpp`): the bridge parses the
+key against the rank only (slices as `PySlice_Unpack` gives them, indices
+as given) and the runtime keeps the steps (keep, slice, index, new axis) or
+the permutation. The view's metadata has its rank, its dtype and the base's
+producer as its task; nothing else is known. Its shape follows from the
+base's shape, its strides and offset from the base's layout, each derived
+once (`std::call_once` per stage, the shape never written again after the
+first stage) by whoever needs it first: a task's size or layout step
+reading the view as an input, or a main-thread wait on it (`wait_stage`).
+A view of a view derives its base first. An index out of bounds is the
+view's own error (NumPy's IndexError message, recorded once with the
+view's issue site and op name `indexing`): its consumers inherit it,
+sync points raise it (`AsyncIndexError`). Keys that consume more axes
+than the rank, non-basic keys and keys giving a 0-d result (NumPy's
+scalar) take the regular path and wait for the base's layout. Index
+assignment into such an array still waits. Cost at O1 (callgrind, `a[1:3]`
+and `a[5]` of 100 elements): ~5 instructions per subscript, the level test
+(2,216 -> 2,227 per pair).
+
+**Not yet:** casts (ufuncs with cast inputs, `astype`), matmul, gathers
+and the other regular-path ops
 read their inputs' layouts at issue, so one issued on an array a task
 still sizes (S2/S4) waits at its issue for that array's layout (for an
 S4 array: until its size input is computed). Making them deferred

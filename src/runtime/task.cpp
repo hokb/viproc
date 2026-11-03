@@ -353,6 +353,12 @@ void Task::run_steps(int upto) {
 void Task::size_step() {
     InlineVector<const Layout*, 4> in;
     for (std::size_t i = 0; i < ninputs_; ++i) {
+        const Metadata& m = *operands_[i].meta;
+        if (const ViewRule* r = m.rule()) [[unlikely]] { // a view: its shape first
+            if (ErrorRef e = r->derive(m, false, errors_)) {
+                claim_size_error(e); // the view's IndexError, as an input's
+            }
+        }
         in.push_back(&operands_[i].layout());
     }
     InlineVector<Layout, 2> out;
@@ -397,6 +403,10 @@ void Task::size_step() {
 void Task::layout_step() {
     InlineVector<const Layout*, 4> in;
     for (std::size_t i = 0; i < ninputs_; ++i) {
+        const Metadata& m = *operands_[i].meta;
+        if (const ViewRule* r = m.rule()) [[unlikely]] {
+            (void)r->derive(m, true, errors_); // its error is the size step's
+        }
         in.push_back(&operands_[i].layout());
     }
     InlineVector<Layout, 2> out;
@@ -845,6 +855,134 @@ TaskList Task::execute(ErrorTable* errors) {
         list = next;
     }
     return runnable;
+}
+
+} // namespace viproc
+
+namespace viproc {
+
+namespace {
+
+// CPython's PySlice_AdjustIndices: the slice's length for an extent.
+std::int64_t adjust_slice(std::int64_t length, std::int64_t& start, std::int64_t& stop,
+                          std::int64_t step) {
+    if (start < 0) {
+        start += length;
+        if (start < 0) {
+            start = step < 0 ? -1 : 0;
+        }
+    } else if (start >= length) {
+        start = step < 0 ? length - 1 : length;
+    }
+    if (stop < 0) {
+        stop += length;
+        if (stop < 0) {
+            stop = step < 0 ? -1 : 0;
+        }
+    } else if (stop >= length) {
+        stop = step < 0 ? length - 1 : length;
+    }
+    if (step < 0) {
+        return stop < start ? (start - stop - 1) / (-step) + 1 : 0;
+    }
+    return start < stop ? (stop - start - 1) / step + 1 : 0;
+}
+
+} // namespace
+
+ErrorRef ViewRule::derive(const Metadata& view, bool layout, ErrorTable* errors) const {
+    std::call_once(once_[0], [&] { error_ = compute(view, false, errors); });
+    if (layout && !error_) {
+        std::call_once(once_[1], [&] { (void)compute(view, true, errors); });
+    }
+    return error_;
+}
+
+ErrorRef ViewRule::compute(const Metadata& view, bool layout, ErrorTable* errors) const {
+    if (const ViewRule* r = base_->rule()) { // a view of a view: the base first
+        if (ErrorRef e = r->derive(*base_, layout, errors)) {
+            return e;
+        }
+    }
+    const Layout& b = base_->sd();
+    Layout& v = view.sd_for_task();
+    if (!steps_.empty() || perm_.empty()) {
+        Shape shape;
+        Strides strides;
+        std::int64_t offset = b.offset;
+        std::size_t od = 0; // base dimension
+        for (const ViewStep& s : steps_) {
+            switch (s.kind) {
+            case ViewStep::NewAxis:
+                shape.push_back(1);
+                strides.push_back(0);
+                break;
+            case ViewStep::Keep:
+                shape.push_back(b.shape[od]);
+                strides.push_back(layout ? b.strides[od] : 0);
+                ++od;
+                break;
+            case ViewStep::Slice: {
+                std::int64_t start = s.start, stop = s.stop, step = s.step;
+                std::int64_t len = adjust_slice(b.shape[od], start, stop, step);
+                if (len <= 0) { // as NumPy: points to the start
+                    len = 0;
+                    step = 1;
+                    start = 0;
+                }
+                shape.push_back(len);
+                if (layout) {
+                    offset += b.strides[od] * start;
+                    strides.push_back(b.strides[od] * step);
+                } else {
+                    strides.push_back(0);
+                }
+                ++od;
+                break;
+            }
+            case ViewStep::Index: {
+                const std::int64_t n = b.shape[od];
+                if (s.start < -n || s.start >= n) {
+                    if (errors == nullptr) {
+                        return {};
+                    }
+                    return errors->record(TaskError{"IndexError: index " + std::to_string(s.start) +
+                                                        " is out of bounds for axis " +
+                                                        std::to_string(od) + " with size " +
+                                                        std::to_string(n),
+                                                    site_, "indexing", id_});
+                }
+                if (layout) {
+                    offset += b.strides[od] * (s.start < 0 ? s.start + n : s.start);
+                }
+                ++od;
+                break;
+            }
+            }
+        }
+        // The shape is published at the first stage: never written again
+        // (other threads read it from then on).
+        if (layout) {
+            v.strides = std::move(strides);
+            v.offset = offset;
+        } else {
+            v.shape = std::move(shape);
+        }
+    } else if (layout) {
+        Strides strides(perm_.size());
+        for (std::size_t i = 0; i < perm_.size(); ++i) {
+            strides[i] = b.strides[static_cast<std::size_t>(perm_[i])];
+        }
+        v.strides = std::move(strides);
+        v.offset = b.offset;
+    } else {
+        Shape shape(perm_.size());
+        for (std::size_t i = 0; i < perm_.size(); ++i) {
+            shape[i] = b.shape[static_cast<std::size_t>(perm_[i])];
+        }
+        v.shape = std::move(shape);
+    }
+    return {};
 }
 
 } // namespace viproc

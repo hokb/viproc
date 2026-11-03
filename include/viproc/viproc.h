@@ -180,6 +180,15 @@ vp_array* vp_array_reshape(vp_runtime* rt, const vp_array* a, int ndim, const in
  * to base's first element; strides are in bytes. Metadata only. */
 vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, vp_dtype dtype, int ndim,
                         const int64_t* shape, const int64_t* strides, int64_t offset);
+/* [GIL] O2: a view of `base` while its task still sizes it (vp_array_sized
+ * 0). Basic indexing: one step per view dimension or consumed base
+ * dimension, `kinds` 0 keep, 1 slice (start, stop, step as PySlice_Unpack
+ * gives them), 2 index (start; out of bounds: the view's asynchronous
+ * IndexError), 3 new axis. Transpose: `perm` (view axis i is base axis
+ * perm[i]); kinds NULL. Metadata only; its SD follows when base's is known. */
+vp_array* vp_array_view_deferred(vp_runtime* rt, const vp_array* base, int n, const int* kinds,
+                                 const int64_t* starts, const int64_t* stops, const int64_t* steps,
+                                 const int* perm, const char* site);
 /* [GIL] Releases the handle. Pending work continues. */
 void vp_array_release(vp_array* a);
 
