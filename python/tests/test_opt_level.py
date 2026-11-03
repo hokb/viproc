@@ -326,6 +326,34 @@ def test_o2_views_of_deferred_arrays(level2, order):
         assert np.array_equal(rv, f(w))
 
 
+def test_o2_reshape_of_deferred_1d(level2):
+    """O2: a 1-d array always reshapes into a view (_attempt_nocopy_reshape),
+    so one its task still sizes is reshaped by a rule, without a wait; a
+    size mismatch is the view's asynchronous ValueError."""
+    a = np.random.default_rng(9).random(240)
+    calls = [lambda t: t.reshape(12, 20), lambda t: t.reshape((4, -1, 3)),
+             lambda t: t[::-2].reshape(4, 30, order="F"), lambda t: np.reshape(t, (2, -1), order="A"),
+             lambda t: t[::3].reshape(-1), lambda t: t.reshape(240, 1, 1).T,
+             lambda t: t.reshape(6, 40)[1:3, ::4]]
+    slow = _slow()[:1] * 0
+    before = _stats()
+    got = [f(np.sin(viproc.asarray(a) + slow)) for f in calls]
+    assert _stats() == before  # neither a sync nor a size wait
+    w = np.sin(a + np.zeros(1))
+    for g, f in zip(got, calls):
+        r, want = np.asarray(g), f(w)
+        assert r.shape == want.shape and r.strides == want.strides and np.array_equal(r, want)
+    y = np.sin(viproc.asarray(a) + _slow()[:1] * 0)
+    v = y.reshape(12, 20)
+    v[0, 0] = 5.0  # a view: writes through to its base
+    assert v.base is y and float(y[0]) == 5.0
+    with pytest.raises(viproc.AsyncValueError,
+                       match=r"cannot reshape array of size 240 into shape \(4,20\)"):
+        r = np.sin(viproc.asarray(a) + _slow()[:1] * 0).reshape(4, 20) + 1.0
+        np.asarray(r)
+    viproc.wait_all()  # raised once
+
+
 def test_o2_view_index_error_is_asynchronous(level2):
     x = _pending(np.ones((300, 4)))
     with pytest.raises(viproc.AsyncIndexError,

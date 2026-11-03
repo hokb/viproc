@@ -295,7 +295,15 @@ reading the view as an input, or a main-thread wait on it (`wait_stage`).
 A view of a view derives its base first. An index out of bounds is the
 view's own error (NumPy's IndexError message, recorded once with the
 view's issue site and op name `indexing`): its consumers inherit it,
-sync points raise it (`AsyncIndexError`). Keys that consume more axes
+sync points raise it (`AsyncIndexError`). A **reshape of a 1-d** such
+array (`a.reshape`, `np.reshape`, any order) is a view by a rule too
+(`vp_array_reshape_deferred`): a 1-d array always reshapes without a copy
+(`_attempt_nocopy_reshape`), so the decision NumPy makes from the strides,
+view or copy, is known at issue; the unknown dimension and NumPy's size
+mismatch ValueError follow at the size step, the strides from
+`reshape_view` at the layout step. An n-d reshape still waits for the
+base's layout: whether it is a view (aliasing, `base`) depends on the
+strides, and a view cannot leave its alias group later. Keys that consume more axes
 than the rank, non-basic keys and keys giving a 0-d result (NumPy's
 scalar) take the regular path and wait for the base's layout. Index
 assignment into such an array still waits. Cost at O1 (callgrind, `a[1:3]`

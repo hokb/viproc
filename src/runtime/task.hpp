@@ -421,7 +421,7 @@ struct ViewStep {
     std::int64_t start = 0, stop = 0, step = 1; // Slice; Index: start
 };
 
-// O2: a view (basic indexing, transpose) of an array whose SD a task still
+// O2: a view (basic indexing, transpose, reshape of 1-d) of an array whose SD a task still
 // completes. Its SD follows from the base's by NumPy's rules
 // (get_view_from_index, PyArray_Transpose); the first thread that needs it
 // computes it, once per stage: the shape when the base is size completed,
@@ -437,6 +437,11 @@ class ViewRule {
              std::uint64_t id)
         : base_(std::move(base)), steps_(std::move(steps)), perm_(std::move(perm)), site_(site),
           id_(id) {}
+    // A reshape of a 1-d base into `dims` (one may be negative: NumPy's
+    // unknown dimension) in `order` 'C' or 'F': always a view of a 1-d
+    // array (_attempt_nocopy_reshape), a size mismatch the view's error.
+    ViewRule(MetadataPtr base, Shape dims, char order, const char* site, std::uint64_t id)
+        : base_(std::move(base)), dims_(std::move(dims)), order_(order), site_(site), id_(id) {}
     // Any thread, once the base reached the stage: fills `view`'s shape
     // (layout false) or its whole SD (layout true; the shape first).
     ErrorRef derive(const Metadata& view, bool layout, ErrorTable* errors) const;
@@ -447,6 +452,8 @@ class ViewRule {
     MetadataPtr base_;
     std::vector<ViewStep> steps_;
     std::vector<int> perm_;
+    Shape dims_;     // a reshape (order_ 'C' or 'F')
+    char order_ = 0; // 0: steps_ or perm_
     const char* site_;
     std::uint64_t id_;
     mutable std::once_flag once_[2];

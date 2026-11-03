@@ -3156,6 +3156,27 @@ static PyObject* m_transpose(PyObject* self, PyObject* const* args, Py_ssize_t n
  * size mismatches raise as in NumPy (_fix_unknown_dimension). */
 static PyObject* reshape_view(PyObject* a, int64_t* dims, int nd, int order) {
     vp_array* x = array_of(a);
+    if (g_opt >= 2 && !vp_array_sized(x) && vp_array_rank(x) == 1 &&
+        (order == 'C' || order == 'F' || order == 'A')) {
+        /* O2: a 1-d array always reshapes into a view; its task still sizes
+         * it, so the size check and the strides follow (pipelining.md,
+         * "Views at O2"). */
+        int unknown = 0;
+        for (int i = 0; i < nd; ++i) {
+            unknown += dims[i] < 0;
+        }
+        if (unknown > 1) {
+            PyErr_SetString(PyExc_ValueError, "can only specify one unknown dimension");
+            return NULL;
+        }
+        PyObject* v = wrap_array(
+            vp_array_reshape_deferred(g_rt, x, nd, dims, order == 'F' ? 'F' : 'C', issue_site()));
+        if (v != NULL) {
+            ((ArrayObject*)v)->readonly = ((ArrayObject*)a)->readonly;
+            ((ArrayObject*)v)->warn_on_write = ((ArrayObject*)a)->warn_on_write;
+        }
+        return set_base(v, a);
+    }
     int64_t size = 1;
     for (int i = 0; i < vp_array_ndim(x); ++i) {
         size *= vp_array_shape(x)[i];

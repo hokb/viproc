@@ -182,6 +182,9 @@ class Runtime {
     // now; metadata queries wait as for base. Main thread.
     ArrayPtr view_deferred(const ArrayPtr& base, int rank, std::vector<ViewStep> steps,
                            std::vector<int> perm, const char* issue_site);
+    // O2: `base` (1-d, sized by its task) reshaped into `dims` (order 'C' or
+    // 'F'): a view by a rule as view_deferred. Main thread.
+    ArrayPtr reshape_deferred(const ArrayPtr& base, Shape dims, char order, const char* issue_site);
 
     // Issues one array op and returns immediately.
     //  - `inputs` are read.

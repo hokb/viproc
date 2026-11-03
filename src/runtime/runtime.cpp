@@ -211,6 +211,22 @@ ArrayPtr Runtime::view_deferred(const ArrayPtr& base, int rank, std::vector<View
     return ArrayPtr(&a);
 }
 
+ArrayPtr Runtime::reshape_deferred(const ArrayPtr& base, Shape dims, char order,
+                                   const char* issue_site) {
+    assert(unsized(*base) && rank(*base) == 1);
+    Layout l;
+    l.dtype = base->meta_->sd().dtype;
+    MetadataPtr meta = make_metadata(std::move(l));
+    meta->set_rank(static_cast<int>(dims.size()));
+    ++views_;
+    meta->set_rule(
+        std::make_shared<const ViewRule>(base->meta_, std::move(dims), order, issue_site, ++seq_));
+    meta->set_task(base->meta_->task());
+    ArrayBlock* block = new_block(1);
+    Array& a = block->array.emplace(std::move(meta), base->group_, block);
+    return ArrayPtr(&a);
+}
+
 namespace {
 
 // RuntimeOptions::block_enter / block_leave around a blocking wait.

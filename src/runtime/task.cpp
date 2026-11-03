@@ -906,6 +906,59 @@ ErrorRef ViewRule::compute(const Metadata& view, bool layout, ErrorTable* errors
     }
     const Layout& b = base_->sd();
     Layout& v = view.sd_for_task();
+    if (order_ != 0) { // a reshape of a 1-d base (_fix_unknown_dimension)
+        Shape dims = dims_;
+        const std::int64_t size = b.shape[0];
+        std::int64_t known = 1;
+        std::size_t unknown = dims.size();
+        for (std::size_t i = 0; i < dims.size(); ++i) {
+            if (dims[i] < 0) {
+                unknown = i;
+            } else {
+                known *= dims[i];
+            }
+        }
+        if (unknown < dims.size()) {
+            if (known == 0 || size % known != 0) {
+                known = -1;
+            } else {
+                dims[unknown] = size / known;
+                known = size;
+            }
+        }
+        if (known != size) { // NumPy's message (convert_shape_to_string)
+            if (errors == nullptr) {
+                return {};
+            }
+            std::string text;
+            std::size_t i = 0;
+            while (i < dims_.size() && dims_[i] < 0) {
+                ++i; // leading unknown dimensions are not printed
+            }
+            if (i == dims_.size()) {
+                text = "()";
+            } else {
+                text = "(" + std::to_string(dims_[i++]);
+                for (; i < dims_.size(); ++i) {
+                    text += dims_[i] < 0 ? std::string(",newaxis") : "," + std::to_string(dims_[i]);
+                }
+                text += dims_.size() == 1 ? ",)" : ")";
+            }
+            return errors->record(TaskError{"ValueError: cannot reshape array of size " +
+                                                std::to_string(size) + " into shape " + text,
+                                            site_, "reshape", id_});
+        }
+        if (!layout) {
+            v.shape = std::move(dims);
+            return {};
+        }
+        Layout out;
+        [[maybe_unused]] const bool view_ok = reshape_view(b, v.shape, order_, out);
+        assert(view_ok); // a 1-d array always reshapes without a copy
+        v.strides = std::move(out.strides);
+        v.offset = out.offset;
+        return {};
+    }
     if (!steps_.empty() || perm_.empty()) {
         Shape shape;
         Strides strides;

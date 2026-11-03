@@ -189,6 +189,12 @@ vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, vp_dtype dtype, in
 vp_array* vp_array_view_deferred(vp_runtime* rt, const vp_array* base, int n, const int* kinds,
                                  const int64_t* starts, const int64_t* stops, const int64_t* steps,
                                  const int* perm, const char* site);
+/* [GIL] O2: `base` (1-d, vp_array_sized 0) reshaped into `dims` (at most
+ * one negative: NumPy's unknown dimension) in `order` 'C' or 'F': a view
+ * whose SD follows base's; a size mismatch is the view's asynchronous
+ * ValueError. */
+vp_array* vp_array_reshape_deferred(vp_runtime* rt, const vp_array* base, int ndim,
+                                    const int64_t* dims, char order, const char* site);
 /* [GIL] Releases the handle. Pending work continues. */
 void vp_array_release(vp_array* a);
 

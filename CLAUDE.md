@@ -308,7 +308,8 @@ size themselves in the task, pipelining.md S2; `zeros`/`ones`/`empty`/
 1-d `nonzero` of pending data are tasks sizing from the data, S4;
 reductions without casts sized, laid out and planned in their tasks,
 `vp_reduce_deferred`; ranks known at issue, `Runtime::rank`; basic
-indexing and transposes of such arrays as views by a rule, `ViewRule`; NumPy
+indexing, transposes and 1-d reshapes of such arrays as views by a rule,
+`ViewRule`; NumPy
 functions may still run as a whole), **O3** micro kernels (own, fused or split kernels, re-implemented
 NumPy internals), **O4** automatic device offloading, **O5** reserved.
 The level is chosen per process: `viproc.init(level=n)`,

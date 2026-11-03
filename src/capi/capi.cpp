@@ -459,6 +459,11 @@ vp_array* vp_array_view_deferred(vp_runtime* rt, const vp_array* base, int n, co
                                           site)); // interned by the bridge (issue_site)
 }
 
+vp_array* vp_array_reshape_deferred(vp_runtime* rt, const vp_array* base, int ndim,
+                                    const int64_t* dims, char order, const char* site) {
+    return hand_out(rt->rt->reshape_deferred(ref(base), Shape(dims, dims + ndim), order, site));
+}
+
 void vp_array_release(vp_array* a) { ArrayPtr::adopt(&arr(a)).reset(); }
 
 int vp_array_ndim(const vp_array* a) { return static_cast<int>(arr(a).layout().shape.size()); }
