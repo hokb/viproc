@@ -197,6 +197,37 @@ other ops take the regular path. Cost at O1 (callgrind, 1 worker): main
 thread +10 to +30 instructions per op (the layout check of every
 `Array::layout` call), direct path +12.
 
+**Ranks at issue.** Extents may be unknown at issue, the number of
+dimensions never is: element-wise results have the largest input rank,
+creators the shape's length, `x[mask]` `x.ndim - mask.ndim + 1`,
+`flatnonzero` 1, reductions the input's rank less the removed axes. The
+caller passes it to `issue_deferred` (stored in the Metadata, checked
+against the size step in debug builds); `Runtime::rank` / `vp_array_rank`
+read it without a wait, `x.ndim` no longer waits, and ops that need only
+the rank at issue (axis normalization) are issued without one. ILNumerics'
+Accelerator does the same split: `Segment.SetSize` computes "number and
+length of dimensions, but no strides, yet" when all input sizes are
+there, with one size rule per function category (`broadcasting_size`,
+`aggregating_size`).
+
+**Reductions at O2 (implemented).** `sum`, `prod`, `max`, `min`, `any`,
+`all` (methods and module functions with `axis`/`keepdims`, the C path)
+of pending or larger data go through `vp_reduce_deferred`: the axes are
+normalized against the rank at issue, the loop is resolved for the input
+dtype with unknown fixed strides (`UfuncLoop::kAnyStride`), and the shared
+kernel (`make_deferred_reduce_kernel`, cached per ufunc, dtype, rank, axes,
+keepdims and identity) sizes the result (the aggregation rule), lays it out
+C-contiguously (NumPy's fast-path result) and plans the loop calls when it
+runs (`plan_reduction` on the input's final layout). One reduced axis after
+coalescing gives NumPy's loop calls (identical results, tested for C, F and
+strided inputs); several that do not coalesce are visited one by one where
+NumPy's iterator would buffer (floating-point sums may round differently,
+O2). A reduced axis of extent 0 without an identity fails the size step
+with NumPy's ValueError (asynchronously). Reductions that cast (int32
+sums accumulate in int64), `dtype=`, `initial=`, `out=`, `where=` take the
+regular path. Cost at O1 (callgrind, `x.sum(axis=0)` of 100 elements):
+unchanged (8,060 vs. 7,820 instructions per call, noise).
+
 **Today.** Every asynchronous op is a NumPy function taken as a whole: its
 result shape is computed on the main thread at issue, so every task reaches
 `SizeCompleted` at issue (`runtime.cpp`, `issue`); consumers receive the
@@ -244,7 +275,8 @@ themselves on it. At O1 they sync on the mask. n-d `nonzero` (NumPy's
 index arrays are column views of one array), `argwhere`, `unique` and
 boolean masks in tuples still sync.
 
-**Not yet:** reductions, matmul, gathers and the other regular-path ops
+**Not yet:** casts (ufuncs with cast inputs, `astype`), matmul, gathers,
+views and the other regular-path ops
 read their inputs' layouts at issue, so one issued on an array a task
 still sizes (S2/S4) waits at its issue for that array's layout (for an
 S4 array: until its size input is computed). Making them deferred

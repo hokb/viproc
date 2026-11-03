@@ -178,6 +178,45 @@ def test_o2_zero_d_results_are_scalars(level2):
     assert t2 is not t and float(t2) == float(np.sqrt(np.arange(5000.0).sum()) * 2.0 + 1.0)
 
 
+@pytest.mark.parametrize("order", ["C", "F", "strided"])
+def test_o2_reductions_in_tasks(level2, order):
+    """O2: sum/prod/max/min/any/all of pending data are issued without the
+    input's size (its rank is known at issue); the task sizes, lays out and
+    plans them. Reduced axes that coalesce give NumPy's loop calls."""
+    rng = np.random.default_rng(6)
+    a = rng.standard_normal((300, 40))
+    a = {"C": a, "F": np.asfortranarray(a), "strided": a[::-1, ::2]}[order]
+    slow = np.sin(np.sin(viproc.asarray(np.ones(2_000_000))))[:1] * 0
+    x = np.sin(viproc.asarray(a) + slow)  # deferred, pending
+    w = np.sin(a + np.zeros(1))
+    before = _stats()
+    calls = [lambda t: t.sum(axis=0), lambda t: t.sum(axis=-1), lambda t: t.max(axis=0),
+             lambda t: np.min(t, axis=1, keepdims=True), lambda t: t.prod(axis=(0,)),
+             lambda t: (t > 0).any(axis=0), lambda t: (t > -5).all(axis=1)]
+    got = [f(x) for f in calls]
+    full = x.sum()
+    assert _stats() == before  # neither a sync nor a size wait
+    assert full._scalar and full.ndim == 0
+    for g, f in zip(got, calls):
+        want = f(w)
+        r = np.asarray(g)
+        assert r.dtype == want.dtype and r.shape == want.shape
+        assert np.array_equal(r, want)  # one reduced axis: NumPy's loop calls
+    np.testing.assert_allclose(float(full), w.sum(), rtol=1e-12)  # blocks may differ
+
+
+def test_o2_reduction_errors_and_casts(level2):
+    e = _pending(np.zeros((0, 3)))
+    assert np.array_equal(np.asarray(e.sum(axis=0)), np.zeros(3))
+    assert np.asarray(e.max(axis=1)).shape == (0,)
+    with pytest.raises(viproc.AsyncValueError,
+                       match="zero-size array to reduction operation maximum which has no identity"):
+        np.asarray(e.max(axis=0))
+    i = _pending(np.arange(5000, dtype=np.int32))
+    s = i.sum(axis=0)  # NumPy accumulates in int64: the regular path
+    assert s.dtype == np.arange(3, dtype=np.int32).sum().dtype and int(s) == 4999 * 5000 // 2
+
+
 def _slow():
     return np.sin(np.sin(viproc.asarray(np.ones(2_000_000))))
 

@@ -6,6 +6,7 @@
 #include "runtime/runtime.hpp"
 
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -42,6 +43,9 @@ class UfuncLoop {
     // with reduction=True), for the inner strides `fixed_strides` (acc, in,
     // acc), as NumPy's reduction passes them to get_strided_loop. Fails if
     // the reduction would cast (the accumulator dtype differs from `dtype`).
+    // A fixed stride not known when the loop is resolved (O2: the task lays
+    // its input out): NumPy's loop for any stride (fixed_strides None).
+    static constexpr std::intptr_t kAnyStride = INTPTR_MIN;
     static std::unique_ptr<UfuncLoop> resolve_reduction(PyObject* ufunc, DType dtype,
                                                         const std::array<std::intptr_t, 3>& fixed,
                                                         std::string& error);

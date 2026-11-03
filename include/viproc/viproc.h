@@ -433,6 +433,17 @@ int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char
 int vp_accumulate(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, vp_array** result,
                   const char* site, char* err, size_t errlen);
 
+/* O2 (pipelining.md, S2): vp_reduce() of an input whose size and strides
+ * its task learns. `axes` has one flag per dimension (vp_array_rank(in)).
+ * The task sizes the result, lays it out C-contiguously and plans the loop
+ * calls; reduced axes that do not coalesce are visited one by one (sums may
+ * round differently from NumPy's buffered blocks). VP_UNSUPPORTED where the
+ * reduction casts (int32 sums, ...) or the identity is not a Python bool,
+ * int or float: the regular path. */
+int vp_reduce_deferred(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
+                       int keepdims, PyObject* identity, vp_array** result, const char* site,
+                       char* err, size_t errlen);
+
 /* vp_reduce() into an existing array `out` (in place, *result set to NULL):
  * only where `out` has the dtype and layout of the result NumPy would
  * allocate (strides of extents > 1), so the reduction iterates exactly as

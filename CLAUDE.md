@@ -305,7 +305,9 @@ LAPACK calls no longer serialized; element-wise ufuncs without casts on
 pending or large inputs are issued unsized, `vp_ufunc_issue_deferred`, and
 size themselves in the task, pipelining.md S2; `zeros`/`ones`/`empty`/
 `full`/`arange` with pending size arrays and `x[mask]`, `flatnonzero`,
-1-d `nonzero` of pending data are tasks sizing from the data, S4; NumPy
+1-d `nonzero` of pending data are tasks sizing from the data, S4;
+reductions without casts sized, laid out and planned in their tasks,
+`vp_reduce_deferred`; ranks known at issue, `Runtime::rank`; NumPy
 functions may still run as a whole), **O3** micro kernels (own, fused or split kernels, re-implemented
 NumPy internals), **O4** automatic device offloading, **O5** reserved.
 The level is chosen per process: `viproc.init(level=n)`,

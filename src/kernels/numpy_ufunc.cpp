@@ -242,9 +242,13 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve_reduction(PyObject* ufunc, DType d
 
     PyObject* get = PyObject_GetAttrString(ufunc, "_get_strided_loop");
     PyObject* get_args = PyTuple_Pack(1, loop->capsule_);
-    PyObject* strides =
-        Py_BuildValue("(nnn)", static_cast<Py_ssize_t>(fixed[0]), static_cast<Py_ssize_t>(fixed[1]),
-                      static_cast<Py_ssize_t>(fixed[2]));
+    PyObject* strides = PyTuple_New(3);
+    for (Py_ssize_t i = 0; strides != nullptr && i < 3; ++i) {
+        const std::intptr_t f = fixed[static_cast<std::size_t>(i)];
+        PyTuple_SET_ITEM(strides, i,
+                         f == kAnyStride ? Py_NewRef(Py_None)
+                                         : PyLong_FromSsize_t(static_cast<Py_ssize_t>(f)));
+    }
     PyObject* get_kwargs = Py_BuildValue("{s:O}", "fixed_strides", strides);
     PyObject* filled = get != nullptr && get_args != nullptr && get_kwargs != nullptr
                            ? PyObject_Call(get, get_args, get_kwargs)

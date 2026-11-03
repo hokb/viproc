@@ -1773,6 +1773,77 @@ int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned 
     return VP_OK;
 }
 
+int vp_reduce_deferred(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
+                       int keepdims, PyObject* identity, vp_array** result, const char* site,
+                       char* err, size_t errlen) {
+    Array& a = arr(in);
+    const int rank = Runtime::rank(a);
+    const DType dt = a.meta()->sd().dtype; // known at issue
+    if (identity == nullptr) {
+        identity = Py_None;
+    }
+    if (rank > 64) {
+        set_error(err, errlen, "reduce: too many dimensions");
+        return VP_UNSUPPORTED;
+    }
+    // Shared per (ufunc, dtype, rank, axes, keepdims, identity): the shape
+    // and strides of the key mark it as a deferred kernel (-1 extents).
+    ReduceKey key{ufunc, Layout{}, 0, {}};
+    key.layout.dtype = dt;
+    key.layout.shape = Shape(static_cast<std::size_t>(rank), -1);
+    key.layout.strides = Strides(static_cast<std::size_t>(rank), keepdims != 0 ? -1 : -2);
+    int out_rank = 0;
+    for (int i = 0; i < rank; ++i) {
+        if (axes[i] != 0) {
+            key.axes |= std::uint64_t{1} << i;
+        }
+        out_rank += axes[i] == 0 || keepdims != 0 ? 1 : 0;
+    }
+    if (!identity_key(identity, key.identity)) {
+        set_error(err, errlen, "reduce: identity not cached");
+        return VP_UNSUPPORTED;
+    }
+    std::shared_ptr<Kernel>& kernel = rt->reduce_kernels[key];
+    if (!kernel) {
+        std::string e;
+        const numpy::UfuncLoop* loop =
+            rt->loops->get_reduction(ufunc, dt,
+                                     {numpy::UfuncLoop::kAnyStride, numpy::UfuncLoop::kAnyStride,
+                                      numpy::UfuncLoop::kAnyStride},
+                                     e);
+        std::vector<std::byte> init;
+        if (loop == nullptr || (identity != Py_None && !numpy::scalar_bytes(identity, dt, init))) {
+            PyErr_Clear();
+            rt->reduce_kernels.erase(key);
+            set_error(err, errlen, loop == nullptr ? e : "reduce: identity");
+            return VP_UNSUPPORTED; // casts and the rest: the regular path
+        }
+        std::string name = "reduction";
+        if (PyObject* n = PyObject_GetAttrString(ufunc, "__name__")) {
+            if (const char* c = PyUnicode_AsUTF8(n)) {
+                name = c;
+            }
+            Py_DECREF(n);
+        }
+        PyErr_Clear();
+        std::vector<bool> reduced(static_cast<std::size_t>(rank));
+        for (int i = 0; i < rank; ++i) {
+            reduced[static_cast<std::size_t>(i)] = axes[i] != 0;
+        }
+        kernel = numpy::make_deferred_reduce_kernel(
+            loop, std::move(reduced), keepdims != 0, std::move(init),
+            "ValueError: zero-size array to reduction operation " + name +
+                " which has no identity");
+    }
+    rt->graveyard->drain();
+    const ArrayPtr ins[] = {ref(in)};
+    ArrayPtr res;
+    rt->rt->issue_deferred(kernel, ins, std::span(&dt, 1), std::span(&out_rank, 1), site,
+                           std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
 int vp_accumulate(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, vp_array** result,
                   const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();

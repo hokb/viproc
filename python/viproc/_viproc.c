@@ -1720,7 +1720,7 @@ static int fast_matmul(PyObject* ufunc, PyObject* a, PyObject* b, PyObject** res
     if (*result == NULL) {
         return -1;
     }
-    if (vp_array_ndim(r) == 0) {
+    if (vp_array_rank(r) == 0) {
         ((ArrayObject*)*result)->scalar = 1;
     }
     return 1;
@@ -4112,20 +4112,29 @@ static int red_async(const RedSpec* sp, PyObject* self, PyObject* const* v, PyOb
         return 0; /* `a != 0` first: the Python handler */
     }
     unsigned char flags[MAXDIMS];
-    if (!red_axes(v[RA_AXIS], vp_array_ndim(a), flags)) {
+    /* the rank is known at issue, also while the size is not (O2) */
+    if (!red_axes(v[RA_AXIS], vp_array_rank(a), flags)) {
         return 0;
     }
     vp_array* r = NULL;
     char err[ERRLEN] = "";
-    const int st = vp_reduce(g_rt, sp->ufunc, a, flags, keepdims, Py_None, sp->identity, &r,
-                             issue_site(), err, sizeof err);
+    int st = VP_UNSUPPORTED;
+    if (g_opt >= 2 && !(vp_array_sized(a) && vp_array_ready(a) && array_size(a) <= g_small)) {
+        /* O2: the task sizes, lays out and plans it (pipelining.md, S2) */
+        st = vp_reduce_deferred(g_rt, sp->ufunc, a, flags, keepdims, sp->identity, &r,
+                                issue_site(), err, sizeof err);
+    }
+    if (st == VP_UNSUPPORTED) {
+        st = vp_reduce(g_rt, sp->ufunc, a, flags, keepdims, Py_None, sp->identity, &r,
+                       issue_site(), err, sizeof err);
+    }
     if (st == VP_UNSUPPORTED) {
         return 0;
     }
     if (raise_status(st, err) < 0) {
         return -1;
     }
-    if (vp_array_ndim(r) == 0 && vp_array_ready(r) &&
+    if (vp_array_rank(r) == 0 && vp_array_ready(r) &&
         vp_array_wait(g_rt, r, err, sizeof err) == VP_OK) {
         *result = vp_array_scalar(r); /* NumPy's scalar: the data is there */
         vp_array_release(r);
@@ -4135,7 +4144,7 @@ static int red_async(const RedSpec* sp, PyObject* self, PyObject* const* v, PyOb
     if (*result == NULL) {
         return -1;
     }
-    if (vp_array_ndim(r) == 0) {
+    if (vp_array_rank(r) == 0) {
         ((ArrayObject*)*result)->scalar = 1;
     }
     return 1;

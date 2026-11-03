@@ -10,6 +10,7 @@
 
 #include "kernels/numpy_iter.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -114,6 +115,103 @@ ReducePlan plan_reduction(const Layout& in, std::span<const bool> reduced, const
 
 namespace {
 
+// Visits the positions of the first `n` plan axes (outermost first),
+// calling fn(in_ptr, out_ptr, first) where `first` tells whether all reduced
+// coordinates are 0. With kept_only, reduced axes stay at 0 (one visit per
+// result element; n then covers all axes).
+template <class Fn>
+bool for_each(const ReducePlan& plan, std::size_t n, Fn&& fn, char* in, char* out, bool kept_only) {
+    const auto& axes = plan.axes;
+    SmallVector<std::int64_t, kInlineRank> idx(n, 0);
+    for (;;) {
+        bool first = true;
+        for (std::size_t k = 0; k < n; ++k) {
+            first = first && (!axes[k].reduced || idx[k] == 0);
+        }
+        if (!fn(in, out, first)) {
+            return false;
+        }
+        std::size_t k = n;
+        for (;;) {
+            if (k == 0) {
+                return true;
+            }
+            --k;
+            if (kept_only && axes[k].reduced) {
+                continue;
+            }
+            if (++idx[k] < axes[k].shape) {
+                in += axes[k].in_stride;
+                out += axes[k].out_stride;
+                break;
+            }
+            in -= (axes[k].shape - 1) * axes[k].in_stride;
+            out -= (axes[k].shape - 1) * axes[k].out_stride;
+            idx[k] = 0;
+        }
+    }
+}
+
+// One reduction as planned: initial values, then the loop calls.
+KernelResult run_reduction(const UfuncLoop* loop, const ReducePlan& plan,
+                           const std::vector<std::byte>& identity, const Operand& input,
+                           const Operand& output) {
+    const Layout& out_layout = output.layout();
+    const std::size_t isz = itemsize(out_layout.dtype);
+    char* const in = reinterpret_cast<char*>(input.first());
+    char* const out = reinterpret_cast<char*>(output.first());
+    const auto& axes = plan.axes;
+    const std::size_t nouter = axes.size() - 1;
+
+    // Initial values: the identity, or the first elements along the reduced
+    // axes (as PyArray_CopyInitialReduceValues).
+    if (!identity.empty()) {
+        const std::int64_t n = out_layout.size();
+        for (std::int64_t i = 0; i < n; ++i) {
+            std::memcpy(out + i * static_cast<std::int64_t>(isz), identity.data(), isz);
+        }
+    } else {
+        for_each(
+            plan, axes.size(),
+            [&](char* src, char* dst, bool first) {
+                if (first) {
+                    std::memcpy(dst, src, isz);
+                }
+                return true;
+            },
+            in, out, /*kept_only=*/true);
+    }
+
+    // The loop calls, once per position of the outer axes. Without an
+    // identity, elements already copied are skipped, as NumPy's reduce_loop
+    // does on the first visit of a result element.
+    const ReduceAxis& inner = axes.back();
+    const std::intptr_t strides[3] = {static_cast<std::intptr_t>(inner.out_stride),
+                                      static_cast<std::intptr_t>(inner.in_stride),
+                                      static_cast<std::intptr_t>(inner.out_stride)};
+    const bool skip_first = identity.empty();
+    const bool ok = for_each(
+        plan, nouter,
+        [&](char* src, char* dst, bool first) {
+            std::intptr_t count = static_cast<std::intptr_t>(inner.shape);
+            if (skip_first && first) {
+                if (inner.reduced) {
+                    --count;
+                    src += inner.in_stride;
+                } else {
+                    count = 0;
+                }
+            }
+            if (count <= 0) {
+                return true;
+            }
+            char* data[3] = {dst, src, dst};
+            return loop->call(data, &count, strides) == 0;
+        },
+        in, out, /*kept_only=*/false);
+    return ok ? KernelResult{} : KernelResult{1, "NumPy reduction loop failed", 0};
+}
+
 class ReduceKernel : public Kernel {
   public:
     ReduceKernel(const UfuncLoop* loop, ReducePlan plan, std::vector<std::byte> identity)
@@ -122,106 +220,82 @@ class ReduceKernel : public Kernel {
     const char* fp_name() const override { return loop_->reports_fp_errors() ? "reduce" : nullptr; }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
-        const Layout& out_layout = outputs[0].layout();
-        const std::size_t isz = itemsize(out_layout.dtype);
-        char* const in = reinterpret_cast<char*>(inputs[0].first());
-        char* const out = reinterpret_cast<char*>(outputs[0].first());
-        const auto& axes = plan_.axes;
-        const std::size_t nouter = axes.size() - 1;
-
-        // Initial values: the identity, or the first elements along the
-        // reduced axes (as PyArray_CopyInitialReduceValues).
-        if (!identity_.empty()) {
-            const std::int64_t n = out_layout.size();
-            for (std::int64_t i = 0; i < n; ++i) {
-                std::memcpy(out + i * static_cast<std::int64_t>(isz), identity_.data(), isz);
-            }
-        } else {
-            for_each(
-                axes.size(),
-                [&](char* src, char* dst, bool first) {
-                    if (first) {
-                        std::memcpy(dst, src, isz);
-                    }
-                    return true;
-                },
-                in, out, /*kept_only=*/true);
-        }
-
-        // The loop calls, once per position of the outer axes. Without an
-        // identity, elements already copied are skipped, as NumPy's
-        // reduce_loop does on the first visit of a result element.
-        const ReduceAxis& inner = axes.back();
-        const std::intptr_t strides[3] = {static_cast<std::intptr_t>(inner.out_stride),
-                                          static_cast<std::intptr_t>(inner.in_stride),
-                                          static_cast<std::intptr_t>(inner.out_stride)};
-        const bool skip_first = identity_.empty();
-        const bool ok = for_each(
-            nouter,
-            [&](char* src, char* dst, bool first) {
-                std::intptr_t count = static_cast<std::intptr_t>(inner.shape);
-                if (skip_first && first) {
-                    if (inner.reduced) {
-                        --count;
-                        src += inner.in_stride;
-                    } else {
-                        count = 0;
-                    }
-                }
-                if (count <= 0) {
-                    return true;
-                }
-                char* data[3] = {dst, src, dst};
-                return loop_->call(data, &count, strides) == 0;
-            },
-            in, out, /*kept_only=*/false);
-        return ok ? KernelResult{} : KernelResult{1, "NumPy reduction loop failed", 0};
+        return run_reduction(loop_, plan_, identity_, inputs[0], outputs[0]);
     }
 
     DirectCost* direct_cost() override { return &cost_; }
 
   private:
-    // Visits the positions of the first `n` plan axes (outermost first),
-    // calling fn(in_ptr, out_ptr, first) where `first` tells whether
-    // all reduced coordinates are 0. With kept_only, reduced axes stay at 0
-    // (one visit per result element; n then covers all axes).
-    template <class Fn>
-    bool for_each(std::size_t n, Fn&& fn, char* in, char* out, bool kept_only) const {
-        const auto& axes = plan_.axes;
-        SmallVector<std::int64_t, kInlineRank> idx(n, 0);
-        for (;;) {
-            bool first = true;
-            for (std::size_t k = 0; k < n; ++k) {
-                first = first && (!axes[k].reduced || idx[k] == 0);
-            }
-            if (!fn(in, out, first)) {
-                return false;
-            }
-            std::size_t k = n;
-            for (;;) {
-                if (k == 0) {
-                    return true;
-                }
-                --k;
-                if (kept_only && axes[k].reduced) {
-                    continue;
-                }
-                if (++idx[k] < axes[k].shape) {
-                    in += axes[k].in_stride;
-                    out += axes[k].out_stride;
-                    break;
-                }
-                in -= (axes[k].shape - 1) * axes[k].in_stride;
-                out -= (axes[k].shape - 1) * axes[k].out_stride;
-                idx[k] = 0;
-            }
-        }
-    }
-
     const UfuncLoop* loop_;
     ReducePlan plan_;
     std::vector<std::byte> identity_;
     DirectCost cost_; // shared kernel: learned across its ops
+};
+
+// O2 (Runtime::issue_deferred): the input's size and strides are not known
+// at issue. The task sizes the result (the reduced axes removed, or kept as
+// extent 1), lays it out C-contiguously (as NumPy's fast path allocates it)
+// and plans the loop calls when it runs. Where the reduced axes do not
+// coalesce, the plan visits them all: blocks NumPy's iterator would buffer
+// differently, so floating-point sums may round differently (O2).
+class DeferredReduceKernel : public Kernel {
+  public:
+    DeferredReduceKernel(const UfuncLoop* loop, std::vector<bool> reduced, bool keepdims,
+                         std::vector<std::byte> identity, std::string empty_error)
+        : loop_(loop), reduced_(std::move(reduced)), keepdims_(keepdims),
+          identity_(std::move(identity)), empty_error_(std::move(empty_error)) {}
+    const char* name() const override { return loop_->name(); }
+    const char* fp_name() const override { return loop_->reports_fp_errors() ? "reduce" : nullptr; }
+
+    KernelResult size(std::span<const Layout* const> inputs, std::span<Layout> outputs) override {
+        const Layout& in = *inputs[0];
+        Shape shape;
+        for (std::size_t i = 0; i < in.shape.size(); ++i) {
+            if (!reduced_[i]) {
+                shape.push_back(in.shape[i]);
+            } else if (keepdims_) {
+                shape.push_back(1);
+            }
+        }
+        if (in.size() == 0 && identity_.empty()) {
+            for (std::size_t i = 0; i < in.shape.size(); ++i) {
+                if (reduced_[i] && in.shape[i] == 0) {
+                    return KernelResult{1, empty_error_, 0}; // nothing to start from
+                }
+            }
+        }
+        outputs[0].shape = std::move(shape);
+        return {};
+    }
+    void layout(std::span<const Layout* const> inputs, std::span<Layout> outputs) override {
+        (void)inputs;
+        outputs[0] = Layout::contiguous(outputs[0].dtype, outputs[0].shape);
+    }
+
+    KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
+        const Layout& in = inputs[0].layout();
+        const Layout& out = outputs[0].layout();
+        if (in.size() == 0) { // the identity everywhere (size() refused the rest)
+            const std::size_t isz = itemsize(out.dtype);
+            char* o = reinterpret_cast<char*>(outputs[0].first());
+            for (std::int64_t i = 0; i < out.size(); ++i) {
+                std::memcpy(o + i * static_cast<std::int64_t>(isz), identity_.data(), isz);
+            }
+            return {};
+        }
+        std::array<bool, 64> flags{}; // NumPy's NPY_MAXDIMS
+        std::copy(reduced_.begin(), reduced_.end(), flags.begin());
+        const ReducePlan plan =
+            plan_reduction(in, std::span<const bool>(flags.data(), reduced_.size()), out);
+        return run_reduction(loop_, plan, identity_, inputs[0], outputs[0]);
+    }
+
+  private:
+    const UfuncLoop* loop_;
+    std::vector<bool> reduced_;
+    bool keepdims_;
+    std::vector<std::byte> identity_;
+    std::string empty_error_;
 };
 
 } // namespace
@@ -229,6 +303,14 @@ class ReduceKernel : public Kernel {
 std::shared_ptr<Kernel> make_reduce_kernel(const UfuncLoop* loop, ReducePlan plan,
                                            std::vector<std::byte> identity) {
     return std::make_shared<ReduceKernel>(loop, std::move(plan), std::move(identity));
+}
+
+std::shared_ptr<Kernel> make_deferred_reduce_kernel(const UfuncLoop* loop,
+                                                    std::vector<bool> reduced, bool keepdims,
+                                                    std::vector<std::byte> identity,
+                                                    std::string empty_error) {
+    return std::make_shared<DeferredReduceKernel>(loop, std::move(reduced), keepdims,
+                                                  std::move(identity), std::move(empty_error));
 }
 
 namespace {
