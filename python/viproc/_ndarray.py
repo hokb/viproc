@@ -1816,7 +1816,9 @@ def _getitem(self, key):
                 and _viproc.opt_level() >= 2 and key.ndim > 0):
             # O2: no sync on a pending mask; the task sizes the result from
             # its data (pipelining.md, S4)
-            return _viproc.mask_select(self, key)
+            r = _viproc.mask_select(self, key)
+            if r is not None:
+                return r
         if type(key) in (ndarray, tuple, np.ndarray):  # a[idx], a[:, idx]: fast path
             r = _gather_fast(self, key)
             if r is not None:

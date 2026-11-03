@@ -1048,8 +1048,9 @@ ArrayPtr issue_deferred1(Runtime& rt, const std::shared_ptr<Kernel>& k,
                          std::initializer_list<ArrayPtr> in) {
     std::vector<ArrayPtr> ins(in);
     const DType dt = DType::Float64;
+    const int rank = 1;
     ArrayPtr r;
-    rt.issue_deferred(k, ins, std::span<const DType>(&dt, 1), "deferred",
+    rt.issue_deferred(k, ins, std::span<const DType>(&dt, 1), std::span(&rank, 1), "deferred",
                       std::span<ArrayPtr>(&r, 1));
     return r;
 }
@@ -1105,7 +1106,7 @@ void test_deferred_ready_inputs() {
     ArrayPtr a = make_ready(rt, 4, 2.0);
     ArrayPtr b = make_ready(rt, 1, 3.0);
     ArrayPtr c = issue_deferred1(rt, k, {a, b}); // (4) + (1) -> (4)
-    std::this_thread::sleep_for(10ms); // idle workers: the step job runs meanwhile
+    std::this_thread::sleep_for(10ms);           // idle workers: the step job runs meanwhile
     rt.wait_stage(*c, TaskState::SizeCompleted);
     check(c->layout().shape == Shape{4}, "deferred, ready inputs: broadcast size");
     ArrayPtr d = issue1(rt, add_const(1.0), {c}, 4); // waits for c's layout at issue

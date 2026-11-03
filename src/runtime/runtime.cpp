@@ -4,6 +4,7 @@
 #include "pool.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cfenv>
 #include <chrono>
 
@@ -671,7 +672,9 @@ void Runtime::trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t 
 
 void Runtime::issue_deferred(const std::shared_ptr<Kernel>& kernel,
                              std::span<const ArrayPtr> inputs, std::span<const DType> outputs,
-                             const char* issue_site, std::span<ArrayPtr> results) {
+                             std::span<const int> ranks, const char* issue_site,
+                             std::span<ArrayPtr> results) {
+    assert(ranks.size() == outputs.size());
     bool host = false;
     for (const ArrayPtr& a : inputs) {
         host = host || a->group_->current_->host_views > 0;
@@ -700,6 +703,7 @@ void Runtime::issue_deferred(const std::shared_ptr<Kernel>& kernel,
         l.dtype = outputs[i];
         auto buffer = make_pooled<CountableArray>(CountableArray::unsized);
         MetadataPtr meta = make_metadata(std::move(l));
+        meta->set_rank(ranks[i]);
         meta->set_task(task); // incomplete until the task sized it
         ops.push_back({buffer, meta});
         results[i] = new_array(std::move(meta), std::move(buffer), task);

@@ -116,6 +116,11 @@ class Metadata {
     // The configuring task only, in its size and layout steps (before it
     // signals SizeCompleted / Allocated): the SD it fills in.
     Layout& sd_for_task() const { return const_cast<Layout&>(sd_); }
+    // The number of dimensions of an SD its task completes, known at issue
+    // (Runtime::issue_deferred): set once by the main thread before the task
+    // is launched, never changed; -1 for SDs complete at issue.
+    int rank() const { return rank_; }
+    void set_rank(int r) const { rank_ = r; }
 
   private:
     friend class MetadataPtr;
@@ -131,6 +136,7 @@ class Metadata {
     // on the task's stages and drops the task once it sees it completed
     // (docs/design/array-data-model.md, "Cycles"). Workers never read it.
     mutable std::shared_ptr<Task> task_;
+    mutable int rank_ = -1;
     mutable std::atomic<int> refs_{1}; // the creating reference
 };
 

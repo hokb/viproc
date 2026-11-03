@@ -312,9 +312,8 @@ static PyObject* Array_get_strides(ArrayObject* self, void* c) {
 
 static PyObject* Array_get_ndim(ArrayObject* self, void* c) {
     (void)c;
-    const int64_t* shape;
-    const int nd = shape_of(self->a, &shape);
-    return nd < 0 ? NULL : PyLong_FromLong(nd);
+    /* known at issue, also while the size is not (O2): no wait */
+    return PyLong_FromLong(vp_array_rank(self->a));
 }
 
 static PyObject* Array_get_dtype(ArrayObject* self, void* c) {

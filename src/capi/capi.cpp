@@ -442,6 +442,7 @@ const int64_t* vp_array_shape(const vp_array* a) { return arr(a).layout().shape.
 const int64_t* vp_array_strides(const vp_array* a) { return arr(a).layout().strides.data(); }
 vp_dtype vp_array_dtype(const vp_array* a) { return to_vp(arr(a).meta()->sd().dtype); }
 int vp_array_sized(const vp_array* a) { return Runtime::unsized(arr(a)) ? 0 : 1; }
+int vp_array_rank(const vp_array* a) { return Runtime::rank(arr(a)); }
 int64_t vp_array_offset(const vp_array* a) { return arr(a).layout().offset; }
 int vp_array_ready(vp_array* a) { return arr(a).ready() ? 1 : 0; }
 int vp_array_same_storage(const vp_array* a, const vp_array* b) {
@@ -688,8 +689,10 @@ int vp_ufunc_issue_deferred(vp_runtime* rt, const vp_loop* loop, vp_array* const
     }
     bool all_ready = true;
     std::int64_t elements = 0;
+    int rank = 0;
     for (int i = 0; i < nin; ++i) {
         Array& a = arr(inputs[i]);
+        rank = std::max(rank, Runtime::rank(a)); // broadcasting: the largest
         if (a.meta()->sd().dtype != loop->dtypes[static_cast<std::size_t>(i)]) {
             return VP_UNSUPPORTED; // casts: the regular path
         }
@@ -714,7 +717,7 @@ int vp_ufunc_issue_deferred(vp_runtime* rt, const vp_loop* loop, vp_array* const
     ArrayPtr res;
     rt->rt->issue_deferred(loop->loop->elementwise_kernel(),
                            std::span<const ArrayPtr>(ins, static_cast<std::size_t>(nin)),
-                           std::span(&out, 1), site, std::span(&res, 1));
+                           std::span(&out, 1), std::span(&rank, 1), site, std::span(&res, 1));
     *result = hand_out(std::move(res));
     return VP_OK;
 }
@@ -754,9 +757,10 @@ int vp_create_deferred(vp_runtime* rt, int kind, int ndim, const int64_t* dims,
         std::memcpy(f.data(), fill, f.size());
     }
     ArrayPtr res;
+    const int rank = ndim;
     rt->rt->issue_deferred(
         make_create_kernel(std::move(d), order, std::move(f), kind == 4, names[kind]), ins,
-        std::span(&dt, 1), site, std::span(&res, 1));
+        std::span(&dt, 1), std::span(&rank, 1), site, std::span(&res, 1));
     *result = hand_out(std::move(res));
     return VP_OK;
 }
@@ -770,9 +774,15 @@ int vp_mask_select(vp_runtime* rt, vp_array* x, vp_array* mask, vp_array** resul
     rt->graveyard->drain();
     const ArrayPtr ins[] = {ref(x), ref(mask)};
     const DType dt = arr(x).meta()->sd().dtype;
+    // NumPy: the mask's dimensions become one (x.ndim - mask.ndim + 1)
+    const int rank = Runtime::rank(arr(x)) - Runtime::rank(arr(mask)) + 1;
+    if (rank < 1) {
+        set_error(err, errlen, "too many indices for array");
+        return VP_UNSUPPORTED; // NumPy's IndexError: the regular path
+    }
     ArrayPtr res;
-    rt->rt->issue_deferred(make_mask_select_kernel(), ins, std::span(&dt, 1), site,
-                           std::span(&res, 1));
+    rt->rt->issue_deferred(make_mask_select_kernel(), ins, std::span(&dt, 1), std::span(&rank, 1),
+                           site, std::span(&res, 1));
     *result = hand_out(std::move(res));
     return VP_OK;
 }
@@ -784,9 +794,10 @@ int vp_flatnonzero(vp_runtime* rt, vp_array* a, vp_array** result, const char* s
     rt->graveyard->drain();
     const ArrayPtr ins[] = {ref(a)};
     const DType dt = DType::Int64;
+    const int rank = 1;
     ArrayPtr res;
-    rt->rt->issue_deferred(make_flatnonzero_kernel(), ins, std::span(&dt, 1), site,
-                           std::span(&res, 1));
+    rt->rt->issue_deferred(make_flatnonzero_kernel(), ins, std::span(&dt, 1), std::span(&rank, 1),
+                           site, std::span(&res, 1));
     *result = hand_out(std::move(res));
     return VP_OK;
 }

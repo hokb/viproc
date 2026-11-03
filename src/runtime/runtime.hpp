@@ -216,15 +216,23 @@ class Runtime {
     // when every input reached SizeCompleted and lays them out when every
     // input reached Allocated, on the thread delivering the last signal or
     // in a pool job, never on the main thread. Inputs only (no in/outs).
+    // `ranks`: the outputs' numbers of dimensions, which the caller knows at
+    // issue (the kernel's size step gives shapes of exactly that rank), so
+    // later ops can be issued against them without a wait (rank()).
     void issue_deferred(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
-                        std::span<const DType> outputs, const char* issue_site,
-                        std::span<ArrayPtr> results);
+                        std::span<const DType> outputs, std::span<const int> ranks,
+                        const char* issue_site, std::span<ArrayPtr> results);
     // Metadata query: waits until `a`'s size (SizeCompleted) or layout
     // (Allocated: strides, offset) is known. No wait for arrays sized at
     // issue. Returns the error of an op that could not size it.
     ErrorRef wait_stage(Array& a, TaskState s);
     // True if `a`'s size or layout may still be unknown (cheap; main thread).
     static bool unsized(const Array& a) { return static_cast<bool>(a.meta()->task()); }
+    // `a`'s number of dimensions, without a wait (main thread).
+    static int rank(const Array& a) {
+        const Metadata& m = *a.meta();
+        return m.task() ? m.rank() : static_cast<int>(m.sd().shape.size());
+    }
 
     // Sync point: waits until `a` is ready. Returns the error of the task that
     // produced it, if any.

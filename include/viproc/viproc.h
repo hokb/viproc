@@ -197,6 +197,9 @@ int64_t vp_array_offset(const vp_array* a);
 int vp_array_ready(vp_array* a);
 /* 1 if `a`'s size and layout are known (metadata queries do not wait). */
 int vp_array_sized(const vp_array* a);
+/* [main thread] `a`'s number of dimensions, known at issue also while its
+ * size is not (no wait, unlike vp_array_ndim). */
+int vp_array_rank(const vp_array* a);
 /* [main thread, GIL] Waits until `a`'s size is known (SizeCompleted, not
  * its strides) and gives its shape. VP_ERROR (message in `err`, as at a
  * sync point) if the op producing it could not size it. */

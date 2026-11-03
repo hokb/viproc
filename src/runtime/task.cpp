@@ -383,7 +383,11 @@ void Task::size_step() {
         }
     }
     for (std::size_t k = 0; k < out.size(); ++k) {
-        Layout& sd = operands_[ninputs_ + k].meta->sd_for_task();
+        const Metadata& m = *operands_[ninputs_ + k].meta;
+        Layout& sd = m.sd_for_task();
+        assert((size_error_ || m.rank() < 0 ||
+                out.data()[k].shape.size() == static_cast<std::size_t>(m.rank())) &&
+               "the size step gives the rank declared at issue");
         sd.shape = size_error_ ? Shape{} : std::move(out.data()[k].shape);
         sd.offset = 0;
     }
