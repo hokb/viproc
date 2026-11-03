@@ -178,10 +178,14 @@ def test_o2_zero_d_results_are_scalars(level2):
     assert t2 is not t and float(t2) == float(np.sqrt(np.arange(5000.0).sum()) * 2.0 + 1.0)
 
 
-def _pending_int(value, dtype=np.int64):
+def _slow():
+    return np.sin(np.sin(viproc.asarray(np.ones(2_000_000))))
+
+
+def _pending_int(value, dtype=np.int64, slow=None):
     """A 0-d integer viproc array that is still pending: value + 0 * (a
     slow computation)."""
-    slow = np.sin(np.sin(viproc.asarray(np.ones(2_000_000))))
+    slow = _slow() if slow is None else slow
     return (slow[:4] * 0).astype(dtype).sum() + value
 
 
@@ -197,7 +201,8 @@ def _pending_int(value, dtype=np.int64):
 def test_o2_pending_sizes(level2, call):
     """S4: a creator whose size is a pending array issues a task that sizes
     its result when the size is computed; the main thread does not sync."""
-    n, m = _pending_int(5), _pending_int(3, np.int32)
+    slow = _slow()  # one computation behind both: pending together
+    n, m = _pending_int(5, slow=slow), _pending_int(3, np.int32, slow)
     assert not n.ready() and not m.ready()
     before = _stats()
     r = call(n, m)
