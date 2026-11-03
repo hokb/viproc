@@ -162,7 +162,14 @@ kernel. Metadata queries of the main thread wait for the stage they need
 (`Runtime::wait_stage`: shape at size completed, strides at allocated);
 an op issued on an unsized input on the regular path still waits for its
 allocated stage (it needs the layout; `Array::layout` waits, so the main
-thread never reads an incomplete one). The layout step needs the inputs'
+thread never reads an incomplete one). A step job can wait in the queue
+behind running kernels (all workers busy): a metadata query that finds its
+stage not reached first runs the step jobs the main thread queued itself
+(`Runtime::help_steps`, `main_steps_`; the combining word makes the queued
+job a no-op), and the steps they make due; it waits only if that does not
+reach the stage. Found on a 2-core CI runner: one worker in a 10 ms kernel
+held every metadata query (and an `astype` issued on a deferred output)
+until the kernel was done (`test_deferred_size_wait_helps`). The layout step needs the inputs'
 strides, not their memory: an input sized at issue counts as laid out at
 registration, so a deferred op behind regular ones is laid out at once,
 not when they run (else a regular op's allocated signal, right before its

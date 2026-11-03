@@ -1080,14 +1080,32 @@ void test_deferred_sizes_run_ahead() {
     check(!k->threads.contains(std::this_thread::get_id()), "deferred: no size on the main thread");
 }
 
+// A metadata query does not wait behind running kernels: with the only worker
+// busy, the main thread runs the step job it queued itself (help_steps).
+void test_deferred_size_wait_helps() {
+    Runtime rt(opts(1));
+    auto k = std::make_shared<DeferredAdd>();
+    ArrayPtr busy = issue1(rt, add_const(1.0, 300ms), {make_ready(rt, 5, 0.0)}, 5);
+    std::this_thread::sleep_for(10ms); // the worker runs it
+    const auto t0 = std::chrono::steady_clock::now();
+    ArrayPtr c = issue_deferred1(rt, k, {make_ready(rt, 4, 1.0)});
+    ArrayPtr d = issue_deferred1(rt, k, {c});
+    rt.wait_stage(*d, TaskState::Allocated);
+    check(d->layout().shape == Shape{4} && std::chrono::steady_clock::now() - t0 < 200ms,
+          "deferred: a size wait runs the queued steps, not after the busy worker");
+    check(value(rt, d, 0) == 1.0 && value(rt, busy, 0) == 1.0, "deferred: values after helping");
+}
+
 // Ready inputs: the task sizes its outputs in a pool job (or when it runs),
-// never on the main thread; ops sized at issue may read deferred outputs.
+// not on the main thread unless it waits for the size before the job ran
+// (Runtime::help_steps); ops sized at issue may read deferred outputs.
 void test_deferred_ready_inputs() {
     Runtime rt(opts(2));
     auto k = std::make_shared<DeferredAdd>(20ms);
     ArrayPtr a = make_ready(rt, 4, 2.0);
     ArrayPtr b = make_ready(rt, 1, 3.0);
     ArrayPtr c = issue_deferred1(rt, k, {a, b}); // (4) + (1) -> (4)
+    std::this_thread::sleep_for(10ms); // idle workers: the step job runs meanwhile
     rt.wait_stage(*c, TaskState::SizeCompleted);
     check(c->layout().shape == Shape{4}, "deferred, ready inputs: broadcast size");
     ArrayPtr d = issue1(rt, add_const(1.0), {c}, 4); // waits for c's layout at issue
@@ -1135,6 +1153,7 @@ int main() {
     test_three_signals();
     test_deferred_sizes_run_ahead();
     test_deferred_ready_inputs();
+    test_deferred_size_wait_helps();
     test_deferred_size_error();
     test_active_limit();
     test_random_programs(3, false);

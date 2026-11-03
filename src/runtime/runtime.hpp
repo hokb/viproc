@@ -280,6 +280,9 @@ class Runtime {
     [[gnu::noinline]] void due_steps(bool here);
     [[gnu::noinline]] TaskList step_job(Task& task);
     [[gnu::noinline]] void configure_now(Task& task);
+    // Main thread, waiting for a stage: runs the steps it queued as step jobs
+    // (main_steps_) itself, and the steps they make due.
+    [[gnu::noinline]] void help_steps();
     void enqueue(std::shared_ptr<Task> task);
     void trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t elements);
     // The direct path of issue(): see there.
@@ -304,6 +307,10 @@ class Runtime {
     std::uint64_t direct_ = 0; // ... of which ran directly, without a task
     std::uint64_t syncs_ = 0;
     std::uint64_t size_waits_ = 0; // waits that found the array pending (main thread only)
+    // Tasks whose steps the main thread queued as step jobs, not yet seen
+    // laid out (main thread only). A step job waits in the pool behind
+    // running kernels; a metadata query waiting for one runs it (help_steps).
+    std::vector<std::shared_ptr<Task>> main_steps_;
     std::atomic<std::size_t> active_{0};
     // Threads waiting in wait_active_below(): run() notifies only if > 0.
     std::atomic<int> active_waiters_{0};

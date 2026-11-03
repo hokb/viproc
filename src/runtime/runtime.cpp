@@ -724,6 +724,9 @@ ErrorRef Runtime::wait_stage(Array& a, TaskState s) {
     }
     if (t->state() < s) {
         ++size_waits_;
+        help_steps(); // a queued step job may be all it waits for
+    }
+    if (t->state() < s) {
         const Blocking blocking(options_);
         if (!spin_until([&] { return t->state() >= s; })) {
             t->wait_state(s);
@@ -734,6 +737,26 @@ ErrorRef Runtime::wait_stage(Array& a, TaskState s) {
         a.meta_->set_task(nullptr); // its SD is complete for good
     } // else no size: every metadata query raises the op's error again
     return e;
+}
+
+void Runtime::help_steps() {
+    for (bool progress = true; progress && !main_steps_.empty();) {
+        progress = false;
+        for (std::shared_ptr<Task>& t : main_steps_) {
+            if (t && t->state() < TaskState::Allocated) {
+                t->run_due_steps(); // idempotent: the step job finds them done
+            }
+            if (t && t->state() >= TaskState::Allocated) {
+                t.reset();
+                progress = true;
+            }
+        }
+        std::erase(main_steps_, nullptr);
+        if (!Task::due_steps_empty()) {
+            due_steps(true); // their signals made steps due: run them here
+            progress = true;
+        }
+    }
 }
 
 void Runtime::configure_now(Task& task) {
@@ -761,6 +784,14 @@ void Runtime::due_steps(bool here) {
             if (here) {
                 t->run_due_steps(); // may make more steps due: loop
             } else if (t->add_job(Task::Job::Steps)) {
+                if (std::this_thread::get_id() == main_thread_) {
+                    if (main_steps_.size() >= 256) {
+                        std::erase_if(main_steps_, [](const std::shared_ptr<Task>& m) {
+                            return m->state() >= TaskState::Allocated;
+                        });
+                    }
+                    main_steps_.push_back(t);
+                }
                 enqueue(std::move(t));
             }
         }
