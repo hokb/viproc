@@ -2,6 +2,8 @@
 bit-identical to NumPy; O2 runs every BLAS call on one thread and no longer
 serializes LAPACK calls, with results that are correct but may deviate."""
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -352,6 +354,47 @@ def test_o2_reshape_of_deferred_1d(level2):
         r = np.sin(viproc.asarray(a) + _slow()[:1] * 0).reshape(4, 20) + 1.0
         np.asarray(r)
     viproc.wait_all()  # raised once
+
+
+@pytest.mark.parametrize("order", ["C", "F"])
+def test_o2_casts_in_tasks(level2, order):
+    """O2: ufuncs whose loop casts an input and astype size, lay out and cast
+    in their tasks (pipelining.md, "Casts at O2"): no wait on the main
+    thread, NumPy's values, dtypes and strides."""
+    rng = np.random.default_rng(11)
+    x = np.asfortranarray(rng.random((60, 50))) if order == "F" else rng.random((60, 50))
+    i = (x * 100).astype(np.int32)
+    calls = [lambda a, b: b + a, lambda a, b: (a > 0.5) * a.astype(np.float32),
+             lambda a, b: a.astype(np.float32) + 1.5, lambda a, b: b / (b + 1),
+             lambda a, b: b + a[0], lambda a, b: a.astype(np.int32), lambda a, b: a.astype(np.int64, order="F"),
+             lambda a, b: a.T.astype(np.float32, order="C"), lambda a, b: a[::2, ::-3].astype(np.complex64),
+             lambda a, b: b.astype(np.bool_), lambda a, b: a.astype(np.float64)]
+    slow = _slow()[:1] * 0
+    before = _stats()
+    va = np.sin(viproc.asarray(x) + slow)
+    vb = (viproc.asarray(i) + slow.astype(np.int32))
+    got = [f(va, vb) for f in calls]
+    assert _stats() == before  # neither a sync nor a size wait
+    wa = np.sin(x + np.zeros(1))
+    for g, f in zip(got, calls):
+        r, want = np.asarray(g), f(wa, i)
+        assert r.dtype == want.dtype and r.strides == want.strides and np.array_equal(r, want)
+
+
+def test_o2_cast_empty_and_warnings(level2):
+    """O2 astype: empty arrays get NumPy's all-zero strides; NaN to int warns
+    as NumPy does (at the result's sync point)."""
+    for a in [np.zeros((0, 3)), np.zeros((3, 0, 2)).transpose(1, 0, 2)]:
+        r = np.asarray((viproc.asarray(a) + _slow()[:1] * 0).astype(np.int32))
+        want = a.astype(np.int32)
+        assert r.shape == want.shape and r.strides == want.strides
+    a = np.array([np.nan, 1e300, 2.5] * 1000)
+    with pytest.warns(RuntimeWarning, match="invalid value encountered in cast"):
+        r = np.asarray((viproc.asarray(a) + _slow()[:1] * 0).astype(np.int32))
+        viproc.wait_all()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert np.array_equal(r, a.astype(np.int32))
 
 
 def test_o2_view_index_error_is_asynchronous(level2):

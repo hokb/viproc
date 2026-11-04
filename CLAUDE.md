@@ -301,8 +301,8 @@ level **O1**, the default (array ILP only, NumPy executes every
 function). Higher levels (goals.md, "Optimization levels") each add to
 the one below and compute correct but possibly deviating results: **O2**
 stage pipelining and BLAS threading removed (started: one BLAS thread,
-LAPACK calls no longer serialized; element-wise ufuncs without casts on
-pending or large inputs are issued unsized, `vp_ufunc_issue_deferred`, and
+LAPACK calls no longer serialized; element-wise ufuncs (casts of inputs
+in the task) and `astype` on pending or large inputs are issued unsized, `vp_ufunc_issue_deferred`, and
 size themselves in the task, pipelining.md S2; `zeros`/`ones`/`empty`/
 `full`/`arange` with pending size arrays and `x[mask]`, `flatnonzero`,
 1-d `nonzero` of pending data are tasks sizing from the data, S4;

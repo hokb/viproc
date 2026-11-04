@@ -1385,7 +1385,7 @@ class ndarray(_viproc._Array):
             return self
         code = _CODES.get(dtype)
         if (code is not None and order in ("K", "C", "F") and casting == "unsafe"
-                and self.size and type(self) is ndarray):
+                and type(self) is ndarray):  # empty: vp_astype refuses at O1
             r = _viproc.astype(self, code, order)  # NumPy's casts, asynchronously
             if r is not None:
                 return r

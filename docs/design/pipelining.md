@@ -192,8 +192,8 @@ iterator would need the GIL to plan; values may round differently). A
 all 0-d (unsized ones marked so). `x.shape`, `x.ndim`, `x.size` wait for
 the size only and raise the op's error if it could not size the array (as
 a sync point, every time); `offload_stats()["size_waits"]` counts the
-metadata queries that blocked. Casts, `out=`, several outputs and the
-other ops take the regular path. Cost at O1 (callgrind, 1 worker): main
+metadata queries that blocked. `out=`, several outputs and the other ops
+take the regular path (casts: see "Casts at O2"). Cost at O1 (callgrind, 1 worker): main
 thread +10 to +30 instructions per op (the layout check of every
 `Array::layout` call), direct path +12.
 
@@ -310,8 +310,32 @@ assignment into such an array still waits. Cost at O1 (callgrind, `a[1:3]`
 and `a[5]` of 100 elements): ~5 instructions per subscript, the level test
 (2,216 -> 2,227 per pair).
 
-**Not yet:** casts (ufuncs with cast inputs, `astype`), matmul, gathers
-and the other regular-path ops
+**Casts at O2 (implemented).** An element-wise ufunc whose loop casts an
+input (`int32 + float64`, `bool * float32`, integer `divide`) is issued
+deferred too: the shared element-wise kernel takes the loop's dtypes
+(`UfuncLoop::dtypes`) for the result layout and, in the task, casts every
+input of another dtype row by row, in chunks of 8,192 elements, into
+per-thread buffers before the loop call (a broadcast input once per row).
+`astype` (orders K, C, F; not complex to real, which warns per call) is a
+deferred task of its own (`DeferredCastKernel`, kernel per (dtype, order)
+cached in the runtime): its size step copies the shape, its layout step is
+`numpy::astype_layout` (`PyArray_NewLikeArray`'s order; all strides 0 for
+an empty array, as NumPy), its run casts along the output's fastest axis.
+The element casts are NumPy's: NumPy 2 leaves the legacy
+`ArrFuncs->cast` table empty, so a cast is a ranged, buffered `NpyIter`
+template per (from, to) over 8,192 contiguous elements, copied per thread
+from the template's pool and pointed at the data
+(`NpyIter_ResetBasePointers`, no GIL), the converted elements copied out
+of its buffer (`numpy::cast_elements`). Every reset of a buffered iterator
+copies its current range from its current base pointers: a range change
+(a short last chunk) is therefore made on pointers to a static block of
+zeros (no FP flags), never on the pointers of an earlier call, which may
+be freed. FP flags of the casts (NaN to int: "invalid value encountered in
+cast") are reported as NumPy's. Cost at O1 (callgrind, `x * y` of 8
+elements, `z.astype(np.float32)` of 100): unchanged within the noise
+(< 10 instructions per op).
+
+**Not yet:** matmul, gathers and the other regular-path ops
 read their inputs' layouts at issue, so one issued on an array a task
 still sizes (S2/S4) waits at its issue for that array's layout (for an
 S4 array: until its size input is computed). Making them deferred

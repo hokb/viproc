@@ -193,6 +193,7 @@ std::unique_ptr<UfuncLoop> UfuncLoop::resolve(PyObject* ufunc, std::span<const D
         return nullptr;
     }
     loop->init_info("");
+    loop->dtypes_.assign(dtypes.begin(), dtypes.end());
     loop->kernel_ = make_elementwise_kernel(loop.get());
     return loop;
 }
@@ -541,6 +542,12 @@ class ElementwiseKernel : public Kernel {
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         const Shape& shape = outputs[0].layout().shape;
         const auto nin = static_cast<std::size_t>(loop_->nin());
+        const std::span<const DType> dts = loop_->dtypes();
+        for (std::size_t i = 0; i < nin && dts.size() > nin; ++i) {
+            if (inputs[i].layout().dtype != dts[i]) [[unlikely]] {
+                return run_casting(inputs, outputs); // O2: issue_deferred casts here
+            }
+        }
         if (nin + outputs.size() <= kMaxFlat && outputs.size() == 1) {
             const Layout* layouts[kMaxFlat];
             char* ptrs[kMaxFlat];
@@ -608,12 +615,72 @@ class ElementwiseKernel : public Kernel {
         const auto nin = static_cast<std::size_t>(loop_->nin());
         DType dts[kMaxFlat];
         for (std::size_t i = 0; i < nin; ++i) {
-            dts[i] = inputs[i]->dtype; // issue_deferred: no casts
+            dts[i] = loop_->dtypes().size() > i ? loop_->dtypes()[i] : inputs[i]->dtype;
         }
         elementwise_layout(outputs[0], inputs.first(nin), std::span(dts, nin));
     }
 
   private:
+    // O2: inputs of another dtype than the loop's are cast row by row, in
+    // chunks of kCastChunk elements, into per-thread buffers (as NumPy's
+    // buffered iterator casts them), then the loop runs on the chunk. A
+    // broadcast input (stride 0) is cast once per chunk.
+    static constexpr std::intptr_t kCastChunk = 8192;
+    KernelResult run_casting(std::span<const Operand> inputs, std::span<const Operand> outputs) {
+        const Shape& shape = outputs[0].layout().shape;
+        const auto nin = static_cast<std::size_t>(loop_->nin());
+        const std::span<const DType> dts = loop_->dtypes();
+        std::vector<Layout> layouts;
+        layouts.reserve(nin + 1);
+        OperandPointers base;
+        DType from[kMaxFlat];
+        for (std::size_t i = 0; i < nin; ++i) {
+            layouts.push_back(broadcast_to(inputs[i].layout(), shape));
+            base.push_back(reinterpret_cast<char*>(inputs[i].first()));
+            from[i] = inputs[i].layout().dtype;
+        }
+        layouts.push_back(outputs[0].layout());
+        base.push_back(reinterpret_cast<char*>(outputs[0].first()));
+        thread_local std::vector<std::byte> buffers[kMaxFlat];
+        std::string cast_error;
+        for (std::size_t i = 0; i < nin; ++i) {
+            if (from[i] != dts[i]) {
+                buffers[i].resize(static_cast<std::size_t>(kCastChunk) * itemsize(dts[i]));
+            }
+        }
+        const bool ok = for_each_row(
+            shape, layouts, std::move(base),
+            [&](char** ptrs, std::intptr_t n, const std::intptr_t* st) {
+                for (std::intptr_t off = 0; off < n; off += kCastChunk) {
+                    std::intptr_t m = std::min(kCastChunk, n - off);
+                    char* data[kMaxFlat];
+                    std::intptr_t strides[kMaxFlat];
+                    for (std::size_t i = 0; i <= nin; ++i) {
+                        data[i] = ptrs[i] + off * st[i];
+                        strides[i] = st[i];
+                        if (i < nin && from[i] != dts[i]) {
+                            char* buf = reinterpret_cast<char*>(buffers[i].data());
+                            if (!cast_elements(from[i], dts[i], data[i], st[i], buf,
+                                               st[i] == 0 ? 1 : m, cast_error)) {
+                                return false;
+                            }
+                            data[i] = buf;
+                            strides[i] =
+                                st[i] == 0 ? 0 : static_cast<std::intptr_t>(itemsize(dts[i]));
+                        }
+                    }
+                    if (loop_->call(data, &m, strides) != 0) {
+                        return false;
+                    }
+                }
+                return true;
+            });
+        if (!ok && !cast_error.empty()) {
+            return KernelResult{1, "RuntimeError: " + cast_error, 0};
+        }
+        return ok ? KernelResult{} : KernelResult{1, take_loop_error(), 0};
+    }
+
     static std::string broadcast_error(std::span<const Layout* const> inputs) {
         std::string m = "ValueError: operands could not be broadcast together with shapes ";
         for (const Layout* l : inputs) {
@@ -1111,7 +1178,29 @@ std::shared_ptr<Kernel> make_cast_kernel(const Layout& in, const Layout& out, lo
     return kernel;
 }
 
+namespace {
+
+// One cast iterator template per (from, to): 1-d, kCastChunk elements,
+// contiguous, ranged (NpyIter_ResetToIterIndexRange per chunk). Owned by the
+// LoopCache; set on the main thread before the tasks that use it are issued
+// (the issue publishes the entry to the workers), cleared with the cache.
+constexpr std::size_t kDTypes = 7;
+constexpr std::intptr_t kCastChunk = 8192;
+IterTemplate* g_cast_iters[kDTypes][kDTypes] = {};
+
+} // namespace
+
 LoopCache::~LoopCache() {
+    for (auto& row : g_cast_iters) {
+        for (IterTemplate*& t : row) {
+            t = nullptr;
+        }
+    }
+    for (auto& row : cast_templates_) {
+        for (std::shared_ptr<IterTemplate>& t : row) {
+            t.reset();
+        }
+    }
     iter_templates_.clear(); // kernels still holding one release it later
     reduce_templates_.clear();
     Py_XDECREF(extobj_);
@@ -1461,6 +1550,243 @@ PyObject* borrow_ndarray(const Array& a) { return ndarray_over(a, true); }
 bool pin_borrowed(const Array& a, PyObject* view) {
     PyArray_CLEARFLAGS(reinterpret_cast<PyArrayObject*>(view), NPY_ARRAY_WRITEABLE);
     return attach_export(a, view, false);
+}
+
+bool LoopCache::prepare_cast(DType from, DType to, DeferRelease defer) {
+    if (from == to) {
+        return true;
+    }
+    const auto f = static_cast<std::size_t>(from), t = static_cast<std::size_t>(to);
+    std::shared_ptr<IterTemplate>& templ = cast_templates_[f][t];
+    if (!templ) {
+        char* const dummy = template_address();
+        const Shape shape{kCastChunk};
+        PyArrayObject* op[2] = {template_array(Layout::contiguous(from, shape), dummy, false),
+                                template_array(Layout::contiguous(to, shape), dummy, true)};
+        PyArray_Descr* descr = PyArray_DescrFromType(type_num(to));
+        PyArray_Descr* descrs[2] = {descr, descr};
+        npy_uint32 op_flags[2] = {NPY_ITER_READONLY | NPY_ITER_ALIGNED,
+                                  NPY_ITER_WRITEONLY | NPY_ITER_ALIGNED};
+        NpyIter* iter = nullptr;
+        if (op[0] != nullptr && op[1] != nullptr && descr != nullptr) {
+            iter = NpyIter_AdvancedNew(2, op,
+                                       NPY_ITER_BUFFERED | NPY_ITER_EXTERNAL_LOOP |
+                                           NPY_ITER_RANGED | NPY_ITER_DELAY_BUFALLOC,
+                                       NPY_KEEPORDER, NPY_UNSAFE_CASTING, op_flags, descrs, -1,
+                                       nullptr, nullptr, static_cast<npy_intp>(kCastChunk));
+        }
+        Py_XDECREF(op[0]);
+        Py_XDECREF(op[1]);
+        Py_XDECREF(descr);
+        if (iter == nullptr || NpyIter_IterationNeedsAPI(iter)) {
+            if (iter != nullptr) {
+                NpyIter_Deallocate(iter);
+            }
+            PyErr_Clear();
+            return false;
+        }
+        templ = new_iter_template();
+        templ->templ = iter;
+        templ->defer = std::move(defer);
+        g_cast_iters[f][t] = templ.get();
+    }
+    if (!templ->reserve()) {
+        PyErr_Clear();
+        return false;
+    }
+    return true;
+}
+
+// Read-only zeros of the largest dtype for kCastChunk elements, see cast_elements.
+alignas(64) const std::byte kCastZeros[16 * kCastChunk]{};
+
+bool cast_elements(DType from, DType to, const char* src, std::intptr_t sstride, char* dst,
+                   std::intptr_t n, std::string& error) {
+    const auto fsz = static_cast<std::intptr_t>(itemsize(from));
+    if (from == to) {
+        if (sstride == fsz) {
+            std::memcpy(dst, src, static_cast<std::size_t>(n * fsz));
+        } else {
+            for (std::intptr_t i = 0; i < n; ++i) {
+                std::memcpy(dst + i * fsz, src + i * sstride, static_cast<std::size_t>(fsz));
+            }
+        }
+        return true;
+    }
+    IterTemplate* t = g_cast_iters[static_cast<std::size_t>(from)][static_cast<std::size_t>(to)];
+    PooledIter p;
+    if (!t->acquire(p, error)) {
+        return false;
+    }
+    const auto tsz = static_cast<std::intptr_t>(itemsize(to));
+    thread_local std::vector<std::byte> gathered;
+    bool clean = true;
+    for (std::intptr_t off = 0; off < n && clean; off += kCastChunk) {
+        const std::intptr_t m = std::min(kCastChunk, n - off);
+        const char* s = src + off * sstride;
+        if (sstride != fsz && m > 1) { // the template reads contiguous data
+            gathered.resize(static_cast<std::size_t>(m * fsz));
+            for (std::intptr_t i = 0; i < m; ++i) {
+                std::memcpy(gathered.data() + i * fsz, s + i * sstride,
+                            static_cast<std::size_t>(fsz));
+            }
+            s = reinterpret_cast<const char*>(gathered.data());
+        }
+        char* base[2] = {const_cast<char*>(s), dst + off * tsz};
+        char* errmsg = nullptr;
+        // Every reset copies the iterator's current range from its current
+        // base pointers into the cast buffer: a range change on the pointers
+        // of an earlier call would read freed memory. So the range changes
+        // only on pointers to zeros (no FP flags), then moves to the data.
+        npy_intp start = 0, end = 0;
+        NpyIter_GetIterIndexRange(p.iter, &start, &end);
+        bool ok = true;
+        if (start != 0 || end != m) {
+            char* zeros[2] = {const_cast<char*>(reinterpret_cast<const char*>(kCastZeros)),
+                              const_cast<char*>(reinterpret_cast<const char*>(kCastZeros))};
+            ok = NpyIter_ResetBasePointers(p.iter, zeros, &errmsg) == NPY_SUCCEED &&
+                 NpyIter_ResetToIterIndexRange(p.iter, 0, m, &errmsg) == NPY_SUCCEED;
+        }
+        if (!ok || NpyIter_ResetBasePointers(p.iter, base, &errmsg) != NPY_SUCCEED) {
+            error = errmsg != nullptr ? errmsg : "cast iterator reset failed";
+            clean = false;
+            break;
+        }
+        do {
+            const npy_intp k = *p.countptr;
+            if (p.strideptr[0] == tsz && p.strideptr[1] == tsz) {
+                std::memcpy(p.dataptr[1], p.dataptr[0], static_cast<std::size_t>(k * tsz));
+            } else {
+                for (npy_intp i = 0; i < k; ++i) {
+                    std::memcpy(p.dataptr[1] + i * p.strideptr[1],
+                                p.dataptr[0] + i * p.strideptr[0], static_cast<std::size_t>(tsz));
+                }
+            }
+        } while (p.iternext(p.iter));
+    }
+    t->give_back(p, clean);
+    return clean;
+}
+
+Layout astype_layout(const Layout& l, DType to, char order) {
+    Layout out;
+    out.dtype = to;
+    out.shape = l.shape;
+    out.strides.resize(l.shape.size());
+    auto fill = [&](auto&& perm) { // perm: axes from the slowest to the fastest
+        std::int64_t step = static_cast<std::int64_t>(itemsize(to));
+        for (std::size_t k = perm.size(); k-- > 0;) {
+            out.strides[perm[k]] = step;
+            if (l.shape[perm[k]] != 0) {
+                step *= l.shape[perm[k]];
+            }
+        }
+    };
+    std::vector<std::size_t> perm(l.shape.size());
+    for (std::size_t i = 0; i < perm.size(); ++i) {
+        perm[i] = i;
+    }
+    if (order == 'F') {
+        std::reverse(perm.begin(), perm.end());
+    } else if (order == 'K' && !l.c_contiguous() && l.shape.size() > 1) {
+        // PyArray_NewLikeArray(KEEPORDER): F order if `in` is F-contiguous,
+        // else axes by decreasing |stride| (stable), C order among equals.
+        if (!l.f_contiguous()) {
+            std::stable_sort(perm.begin(), perm.end(), [&](std::size_t a, std::size_t b) {
+                return std::llabs(l.strides[a]) > std::llabs(l.strides[b]);
+            });
+        } else {
+            std::reverse(perm.begin(), perm.end());
+        }
+    }
+    fill(perm);
+    if (std::find(l.shape.begin(), l.shape.end(), 0) != l.shape.end()) {
+        // NumPy gives an empty array all-zero strides, whatever the order
+        std::fill(out.strides.begin(), out.strides.end(), 0);
+    }
+    return out;
+}
+
+namespace {
+
+// a.astype(to, order) at O2: shape and layout in the task (size()/layout()),
+// the elements cast row by row along the output's fastest axis.
+class DeferredCastKernel : public Kernel {
+  public:
+    DeferredCastKernel(DType to, char order) : to_(to), order_(order) {}
+    const char* name() const override { return "astype"; }
+    const char* fp_name() const override { return "cast"; }
+
+    KernelResult size(std::span<const Layout* const> inputs, std::span<Layout> outputs) override {
+        outputs[0].shape = inputs[0]->shape;
+        return {};
+    }
+    void layout(std::span<const Layout* const> inputs, std::span<Layout> outputs) override {
+        outputs[0] = astype_layout(*inputs[0], to_, order_);
+    }
+
+    KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
+        const Layout& in = inputs[0].layout();
+        const Layout& out = outputs[0].layout();
+        // iterate with the output's fastest axis innermost: rows of it are
+        // contiguous
+        const std::size_t nd = out.shape.size();
+        std::vector<std::size_t> perm(nd);
+        for (std::size_t i = 0; i < nd; ++i) {
+            perm[i] = i;
+        }
+        std::stable_sort(perm.begin(), perm.end(), [&](std::size_t a, std::size_t b) {
+            return std::llabs(out.strides[a]) > std::llabs(out.strides[b]);
+        });
+        Shape shape(nd);
+        std::vector<Layout> layouts(2);
+        layouts[0].dtype = in.dtype;
+        layouts[1].dtype = out.dtype;
+        layouts[0].strides.resize(nd);
+        layouts[1].strides.resize(nd);
+        for (std::size_t k = 0; k < nd; ++k) {
+            shape[k] = out.shape[perm[k]];
+            layouts[0].strides[k] = in.strides[perm[k]];
+            layouts[1].strides[k] = out.strides[perm[k]];
+        }
+        layouts[0].shape = shape;
+        layouts[1].shape = shape;
+        OperandPointers base;
+        base.push_back(reinterpret_cast<char*>(inputs[0].first()));
+        base.push_back(reinterpret_cast<char*>(outputs[0].first()));
+        const DType from = in.dtype;
+        const auto osz = static_cast<std::intptr_t>(itemsize(to_));
+        thread_local std::vector<std::byte> buf;
+        std::string error;
+        const bool ok = for_each_row(
+            shape, layouts, std::move(base),
+            [&](char** ptrs, std::intptr_t n, const std::intptr_t* st) {
+                if (st[1] == osz) {
+                    return cast_elements(from, to_, ptrs[0], st[0], ptrs[1], n, error);
+                }
+                buf.resize(static_cast<std::size_t>(n * osz)); // a row of extent 1, 0-d
+                if (!cast_elements(from, to_, ptrs[0], st[0], reinterpret_cast<char*>(buf.data()),
+                                   n, error)) {
+                    return false;
+                }
+                for (std::intptr_t i = 0; i < n; ++i) {
+                    std::memcpy(ptrs[1] + i * st[1], buf.data() + i * osz,
+                                static_cast<std::size_t>(osz));
+                }
+                return true;
+            });
+        return ok ? KernelResult{} : KernelResult{1, "RuntimeError: " + error, 0};
+    }
+
+  private:
+    DType to_;
+    char order_;
+};
+
+} // namespace
+
+std::shared_ptr<Kernel> make_deferred_cast_kernel(DType to, char order) {
+    return std::make_shared<DeferredCastKernel>(to, order);
 }
 
 } // namespace viproc::numpy

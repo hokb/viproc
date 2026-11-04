@@ -207,6 +207,8 @@ struct vp_runtime {
         gufunc_kernels;
     // Fast-path reduce kernels (ReduceKey), cleared when it grows large.
     std::unordered_map<ReduceKey, std::shared_ptr<Kernel>, ReduceKeyHash> reduce_kernels;
+    // O2: deferred astype kernels per (dtype, order index K/C/F).
+    std::shared_ptr<Kernel> cast_kernels[7][3];
 };
 
 // A vp_array* is an Array* holding one reference (no wrapper allocation).
@@ -722,8 +724,10 @@ int vp_ufunc_issue_deferred(vp_runtime* rt, const vp_loop* loop, vp_array* const
     for (int i = 0; i < nin; ++i) {
         Array& a = arr(inputs[i]);
         rank = std::max(rank, Runtime::rank(a)); // broadcasting: the largest
-        if (a.meta()->sd().dtype != loop->dtypes[static_cast<std::size_t>(i)]) {
-            return VP_UNSUPPORTED; // casts: the regular path
+        const DType from = a.meta()->sd().dtype, to = loop->dtypes[static_cast<std::size_t>(i)];
+        if (from != to && (loop->loop->dtypes().empty() ||
+                           !rt->loops->prepare_cast(from, to, defer_release(rt->graveyard)))) {
+            return VP_UNSUPPORTED; // the kernel casts (ElementwiseKernel::run_casting)
         }
         if (all_ready && a.ready() && Runtime::unsized(a)) {
             rt->rt->wait_stage(a, TaskState::Allocated); // done: no wait; sized unless it failed
@@ -974,8 +978,36 @@ int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, 
 int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array** result,
               const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
-    const Layout& l = arr(in).layout();
     const DType to = to_dtype(dtype);
+    if (rt->rt->opt_level() >= 2) [[unlikely]] {
+        // O2 (pipelining.md, "Casts at O2"): sized and laid out in the task,
+        // unless it takes the direct path (small ready data, sized here).
+        Array& a = arr(in);
+        const DType from = a.meta()->sd().dtype;
+        const bool complex_to_real = (from == DType::Complex64 || from == DType::Complex128) &&
+                                     to != DType::Complex64 && to != DType::Complex128;
+        const int oi = order == 'K' ? 0 : order == 'C' ? 1 : order == 'F' ? 2 : -1;
+        if (a.ready() && Runtime::unsized(a)) {
+            rt->rt->wait_stage(a, TaskState::Allocated); // done: no wait
+        }
+        const bool small = !Runtime::unsized(a) && a.ready() &&
+                           a.layout().size() < rt->rt->offload_policy().options().sync_below;
+        if (oi >= 0 && !complex_to_real && !small &&
+            rt->loops->prepare_cast(from, to, defer_release(rt->graveyard))) {
+            std::shared_ptr<Kernel>& k = rt->cast_kernels[static_cast<int>(to)][oi];
+            if (!k) {
+                k = numpy::make_deferred_cast_kernel(to, order);
+            }
+            const ArrayPtr ins[] = {ref(in)};
+            const int rank = Runtime::rank(a);
+            ArrayPtr res;
+            rt->rt->issue_deferred(k, ins, std::span(&to, 1), std::span(&rank, 1), site,
+                                   std::span(&res, 1));
+            *result = hand_out(std::move(res));
+            return VP_OK;
+        }
+    }
+    const Layout& l = arr(in).layout();
     Layout out;
     if (order == 'F') {
         out.dtype = to;
