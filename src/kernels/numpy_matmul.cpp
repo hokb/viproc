@@ -1,6 +1,7 @@
 #include "kernels/numpy_matmul.hpp"
 
 #include <algorithm>
+#include <string>
 #include <vector>
 
 namespace viproc::numpy {
@@ -118,6 +119,61 @@ class MatmulKernel : public Kernel {
                 return {};
             }
         }
+    }
+
+    // O2 (Runtime::issue_deferred): the result shape with NumPy's errors,
+    // in NumPy's order (core dimensions, then the batch broadcast).
+    KernelResult size(std::span<const Layout* const> inputs, std::span<Layout> outputs) override {
+        const Layout& a = *inputs[0];
+        const Layout& b = *inputs[1];
+        const std::size_t na = a.shape.size();
+        const std::size_t nbd = b.shape.size();
+        const std::int64_t n = a.shape[na - 1];
+        const std::int64_t k = b.shape[nbd >= 2 ? nbd - 2 : nbd - 1];
+        if (n != k) {
+            return KernelResult{1,
+                                "ValueError: matmul: Input operand 1 has a mismatch in its core "
+                                "dimension 0, with gufunc signature (n?,k),(k,m?)->(n?,m?) "
+                                "(size " +
+                                    std::to_string(k) + " is different from " + std::to_string(n) +
+                                    ")",
+                                0};
+        }
+        Shape shape;
+        if (!broadcast_shapes(batch_shape(a), batch_shape(b), shape)) {
+            // both operands have batch axes, so both have two core axes
+            auto dims = [](const Shape& s, std::size_t count, bool newaxes) {
+                std::string t = "(";
+                for (std::size_t i = 0; i < count; ++i) {
+                    t += (i ? "," : "") + std::to_string(s[i]);
+                }
+                if (newaxes) {
+                    t += ",newaxis,newaxis";
+                }
+                return t + ")";
+            };
+            const Shape core{a.shape[na - 2], b.shape[nbd - 1]};
+            return KernelResult{1,
+                                "ValueError: operands could not be broadcast together with "
+                                "remapped shapes [original->remapped]: " +
+                                    dims(a.shape, na, false) + "->" + dims(a.shape, na - 2, true) +
+                                    " " + dims(b.shape, nbd, false) + "->" +
+                                    dims(b.shape, nbd - 2, true) + "  and requested shape " +
+                                    dims(core, 2, false),
+                                0};
+        }
+        if (na >= 2) {
+            shape.push_back(a.shape[na - 2]);
+        }
+        if (nbd >= 2) {
+            shape.push_back(b.shape[nbd - 1]);
+        }
+        outputs[0].shape = std::move(shape);
+        return {};
+    }
+    void layout(std::span<const Layout* const> inputs, std::span<Layout> outputs) override {
+        std::int64_t work = 0;
+        matmul_layout(*inputs[0], *inputs[1], outputs[0], work); // sized: cannot fail
     }
 
   private:

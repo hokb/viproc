@@ -1280,6 +1280,38 @@ bool numpy_aligned(const Array& a) {
 int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_array** result,
               const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
+    if (rt->rt->opt_level() >= 2 && (Runtime::unsized(arr(a)) || Runtime::unsized(arr(b))))
+        [[unlikely]] {
+        // O2: sized and laid out in the task (MatmulKernel::size/layout).
+        // Ranks and dtypes are known at issue; an unsized array's data is
+        // aligned (a pool block, views by item-sized steps).
+        const int ra = Runtime::rank(arr(a)), rb = Runtime::rank(arr(b));
+        const DType dt = arr(a).meta()->sd().dtype;
+        if (ra == 0 || rb == 0 || dt != arr(b).meta()->sd().dtype) {
+            set_error(err, errlen, "matmul: NumPy's error or cast");
+            return VP_UNSUPPORTED;
+        }
+        std::string e;
+        const DType d[] = {dt, dt, dt};
+        const numpy::UfuncLoop* loop = rt->loops->get(ufunc, d, e);
+        if (loop == nullptr) {
+            PyErr_Clear();
+            set_error(err, errlen, e);
+            return VP_UNSUPPORTED;
+        }
+        std::shared_ptr<Kernel>& kernel = rt->matmul_kernels[loop];
+        if (!kernel) {
+            kernel = numpy::make_matmul_kernel(loop);
+        }
+        const int rank = std::max(ra - (ra >= 2 ? 2 : 1), rb - (rb >= 2 ? 2 : 1)) +
+                         (ra >= 2 ? 1 : 0) + (rb >= 2 ? 1 : 0);
+        const ArrayPtr ins[] = {ref(a), ref(b)};
+        ArrayPtr res;
+        rt->rt->issue_deferred(kernel, ins, std::span(&dt, 1), std::span(&rank, 1), site,
+                               std::span(&res, 1));
+        *result = hand_out(std::move(res));
+        return VP_OK;
+    }
     const Layout& la = arr(a).layout();
     const Layout& lb = arr(b).layout();
     Layout out;

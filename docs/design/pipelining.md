@@ -335,7 +335,20 @@ cast") are reported as NumPy's. Cost at O1 (callgrind, `x * y` of 8
 elements, `z.astype(np.float32)` of 100): unchanged within the noise
 (< 10 instructions per op).
 
-**Not yet:** matmul, gathers and the other regular-path ops
+**Matmul at O2 (implemented).** `a @ b` / `np.matmul(a, b)` of arrays
+tasks still size (`vp_matmul`: either operand unsized) is a deferred task:
+ranks and dtypes are known at issue (0-d operands and casts take the
+regular path, NumPy's error or iterator copy), the result's rank follows
+from them; `MatmulKernel::size` checks the core dimension and broadcasts
+the batch axes with NumPy's two messages, in NumPy's order (core first),
+`layout` is `matmul_layout`. An unsized operand's data is aligned (a pool
+block, views by item-sized steps), so NumPy would take it as it is.
+`swapaxes` of such arrays is a deferred view (the transpose rule), so
+`a @ a.swapaxes(-1, -2)` keeps NumPy's syrk. `np.dot` still reads strides
+at issue (`_dot_operand`). Cost at O1 (callgrind, `x @ x` of 3 x 3,
+`x.swapaxes(0, 1)`): unchanged within the noise.
+
+**Not yet:** gathers and the other regular-path ops
 read their inputs' layouts at issue, so one issued on an array a task
 still sizes (S2/S4) waits at its issue for that array's layout (for an
 S4 array: until its size input is computed). Making them deferred

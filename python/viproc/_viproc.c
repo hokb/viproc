@@ -1710,7 +1710,7 @@ static int fast_matmul(PyObject* ufunc, PyObject* a, PyObject* b, PyObject** res
     if (raise_status(st, err) < 0) {
         return -1;
     }
-    if (vp_array_ndim(r) == 0 && vp_array_ready(r) &&
+    if (vp_array_rank(r) == 0 && vp_array_ready(r) &&
         vp_array_wait(g_rt, r, err, sizeof err) == VP_OK) {
         *result = vp_array_scalar(r);
         vp_array_release(r);
@@ -3383,8 +3383,18 @@ static PyObject* Array_swapaxes(PyObject* self, PyObject* const* args, Py_ssize_
     if (Py_TYPE(self) == g_array_cls && kwnames == NULL && nargs == 2 && exact_dims(args, 2, ij) &&
         check_runtime() == 0) {
         vp_array* x = array_of(self);
-        const int nd = vp_array_ndim(x);
+        const int deferred = g_opt >= 2 && !vp_array_sized(x); /* O2: the rank is known */
+        const int nd = deferred ? vp_array_rank(x) : vp_array_ndim(x);
         int64_t i = ij[0] < 0 ? ij[0] + nd : ij[0], j = ij[1] < 0 ? ij[1] + nd : ij[1];
+        if (deferred && i >= 0 && i < nd && j >= 0 && j < nd) {
+            int perm[MAXDIMS];
+            for (int k = 0; k < nd; ++k) {
+                perm[k] = k;
+            }
+            perm[i] = (int)j;
+            perm[j] = (int)i;
+            return make_deferred_view(self, nd, NULL, NULL, NULL, NULL, perm);
+        }
         if (i >= 0 && i < nd && j >= 0 && j < nd) {
             int64_t shape[MAXDIMS], strides[MAXDIMS];
             memcpy(shape, vp_array_shape(x), (size_t)nd * sizeof(int64_t));

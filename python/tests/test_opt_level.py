@@ -397,6 +397,46 @@ def test_o2_cast_empty_and_warnings(level2):
         assert np.array_equal(r, a.astype(np.int32))
 
 
+@pytest.mark.parametrize("dtype", [np.float64, np.complex64, np.int64])
+def test_o2_matmul_in_tasks(level2, dtype):
+    """O2: a matmul of arrays tasks still size is sized and laid out in its
+    task (MatmulKernel::size/layout): no wait, NumPy's values and strides
+    (also a @ a.T on the swapaxes view, NumPy's syrk)."""
+    rng = np.random.default_rng(5)
+    shapes = [((30, 40), (40, 20)), ((40,), (40, 20)), ((30, 40), (40,)), ((40,), (40,)),
+              ((5, 30, 40), (40, 20)), ((30, 40), (3, 1, 40, 20))]
+    data = [(rng.random(sa) * 10).astype(dtype) for sa, _ in shapes]
+    datb = [(rng.random(sb) * 10).astype(dtype) for _, sb in shapes]
+    slow = _slow()[:1] * 0
+    before = _stats()
+    va = [viproc.asarray(a) + slow.astype(dtype) for a in data]
+    vb = [viproc.asarray(b) + slow.astype(dtype) for b in datb]
+    got = [x @ y for x, y in zip(va, vb)] + [va[4] @ va[4].swapaxes(1, 2)]
+    assert _stats() == before  # neither a sync nor a size wait
+    want = [a @ b for a, b in zip(data, datb)] + [data[4] @ data[4].swapaxes(1, 2)]
+    for g, w in zip(got, want):
+        r = np.asarray(g)
+        assert r.dtype == w.dtype and r.shape == w.shape and np.array_equal(r, w)
+        assert r.strides == np.asarray(w).strides
+
+
+@pytest.mark.parametrize("sa, sb, msg", [
+    ((3, 4), (5, 6), r"matmul: Input operand 1 has a mismatch in its core dimension 0, with "
+                     r"gufunc signature \(n\?,k\),\(k,m\?\)->\(n\?,m\?\) \(size 5 is "
+                     r"different from 4\)"),
+    ((2, 3, 4), (3, 4, 5), r"operands could not be broadcast together with remapped shapes "
+                           r"\[original->remapped\]: \(2,3,4\)->\(2,newaxis,newaxis\) "
+                           r"\(3,4,5\)->\(3,newaxis,newaxis\)  and requested shape \(3,5\)"),
+])
+def test_o2_matmul_errors_are_asynchronous(level2, sa, sb, msg):
+    with pytest.raises(ValueError, match=msg):
+        np.ones(sa) @ np.ones(sb)
+    with pytest.raises(viproc.AsyncValueError, match=msg):
+        r = (viproc.asarray(np.ones(sa)) + _slow()[:1] * 0) @ (viproc.asarray(np.ones(sb)) + 0.0)
+        np.asarray(r)
+    viproc.wait_all()  # raised once
+
+
 def test_o2_view_index_error_is_asynchronous(level2):
     x = _pending(np.ones((300, 4)))
     with pytest.raises(viproc.AsyncIndexError,
