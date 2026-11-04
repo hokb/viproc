@@ -336,19 +336,46 @@ elements, `z.astype(np.float32)` of 100): unchanged within the noise
 (< 10 instructions per op).
 
 **Matmul at O2 (implemented).** `a @ b` / `np.matmul(a, b)` of arrays
-tasks still size (`vp_matmul`: either operand unsized) is a deferred task:
+tasks may still size or lay out (`vp_matmul`: either operand pending) is a
+deferred task:
 ranks and dtypes are known at issue (0-d operands and casts take the
 regular path, NumPy's error or iterator copy), the result's rank follows
 from them; `MatmulKernel::size` checks the core dimension and broadcasts
 the batch axes with NumPy's two messages, in NumPy's order (core first),
 `layout` is `matmul_layout`. An unsized operand's data is aligned (a pool
-block, views by item-sized steps), so NumPy would take it as it is.
+block, views by item-sized steps), so NumPy would take it as it is; a
+laid-out one is checked as at O1. The test is "pending", not "unsized": an
+array its task has sized is laid out only at its Allocated stage, so a
+regular path reading its layout would still wait.
 `swapaxes` of such arrays is a deferred view (the transpose rule), so
 `a @ a.swapaxes(-1, -2)` keeps NumPy's syrk. `np.dot` still reads strides
 at issue (`_dot_operand`). Cost at O1 (callgrind, `x @ x` of 3 x 3,
 `x.swapaxes(0, 1)`): unchanged within the noise.
 
-**Not yet:** gathers and the other regular-path ops
+**Gathers at O2 (implemented).** `a[key]` for keys of slices and integer
+index arrays (viproc arrays of any state, NumPy integer arrays) where `a`
+or an index array is pending: the bridge places the result axes by the
+ranks alone (NumPy's rule: the broadcast index dimensions replace adjacent
+indexed axes, else go first; `_gather_deferred`, reached through the O2
+hook `_getitem_o2`, so O1 runs no level test in Python), the basic part a
+deferred view, and issues `vp_gather` with `VP_INDEX_DEFERRED` (the C side
+does not decide again: the operands may have completed meanwhile). The
+task (`DeferredGatherKernel`, `index_deferred.cpp`, wrapping the O1 gather
+kernel, whose code stays as it is) broadcasts the index shapes with
+NumPy's IndexError, sizes the result and lays it out as NumPy's mapiter
+allocates it: the index dimensions outermost in C order, the other axes
+inside them in the order NumPy's iterator keeps the source's
+(`Layout::iteration_order`), all strides 0 when empty. Out-of-bounds
+indices are the kernel's `AsyncIndexError`, as at O1. An advanced key on
+an array its task still sizes no longer reads the array's layout in the C
+slot (`advanced_key` in `m_basic_view`). Ints, `None`, `Ellipsis`, masks
+and lists in the key take the regular path. Tasks that size from data
+(S4: `x[mask]`, `flatnonzero`, `nonzero`) derive a view input's strides,
+not only its shape, before sizing: they read its data. Cost at O1
+(callgrind, `x[i]` of 1,000 elements, 334 indices): unchanged
+(~29,900 instructions per op).
+
+**Not yet:** `take`, `np.dot`, assignments and the other regular-path ops
 read their inputs' layouts at issue, so one issued on an array a task
 still sizes (S2/S4) waits at its issue for that array's layout (for an
 S4 array: until its size input is computed). Making them deferred

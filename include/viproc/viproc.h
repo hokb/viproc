@@ -374,6 +374,10 @@ int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array
  * modes: VP_INDEX_RAISE (the task fails), VP_INDEX_WRAP (i mod n),
  * VP_INDEX_CLIP (to 0 or n - 1; clip maps negative indices to 0 too). */
 enum { VP_INDEX_RAISE = 0, VP_INDEX_WRAP = 1, VP_INDEX_CLIP = 2 };
+/* vp_gather's `mode` may add VP_INDEX_DEFERRED (O2, `result_strides` NULL):
+ * the task sizes and lays out the result (NumPy's layout), whether the
+ * operands are ready or not. */
+enum { VP_INDEX_DEFERRED = 4 };
 /* r = src[idx...]: a new array with `result_strides` (NumPy's layout for the
  * indexing result; NULL for C order). */
 int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, const int* idx_axes,

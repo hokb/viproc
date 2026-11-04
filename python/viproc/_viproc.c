@@ -71,6 +71,7 @@ static PyObject* g_where_impl = NULL;    /* numpy.where._implementation */
 static PyObject* g_np_integer = NULL;    /* numpy.integer */
 static PyObject* g_ops = NULL;           /* dict: operator name -> ufunc */
 static PyObject* g_getitem = NULL;       /* getitem(a, key): a[key] beyond the C fast path */
+static PyObject* g_getitem_o2 = NULL;    /* the same from O2 on (set_getitem_o2) */
 static PyObject* g_setitem = NULL;       /* setitem(a, key, v): a[key] = v beyond C */
 
 /* Caches (main thread only). */
@@ -2268,7 +2269,9 @@ static PyObject* Array_subscript(PyObject* self, PyObject* key) {
         PyErr_SetString(PyExc_RuntimeError, "viproc: setup() was not called");
         return NULL;
     }
-    return PyObject_CallFunctionObjArgs(g_getitem, self, key, NULL);
+    return PyObject_CallFunctionObjArgs(g_opt >= 2 && g_getitem_o2 != NULL ? g_getitem_o2
+                                                                           : g_getitem,
+                                        self, key, NULL);
 }
 
 static int64_t array_size(vp_array* a);
@@ -3057,6 +3060,21 @@ static int deferred_basic_view(PyObject* a, PyObject* key, PyObject** out) {
     return 1;
 }
 
+/* 1 if the key (or an item of a key tuple) is an array or a list: an
+ * advanced index, never a basic view. */
+static int advanced_key(PyObject* key) {
+    PyObject* const* items = PyTuple_Check(key) ? &PyTuple_GET_ITEM(key, 0) : &key;
+    const Py_ssize_t n = PyTuple_Check(key) ? PyTuple_GET_SIZE(key) : 1;
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject* k = items[i];
+        if (is_array(k) || PyList_Check(k) ||
+            (g_np_ndarray != NULL && PyObject_TypeCheck(k, (PyTypeObject*)g_np_ndarray))) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* a[key] for a basic key as a view (basic_layout), or None. */
 static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t nargs) {
     (void)self;
@@ -3069,6 +3087,9 @@ static PyObject* m_basic_view(PyObject* self, PyObject* const* args, Py_ssize_t 
         PyObject* v;
         if (deferred_basic_view(a, key, &v)) {
             return v;
+        }
+        if (advanced_key(key)) {
+            Py_RETURN_NONE; /* no basic view: never wait for the layout */
         }
     }
     int64_t nshape[MAXDIMS], nstrides[MAXDIMS], offset = 0;
@@ -3552,6 +3573,24 @@ static PyObject* m_item(PyObject* self, PyObject* const* args, Py_ssize_t nargs)
     PyObject* r = vp_array_scalar(e);
     vp_array_release(e);
     return r;
+}
+
+/* set_getitem_o2(fn): the hook a[key] calls instead of the getitem hook
+ * from optimization level O2 on (no level test in Python at O1). */
+static PyObject* m_set_getitem_o2(PyObject* self, PyObject* fn) {
+    (void)self;
+    Py_XSETREF(g_getitem_o2, Py_NewRef(fn));
+    Py_RETURN_NONE;
+}
+
+/* sized(x): False while a task still sizes x (O2), no wait. */
+static PyObject* m_sized(PyObject* self, PyObject* o) {
+    (void)self;
+    vp_array* a = array_of(o);
+    if (a == NULL || check_runtime() < 0) {
+        return NULL;
+    }
+    return PyBool_FromLong(vp_array_sized(a));
 }
 
 static PyObject* m_ready(PyObject* self, PyObject* o) {
@@ -5431,6 +5470,8 @@ static PyMethodDef methods[] = {
     {"from_ndarray", m_from_ndarray, METH_O, "Wrap a NumPy array (no copy)."},
     {"view", m_view, METH_VARARGS, "view(a, shape, strides, offset)"},
     {"ready", m_ready, METH_O, NULL},
+    {"sized", m_sized, METH_O, NULL},
+    {"set_getitem_o2", m_set_getitem_o2, METH_O, NULL},
     {"same_storage", m_same_storage, METH_VARARGS, NULL},
     {"wait", m_wait, METH_O, "Sync point: wait for a, raise AsyncError on failure."},
     {"export", m_export, METH_VARARGS,

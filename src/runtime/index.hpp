@@ -32,6 +32,10 @@ struct IndexSpec {
 // Gather. Operands: inputs = {src view, index arrays...}, outputs = {result}.
 // An index out of bounds fails the task with an IndexError message.
 std::shared_ptr<Kernel> make_gather_kernel(IndexSpec spec);
+// The same at O2 (Runtime::issue_deferred, index_deferred.cpp): `spec`
+// without bshape; the task sizes (NumPy's IndexError for index arrays that
+// do not broadcast) and lays out the result (NumPy's layout).
+std::shared_ptr<Kernel> make_deferred_gather_kernel(IndexSpec spec);
 
 // Scatter (NumPy's order: the last of repeated indices wins). Operands:
 // inputs = {values (broadcastable to the indexing result's shape, the view's

@@ -296,6 +296,19 @@ def test_o2_data_dependent_sizes(level2, dtype, order):
     assert isinstance(nz, tuple) and len(nz) == 1
 
 
+def test_o2_data_dependent_sizes_of_deferred_views(level2):
+    """S4 tasks reading a view a rule derives (its base still sized by its
+    task) take the view's strides, not only its shape."""
+    a = np.asarray(np.random.default_rng(6).integers(-2, 3, (300, 40)), dtype=np.float64)
+    x = _pending(a)
+    nz = np.nonzero(x[:, 5])[0]
+    flat = np.flatnonzero(x[::2, 3:7])
+    sel = x[:, 1:4][x[:, 1:4] > 0]
+    for got, ref in ((nz, np.nonzero(a[:, 5])[0]), (flat, np.flatnonzero(a[::2, 3:7])),
+                     (sel, a[:, 1:4][a[:, 1:4] > 0])):
+        assert np.array_equal(np.asarray(got), ref)
+
+
 def test_o2_mask_mismatch(level2):
     x = _pending(np.ones((30, 4)))
     with pytest.raises(viproc.AsyncIndexError, match="boolean index did not match indexed array "
@@ -435,6 +448,52 @@ def test_o2_matmul_errors_are_asynchronous(level2, sa, sb, msg):
         r = (viproc.asarray(np.ones(sa)) + _slow()[:1] * 0) @ (viproc.asarray(np.ones(sb)) + 0.0)
         np.asarray(r)
     viproc.wait_all()  # raised once
+
+
+@pytest.mark.parametrize("src", ["C", "F", "T", "one"])
+def test_o2_gather_in_tasks(level2, src):
+    """O2: advanced indexing of pending arrays is placed by the ranks at
+    issue and sized, bounds-checked and laid out in the gather task
+    (GatherKernel::size/layout): no wait, NumPy's values and strides."""
+    rng = np.random.default_rng(8)
+    i, j, k1 = np.array([0, 3, 2, 1]), np.array([[0, 1], [1, 2], [2, 0]]), np.array([[1], [0]])
+    full = slice(None)
+    keys = [(i,), (full, i), (full, full, i), (i, i), (full, i, i), (i, full, i), (j,), (full, j),
+            (slice(1, None), i), (i, slice(None, None, -1)), (k1, full, i),
+            (full, np.array([[1]]), full)]
+    for key in keys:
+        x = {"C": lambda: rng.random((4, 5, 6)),
+             "F": lambda: np.asfortranarray(rng.random((4, 5, 6))),
+             "T": lambda: rng.random((6, 4, 5)).transpose(1, 2, 0),
+             "one": lambda: rng.random((4, 1, 6))}[src]()
+        try:
+            want = x[key]
+        except IndexError:
+            continue
+        slow = _slow()[:1] * 0
+        if src == "T":
+            vx = (viproc.asarray(np.ascontiguousarray(x.transpose(2, 0, 1))) + slow).transpose(1, 2, 0)
+        else:
+            vx = viproc.asarray(x) + slow
+        before = _stats()
+        r = vx[key]
+        assert _stats() == before  # neither a sync nor a size wait
+        g = np.asarray(r)
+        assert g.shape == want.shape and g.strides == want.strides and np.array_equal(g, want)
+
+
+def test_o2_gather_errors_are_asynchronous(level2):
+    with pytest.raises(viproc.AsyncIndexError, match=r"shape mismatch: indexing arrays could "
+                       r"not be broadcast together with shapes \(3,\) \(2,\) "):
+        r = (viproc.asarray(np.ones((4, 5))) + _slow()[:1] * 0)[np.array([0, 1, 2]),
+                                                                np.array([0, 1])]
+        np.asarray(r)
+    viproc.wait_all()
+    with pytest.raises(viproc.AsyncIndexError, match="index 5 is out of bounds for axis 0 with "
+                       "size 4"):
+        r = (viproc.asarray(np.ones((4, 5))) + _slow()[:1] * 0)[np.array([5])]
+        np.asarray(r)
+    viproc.wait_all()
 
 
 def test_o2_view_index_error_is_asynchronous(level2):

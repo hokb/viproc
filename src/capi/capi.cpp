@@ -1099,6 +1099,48 @@ bool index_spec(const Layout& view, int nidx, vp_array* const* idx, const int* i
     return true;
 }
 
+// vp_gather at O2 of unsized operands: ranks and dtypes checked here, the
+// shapes in the task.
+int gather_deferred(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx,
+                    const int* idx_axes, int nres, const int* result_axes, int mode,
+                    vp_array** result, const char* site, char* err, size_t errlen) {
+    const int nd = Runtime::rank(arr(src));
+    int nb = 0;
+    IndexSpec spec;
+    for (int j = 0; j < nidx; ++j) {
+        const DType d = arr(idx[j]).meta()->sd().dtype;
+        if ((d != DType::Int32 && d != DType::Int64) || idx_axes[j] < 0 || idx_axes[j] >= nd) {
+            set_error(err, errlen, "index arrays: wrong dtype or axis");
+            return VP_INVALID;
+        }
+        nb = std::max(nb, Runtime::rank(arr(idx[j])));
+        spec.index_axes.push_back(idx_axes[j]);
+    }
+    for (int k = 0; k < nres; ++k) {
+        const int a = result_axes[k];
+        if (a >= nd || (a < 0 && -1 - a >= nb)) {
+            set_error(err, errlen, "result axes out of range");
+            return VP_INVALID;
+        }
+        spec.result_axes.push_back(a);
+    }
+    if (mode < VP_INDEX_RAISE || mode > VP_INDEX_CLIP) {
+        set_error(err, errlen, "indexing: unknown index mode");
+        return VP_INVALID;
+    }
+    spec.mode = static_cast<IndexMode>(mode);
+    std::vector<ArrayPtr> ins{ref(src)};
+    for (int j = 0; j < nidx; ++j) {
+        ins.push_back(ref(idx[j]));
+    }
+    const DType dt = arr(src).meta()->sd().dtype;
+    ArrayPtr res;
+    rt->rt->issue_deferred(make_deferred_gather_kernel(std::move(spec)), ins, std::span(&dt, 1),
+                           std::span(&nres, 1), site, std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
 } // namespace
 
 extern "C" {
@@ -1107,6 +1149,17 @@ int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, con
               int nres, const int* result_axes, const int64_t* result_strides, int mode,
               vp_array** result, const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
+    if ((mode & VP_INDEX_DEFERRED) != 0) [[unlikely]] {
+        // O2 (the bridge saw a pending operand, whose layout its task may
+        // still compute): sized and laid out in the task, whatever the
+        // operands' state is by now (GatherKernel::size/layout)
+        if (rt->rt->opt_level() < 2 || result_strides != nullptr) {
+            set_error(err, errlen, "gather: deferred only at O2, without strides");
+            return VP_INVALID;
+        }
+        return gather_deferred(rt, src, nidx, idx, idx_axes, nres, result_axes,
+                               mode & ~VP_INDEX_DEFERRED, result, site, err, errlen);
+    }
     const Layout& v = arr(src).layout();
     IndexSpec spec;
     Shape shape;
@@ -1280,14 +1333,18 @@ bool numpy_aligned(const Array& a) {
 int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_array** result,
               const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
-    if (rt->rt->opt_level() >= 2 && (Runtime::unsized(arr(a)) || Runtime::unsized(arr(b))))
+    if (rt->rt->opt_level() >= 2 && (!arr(a).ready() || !arr(b).ready() ||
+                                     Runtime::unsized(arr(a)) || Runtime::unsized(arr(b))))
         [[unlikely]] {
-        // O2: sized and laid out in the task (MatmulKernel::size/layout).
+        // O2, a pending operand (its layout may still be computed by its
+        // task): sized and laid out in the task (MatmulKernel::size/layout).
         // Ranks and dtypes are known at issue; an unsized array's data is
         // aligned (a pool block, views by item-sized steps).
         const int ra = Runtime::rank(arr(a)), rb = Runtime::rank(arr(b));
         const DType dt = arr(a).meta()->sd().dtype;
-        if (ra == 0 || rb == 0 || dt != arr(b).meta()->sd().dtype) {
+        if (ra == 0 || rb == 0 || dt != arr(b).meta()->sd().dtype ||
+            (!Runtime::unsized(arr(a)) && !numpy_aligned(arr(a))) || // laid out: no wait
+            (!Runtime::unsized(arr(b)) && !numpy_aligned(arr(b)))) {
             set_error(err, errlen, "matmul: NumPy's error or cast");
             return VP_UNSUPPORTED;
         }

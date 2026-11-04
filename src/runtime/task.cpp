@@ -352,10 +352,13 @@ void Task::run_steps(int upto) {
 
 void Task::size_step() {
     InlineVector<const Layout*, 4> in;
+    // S4 sizes from the data: its inputs completed, a view's strides are
+    // needed to read it (and known: its base is laid out)
+    const bool from_data = kernel_->sizes_from_data();
     for (std::size_t i = 0; i < ninputs_; ++i) {
         const Metadata& m = *operands_[i].meta;
         if (const ViewRule* r = m.rule()) [[unlikely]] { // a view: its shape first
-            if (ErrorRef e = r->derive(m, false, errors_)) {
+            if (ErrorRef e = r->derive(m, from_data, errors_)) {
                 claim_size_error(e); // the view's IndexError, as an input's
             }
         }
@@ -367,7 +370,7 @@ void Task::size_step() {
         l.dtype = operands_[o].layout().dtype;
         out.push_back(std::move(l));
     }
-    const bool from_data = kernel_->sizes_from_data(); // in execute(): error_ is this thread's
+    // from_data: in execute(), error_ is this thread's
     if (size_upstream_claimed_.load(std::memory_order_acquire)) {
         size_error_ = size_upstream_; // an input could not be sized: neither can this op
     } else if (from_data && error_) {

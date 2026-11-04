@@ -302,7 +302,7 @@ function). Higher levels (goals.md, "Optimization levels") each add to
 the one below and compute correct but possibly deviating results: **O2**
 stage pipelining and BLAS threading removed (started: one BLAS thread,
 LAPACK calls no longer serialized; element-wise ufuncs (casts of inputs
-in the task) and `astype` on pending or large inputs, `matmul` of unsized
+in the task) and `astype` on pending or large inputs, `matmul` of pending
 ones, are issued unsized, `vp_ufunc_issue_deferred`, and
 size themselves in the task, pipelining.md S2; `zeros`/`ones`/`empty`/
 `full`/`arange` with pending size arrays and `x[mask]`, `flatnonzero`,
@@ -310,7 +310,8 @@ size themselves in the task, pipelining.md S2; `zeros`/`ones`/`empty`/
 reductions without casts sized, laid out and planned in their tasks,
 `vp_reduce_deferred`; ranks known at issue, `Runtime::rank`; basic
 indexing, transposes, `swapaxes` and 1-d reshapes of such arrays as views by a rule,
-`ViewRule`; NumPy
+`ViewRule`; advanced indexing with slices and index arrays as deferred
+gathers, `DeferredGatherKernel`; NumPy
 functions may still run as a whole), **O3** micro kernels (own, fused or split kernels, re-implemented
 NumPy internals), **O4** automatic device offloading, **O5** reserved.
 The level is chosen per process: `viproc.init(level=n)`,
@@ -400,6 +401,7 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
   assign.*             element copy kernels (dst[...] = src; a new array
                        placed from parts: concatenate, tile, pad, ...)
   index.*              gather / scatter / masked assignment / select (indexing, np.where)
+  index_deferred.cpp   the gather sized and laid out in its task (O2)
 src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
   numpy_ufunc.*        UfuncLoop / LoopCache (resolved NumPy loops),
                        element-wise kernel, wrap_ndarray / to_ndarray

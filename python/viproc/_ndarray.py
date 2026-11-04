@@ -1150,6 +1150,49 @@ def _gather_fast(a, key):
     return _viproc.gather(a, (idx,), (p,), res, strides)
 
 
+def _gather_deferred(a, key):
+    """O2: a[key] for keys of slices and integer index arrays when `a` or a
+    viproc index array is pending (its size or layout may still be computed
+    by its task): placed by the ranks alone
+    (NumPy's rules, as _parse_index), shapes, bounds and layout in the
+    gather task (GatherKernel::size/layout). None for other keys or sized
+    operands: the regular path."""
+    keys = key if type(key) is tuple else (key,)
+    nd = a.ndim  # the rank: known at issue
+    if len(keys) > nd:
+        return None
+    pending = not _viproc.ready(a)  # its layout may still be computed by its task
+    basic, idx, axes = [], [], []
+    for n, k in enumerate(keys):
+        if type(k) is slice:
+            basic.append(k)
+            continue
+        if type(k) is ndarray:
+            if k.dtype not in _INDEX_DTYPES:
+                return None
+            pending = pending or not _viproc.ready(k)
+        elif type(k) is np.ndarray and k.dtype.kind in "iu" and k.size:
+            k = asarray(k if k.dtype in _INDEX_DTYPES else k.astype(np.intp))
+        else:
+            return None
+        basic.append(_FULL)
+        idx.append(k)
+        axes.append(n)
+    if not idx or not pending:
+        return None
+    v = a if all(k == _FULL for k in basic) else a._view(tuple(basic))
+    rest = [k for k in range(nd) if k not in axes]
+    bdims = [-1 - d for d in range(max(x.ndim for x in idx))]
+    if axes == list(range(axes[0], axes[0] + len(axes))):  # adjacent: in place
+        res = [k for k in rest if k < axes[0]] + bdims + [k for k in rest if k > axes[-1]]
+    else:
+        res = bdims + rest
+    return _viproc.gather(v, tuple(idx), tuple(axes), res, None, _GATHER_DEFERRED)
+
+
+_GATHER_DEFERRED = 4  # VP_INDEX_DEFERRED (viproc.h)
+
+
 def _gather(a, key):
     parsed = _parse_index(a, key)
     if parsed is None:
@@ -1876,6 +1919,18 @@ _viproc.setup_reductions(
     np._NoValue,
     _REDUCE_ASYNC,
 )
+
+def _getitem_o2(self, key):
+    """a[key] beyond the C fast path from O2 on (the C slot calls it instead
+    of _getitem): advanced keys of pending arrays without a wait first."""
+    if type(key) in (ndarray, tuple, np.ndarray):
+        r = _gather_deferred(self, key)
+        if r is not None:
+            return r
+    return _getitem(self, key)
+
+
+_viproc.set_getitem_o2(_getitem_o2)
 
 _viproc.setup(
     ndarray,
