@@ -38,6 +38,14 @@ class CountableArray {
     struct Deferred {};
     static constexpr Deferred deferred{};
     CountableArray(std::size_t nbytes, Deferred);
+    // A deferred buffer whose size its producing task decides (pipelining.md,
+    // S2): set_size() before its Allocated stage, then as a deferred one.
+    struct Unsized {};
+    static constexpr Unsized unsized{};
+    explicit CountableArray(Unsized) : nbytes_(0) {}
+    // The producing task of an unsized buffer, once (any thread; published
+    // with the task's Allocated stage).
+    void set_size(std::size_t nbytes);
     // Wraps memory owned elsewhere (e.g. by a NumPy array); `owner` keeps it alive.
     CountableArray(void* data, std::size_t nbytes, std::shared_ptr<void> owner);
     ~CountableArray();

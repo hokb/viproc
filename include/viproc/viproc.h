@@ -111,6 +111,13 @@ int vp_take_fp_events(vp_runtime* rt, PyObject** out);
  * execution while its results are usually waited on right after issuing.
  * adaptive == 0 gives a deterministic schedule. */
 void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive);
+/* [main thread] Optimization level (docs/design/goals.md): 1 (default)
+ * gives results bit-identical to NumPy; 2 allows optimizations whose results
+ * are correct but may deviate from NumPy's (stage pipelining,
+ * single-threaded BLAS calls); 3-5 act as 2 until implemented. Set it
+ * before issuing ops. */
+void vp_set_opt_level(vp_runtime* rt, int level);
+int vp_opt_level(const vp_runtime* rt);
 /* Number of ops the policy ran inline / handed to workers so far. */
 void vp_offload_counts(const vp_runtime* rt, uint64_t* inline_ops, uint64_t* offloaded_ops);
 /* Ops that ran directly on the main thread, without a task (small, all
@@ -123,6 +130,9 @@ uint64_t vp_task_count(const vp_runtime* rt);
  * blocked (vp_array_wait, vp_array_prepare_write, ...; vp_wait_all is not
  * counted). Waits on ready arrays (to read their error) are no syncs. */
 uint64_t vp_sync_count(const vp_runtime* rt);
+/* Metadata queries so far that found an array's size or layout unknown (its
+ * task sizes it, O2), so the main thread blocked. */
+uint64_t vp_size_wait_count(const vp_runtime* rt);
 /* Sleeping workers woken by the thread that queued a task (mostly the main
  * thread issuing ready ops; a futex call each). */
 uint64_t vp_wake_count(const vp_runtime* rt);
@@ -170,10 +180,28 @@ vp_array* vp_array_reshape(vp_runtime* rt, const vp_array* a, int ndim, const in
  * to base's first element; strides are in bytes. Metadata only. */
 vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, vp_dtype dtype, int ndim,
                         const int64_t* shape, const int64_t* strides, int64_t offset);
+/* [GIL] O2: a view of `base` while its task still sizes it (vp_array_sized
+ * 0). Basic indexing: one step per view dimension or consumed base
+ * dimension, `kinds` 0 keep, 1 slice (start, stop, step as PySlice_Unpack
+ * gives them), 2 index (start; out of bounds: the view's asynchronous
+ * IndexError), 3 new axis. Transpose: `perm` (view axis i is base axis
+ * perm[i]); kinds NULL. Metadata only; its SD follows when base's is known. */
+vp_array* vp_array_view_deferred(vp_runtime* rt, const vp_array* base, int n, const int* kinds,
+                                 const int64_t* starts, const int64_t* stops, const int64_t* steps,
+                                 const int* perm, const char* site);
+/* [GIL] O2: `base` (1-d, vp_array_sized 0) reshaped into `dims` (at most
+ * one negative: NumPy's unknown dimension) in `order` 'C' or 'F': a view
+ * whose SD follows base's; a size mismatch is the view's asynchronous
+ * ValueError. */
+vp_array* vp_array_reshape_deferred(vp_runtime* rt, const vp_array* base, int ndim,
+                                    const int64_t* dims, char order, const char* site);
 /* [GIL] Releases the handle. Pending work continues. */
 void vp_array_release(vp_array* a);
 
-/* Metadata, available immediately (also for pending arrays). */
+/* [main thread] Metadata, available immediately for arrays sized at issue;
+ * for an array its task sizes (vp_ufunc_issue_deferred, optimization level
+ * O2) these wait until its layout is known (a metadata query; the dtype is
+ * known at once). */
 int vp_array_ndim(const vp_array* a);
 const int64_t* vp_array_shape(const vp_array* a);
 const int64_t* vp_array_strides(const vp_array* a);
@@ -182,6 +210,16 @@ vp_dtype vp_array_dtype(const vp_array* a);
 int64_t vp_array_offset(const vp_array* a);
 /* 1 if the data is final (no pending task writes it). */
 int vp_array_ready(vp_array* a);
+/* 1 if `a`'s size and layout are known (metadata queries do not wait). */
+int vp_array_sized(const vp_array* a);
+/* [main thread] `a`'s number of dimensions, known at issue also while its
+ * size is not (no wait, unlike vp_array_ndim). */
+int vp_array_rank(const vp_array* a);
+/* [main thread, GIL] Waits until `a`'s size is known (SizeCompleted, not
+ * its strides) and gives its shape. VP_ERROR (message in `err`, as at a
+ * sync point) if the op producing it could not size it. */
+int vp_array_wait_size(vp_runtime* rt, vp_array* a, int* ndim, const int64_t** shape, char* err,
+                       size_t errlen);
 /* 1 if both arrays share their storage (base and views). */
 int vp_array_same_storage(const vp_array* a, const vp_array* b);
 /* [main thread] Size in bytes if `a`'s buffer may be overwritten by an op
@@ -281,6 +319,39 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
                    const int64_t* out_shape, vp_array* out, vp_array** result, const char* site,
                    char* err, size_t errlen);
 
+/* Optimization level O2 (docs/design/pipelining.md, S2): issues the
+ * element-wise op with the loop's dtypes as a task that sizes and lays out
+ * its result itself, on its inputs' stage signals; the main thread reads no
+ * input size. A broadcasting error becomes the op's asynchronous error
+ * (AsyncValueError). VP_UNSUPPORTED (nothing issued) where the regular path
+ * applies: an input of another dtype than the loop's (casts), a loop with
+ * several outputs, or every input ready and the result small enough for the
+ * direct path. */
+int vp_ufunc_issue_deferred(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
+                            vp_array** result, const char* site, char* err, size_t errlen);
+
+/* Optimization level O2, pending sizes (docs/design/pipelining.md, S4):
+ * creates np.zeros / ones / empty / full (`kind` 0-3) of `ndim` extents
+ * `dims`, each >= 0 or -1 for the value of the next of `sizes` (0-d int32 or
+ * int64 arrays, typically pending), or np.arange(stop) (`kind` 4: ndim 1,
+ * dims {-1}, int64) as a task: the main thread does not wait for the sizes;
+ * the task sizes its result when they are computed (a negative extent fails
+ * it with NumPy's ValueError, asynchronously). `order` 'C' or 'F'. `fill`:
+ * the element bytes of the fill value (kinds 1 and 3). */
+int vp_create_deferred(vp_runtime* rt, int kind, int ndim, const int64_t* dims,
+                       vp_array* const* sizes, int nsizes, vp_dtype dtype, char order,
+                       const void* fill, vp_array** result, const char* site, char* err,
+                       size_t errlen);
+
+/* Optimization level O2, data-dependent result sizes (pipelining.md, S4):
+ * x[mask] (a bool mask over x's leading axes; NumPy's IndexError
+ * asynchronously) and np.flatnonzero(a) as tasks that size their results
+ * from the data when it is computed: no sync on the mask. */
+int vp_mask_select(vp_runtime* rt, vp_array* x, vp_array* mask, vp_array** result, const char* site,
+                   char* err, size_t errlen);
+int vp_flatnonzero(vp_runtime* rt, vp_array* a, vp_array** result, const char* site, char* err,
+                   size_t errlen);
+
 /* Issues a cast of `in` to `dtype` (NumPy's a.astype(dtype, order)) with
  * NumPy's cast functions. `order` 'K' gives the result NumPy's layout for
  * astype (PyArray_NewLikeArray: C or F if `in` is, else its axis order),
@@ -303,6 +374,10 @@ int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array
  * modes: VP_INDEX_RAISE (the task fails), VP_INDEX_WRAP (i mod n),
  * VP_INDEX_CLIP (to 0 or n - 1; clip maps negative indices to 0 too). */
 enum { VP_INDEX_RAISE = 0, VP_INDEX_WRAP = 1, VP_INDEX_CLIP = 2 };
+/* vp_gather's `mode` may add VP_INDEX_DEFERRED (O2, `result_strides` NULL):
+ * the task sizes and lays out the result (NumPy's layout), whether the
+ * operands are ready or not. */
+enum { VP_INDEX_DEFERRED = 4 };
 /* r = src[idx...]: a new array with `result_strides` (NumPy's layout for the
  * indexing result; NULL for C order). */
 int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, const int* idx_axes,
@@ -376,6 +451,17 @@ int vp_reduce(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char
  * that is unavailable or needs the Python API; the caller then falls back. */
 int vp_accumulate(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, vp_array** result,
                   const char* site, char* err, size_t errlen);
+
+/* O2 (pipelining.md, S2): vp_reduce() of an input whose size and strides
+ * its task learns. `axes` has one flag per dimension (vp_array_rank(in)).
+ * The task sizes the result, lays it out C-contiguously and plans the loop
+ * calls; reduced axes that do not coalesce are visited one by one (sums may
+ * round differently from NumPy's buffered blocks). VP_UNSUPPORTED where the
+ * reduction casts (int32 sums, ...) or the identity is not a Python bool,
+ * int or float: the regular path. */
+int vp_reduce_deferred(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
+                       int keepdims, PyObject* identity, vp_array** result, const char* site,
+                       char* err, size_t errlen);
 
 /* vp_reduce() into an existing array `out` (in place, *result set to NULL):
  * only where `out` has the dtype and layout of the result NumPy would

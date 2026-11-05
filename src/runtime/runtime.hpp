@@ -91,7 +91,15 @@ class Array : public MainThreadCounted {
     Array(MetadataPtr meta, Ref<AliasGroup> group, ArrayBlock* block)
         : meta_(std::move(meta)), group_(std::move(group)), block_(block) {}
 
-    const Layout& layout() const { return meta_->sd(); }
+    // The array's size descriptor. An array sized by its task (S2,
+    // Runtime::issue_deferred) is waited for until its layout is known (a
+    // metadata query, S5): the main thread never reads an incomplete one.
+    const Layout& layout() const {
+        if (meta_->task()) [[unlikely]] {
+            wait_configured();
+        }
+        return meta_->sd();
+    }
     const MetadataPtr& meta() const { return meta_; }
     const Ref<AliasGroup>& group() const { return group_; }
     // The current data version.
@@ -103,6 +111,7 @@ class Array : public MainThreadCounted {
 
   private:
     friend class Runtime;
+    [[gnu::noinline]] void wait_configured() const;
 
     MetadataPtr meta_;
     Ref<AliasGroup> group_;
@@ -144,6 +153,12 @@ struct RuntimeOptions {
     // to the shared queue. A spinning (idle) worker takes local tasks over from busy ones. 0: all
     // go to the shared queue.
     std::int64_t local_below = 65536;
+    // Optimization level (docs/design/goals.md, "Optimization levels"): 1 (O1,
+    // default) keeps results bit-identical to NumPy; 2 (O2) allows stage
+    // pipelining and single-threaded BLAS calls, results correct but possibly
+    // deviating from NumPy's. 3-5 are accepted and act as 2 until they are
+    // implemented.
+    int opt_level = 1;
 };
 
 class Runtime {
@@ -161,6 +176,15 @@ class Runtime {
     // A view of `base`: same alias group, different layout (shape, strides,
     // offset into its current data version). Metadata only, no task.
     ArrayPtr view(const ArrayPtr& base, Layout&& layout);
+    // O2: a view of `base` while its task still completes base's SD (S2):
+    // the view's SD follows from base's by `steps` (basic indexing) or
+    // `perm` (a transpose) when it is known (ViewRule). Its rank is known
+    // now; metadata queries wait as for base. Main thread.
+    ArrayPtr view_deferred(const ArrayPtr& base, int rank, std::vector<ViewStep> steps,
+                           std::vector<int> perm, const char* issue_site);
+    // O2: `base` (1-d, sized by its task) reshaped into `dims` (order 'C' or
+    // 'F'): a view by a rule as view_deferred. Main thread.
+    ArrayPtr reshape_deferred(const ArrayPtr& base, Shape dims, char order, const char* issue_site);
 
     // Issues one array op and returns immediately.
     //  - `inputs` are read.
@@ -195,6 +219,30 @@ class Runtime {
                                 std::span<const ArrayPtr> inputs, std::span<const ArrayPtr> inouts,
                                 std::span<const Layout> new_outputs, const char* issue_site);
 
+    // Issues an op whose output sizes and layouts its task computes
+    // (pipelining.md, S2; Kernel::size, Kernel::layout): the outputs are
+    // created with their dtype only, no size, no memory. The task sizes them
+    // when every input reached SizeCompleted and lays them out when every
+    // input reached Allocated, on the thread delivering the last signal or
+    // in a pool job, never on the main thread. Inputs only (no in/outs).
+    // `ranks`: the outputs' numbers of dimensions, which the caller knows at
+    // issue (the kernel's size step gives shapes of exactly that rank), so
+    // later ops can be issued against them without a wait (rank()).
+    void issue_deferred(const std::shared_ptr<Kernel>& kernel, std::span<const ArrayPtr> inputs,
+                        std::span<const DType> outputs, std::span<const int> ranks,
+                        const char* issue_site, std::span<ArrayPtr> results);
+    // Metadata query: waits until `a`'s size (SizeCompleted) or layout
+    // (Allocated: strides, offset) is known. No wait for arrays sized at
+    // issue. Returns the error of an op that could not size it.
+    ErrorRef wait_stage(Array& a, TaskState s);
+    // True if `a`'s size or layout may still be unknown (cheap; main thread).
+    static bool unsized(const Array& a) { return static_cast<bool>(a.meta()->task()); }
+    // `a`'s number of dimensions, without a wait (main thread).
+    static int rank(const Array& a) {
+        const Metadata& m = *a.meta();
+        return m.task() ? m.rank() : static_cast<int>(m.sd().shape.size());
+    }
+
     // Sync point: waits until `a` is ready. Returns the error of the task that
     // produced it, if any.
     ErrorRef wait(Array& a);
@@ -216,10 +264,13 @@ class Runtime {
     std::uint64_t direct_count() const { return direct_; }
     // Tasks issued so far (ops that did not take the direct path, plus the
     // copy-on-write copies issued for them).
-    std::uint64_t task_count() const { return seq_ - direct_; }
+    std::uint64_t task_count() const { return seq_ - direct_ - views_; }
     // Sync points so far that found their array pending (wait() blocked; main
     // thread; wait_all() not counted).
     std::uint64_t sync_count() const { return syncs_; }
+    // Metadata queries (wait_stage) that found the size or layout unknown, so
+    // the main thread blocked (main thread only).
+    std::uint64_t size_wait_count() const { return size_waits_; }
     // Sleeping workers enqueue() woke (any thread; relaxed).
     std::uint64_t wake_count() const { return wakes_.load(std::memory_order_relaxed); }
     // Main thread, before issuing ops: replaces the dispatch policy.
@@ -228,6 +279,10 @@ class Runtime {
         policy_.set_workers(workers_.size());
     }
     std::size_t worker_count() const { return workers_.size(); }
+    // Main thread: the optimization level (RuntimeOptions::opt_level), set
+    // before the first op is issued.
+    int opt_level() const { return options_.opt_level; }
+    void set_opt_level(int level) { options_.opt_level = level; }
     // The one store of failed ops' errors (see ErrorTable). Any thread.
     ErrorTable& errors() { return *errors_; }
     // Main thread: NumPy's errstate for the ops issued from now on (the
@@ -237,6 +292,14 @@ class Runtime {
   private:
     // Executes `task` on the current thread and returns its runnable consumers.
     TaskList run(const std::shared_ptr<Task>& task);
+    // The configuring tasks whose steps became due on this thread: run them
+    // (a worker) or queue them as step jobs (the main thread).
+    [[gnu::noinline]] void due_steps(bool here);
+    [[gnu::noinline]] TaskList step_job(Task& task);
+    [[gnu::noinline]] void configure_now(Task& task);
+    // Main thread, waiting for a stage: runs the steps it queued as step jobs
+    // (main_steps_) itself, and the steps they make due.
+    [[gnu::noinline]] void help_steps();
     void enqueue(std::shared_ptr<Task> task);
     void trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t elements);
     // The direct path of issue(): see there.
@@ -252,13 +315,20 @@ class Runtime {
     // the old data (issued as its own task); views keep their layouts.
     void issue_group_copy(AliasGroup& g);
 
+    std::thread::id main_thread_ = std::this_thread::get_id(); // created there
     RuntimeOptions options_;
     std::shared_ptr<ErrorTable> errors_ = std::make_shared<ErrorTable>();
     OffloadPolicy policy_;     // main thread only
     std::uint64_t seq_ = 0;    // ops issued so far (main thread only)
+    std::uint64_t views_ = 0;  // deferred views among them (an id for their errors, no task)
     FpMode fp_mode_;           // errstate of the ops issued now (main thread only)
     std::uint64_t direct_ = 0; // ... of which ran directly, without a task
-    std::uint64_t syncs_ = 0;  // waits that found the array pending (main thread only)
+    std::uint64_t syncs_ = 0;
+    std::uint64_t size_waits_ = 0; // waits that found the array pending (main thread only)
+    // Tasks whose steps the main thread queued as step jobs, not yet seen
+    // laid out (main thread only). A step job waits in the pool behind
+    // running kernels; a metadata query waiting for one runs it (help_steps).
+    std::vector<std::shared_ptr<Task>> main_steps_;
     std::atomic<std::size_t> active_{0};
     // Threads waiting in wait_active_below(): run() notifies only if > 0.
     std::atomic<int> active_waiters_{0};

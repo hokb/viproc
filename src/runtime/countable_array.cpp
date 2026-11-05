@@ -23,6 +23,15 @@ CountableArray::CountableArray(std::size_t nbytes, Deferred) : nbytes_(nbytes) {
     }
 }
 
+void CountableArray::set_size(std::size_t nbytes) {
+    nbytes_ = nbytes;
+    if (nbytes_ <= kInlineBytes) {
+        handles_[kHost].data.store(inline_, std::memory_order_relaxed);
+    } else {
+        handles_[kHost].capacity = ElementPool::capacity_for(nbytes_);
+    }
+}
+
 CountableArray::CountableArray(void* data, std::size_t nbytes, std::shared_ptr<void> owner)
     : nbytes_(nbytes), owner_(std::move(owner)) {
     handles_[kHost].data.store(static_cast<std::byte*>(data), std::memory_order_relaxed);

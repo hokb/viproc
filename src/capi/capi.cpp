@@ -205,8 +205,17 @@ struct vp_runtime {
     std::map<std::tuple<const numpy::UfuncLoop*, std::vector<std::vector<int>>, std::string, int>,
              std::shared_ptr<Kernel>>
         gufunc_kernels;
-    // Fast-path reduce kernels (ReduceKey), cleared when it grows large.
-    std::unordered_map<ReduceKey, std::shared_ptr<Kernel>, ReduceKeyHash> reduce_kernels;
+    // Fast-path reduce kernels (ReduceKey) with their result layouts
+    // (reduction_result without and with keepdims), cleared when it grows
+    // large.
+    struct ReduceEntry {
+        std::shared_ptr<Kernel> kernel;
+        Layout out[2];
+        bool laid_out = false; // out[] set (the fast path's entries)
+    };
+    std::unordered_map<ReduceKey, ReduceEntry, ReduceKeyHash> reduce_kernels;
+    // O2: deferred astype kernels per (dtype, order index K/C/F).
+    std::shared_ptr<Kernel> cast_kernels[7][3];
 };
 
 // A vp_array* is an Array* holding one reference (no wrapper allocation).
@@ -343,11 +352,15 @@ void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive) {
     rt->rt->set_offload_options(o);
 }
 
+void vp_set_opt_level(vp_runtime* rt, int level) { rt->rt->set_opt_level(level); }
+int vp_opt_level(const vp_runtime* rt) { return rt->rt->opt_level(); }
+
 uint64_t vp_direct_count(const vp_runtime* rt) { return rt->rt->direct_count(); }
 
 uint64_t vp_task_count(const vp_runtime* rt) { return rt->rt->task_count(); }
 
 uint64_t vp_sync_count(const vp_runtime* rt) { return rt->rt->sync_count(); }
+uint64_t vp_size_wait_count(const vp_runtime* rt) { return rt->rt->size_wait_count(); }
 
 uint64_t vp_wake_count(const vp_runtime* rt) { return rt->rt->wake_count(); }
 
@@ -431,12 +444,43 @@ vp_array* vp_array_view(vp_runtime* rt, const vp_array* base, vp_dtype dtype, in
     return hand_out(rt->rt->view(ref(base), std::move(l)));
 }
 
+vp_array* vp_array_view_deferred(vp_runtime* rt, const vp_array* base, int n, const int* kinds,
+                                 const int64_t* starts, const int64_t* stops, const int64_t* steps,
+                                 const int* perm, const char* site) {
+    std::vector<ViewStep> vs;
+    std::vector<int> p;
+    int rank = 0;
+    if (kinds != nullptr) {
+        for (int i = 0; i < n; ++i) {
+            ViewStep s;
+            s.kind = static_cast<ViewStep::Kind>(kinds[i]);
+            s.start = starts[i];
+            s.stop = stops[i];
+            s.step = steps[i];
+            rank += s.kind == ViewStep::Index ? 0 : 1;
+            vs.push_back(s);
+        }
+    } else {
+        p.assign(perm, perm + n);
+        rank = n;
+    }
+    return hand_out(rt->rt->view_deferred(ref(base), rank, std::move(vs), std::move(p),
+                                          site)); // interned by the bridge (issue_site)
+}
+
+vp_array* vp_array_reshape_deferred(vp_runtime* rt, const vp_array* base, int ndim,
+                                    const int64_t* dims, char order, const char* site) {
+    return hand_out(rt->rt->reshape_deferred(ref(base), Shape(dims, dims + ndim), order, site));
+}
+
 void vp_array_release(vp_array* a) { ArrayPtr::adopt(&arr(a)).reset(); }
 
 int vp_array_ndim(const vp_array* a) { return static_cast<int>(arr(a).layout().shape.size()); }
 const int64_t* vp_array_shape(const vp_array* a) { return arr(a).layout().shape.data(); }
 const int64_t* vp_array_strides(const vp_array* a) { return arr(a).layout().strides.data(); }
-vp_dtype vp_array_dtype(const vp_array* a) { return to_vp(arr(a).layout().dtype); }
+vp_dtype vp_array_dtype(const vp_array* a) { return to_vp(arr(a).meta()->sd().dtype); }
+int vp_array_sized(const vp_array* a) { return Runtime::unsized(arr(a)) ? 0 : 1; }
+int vp_array_rank(const vp_array* a) { return Runtime::rank(arr(a)); }
 int64_t vp_array_offset(const vp_array* a) { return arr(a).layout().offset; }
 int vp_array_ready(vp_array* a) { return arr(a).ready() ? 1 : 0; }
 int vp_array_same_storage(const vp_array* a, const vp_array* b) {
@@ -451,6 +495,20 @@ size_t vp_array_reusable_bytes(const vp_array* a) {
                     !b.has_readers() && l.offset == 0 && l.c_contiguous() &&
                     l.nbytes() == b.nbytes();
     return ok ? b.nbytes() : 0;
+}
+
+int vp_array_wait_size(vp_runtime* rt, vp_array* a, int* ndim, const int64_t** shape, char* err,
+                       size_t errlen) {
+    Array& x = arr(a);
+    ErrorRef e = rt->rt->wait_stage(x, TaskState::SizeCompleted);
+    if (e) {
+        set_error(err, errlen, describe(rt->rt->errors().raise_at_sync_point(e)));
+        return VP_ERROR;
+    }
+    const Layout& l = x.meta()->sd(); // the shape is final at SizeCompleted
+    *ndim = static_cast<int>(l.shape.size());
+    *shape = l.shape.data();
+    return VP_OK;
 }
 
 int vp_array_wait(vp_runtime* rt, vp_array* a, char* err, size_t errlen) {
@@ -640,47 +698,146 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
         *result = nullptr;
         return VP_OK;
     }
-    // NumPy's result layout (order='K'); C order unless an input is not.
-    bool all_c = true;
+    // NumPy's result layout (order='K')
+    const Layout* in_layouts[3];
     for (int i = 0; i < nin; ++i) {
-        const Layout& il = ins[i]->layout();
-        all_c = all_c && (il.c_contiguous() || il.size() <= 1);
-    }
-    // NumPy's trivial loop allocates F order when every input is a 0-d array
-    // or F- (and not C-) contiguous with the result's shape, without a cast; that fixes the
-    // strides of extent-1 dimensions too, which keep_order() would not.
-    bool all_f = !all_c && out_ndim > 1;
-    for (int i = 0; i < nin && all_f; ++i) {
-        const Layout& il = ins[i]->layout();
-        all_f = il.shape.empty() || (il.shape == shape && f_contiguous(il) && !il.c_contiguous() &&
-                                     il.dtype == loop->dtypes[i]);
+        in_layouts[i] = &ins[i]->layout();
     }
     Layout l;
-    if (all_c) {
-        l = Layout::contiguous(out_dtype, std::move(shape));
-    } else if (all_f) {
-        l.dtype = out_dtype;
-        l.strides.resize(shape.size());
-        std::int64_t step = static_cast<std::int64_t>(itemsize(out_dtype));
-        for (std::size_t i = 0; i < shape.size(); ++i) {
-            l.strides[i] = step;
-            step *= shape[i];
-        }
-        l.shape = std::move(shape);
-    } else {
-        Layout in_layouts[3];
-        for (int i = 0; i < nin; ++i) {
-            in_layouts[i] = ins[i]->layout();
-        }
-        l = Layout::keep_order(out_dtype, std::move(shape),
-                               std::span<const Layout>(in_layouts, static_cast<std::size_t>(nin)));
-    }
+    l.dtype = out_dtype;
+    l.shape = std::move(shape);
+    numpy::elementwise_layout(l, std::span(in_layouts, static_cast<std::size_t>(nin)),
+                              std::span(loop->dtypes.data(), static_cast<std::size_t>(nin)));
     std::shared_ptr<Kernel> k = elementwise_kernel(rt, *loop, in_span, l, false, err, errlen);
     if (!k) {
         return VP_UNSUPPORTED;
     }
     ArrayPtr res;
     rt->rt->issue(k, in_span, {}, std::span(&l, 1), site, std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
+int vp_ufunc_issue_deferred(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
+                            vp_array** result, const char* site, char* err, size_t errlen) {
+    const int nin = loop->loop->nin();
+    if (nin > 3 || loop->loop->nout() != 1) {
+        set_error(err, errlen, "unsupported deferred ufunc");
+        return VP_UNSUPPORTED;
+    }
+    bool all_ready = true;
+    std::int64_t elements = 0;
+    int rank = 0;
+    for (int i = 0; i < nin; ++i) {
+        Array& a = arr(inputs[i]);
+        rank = std::max(rank, Runtime::rank(a)); // broadcasting: the largest
+        const DType from = a.meta()->sd().dtype, to = loop->dtypes[static_cast<std::size_t>(i)];
+        if (from != to && (loop->loop->dtypes().empty() ||
+                           !rt->loops->prepare_cast(from, to, defer_release(rt->graveyard)))) {
+            return VP_UNSUPPORTED; // the kernel casts (ElementwiseKernel::run_casting)
+        }
+        if (all_ready && a.ready() && Runtime::unsized(a)) {
+            rt->rt->wait_stage(a, TaskState::Allocated); // done: no wait; sized unless it failed
+        }
+        if (all_ready && a.ready() && !Runtime::unsized(a)) {
+            elements = std::max(elements, a.layout().size()); // ready: no wait
+        } else {
+            all_ready = false;
+        }
+    }
+    if (all_ready && elements < rt->rt->offload_policy().options().sync_below) {
+        return VP_UNSUPPORTED; // the direct path, sized on the main thread
+    }
+    rt->graveyard->drain();
+    ArrayPtr ins[3];
+    for (int i = 0; i < nin; ++i) {
+        ins[i] = ref(inputs[i]);
+    }
+    const DType out = loop->dtypes[static_cast<std::size_t>(nin)];
+    ArrayPtr res;
+    rt->rt->issue_deferred(loop->loop->elementwise_kernel(),
+                           std::span<const ArrayPtr>(ins, static_cast<std::size_t>(nin)),
+                           std::span(&out, 1), std::span(&rank, 1), site, std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
+int vp_create_deferred(vp_runtime* rt, int kind, int ndim, const int64_t* dims,
+                       vp_array* const* sizes, int nsizes, vp_dtype dtype, char order,
+                       const void* fill, vp_array** result, const char* site, char* err,
+                       size_t errlen) {
+    static const char* const names[] = {"numpy.zeros", "numpy.ones", "numpy.empty", "numpy.full",
+                                        "numpy.arange"};
+    if (kind < 0 || kind > 4 || ndim < 0 || nsizes < 1 || (order != 'C' && order != 'F')) {
+        set_error(err, errlen, "invalid creator");
+        return VP_INVALID;
+    }
+    rt->graveyard->drain();
+    const DType dt = to_dtype(dtype);
+    std::vector<std::int64_t> d(dims, dims + ndim);
+    int taken = 0;
+    for (const std::int64_t x : d) {
+        taken += x < 0 ? 1 : 0;
+    }
+    std::vector<ArrayPtr> ins;
+    for (int i = 0; i < nsizes; ++i) {
+        const DType sdt = arr(sizes[i]).meta()->sd().dtype;
+        if (sdt != DType::Int32 && sdt != DType::Int64) {
+            set_error(err, errlen, "size arrays must be int32 or int64");
+            return VP_UNSUPPORTED;
+        }
+        ins.push_back(ref(sizes[i]));
+    }
+    if (taken != nsizes || (kind == 4 && (ndim != 1 || dt != DType::Int64))) {
+        set_error(err, errlen, "invalid creator");
+        return VP_INVALID;
+    }
+    std::vector<std::byte> f(itemsize(dt));
+    if ((kind == 1 || kind == 3) && fill != nullptr) {
+        std::memcpy(f.data(), fill, f.size());
+    }
+    ArrayPtr res;
+    const int rank = ndim;
+    rt->rt->issue_deferred(
+        make_create_kernel(std::move(d), order, std::move(f), kind == 4, names[kind]), ins,
+        std::span(&dt, 1), std::span(&rank, 1), site, std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
+int vp_mask_select(vp_runtime* rt, vp_array* x, vp_array* mask, vp_array** result, const char* site,
+                   char* err, size_t errlen) {
+    if (arr(mask).meta()->sd().dtype != DType::Bool) {
+        set_error(err, errlen, "the mask must be bool");
+        return VP_UNSUPPORTED;
+    }
+    rt->graveyard->drain();
+    const ArrayPtr ins[] = {ref(x), ref(mask)};
+    const DType dt = arr(x).meta()->sd().dtype;
+    // NumPy: the mask's dimensions become one (x.ndim - mask.ndim + 1)
+    const int rank = Runtime::rank(arr(x)) - Runtime::rank(arr(mask)) + 1;
+    if (rank < 1) {
+        set_error(err, errlen, "too many indices for array");
+        return VP_UNSUPPORTED; // NumPy's IndexError: the regular path
+    }
+    ArrayPtr res;
+    rt->rt->issue_deferred(make_mask_select_kernel(), ins, std::span(&dt, 1), std::span(&rank, 1),
+                           site, std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
+int vp_flatnonzero(vp_runtime* rt, vp_array* a, vp_array** result, const char* site, char* err,
+                   size_t errlen) {
+    (void)err;
+    (void)errlen;
+    rt->graveyard->drain();
+    const ArrayPtr ins[] = {ref(a)};
+    const DType dt = DType::Int64;
+    const int rank = 1;
+    ArrayPtr res;
+    rt->rt->issue_deferred(make_flatnonzero_kernel(), ins, std::span(&dt, 1), std::span(&rank, 1),
+                           site, std::span(&res, 1));
     *result = hand_out(std::move(res));
     return VP_OK;
 }
@@ -828,8 +985,36 @@ int vp_ufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs, 
 int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array** result,
               const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
-    const Layout& l = arr(in).layout();
     const DType to = to_dtype(dtype);
+    if (rt->rt->opt_level() >= 2) [[unlikely]] {
+        // O2 (pipelining.md, "Casts at O2"): sized and laid out in the task,
+        // unless it takes the direct path (small ready data, sized here).
+        Array& a = arr(in);
+        const DType from = a.meta()->sd().dtype;
+        const bool complex_to_real = (from == DType::Complex64 || from == DType::Complex128) &&
+                                     to != DType::Complex64 && to != DType::Complex128;
+        const int oi = order == 'K' ? 0 : order == 'C' ? 1 : order == 'F' ? 2 : -1;
+        if (a.ready() && Runtime::unsized(a)) {
+            rt->rt->wait_stage(a, TaskState::Allocated); // done: no wait
+        }
+        const bool small = !Runtime::unsized(a) && a.ready() &&
+                           a.layout().size() < rt->rt->offload_policy().options().sync_below;
+        if (oi >= 0 && !complex_to_real && !small &&
+            rt->loops->prepare_cast(from, to, defer_release(rt->graveyard))) {
+            std::shared_ptr<Kernel>& k = rt->cast_kernels[static_cast<int>(to)][oi];
+            if (!k) {
+                k = numpy::make_deferred_cast_kernel(to, order);
+            }
+            const ArrayPtr ins[] = {ref(in)};
+            const int rank = Runtime::rank(a);
+            ArrayPtr res;
+            rt->rt->issue_deferred(k, ins, std::span(&to, 1), std::span(&rank, 1), site,
+                                   std::span(&res, 1));
+            *result = hand_out(std::move(res));
+            return VP_OK;
+        }
+    }
+    const Layout& l = arr(in).layout();
     Layout out;
     if (order == 'F') {
         out.dtype = to;
@@ -921,6 +1106,48 @@ bool index_spec(const Layout& view, int nidx, vp_array* const* idx, const int* i
     return true;
 }
 
+// vp_gather at O2 of unsized operands: ranks and dtypes checked here, the
+// shapes in the task.
+int gather_deferred(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx,
+                    const int* idx_axes, int nres, const int* result_axes, int mode,
+                    vp_array** result, const char* site, char* err, size_t errlen) {
+    const int nd = Runtime::rank(arr(src));
+    int nb = 0;
+    IndexSpec spec;
+    for (int j = 0; j < nidx; ++j) {
+        const DType d = arr(idx[j]).meta()->sd().dtype;
+        if ((d != DType::Int32 && d != DType::Int64) || idx_axes[j] < 0 || idx_axes[j] >= nd) {
+            set_error(err, errlen, "index arrays: wrong dtype or axis");
+            return VP_INVALID;
+        }
+        nb = std::max(nb, Runtime::rank(arr(idx[j])));
+        spec.index_axes.push_back(idx_axes[j]);
+    }
+    for (int k = 0; k < nres; ++k) {
+        const int a = result_axes[k];
+        if (a >= nd || (a < 0 && -1 - a >= nb)) {
+            set_error(err, errlen, "result axes out of range");
+            return VP_INVALID;
+        }
+        spec.result_axes.push_back(a);
+    }
+    if (mode < VP_INDEX_RAISE || mode > VP_INDEX_CLIP) {
+        set_error(err, errlen, "indexing: unknown index mode");
+        return VP_INVALID;
+    }
+    spec.mode = static_cast<IndexMode>(mode);
+    std::vector<ArrayPtr> ins{ref(src)};
+    for (int j = 0; j < nidx; ++j) {
+        ins.push_back(ref(idx[j]));
+    }
+    const DType dt = arr(src).meta()->sd().dtype;
+    ArrayPtr res;
+    rt->rt->issue_deferred(make_deferred_gather_kernel(std::move(spec)), ins, std::span(&dt, 1),
+                           std::span(&nres, 1), site, std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
 } // namespace
 
 extern "C" {
@@ -929,6 +1156,17 @@ int vp_gather(vp_runtime* rt, vp_array* src, int nidx, vp_array* const* idx, con
               int nres, const int* result_axes, const int64_t* result_strides, int mode,
               vp_array** result, const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
+    if ((mode & VP_INDEX_DEFERRED) != 0) [[unlikely]] {
+        // O2 (the bridge saw a pending operand, whose layout its task may
+        // still compute): sized and laid out in the task, whatever the
+        // operands' state is by now (GatherKernel::size/layout)
+        if (rt->rt->opt_level() < 2 || result_strides != nullptr) {
+            set_error(err, errlen, "gather: deferred only at O2, without strides");
+            return VP_INVALID;
+        }
+        return gather_deferred(rt, src, nidx, idx, idx_axes, nres, result_axes,
+                               mode & ~VP_INDEX_DEFERRED, result, site, err, errlen);
+    }
     const Layout& v = arr(src).layout();
     IndexSpec spec;
     Shape shape;
@@ -1102,6 +1340,42 @@ bool numpy_aligned(const Array& a) {
 int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_array** result,
               const char* site, char* err, size_t errlen) {
     rt->graveyard->drain();
+    if (rt->rt->opt_level() >= 2 && (!arr(a).ready() || !arr(b).ready() ||
+                                     Runtime::unsized(arr(a)) || Runtime::unsized(arr(b))))
+        [[unlikely]] {
+        // O2, a pending operand (its layout may still be computed by its
+        // task): sized and laid out in the task (MatmulKernel::size/layout).
+        // Ranks and dtypes are known at issue; an unsized array's data is
+        // aligned (a pool block, views by item-sized steps).
+        const int ra = Runtime::rank(arr(a)), rb = Runtime::rank(arr(b));
+        const DType dt = arr(a).meta()->sd().dtype;
+        if (ra == 0 || rb == 0 || dt != arr(b).meta()->sd().dtype ||
+            (!Runtime::unsized(arr(a)) && !numpy_aligned(arr(a))) || // laid out: no wait
+            (!Runtime::unsized(arr(b)) && !numpy_aligned(arr(b)))) {
+            set_error(err, errlen, "matmul: NumPy's error or cast");
+            return VP_UNSUPPORTED;
+        }
+        std::string e;
+        const DType d[] = {dt, dt, dt};
+        const numpy::UfuncLoop* loop = rt->loops->get(ufunc, d, e);
+        if (loop == nullptr) {
+            PyErr_Clear();
+            set_error(err, errlen, e);
+            return VP_UNSUPPORTED;
+        }
+        std::shared_ptr<Kernel>& kernel = rt->matmul_kernels[loop];
+        if (!kernel) {
+            kernel = numpy::make_matmul_kernel(loop);
+        }
+        const int rank = std::max(ra - (ra >= 2 ? 2 : 1), rb - (rb >= 2 ? 2 : 1)) +
+                         (ra >= 2 ? 1 : 0) + (rb >= 2 ? 1 : 0);
+        const ArrayPtr ins[] = {ref(a), ref(b)};
+        ArrayPtr res;
+        rt->rt->issue_deferred(kernel, ins, std::span(&dt, 1), std::span(&rank, 1), site,
+                               std::span(&res, 1));
+        *result = hand_out(std::move(res));
+        return VP_OK;
+    }
     const Layout& la = arr(a).layout();
     const Layout& lb = arr(b).layout();
     Layout out;
@@ -1570,20 +1844,13 @@ int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned 
     }
     const std::size_t nd = l.shape.size();
     SmallVector<char, kInlineRank> flags(nd, 0); // no std::vector<bool>: data()
-    Shape out_shape;
     std::uint64_t axis_bits = 0;
     for (std::size_t i = 0; i < nd; ++i) {
         flags[i] = axes[i] != 0;
-        if (!flags[i]) {
-            out_shape.push_back(l.shape[i]);
-        } else {
+        if (flags[i]) {
             axis_bits |= std::uint64_t{1} << (i % 64);
-            if (keepdims) {
-                out_shape.push_back(1);
-            }
         }
     }
-    Layout out_layout = Layout::contiguous(l.dtype, std::move(out_shape));
     const std::span<const bool> reduced(reinterpret_cast<const bool*>(flags.data()), nd);
     if (dtype == nullptr) {
         dtype = Py_None;
@@ -1595,13 +1862,16 @@ int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned 
     key.layout.offset = 0;
     const bool cacheable = dtype == Py_None && nd <= 64 && identity_key(identity, key.identity);
     std::shared_ptr<Kernel> kernel;
+    Layout out_layout;
     if (cacheable) {
         auto it = rt->reduce_kernels.find(key);
-        if (it != rt->reduce_kernels.end()) {
-            kernel = it->second;
+        if (it != rt->reduce_kernels.end() && it->second.laid_out) {
+            kernel = it->second.kernel;
+            out_layout = it->second.out[keepdims != 0];
         }
     }
     if (!kernel) {
+        out_layout = reduction_result(l, reduced, keepdims != 0, l.dtype);
         kernel = make_fast_reduce_kernel(rt, ufunc, l, reduced, out_layout, dtype, identity);
         if (!kernel && PyErr_Occurred()) {
             return VP_PYERR;
@@ -1610,7 +1880,11 @@ int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned 
             if (rt->reduce_kernels.size() >= 4096) {
                 rt->reduce_kernels.clear();
             }
-            rt->reduce_kernels.emplace(std::move(key), kernel);
+            vp_runtime::ReduceEntry& entry = rt->reduce_kernels[std::move(key)];
+            entry.kernel = kernel;
+            entry.out[0] = reduction_result(l, reduced, false, l.dtype);
+            entry.out[1] = reduction_result(l, reduced, true, l.dtype);
+            entry.laid_out = true;
         }
     }
     if (!kernel) {
@@ -1652,6 +1926,77 @@ int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned 
     }
     ArrayPtr res;
     rt->rt->issue(kernel, ins, {}, std::span(&out_layout, 1), site, std::span(&res, 1), l.size());
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
+int vp_reduce_deferred(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
+                       int keepdims, PyObject* identity, vp_array** result, const char* site,
+                       char* err, size_t errlen) {
+    Array& a = arr(in);
+    const int rank = Runtime::rank(a);
+    const DType dt = a.meta()->sd().dtype; // known at issue
+    if (identity == nullptr) {
+        identity = Py_None;
+    }
+    if (rank > 64) {
+        set_error(err, errlen, "reduce: too many dimensions");
+        return VP_UNSUPPORTED;
+    }
+    // Shared per (ufunc, dtype, rank, axes, keepdims, identity): the shape
+    // and strides of the key mark it as a deferred kernel (-1 extents).
+    ReduceKey key{ufunc, Layout{}, 0, {}};
+    key.layout.dtype = dt;
+    key.layout.shape = Shape(static_cast<std::size_t>(rank), -1);
+    key.layout.strides = Strides(static_cast<std::size_t>(rank), keepdims != 0 ? -1 : -2);
+    int out_rank = 0;
+    for (int i = 0; i < rank; ++i) {
+        if (axes[i] != 0) {
+            key.axes |= std::uint64_t{1} << i;
+        }
+        out_rank += axes[i] == 0 || keepdims != 0 ? 1 : 0;
+    }
+    if (!identity_key(identity, key.identity)) {
+        set_error(err, errlen, "reduce: identity not cached");
+        return VP_UNSUPPORTED;
+    }
+    std::shared_ptr<Kernel>& kernel = rt->reduce_kernels[key].kernel;
+    if (!kernel) {
+        std::string e;
+        const numpy::UfuncLoop* loop =
+            rt->loops->get_reduction(ufunc, dt,
+                                     {numpy::UfuncLoop::kAnyStride, numpy::UfuncLoop::kAnyStride,
+                                      numpy::UfuncLoop::kAnyStride},
+                                     e);
+        std::vector<std::byte> init;
+        if (loop == nullptr || (identity != Py_None && !numpy::scalar_bytes(identity, dt, init))) {
+            PyErr_Clear();
+            rt->reduce_kernels.erase(key);
+            set_error(err, errlen, loop == nullptr ? e : "reduce: identity");
+            return VP_UNSUPPORTED; // casts and the rest: the regular path
+        }
+        std::string name = "reduction";
+        if (PyObject* n = PyObject_GetAttrString(ufunc, "__name__")) {
+            if (const char* c = PyUnicode_AsUTF8(n)) {
+                name = c;
+            }
+            Py_DECREF(n);
+        }
+        PyErr_Clear();
+        std::vector<bool> reduced(static_cast<std::size_t>(rank));
+        for (int i = 0; i < rank; ++i) {
+            reduced[static_cast<std::size_t>(i)] = axes[i] != 0;
+        }
+        kernel = numpy::make_deferred_reduce_kernel(
+            loop, std::move(reduced), keepdims != 0, std::move(init),
+            "ValueError: zero-size array to reduction operation " + name +
+                " which has no identity");
+    }
+    rt->graveyard->drain();
+    const ArrayPtr ins[] = {ref(in)};
+    ArrayPtr res;
+    rt->rt->issue_deferred(kernel, ins, std::span(&dt, 1), std::span(&out_rank, 1), site,
+                           std::span(&res, 1));
     *result = hand_out(std::move(res));
     return VP_OK;
 }

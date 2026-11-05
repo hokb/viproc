@@ -5,6 +5,7 @@
 #include "runtime/element_pool.hpp"
 #include "runtime/runtime.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -471,6 +472,7 @@ void test_consumer_registration_races() {
     constexpr int kConsumers = 6;
     std::mt19937 rng(7);
     bool exactly_once = true;
+    bool three_signals = true;
     bool errors_inherited = true;
     std::size_t registered = 0, late = 0;
     for (int round = 0; round < kRounds; ++round) {
@@ -480,10 +482,12 @@ void test_consumer_registration_races() {
         for (std::size_t p = 0; p < np; ++p) {
             producers.push_back(
                 std::make_shared<Task>(static_cast<int>(p) == failing ? fail : ok, "p"));
+            producers.back()->advance(TaskState::SizeCompleted); // as issue() does
         }
         std::vector<std::shared_ptr<Task>> consumers;
         for (int c = 0; c < kConsumers; ++c) {
             consumers.push_back(std::make_shared<Task>(ok, "c"));
+            consumers.back()->advance(TaskState::SizeCompleted);
         }
         std::atomic<bool> go{false};
         std::vector<std::vector<std::shared_ptr<Task>>> unblocked(np);
@@ -507,14 +511,14 @@ void test_consumer_registration_races() {
         for (auto& c : consumers) {
             c->add_pending_inputs(np);
             for (std::size_t p = 0; p < np; ++p) {
-                if (!producers[p]->add_consumer(c, p)) {
-                    c->producer_already_done(*producers[p]);
-                    ++late;
+                if (producers[p]->completed()) {
+                    ++late; // likely all three signals from add_consumer
                 } else {
                     ++registered;
                 }
+                producers[p]->add_consumer(c, p);
             }
-            if (c->release_issue_guard()) {
+            if (c->release_issue_guard(c)) {
                 runnable.push_back(c);
             }
         }
@@ -533,6 +537,12 @@ void test_consumer_registration_races() {
         }
         exactly_once = exactly_once && seen.size() == consumers.size();
         for (auto& c : consumers) {
+            // each producer's three signals arrived exactly once
+            three_signals = three_signals && c->inputs_pending(Signal::SizeCompleted) == 0 &&
+                            c->inputs_pending(Signal::Allocated) == 0 &&
+                            c->inputs_pending(Signal::Completed) == 0;
+        }
+        for (auto& c : consumers) {
             c->execute(errors.get());
             errors_inherited = errors_inherited &&
                                (static_cast<bool>(c->error()) == (failing < static_cast<int>(np)));
@@ -550,6 +560,51 @@ void test_consumer_registration_races() {
     check(exactly_once, "registration racing with completion: each consumer runs exactly once");
     check(errors_inherited,
           "registration racing with completion: failed producers' errors pass on");
+    check(three_signals, "registration racing with completion: exactly three signals per "
+                         "registration (size completed, allocated, completed)");
+}
+
+// The three signals of a registration (pipelining.md, S3) at each state the
+// producer may be in when the consumer registers: those it passed come from
+// add_consumer(), the others from the producer advancing.
+void test_three_signals() {
+    auto ok = std::make_shared<FnKernel>([](auto, auto) { return KernelResult{}; });
+    auto pending = [](const Task& t) {
+        return std::array<int, 3>{t.inputs_pending(Signal::SizeCompleted),
+                                  t.inputs_pending(Signal::Allocated),
+                                  t.inputs_pending(Signal::Completed)};
+    };
+    using P = std::array<int, 3>;
+    for (int at = 0; at < 3; ++at) { // registered while Created, SizeCompleted, Completed
+        auto p = std::make_shared<Task>(ok, "p");
+        auto c = std::make_shared<Task>(ok, "c");
+        if (at >= 1) {
+            p->advance(TaskState::SizeCompleted);
+        }
+        if (at >= 2) {
+            check(p->execute().empty(), "no consumers yet");
+        }
+        c->add_pending_inputs(1);
+        p->add_consumer(c, 0);
+        // + the issue guard; a size known at registration is counted with it
+        const P expect = at <= 1 ? P{2, 2, 2} : P{2, 1, 1};
+        check(pending(*c) == expect, "signals of passed stages come at registration");
+        const bool runnable = c->release_issue_guard(c);
+        check(runnable == (at == 2), "runnable once the producer completed");
+        const P after = at == 0 ? P{1, 1, 1} : at == 1 ? P{0, 1, 1} : P{0, 0, 0};
+        check(pending(*c) == after, "the issue guard dropped");
+        if (at == 0) {
+            p->advance(TaskState::SizeCompleted);
+            check(pending(*c) == P{0, 1, 1}, "size completed signalled on advance");
+        }
+        if (at <= 1) {
+            TaskList r = p->execute();
+            check(r.size() == 1 && r[0] == c, "completed makes the consumer runnable");
+        }
+        check(pending(*c) == P{0, 0, 0}, "exactly three signals");
+        c->advance(TaskState::SizeCompleted);
+        c->execute();
+    }
 }
 
 void test_active_limit() {
@@ -945,6 +1000,135 @@ void test_default_workers() {
           "default runtime has one worker per physical core but one");
 }
 
+// --- Ops that size their outputs in the task (pipelining.md, S2) ---
+
+// Element-wise sum of its 1-d inputs; sizes them by broadcasting in the task
+// and records the threads its size steps ran on.
+class DeferredAdd : public Kernel {
+  public:
+    explicit DeferredAdd(std::chrono::milliseconds delay = 0ms) : delay_(delay) {}
+    KernelResult size(std::span<const Layout* const> in, std::span<Layout> out) override {
+        {
+            std::lock_guard lock(mutex);
+            threads.insert(std::this_thread::get_id());
+        }
+        ++sized;
+        Shape s = in[0]->shape;
+        for (std::size_t k = 1; k < in.size(); ++k) {
+            Shape b;
+            if (!broadcast_shapes(s, in[k]->shape, b)) {
+                return KernelResult{1, "ValueError: operands could not be broadcast together", 0};
+            }
+            s = b;
+        }
+        out[0].shape = s;
+        return {};
+    }
+    KernelResult run(std::span<const Operand> in, std::span<const Operand> out) override {
+        std::this_thread::sleep_for(delay_);
+        const std::int64_t n = out[0].layout().size();
+        for (std::int64_t i = 0; i < n; ++i) {
+            double s = 0;
+            for (const Operand& op : in) {
+                s += at(op, op.layout().shape[0] == 1 ? 0 : i);
+            }
+            at(out[0], i) = s;
+        }
+        return {};
+    }
+    std::mutex mutex;
+    std::set<std::thread::id> threads;
+    std::atomic<int> sized{0};
+
+  private:
+    std::chrono::milliseconds delay_;
+};
+
+ArrayPtr issue_deferred1(Runtime& rt, const std::shared_ptr<Kernel>& k,
+                         std::initializer_list<ArrayPtr> in) {
+    std::vector<ArrayPtr> ins(in);
+    const DType dt = DType::Float64;
+    const int rank = 1;
+    ArrayPtr r;
+    rt.issue_deferred(k, ins, std::span<const DType>(&dt, 1), std::span(&rank, 1), "deferred",
+                      std::span<ArrayPtr>(&r, 1));
+    return r;
+}
+
+// Sizes run ahead of the elements: a chain of ops sized in their tasks knows
+// its last size long before the first element is computed, without the main
+// thread computing any size.
+void test_deferred_sizes_run_ahead() {
+    Runtime rt(opts(2));
+    auto k = std::make_shared<DeferredAdd>();
+    ArrayPtr x = issue1(rt, add_const(1.0, 300ms), {make_ready(rt, 5, 0.0)}, 5); // slow, sized
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 50; ++i) {
+        x = issue_deferred1(rt, k, {x});
+    }
+    check(Runtime::unsized(*x), "deferred: issued without a size");
+    const bool sized_ok = !rt.wait_stage(*x, TaskState::SizeCompleted);
+    const auto dt = std::chrono::steady_clock::now() - t0;
+    check(sized_ok && x->layout().shape == Shape{5}, "deferred: size known through 50 ops");
+    check(dt < 200ms, "deferred: sizes known before the first element (no wait for data)");
+    check(!x->producer()->completed(), "deferred: elements still pending when the size is known");
+    rt.wait_stage(*x, TaskState::Allocated);
+    check(!x->producer()->completed() && std::chrono::steady_clock::now() - t0 < 200ms,
+          "deferred: laid out before the first element (an input sized at issue has its layout)");
+    check(x->layout().strides == Strides{8}, "deferred: layout set by the task");
+    check(value(rt, x, 4) == 1.0, "deferred: elements computed");
+    check(k->sized == 50, "deferred: each op sized once");
+    check(!k->threads.contains(std::this_thread::get_id()), "deferred: no size on the main thread");
+}
+
+// A metadata query does not wait behind running kernels: with the only worker
+// busy, the main thread runs the step job it queued itself (help_steps).
+void test_deferred_size_wait_helps() {
+    Runtime rt(opts(1));
+    auto k = std::make_shared<DeferredAdd>();
+    ArrayPtr busy = issue1(rt, add_const(1.0, 300ms), {make_ready(rt, 5, 0.0)}, 5);
+    std::this_thread::sleep_for(10ms); // the worker runs it
+    const auto t0 = std::chrono::steady_clock::now();
+    ArrayPtr c = issue_deferred1(rt, k, {make_ready(rt, 4, 1.0)});
+    ArrayPtr d = issue_deferred1(rt, k, {c});
+    rt.wait_stage(*d, TaskState::Allocated);
+    check(d->layout().shape == Shape{4} && std::chrono::steady_clock::now() - t0 < 200ms,
+          "deferred: a size wait runs the queued steps, not after the busy worker");
+    check(value(rt, d, 0) == 1.0 && value(rt, busy, 0) == 1.0, "deferred: values after helping");
+}
+
+// Ready inputs: the task sizes its outputs in a pool job (or when it runs),
+// not on the main thread unless it waits for the size before the job ran
+// (Runtime::help_steps); ops sized at issue may read deferred outputs.
+void test_deferred_ready_inputs() {
+    Runtime rt(opts(2));
+    auto k = std::make_shared<DeferredAdd>(20ms);
+    ArrayPtr a = make_ready(rt, 4, 2.0);
+    ArrayPtr b = make_ready(rt, 1, 3.0);
+    ArrayPtr c = issue_deferred1(rt, k, {a, b}); // (4) + (1) -> (4)
+    std::this_thread::sleep_for(10ms);           // idle workers: the step job runs meanwhile
+    rt.wait_stage(*c, TaskState::SizeCompleted);
+    check(c->layout().shape == Shape{4}, "deferred, ready inputs: broadcast size");
+    ArrayPtr d = issue1(rt, add_const(1.0), {c}, 4); // waits for c's layout at issue
+    check(value(rt, d, 3) == 6.0 && value(rt, c, 0) == 5.0, "deferred, ready inputs: values");
+    check(!k->threads.contains(std::this_thread::get_id()),
+          "deferred, ready inputs: no size on the main thread");
+}
+
+// A size error fails the op and every op sized from it, with one record.
+void test_deferred_size_error() {
+    Runtime rt(opts(2));
+    auto k = std::make_shared<DeferredAdd>();
+    ArrayPtr slow = issue1(rt, add_const(1.0, 50ms), {make_ready(rt, 3, 0.0)}, 3);
+    ArrayPtr bad = issue_deferred1(rt, k, {slow, make_ready(rt, 4, 0.0)}); // (3) + (4)
+    ArrayPtr next = issue_deferred1(rt, k, {bad});
+    ErrorRef e1 = rt.wait_stage(*bad, TaskState::SizeCompleted);
+    ErrorRef e2 = rt.wait_stage(*next, TaskState::SizeCompleted);
+    check(e1 && e2 && e1.id() == e2.id(), "deferred: a size error passes to its consumers");
+    check(rt.wait(*next) && rt.wait(*bad), "deferred: a failed size fails the op");
+    check(rt.wait(*slow) == ErrorRef{}, "deferred: the input is unaffected");
+}
+
 int main() {
     test_default_workers();
     test_element_pool();
@@ -967,6 +1151,11 @@ int main() {
     test_error_propagation();
     test_error_reports();
     test_consumer_registration_races();
+    test_three_signals();
+    test_deferred_sizes_run_ahead();
+    test_deferred_ready_inputs();
+    test_deferred_size_wait_helps();
+    test_deferred_size_error();
     test_active_limit();
     test_random_programs(3, false);
     test_random_programs(64, false);

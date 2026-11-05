@@ -20,7 +20,7 @@ import weakref
 import numpy as np  # imports the real NumPy, not viproc
 from numpy.lib.array_utils import normalize_axis_index, normalize_axis_tuple
 
-from . import _viproc
+from . import _blas, _viproc
 
 AsyncError = _viproc.AsyncError
 AsyncIndexError = _viproc.AsyncIndexError
@@ -50,13 +50,38 @@ def _env_policy():
     return sync_below, adaptive
 
 
+# Optimization levels (docs/design/goals.md): O1 is bit-identical to NumPy,
+# O2 adds optimizations whose results are correct but may deviate. O3-O5 are
+# accepted and run as O2 until they are implemented.
+OPT_LEVELS = (1, 2, 3, 4, 5)
+
+
+def _check_level(level):
+    if isinstance(level, bool) or not isinstance(level, int) or level not in OPT_LEVELS:
+        raise ValueError(f"optimization level must be one of {OPT_LEVELS}, got {level!r}")
+    return level
+
+
+def _env_level():
+    env = os.environ.get("VIPROC_OPT", "").strip().upper().removeprefix("O")
+    try:
+        return _check_level(int(env)) if env else 1
+    except ValueError:
+        raise ValueError(f"VIPROC_OPT must be one of {OPT_LEVELS}, got {env!r}") from None
+
+
+def _start(workers, max_active_tasks, sync_below, adaptive, level):
+    _viproc.init(workers, max_active_tasks, sync_below, adaptive, level)
+    _blas.apply_level(level)
+    _small_ops[0] = 2048 if sync_below < 0 else sync_below
+    _scale_budget(adaptive)
+
+
 def _ensure_runtime():
     if not _viproc.initialized():
         workers = int(os.environ.get("VIPROC_WORKERS", "0"))
         sync_below, adaptive = _env_policy()
-        _viproc.init(workers, 0, sync_below, adaptive)
-        _small_ops[0] = 2048 if sync_below < 0 else sync_below
-        _scale_budget(adaptive)
+        _start(workers, 0, sync_below, adaptive, _env_level())
 
 
 # The direct-path budget (OffloadOptions::direct_budget_ns, chain_ns): what
@@ -163,7 +188,54 @@ def asarray(obj, dtype=None, order=None, *, copy=None, like=None, **kwargs):
         return np.asarray(obj, dtype, order, copy=copy, like=like, **kwargs)
     if isinstance(obj, ndarray) and (dtype is None or obj.dtype == np.dtype(dtype)) and not copy:
         return obj
+    if (type(obj) is np.ndarray and order in (None, "K", "A") and copy is not True
+            and (dtype is None or obj.dtype == np.dtype(dtype))):
+        r = _import_strided(obj)
+        if r is not None:
+            return r
     return array(obj, dtype, copy=True, order=order or "K")
+
+
+def _c_strides(a):
+    st, step = [], a.itemsize
+    for n in reversed(a.shape):
+        st.append(step)
+        step *= n
+    return tuple(reversed(st))
+
+
+def _import_strided(obj):
+    """asarray of an ndarray: NumPy returns the array itself, viproc a copy
+    with its strides where they matter (NumPy's loops take other paths on
+    other strides, and their results can differ in the last bit; later
+    results take their layouts from them): an empty array keeps them all
+    (no memory), a dense one (any axis order, also reversed axes and
+    extent-1 axes of any stride) all of them. A strided one (a stepped
+    view) is copied densely, its gaps closed, keeping reversed axes
+    reversed. None: the plain copy of array() has the same strides."""
+    if obj.dtype not in _CODES:
+        return None
+    st = obj.strides
+    if obj.size == 0:
+        r = np.ndarray(obj.shape, obj.dtype, np.empty(0, obj.dtype), strides=st)
+        return _adopt(r)
+    if obj.flags.c_contiguous and st == _c_strides(obj):
+        return None  # the common case: array() copies it as it is
+    lo = hi = 0
+    for n, s in zip(obj.shape, st):
+        if s < 0:
+            lo += (n - 1) * s
+        else:
+            hi += (n - 1) * s
+    if hi - lo + obj.itemsize == obj.nbytes:  # dense: the same strides
+        buf = np.empty(obj.nbytes, np.uint8)
+        r = np.ndarray(obj.shape, obj.dtype, buf, offset=-lo, strides=st)
+        r[...] = obj
+        return _adopt(r)
+    if not any(s < 0 for s in st):
+        return None
+    flip = tuple(slice(None, None, -1) if s < 0 else slice(None) for s in st)
+    return _adopt(obj[flip].copy(order="K")[flip])
 
 
 def fresh(r, args=(), kwargs=None):
@@ -435,12 +507,18 @@ def _r_anyall(ufunc):
 
 
 _INTP = np.intp
+_WIDE = (np.dtype(np.float64), np.dtype(np.complex128))
 
 
 def _divide_by_count(r, n):
     """NumPy's true_divide(r, intp(n), out=r, casting='unsafe') (and, for
     0-d results, r.dtype.type(r / n)): divided in the promoted dtype of r
-    and intp (float64, complex128), cast back to r's dtype."""
+    and intp (float64, complex128), cast back to r's dtype. In place, as
+    NumPy: the result keeps r's layout (a reduction's extent-1 axes)."""
+    if r.ndim:
+        if r.dtype in _WIDE:  # the division's own dtype: no cast
+            return np.true_divide(r, _INTP(n), out=r)
+        return np.true_divide(r, _INTP(n), out=r, casting="unsafe")
     q = np.true_divide(r, _INTP(n))
     return q if q.dtype == r.dtype else q.astype(r.dtype)
 
@@ -900,9 +978,32 @@ def _readonly_call(fn):
     return handler
 
 
+def _data_sized(fn, o2):
+    """At optimization level O2 a pending argument makes a task that sizes
+    its result from the data (pipelining.md, S4: `o2`, None where it does
+    not apply); else NumPy on a read-only export after a sync."""
+    sync = _readonly_call(fn)
+
+    def handler(a, *args, **kwargs):
+        if (not args and not kwargs and type(a) is ndarray and _viproc.opt_level() >= 2
+                and not _viproc.ready(a)):
+            r = o2(a)
+            if r is not None:
+                return r
+        return sync(a, *args, **kwargs)
+
+    return handler
+
+
+def _nonzero_o2(a):
+    if a.ndim != 1:
+        return None  # NumPy's index arrays are views of one (count, ndim) array
+    return (_viproc.flatnonzero(a),)
+
+
 _VIEW_HANDLERS.update({np.where: _where,
-                  np.nonzero: _readonly_call(np.nonzero),
-                  np.flatnonzero: _readonly_call(np.flatnonzero),
+                  np.nonzero: _data_sized(np.nonzero, _nonzero_o2),
+                  np.flatnonzero: _data_sized(np.flatnonzero, _viproc.flatnonzero),
                   np.argwhere: _readonly_call(np.argwhere),
                   np.count_nonzero: _readonly_call(np.count_nonzero)})
 
@@ -1084,7 +1185,7 @@ def _gather_fast(a, key):
             return None
         idx = asarray(idx if idx.dtype in _INDEX_DTYPES else idx.astype(np.intp))
     if (idx.dtype not in _INDEX_DTYPES or not a.ndim or not a.size or not idx.size
-            or not a._c_contiguous):
+            or not a._c_ordered):  # extent-1 axes too: NumPy orders by their strides
         return None
     nb = idx.ndim
     res = list(range(p)) + [-1 - d for d in range(nb)] + list(range(p + 1, a.ndim))
@@ -1100,6 +1201,49 @@ def _gather_fast(a, key):
         strides[k] = step
         step *= shape[k]
     return _viproc.gather(a, (idx,), (p,), res, strides)
+
+
+def _gather_deferred(a, key):
+    """O2: a[key] for keys of slices and integer index arrays when `a` or a
+    viproc index array is pending (its size or layout may still be computed
+    by its task): placed by the ranks alone
+    (NumPy's rules, as _parse_index), shapes, bounds and layout in the
+    gather task (GatherKernel::size/layout). None for other keys or sized
+    operands: the regular path."""
+    keys = key if type(key) is tuple else (key,)
+    nd = a.ndim  # the rank: known at issue
+    if len(keys) > nd:
+        return None
+    pending = not _viproc.ready(a)  # its layout may still be computed by its task
+    basic, idx, axes = [], [], []
+    for n, k in enumerate(keys):
+        if type(k) is slice:
+            basic.append(k)
+            continue
+        if type(k) is ndarray:
+            if k.dtype not in _INDEX_DTYPES:
+                return None
+            pending = pending or not _viproc.ready(k)
+        elif type(k) is np.ndarray and k.dtype.kind in "iu" and k.size:
+            k = asarray(k if k.dtype in _INDEX_DTYPES else k.astype(np.intp))
+        else:
+            return None
+        basic.append(_FULL)
+        idx.append(k)
+        axes.append(n)
+    if not idx or not pending:
+        return None
+    v = a if all(k == _FULL for k in basic) else a._view(tuple(basic))
+    rest = [k for k in range(nd) if k not in axes]
+    bdims = [-1 - d for d in range(max(x.ndim for x in idx))]
+    if axes == list(range(axes[0], axes[0] + len(axes))):  # adjacent: in place
+        res = [k for k in rest if k < axes[0]] + bdims + [k for k in rest if k > axes[-1]]
+    else:
+        res = bdims + rest
+    return _viproc.gather(v, tuple(idx), tuple(axes), res, None, _GATHER_DEFERRED)
+
+
+_GATHER_DEFERRED = 4  # VP_INDEX_DEFERRED (viproc.h)
 
 
 def _gather(a, key):
@@ -1337,7 +1481,7 @@ class ndarray(_viproc._Array):
             return self
         code = _CODES.get(dtype)
         if (code is not None and order in ("K", "C", "F") and casting == "unsafe"
-                and self.size and type(self) is ndarray):
+                and type(self) is ndarray):  # empty: vp_astype refuses at O1
             r = _viproc.astype(self, code, order)  # NumPy's casts, asynchronously
             if r is not None:
                 return r
@@ -1764,6 +1908,13 @@ def _getitem(self, key):
             return _scalar_result(v.copy()) if not _viproc.ready(v) else _viproc.scalar(v)
         return v
     if type(self) is ndarray:
+        if (type(key) is ndarray and key.dtype == np.bool_ and not _viproc.ready(key)
+                and _viproc.opt_level() >= 2 and key.ndim > 0):
+            # O2: no sync on a pending mask; the task sizes the result from
+            # its data (pipelining.md, S4)
+            r = _viproc.mask_select(self, key)
+            if r is not None:
+                return r
         if type(key) in (ndarray, tuple, np.ndarray):  # a[idx], a[:, idx]: fast path
             r = _gather_fast(self, key)
             if r is not None:
@@ -1821,6 +1972,18 @@ _viproc.setup_reductions(
     np._NoValue,
     _REDUCE_ASYNC,
 )
+
+def _getitem_o2(self, key):
+    """a[key] beyond the C fast path from O2 on (the C slot calls it instead
+    of _getitem): advanced keys of pending arrays without a wait first."""
+    if type(key) in (ndarray, tuple, np.ndarray):
+        r = _gather_deferred(self, key)
+        if r is not None:
+            return r
+    return _getitem(self, key)
+
+
+_viproc.set_getitem_o2(_getitem_o2)
 
 _viproc.setup(
     ndarray,
@@ -1918,7 +2081,7 @@ def wait_all():
         _viproc.wait_all()
 
 
-def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
+def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None, level=None):
     """(Re)starts the runtime.
 
     workers: worker threads (0: one per physical core but one, the main
@@ -1929,27 +2092,43 @@ def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None):
         are usually needed right after issuing (default True; False, or env
         VIPROC_DETERMINISTIC=1, gives a deterministic schedule). Results are
         identical either way; only where ops run changes.
+    level: optimization level (docs/design/goals.md; default 1, env
+        VIPROC_OPT=2 or O2, python -m viproc -O2). 1: results bit-identical
+        to NumPy. 2: results correct but possibly deviating from NumPy's:
+        stage pipelining (element-wise ufuncs size their results in their
+        tasks; the main thread does not wait for pending sizes, and a
+        broadcasting error is raised asynchronously, AsyncValueError), every
+        BLAS call runs on one thread (process-wide while the runtime runs;
+        viproc's workers parallelize), LAPACK calls are no longer
+        serialized. 3-5: not implemented yet, run as 2.
     """
     env_sync, env_adaptive = _env_policy()
     sync_below = env_sync if sync_below is None else sync_below
+    level = _env_level() if level is None else _check_level(level)
     try:
         shutdown()  # raises an error of the old runtime nothing reported yet
     finally:
         adaptive = env_adaptive if adaptive is None else adaptive
-        _viproc.init(workers, max_active_tasks, sync_below, adaptive)
-        _small_ops[0] = 2048 if sync_below < 0 else sync_below
-        _scale_budget(adaptive)
+        _start(workers, max_active_tasks, sync_below, adaptive, level)
+
+
+def opt_level():
+    """The runtime's optimization level (see init())."""
+    _ensure_runtime()
+    return _viproc.opt_level()
 
 
 def offload_stats():
     """{'inline': n, 'offloaded': m, 'direct': d, 'tasks': t, 'syncs': s,
-    'wakes': w}:
+    'wakes': w, 'size_waits': z}:
     ready ops run inline as a task / handed to workers / run directly without
     a task (small, inputs ready); t counts every task issued, whether its
     inputs were ready or pending (inline and offloaded count only the ready
     ones); s counts sync points that found their array pending (the main
     thread blocked; wait_all() not counted); w counts sleeping workers woken
-    by the thread queuing a task (mostly the issuing main thread)."""
+    by the thread queuing a task (mostly the issuing main thread); z counts
+    metadata queries that found a size or layout still unknown (O2: a task
+    sizes the array) and blocked."""
     _ensure_runtime()
     return _viproc.offload_counts()
 
@@ -1977,7 +2156,10 @@ def shutdown():
     """Waits for all ops and stops the runtime. Raises the error of a failed op
     that was not reported yet (at exit Python prints it)."""
     if _viproc.initialized():
-        _viproc.shutdown()
+        try:
+            _viproc.shutdown()
+        finally:
+            _blas.apply_level(1)  # the BLAS thread count from before O2
 
 
 def workers():

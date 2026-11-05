@@ -6,6 +6,7 @@
 #include "runtime/runtime.hpp"
 
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -42,6 +43,9 @@ class UfuncLoop {
     // with reduction=True), for the inner strides `fixed_strides` (acc, in,
     // acc), as NumPy's reduction passes them to get_strided_loop. Fails if
     // the reduction would cast (the accumulator dtype differs from `dtype`).
+    // A fixed stride not known when the loop is resolved (O2: the task lays
+    // its input out): NumPy's loop for any stride (fixed_strides None).
+    static constexpr std::intptr_t kAnyStride = INTPTR_MIN;
     static std::unique_ptr<UfuncLoop> resolve_reduction(PyObject* ufunc, DType dtype,
                                                         const std::array<std::intptr_t, 3>& fixed,
                                                         std::string& error);
@@ -71,6 +75,9 @@ class UfuncLoop {
     const char* fp_name() const { return reports_fp_errors() ? ufunc_name() : nullptr; }
 
     int nin() const { return nin_; }
+    // The dtypes of the signature (inputs, then outputs; empty for loops not
+    // resolved by resolve()).
+    std::span<const DType> dtypes() const { return {dtypes_.data(), dtypes_.size()}; }
     // Element-wise kernel for this loop, shared by all tasks using it.
     const std::shared_ptr<Kernel>& elementwise_kernel() const { return kernel_; }
     int nout() const { return nout_; }
@@ -94,6 +101,7 @@ class UfuncLoop {
     int call_watched(char* const* data, const std::intptr_t* dims,
                      const std::intptr_t* strides) const;
     std::shared_ptr<Kernel> kernel_;
+    SmallVector<DType, 8> dtypes_;
 };
 
 // The error of the last failed UfuncLoop::call() on this thread ("ValueError:
@@ -184,12 +192,17 @@ class LoopCache {
     // np.getbufsize(), re-read only when NumPy's extobj context changes.
     long buffersize();
 
+    // O2: makes cast_elements(from, to, ...) available (see there). False if
+    // NumPy cannot cast without the Python API. Main thread with the GIL.
+    bool prepare_cast(DType from, DType to, DeferRelease defer);
+
   private:
     std::map<std::pair<PyObject*, std::vector<DType>>, std::unique_ptr<UfuncLoop>> loops_;
     std::map<std::tuple<PyObject*, DType, std::array<std::intptr_t, 3>>, std::unique_ptr<UfuncLoop>>
         reduction_loops_;
     std::unordered_map<std::string, std::shared_ptr<IterTemplate>> iter_templates_;
     std::unordered_map<std::string, std::shared_ptr<ReduceTemplate>> reduce_templates_;
+    std::shared_ptr<IterTemplate> cast_templates_[7][7];
     PyObject* extobj_var_ = nullptr; // NumPy's extobj context variable
     PyObject* extobj_ = nullptr;     // its value at the last read
     long buffersize_ = 0;
@@ -200,7 +213,19 @@ class LoopCache {
 // Operand order follows Runtime::issue(). The bridge uses it only where
 // single_call() holds; everything else goes through
 // LoopCache::iter_elementwise().
+// At optimization level O2 the same kernel also sizes and lays out its
+// output in the task (Kernel::size: NumPy's broadcasting and its error;
+// Kernel::layout: elementwise_layout), for Runtime::issue_deferred.
 std::shared_ptr<Kernel> make_elementwise_kernel(const UfuncLoop* loop);
+
+// NumPy's result layout of an element-wise ufunc with one output (order='K'):
+// sets the strides and offset of `out`, which comes with its dtype and the
+// broadcast shape. C order unless an input is not; F order when NumPy's
+// trivial loop allocates it (every input 0-d or F- and not C-contiguous with
+// the result's shape and the loop's dtype `in_dtypes`), else
+// Layout::keep_order over the inputs.
+void elementwise_layout(Layout& out, std::span<const Layout* const> inputs,
+                        std::span<const DType> in_dtypes);
 
 // ufunc.at(a, idx, b) for a 1-d int32/int64 index along a's first axis, as
 // NumPy's ufunc_at runs it without casts: every index checked first (an
@@ -231,6 +256,24 @@ bool single_call(std::span<const Layout* const> inputs, const Layout& out, std::
 // warnings (ComplexWarning) are raised here, at issue, as in NumPy's call.
 std::shared_ptr<Kernel> make_cast_kernel(const Layout& in, const Layout& out, long buffersize,
                                          DeferRelease defer, std::string& error);
+
+// O2: element casts without the GIL and without a layout known at issue,
+// on NumPy's cast in a ranged iterator template per (from, to) over
+// contiguous chunks (LoopCache::prepare_cast, main thread, GIL, per issue: it
+// tops up the template's copies). cast_elements() then runs on any thread:
+// `n` elements from `src` (stride `sstride` bytes; strided data gathered
+// first) to the contiguous `dst`; false with `error` if NumPy fails.
+bool cast_elements(DType from, DType to, const char* src, std::intptr_t sstride, char* dst,
+                   std::intptr_t n, std::string& error);
+
+// O2 (Runtime::issue_deferred): a.astype(to, order) ('K', 'C' or 'F') whose
+// shape and layout the task takes from its input's (NumPy's
+// PyArray_NewLikeArray order). One kernel per (to, order); prepare_cast()
+// for the input's dtype first.
+std::shared_ptr<Kernel> make_deferred_cast_kernel(DType to, char order);
+
+// The layout NumPy gives a.astype(to, order) of `in` ('K', 'C' or 'F').
+Layout astype_layout(const Layout& in, DType to, char order);
 
 // NumPy's scalar of the element at `data` (dtype `dtype`). GIL held.
 PyObject* scalar_object(DType dtype, const void* data);

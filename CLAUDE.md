@@ -87,16 +87,18 @@ to plain sequential NumPy execution.
 - A task passes through each state **exactly once, in increasing order**
   (`docs/design/pipelining.md`, S1): a stage with nothing to do is still
   reached and signalled; handlers may rely on it, and a skipped stage can
-  deadlock its waiters. Today's code still skips `DeviceSelected` (no
-  callbacks on it yet) and the direct path creates ready outputs without
-  a task.
-- Full stage pipelining (Accelerator; `docs/design/pipelining.md`, not
-  implemented yet): six array stages (created, size completed, device
+  deadlock its waiters. Every task reaches each state (`DeviceSelected`
+  in `Task::execute`, the CPU; `Task::advance` asserts the next state in
+  debug builds); only the direct path creates ready outputs without a
+  task.
+- Full stage pipelining (Accelerator; `docs/design/pipelining.md`, started
+  at O2: element-wise ufuncs, creators, masks): six array stages (created, size completed, device
   selected, allocated, completed, disposed), each reached exactly once, in
   increasing order; the main thread guarantees only
   `created`, tasks advance the rest on their inputs' stage events. Today
   every task reaches `size_completed` at issue; pending size arguments
-  (`np.zeros(n)` with pending `n`) are to issue a task instead of syncing.
+  (`np.zeros(n)` with pending `n`) issue a task instead of syncing at O2
+  (S4, module functions `zeros`/`ones`/`empty`/`full`/`arange`).
 - The task holds references to its input arrays, its output arrays and the
   resolved NumPy loop.
 - Tasks, CountableArrays, Metadata objects and array blocks come from per-thread memory pools
@@ -172,13 +174,23 @@ reported with that issue site and the NumPy function it runs
   producer, inline up to 3), pushed by the main thread with a CAS and
   closed by the completing thread with one exchange (`kClosed`: a later
   push fails, and the main thread accounts for the producer itself); a
-  bit in the same word marks a waiter in `wait_completed`.
+  bit in the same word marks a waiter in `wait_completed`. **Every
+  registration yields exactly three signals** (`Signal`: size completed,
+  allocated, completed), once each, in order, whatever the producer's
+  state at registration: one signal word per node; the producer walking
+  its list and the registering thread combine on it with CAS (whoever
+  finds nothing being delivered delivers; pipelining.md, "Signals").
+  Tasks issued with `Runtime::issue_deferred` (S2, no bridge op yet) size
+  and lay out their outputs on the size completed and allocated signals
+  (pipelining.md, "Deferred sizing"); for all others only completed
+  triggers anything.
 - **Sync points** (reading data, `print`, `float(x)`, handing memory back to
   plain NumPy) wait for `completed` of the array's producer. Querying only
   metadata (`x.shape`, `x.dtype`) waits for `size_completed` only. Because
   shape is a stage of its own, ops with data-dependent result shapes
   (`nonzero`, boolean indexing, `unique`) fit the model too; in the MVP
-  they still fall back to eager NumPy.
+  they still fall back to eager NumPy (O2: `x[mask]`, `flatnonzero`
+  and 1-d `nonzero` are tasks that size their results from the data).
 
 ### Thread rules
 
@@ -250,8 +262,20 @@ ownership, release or reuse of memory.
   layout NumPy would allocate (`Layout::keep_order`: order='K', dense, axes
   ordered by the inputs' strides as NumPy's iterator orders them; F-order
   inputs give an F-order result), and copy-on-write keeps the array's
-  layout. Importing a non-contiguous NumPy array (`asarray`) copies it
-  densely, in its axis order.
+  layout. A new array without elements has all strides 0 (NumPy >= 2.5;
+  `Runtime::issue` from `nbytes()`, `zero_strides_if_empty`; views
+  compute theirs); such arrays are C- and F-contiguous whatever their
+  strides. A reduction's result is laid out in the input's axis order,
+  extent-1 axes (kept reduced ones too) taking the stride of their
+  position (`reduction_result`, cached with the reduce kernel); mean/var
+  divide it in place, as NumPy. Importing a NumPy array (`asarray`) keeps
+  its strides where the copy can: an empty or dense one (any axis order,
+  reversed axes, extent-1 axes of any stride) exactly, a strided one
+  densely with its reversed axes reversed (`_import_strided`): NumPy's
+  loops round differently on other strides
+  (`exp` of a reversed float64 vector). `python/tests/test_matrix.py`
+  checks all of this against NumPy (shapes incl. empty 1/2/3/8-d and 0-d,
+  layouts, dtypes, NaN/inf, casts, keepdims, indexing, ready/pending).
 - Memory is handed to plain NumPy only after its writer and task readers
   are done; exports are writable aliases, and while one lives
   (`CountableArray::host_views`) ops on that memory run synchronously
@@ -285,14 +309,29 @@ dtypes, shapes, strides, warnings, errors), as the drop-in rule demands
 reordered sums, no fusion or splitting of an op that changes rounding. The
 small per-op overhead on small data that this costs is accepted; work it
 down, never at G2's expense. Bit-identity is the property of optimization
-level **O1**, the current implementation (array ILP only, NumPy executes
-every function). Planned levels (goals.md, "Optimization levels"), not
-started, each adding to the one below and computing correct but possibly
-deviating results: **O2** stage pipelining and BLAS threading removed,
-**O3** micro kernels (own, fused or split kernels, re-implemented NumPy
-internals), **O4** automatic device offloading. O1 stays available. Until
-a level is decided and built, every change is O1 and must stay
-bit-identical.
+level **O1**, the default (array ILP only, NumPy executes every
+function). Higher levels (goals.md, "Optimization levels") each add to
+the one below and compute correct but possibly deviating results: **O2**
+stage pipelining and BLAS threading removed (started: one BLAS thread,
+LAPACK calls no longer serialized; element-wise ufuncs (casts of inputs
+in the task) and `astype` on pending or large inputs, `matmul` of pending
+ones, are issued unsized, `vp_ufunc_issue_deferred`, and
+size themselves in the task, pipelining.md S2; `zeros`/`ones`/`empty`/
+`full`/`arange` with pending size arrays and `x[mask]`, `flatnonzero`,
+1-d `nonzero` of pending data are tasks sizing from the data, S4;
+reductions without casts sized, laid out and planned in their tasks,
+`vp_reduce_deferred`; ranks known at issue, `Runtime::rank`; basic
+indexing, transposes, `swapaxes` and 1-d reshapes of such arrays as views by a rule,
+`ViewRule`; advanced indexing with slices and index arrays as deferred
+gathers, `DeferredGatherKernel`; NumPy
+functions may still run as a whole), **O3** micro kernels (own, fused or split kernels, re-implemented
+NumPy internals), **O4** automatic device offloading, **O5** reserved.
+The level is chosen per process: `viproc.init(level=n)`,
+`VIPROC_OPT=n` (or `On`), `python -m viproc -On prog.py`; `opt_level()`
+reads it (stored in the runtime, `RuntimeOptions::opt_level`); 3-5 run as
+O2 until built. O1 stays available and the default. Every change at O1
+must stay bit-identical; optimizations that may deviate are gated on the
+level.
 
 ### Phase 1 (current): MVP on CPUs
 
@@ -374,6 +413,7 @@ src/runtime/           Runtime core, no Python dependency (library `viproc`)
   assign.*             element copy kernels (dst[...] = src; a new array
                        placed from parts: concatenate, tile, pad, ...)
   index.*              gather / scatter / masked assignment / select (indexing, np.where)
+  index_deferred.cpp   the gather sized and laid out in its task (O2)
 src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
   numpy_ufunc.*        UfuncLoop / LoopCache (resolved NumPy loops),
                        element-wise kernel, wrap_ndarray / to_ndarray
@@ -417,6 +457,8 @@ python/viproc/         Python package
                        irfft, hfft, n-d transforms)
   _sort.py             np.sort/np.argsort/a.sort beyond the C path (axis=None
                        copies, kinds, NumPy's errors)
+  _blas.py             BLAS thread count (OpenBLAS via ctypes): one thread
+                       from optimization level O2 on, restored at shutdown
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -435,6 +477,7 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
                        best/median/worst per point, outlier list
   shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync/
                        expressions/loops/control; --groups selects groups)
+  opt_levels.py        BLAS-heavy programs at O1 and O2 vs. NumPy
   array_pipelining.py  ILNumerics' array-pipelining demo (loop over columns,
                        dependent loop, vectorized): NumPy, NumPy threads,
                        viproc at 1..cores workers
@@ -1068,7 +1111,10 @@ Rules:
   to run asynchronously: the C hot path converts them to NumPy scalars
   and lets NumPy compute it right there (`scalars_of`; operators as NumPy
   scalar math, ufunc calls as NumPy's ufunc), returning NumPy's scalar,
-  as the NumPy program would. Any n-d operand, even of one element, keeps
+  as the NumPy program would. Only `_scalar` arrays become scalars; a
+  plain 0-d array is passed as a borrowed 0-d ndarray: NumPy computes
+  scalars partly with other code than 0-d arrays (complex64 `square`
+  differs in the last bit). Any n-d operand, even of one element, keeps
   the array path and NumPy's output shape. `float()`, `bool()`,
   `format()`, `round()` of a pending 0-d array sync.
 - **Fallback (sync + eager NumPy on viproc memory, `_Host`):** everything

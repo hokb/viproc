@@ -96,8 +96,9 @@ def test_scalar_operands_are_cached_per_object_and_dtype():
 
 
 def test_cast_of_an_input_is_a_task_of_its_own():
+    # from O2 on the cast runs inside the op's task (deferred, pipelining.md)
     (x, v), (y, w) = data(), data(dtype=np.float32)
-    same(assert_async(operator.add, v, w, ops=2), x + y)
+    same(assert_async(operator.add, v, w, ops=1 if viproc.opt_level() >= 2 else 2), x + y)
 
 
 def test_in_place_and_out():
