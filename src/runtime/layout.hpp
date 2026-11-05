@@ -57,12 +57,17 @@ struct Layout {
 
     std::int64_t size() const;
     // True if an extent is 0 (no elements).
-    bool empty() const;
-    // The layout of new memory for this one: itself if dense, else C order;
-    // without elements every stride 0 (NumPy >= 2.5 allocates so).
-    Layout fresh() const;
-    // Every stride 0 if an extent is 0 (as fresh(), for layouts computed
-    // otherwise); true if it was.
+    bool empty() const {
+        for (std::int64_t n : shape) {
+            if (n == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    // Every stride 0 if an extent is 0 (NumPy >= 2.5 allocates arrays
+    // without elements so; Runtime::issue does it from nbytes()); true if it
+    // was.
     bool zero_strides_if_empty();
     // True if the elements lie C-contiguously (dimensions of extent 1 may
     // have any stride; without elements always, as NumPy's flags).

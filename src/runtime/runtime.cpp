@@ -568,9 +568,13 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         }
         // Dense layouts (C, F, any axis order) are kept: ufunc results follow
         // NumPy's order (Layout::keep_order).
-        Layout contiguous = l.fresh();
+        Layout contiguous = l.dense() ? l : Layout::contiguous(l.dtype, l.shape);
+        const std::size_t nbytes = contiguous.nbytes();
+        if (nbytes == 0) { // no elements: all strides 0 (NumPy >= 2.5)
+            std::fill(contiguous.strides.begin(), contiguous.strides.end(), 0);
+        }
         // The task takes the memory when it runs (D11).
-        auto buffer = make_pooled<CountableArray>(contiguous.nbytes(), CountableArray::deferred);
+        auto buffer = make_pooled<CountableArray>(nbytes, CountableArray::deferred);
         MetadataPtr st = make_metadata(std::move(contiguous));
         in_ops.push_back({buffer, st});
         results[i] = new_array(std::move(st), std::move(buffer), task);
@@ -636,8 +640,12 @@ bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<cons
             results[i] = new_array(std::move(st), output_buffers[i], nullptr);
             continue;
         }
-        Layout contiguous = l.fresh();
-        auto buffer = make_pooled<CountableArray>(contiguous.nbytes());
+        Layout contiguous = l.dense() ? l : Layout::contiguous(l.dtype, l.shape);
+        const std::size_t nbytes = contiguous.nbytes();
+        if (nbytes == 0) { // no elements: all strides 0 (NumPy >= 2.5)
+            std::fill(contiguous.strides.begin(), contiguous.strides.end(), 0);
+        }
+        auto buffer = make_pooled<CountableArray>(nbytes);
         MetadataPtr st = make_metadata(std::move(contiguous));
         ops.push_back({buffer, st, false});
         results[i] = new_array(std::move(st), std::move(buffer), nullptr);

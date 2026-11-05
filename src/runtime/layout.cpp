@@ -100,20 +100,12 @@ Layout Layout::keep_order(DType dtype, Shape shape, std::span<const Layout> inpu
     return l;
 }
 
-bool Layout::empty() const { return std::find(shape.begin(), shape.end(), 0) != shape.end(); }
-
 bool Layout::zero_strides_if_empty() {
     if (!empty()) {
         return false;
     }
     std::fill(strides.begin(), strides.end(), 0);
     return true;
-}
-
-Layout Layout::fresh() const {
-    Layout l = dense() ? *this : contiguous(dtype, shape);
-    l.zero_strides_if_empty();
-    return l;
 }
 
 bool Layout::dense() const {
