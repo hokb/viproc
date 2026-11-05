@@ -51,6 +51,11 @@ is slightly slower than NumPy (median 0.75x), because each operation pays the as
 layer (task, dispatch) on top of NumPy's own call and has nothing to overlap with. Reducing
 this overhead is on the roadmap.
 
+*How to read it:* each cell is one array shape (rows x columns, logarithmic steps); its
+number is the median speedup of the single-operation cases at that shape. Blue cells are
+faster than NumPy, red ones slower, light gray ones about equal. Shapes above the dashed line
+have more than 10,000 elements.
+
 ### Real programs
 
 Real programs are not single operations: the more a program does, the more of its array
@@ -64,6 +69,15 @@ the unchanged NumPy script run with `python -m viproc`: 265 ms per run, 3.0x fas
 NumPy with its temporaries' page faults tuned away (789 ms; 2,670 ms with glibc's defaults on
 this VM, where every 481 KB temporary is mapped fresh). Same clusters, same iterations.
 
+*How to read it:* this is ILNumerics' way of measuring. The program runs again and again for
+about 20 seconds. Each marker is one complete k-means run: it sits at the time since the
+program started when the run finished (x) and shows how long that run took (y). So a line
+shows how the program's speed develops while it runs. The first runs include warm-up (one-time
+setup, caches filling); after that the line is flat at the program's steady speed. Lower is
+faster, and more markers in the same 20 seconds mean more runs done: 73 on viproc, 24 on the
+tuned NumPy, 8 on NumPy with glibc's defaults. viproc's first run took 340 ms, and from the
+fourth run on it stays near 250 ms.
+
 ![A Python loop over the columns of A: viproc 1.2-3.1x, free-threaded Python with a thread pool 1.1-2.8x, NumPy with a thread pool 0.24-0.67x](docs/benchmarks/readme/loop.png)
 
 **A plain Python loop, parallel without changes.** ILNumerics' loop demo in NumPy
@@ -74,11 +88,17 @@ way, a thread pool over the columns (`Parallel.For`), makes NumPy slower under t
 Free-threaded Python 3.13t (no GIL) makes the thread pool fast (1.1-2.8x vs. NumPy on that
 interpreter), but it has to be written by hand and gives wrong results for `C[:i+1] = ...`.
 
+*How to read it:* x is the size of the matrix (n x n, so the loop runs n times on columns of
+n elements); y is the speedup over the plain NumPy loop on one core. The dash-dotted line at
+1x is plain NumPy: lines above it are faster, lines below it slower. Solid lines are viproc,
+dashed lines the manual thread pools.
+
 ![Speedups of unchanged NumPy programs on 4 cores](docs/benchmarks/readme/programs.png)
 
 **More programs:** independent chains, an FFT pipeline, finance, a stencil and
 preprocessing gain 1.8-7.5x; a strictly dependent chain (logistic regression) has nothing to
-overlap.
+overlap. Each bar is one program; its length is the speedup over NumPy, and the dashed line
+marks 1x (as fast as NumPy).
 
 Suite scores, all shape maps, other machines and how to measure:
 [docs/benchmarks.md](docs/benchmarks.md). Figure data and scripts: `docs/benchmarks/readme/`.
