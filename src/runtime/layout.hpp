@@ -56,8 +56,16 @@ struct Layout {
                                                     std::span<const Layout> operands);
 
     std::int64_t size() const;
+    // True if an extent is 0 (no elements).
+    bool empty() const;
+    // The layout of new memory for this one: itself if dense, else C order;
+    // without elements every stride 0 (NumPy >= 2.5 allocates so).
+    Layout fresh() const;
+    // Every stride 0 if an extent is 0 (as fresh(), for layouts computed
+    // otherwise); true if it was.
+    bool zero_strides_if_empty();
     // True if the elements lie C-contiguously (dimensions of extent 1 may
-    // have any stride).
+    // have any stride; without elements always, as NumPy's flags).
     bool c_contiguous() const;
     // True if the elements lie F-contiguously (as c_contiguous()).
     bool f_contiguous() const;
@@ -79,6 +87,14 @@ bool broadcast_shapes(const Shape& a, const Shape& b, Shape& out);
 // View of `in` with shape `target` (`in.shape` must broadcast to it).
 // Broadcast dimensions get stride 0.
 Layout broadcast_to(const Layout& in, const Shape& target);
+
+// The result NumPy allocates for a reduction of `in` over the `reduced`
+// axes: its iterator orders the axes by the input's strides
+// (Layout::iteration_order) and lays the result out in that order, every
+// axis of extent 1 (also a kept reduced one) taking the stride of its
+// position; without keepdims the reduced axes are dropped.
+Layout reduction_result(const Layout& in, std::span<const bool> reduced, bool keepdims,
+                        DType dtype);
 
 // Calls `row(ptrs, count, strides)` once per innermost row of `shape` for a
 // set of operands, all already broadcast to `shape` (`layouts[k]`, first

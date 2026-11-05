@@ -568,7 +568,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         }
         // Dense layouts (C, F, any axis order) are kept: ufunc results follow
         // NumPy's order (Layout::keep_order).
-        Layout contiguous = l.dense() ? l : Layout::contiguous(l.dtype, l.shape);
+        Layout contiguous = l.fresh();
         // The task takes the memory when it runs (D11).
         auto buffer = make_pooled<CountableArray>(contiguous.nbytes(), CountableArray::deferred);
         MetadataPtr st = make_metadata(std::move(contiguous));
@@ -636,7 +636,7 @@ bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<cons
             results[i] = new_array(std::move(st), output_buffers[i], nullptr);
             continue;
         }
-        Layout contiguous = l.dense() ? l : Layout::contiguous(l.dtype, l.shape);
+        Layout contiguous = l.fresh();
         auto buffer = make_pooled<CountableArray>(contiguous.nbytes());
         MetadataPtr st = make_metadata(std::move(contiguous));
         ops.push_back({buffer, st, false});

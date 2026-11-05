@@ -188,7 +188,54 @@ def asarray(obj, dtype=None, order=None, *, copy=None, like=None, **kwargs):
         return np.asarray(obj, dtype, order, copy=copy, like=like, **kwargs)
     if isinstance(obj, ndarray) and (dtype is None or obj.dtype == np.dtype(dtype)) and not copy:
         return obj
+    if (type(obj) is np.ndarray and order in (None, "K", "A") and copy is not True
+            and (dtype is None or obj.dtype == np.dtype(dtype))):
+        r = _import_strided(obj)
+        if r is not None:
+            return r
     return array(obj, dtype, copy=True, order=order or "K")
+
+
+def _c_strides(a):
+    st, step = [], a.itemsize
+    for n in reversed(a.shape):
+        st.append(step)
+        step *= n
+    return tuple(reversed(st))
+
+
+def _import_strided(obj):
+    """asarray of an ndarray: NumPy returns the array itself, viproc a copy
+    with its strides where they matter (NumPy's loops take other paths on
+    other strides, and their results can differ in the last bit; later
+    results take their layouts from them): an empty array keeps them all
+    (no memory), a dense one (any axis order, also reversed axes and
+    extent-1 axes of any stride) all of them. A strided one (a stepped
+    view) is copied densely, its gaps closed, keeping reversed axes
+    reversed. None: the plain copy of array() has the same strides."""
+    if obj.dtype not in _CODES:
+        return None
+    st = obj.strides
+    if obj.size == 0:
+        r = np.ndarray(obj.shape, obj.dtype, np.empty(0, obj.dtype), strides=st)
+        return _adopt(r)
+    if obj.flags.c_contiguous and st == _c_strides(obj):
+        return None  # the common case: array() copies it as it is
+    lo = hi = 0
+    for n, s in zip(obj.shape, st):
+        if s < 0:
+            lo += (n - 1) * s
+        else:
+            hi += (n - 1) * s
+    if hi - lo + obj.itemsize == obj.nbytes:  # dense: the same strides
+        buf = np.empty(obj.nbytes, np.uint8)
+        r = np.ndarray(obj.shape, obj.dtype, buf, offset=-lo, strides=st)
+        r[...] = obj
+        return _adopt(r)
+    if not any(s < 0 for s in st):
+        return None
+    flip = tuple(slice(None, None, -1) if s < 0 else slice(None) for s in st)
+    return _adopt(obj[flip].copy(order="K")[flip])
 
 
 def fresh(r, args=(), kwargs=None):
@@ -460,12 +507,18 @@ def _r_anyall(ufunc):
 
 
 _INTP = np.intp
+_WIDE = (np.dtype(np.float64), np.dtype(np.complex128))
 
 
 def _divide_by_count(r, n):
     """NumPy's true_divide(r, intp(n), out=r, casting='unsafe') (and, for
     0-d results, r.dtype.type(r / n)): divided in the promoted dtype of r
-    and intp (float64, complex128), cast back to r's dtype."""
+    and intp (float64, complex128), cast back to r's dtype. In place, as
+    NumPy: the result keeps r's layout (a reduction's extent-1 axes)."""
+    if r.ndim:
+        if r.dtype in _WIDE:  # the division's own dtype: no cast
+            return np.true_divide(r, _INTP(n), out=r)
+        return np.true_divide(r, _INTP(n), out=r, casting="unsafe")
     q = np.true_divide(r, _INTP(n))
     return q if q.dtype == r.dtype else q.astype(r.dtype)
 
@@ -1132,7 +1185,7 @@ def _gather_fast(a, key):
             return None
         idx = asarray(idx if idx.dtype in _INDEX_DTYPES else idx.astype(np.intp))
     if (idx.dtype not in _INDEX_DTYPES or not a.ndim or not a.size or not idx.size
-            or not a._c_contiguous):
+            or not a._c_ordered):  # extent-1 axes too: NumPy orders by their strides
         return None
     nb = idx.ndim
     res = list(range(p)) + [-1 - d for d in range(nb)] + list(range(p + 1, a.ndim))

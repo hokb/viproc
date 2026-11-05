@@ -34,17 +34,14 @@ bool ReducePlan::supported() const {
 
 ReducePlan plan_reduction(const Layout& in, std::span<const bool> reduced, const Layout& out) {
     const std::size_t nd = in.shape.size();
-    const auto isz = static_cast<std::int64_t>(itemsize(out.dtype));
 
-    // Result stride of each kept input axis: the result is C-contiguous over
-    // the kept axes (extent-1 dimensions for reduced axes, if kept, add
-    // nothing).
+    // Result stride of each kept input axis, from `out` (with or without
+    // the reduced axes kept).
     std::vector<std::int64_t> out_stride(nd, 0);
-    std::int64_t step = isz;
-    for (std::size_t i = nd; i-- > 0;) {
+    const bool kept_all = out.shape.size() == nd;
+    for (std::size_t i = 0, j = 0; i < nd; ++i) {
         if (!reduced[i]) {
-            out_stride[i] = step;
-            step *= in.shape[i];
+            out_stride[i] = out.strides[kept_all ? i : j++];
         }
     }
 
@@ -234,7 +231,7 @@ class ReduceKernel : public Kernel {
 
 // O2 (Runtime::issue_deferred): the input's size and strides are not known
 // at issue. The task sizes the result (the reduced axes removed, or kept as
-// extent 1), lays it out C-contiguously (as NumPy's fast path allocates it)
+// extent 1), lays it out as NumPy allocates it (reduction_result)
 // and plans the loop calls when it runs. Where the reduced axes do not
 // coalesce, the plan visits them all: blocks NumPy's iterator would buffer
 // differently, so floating-point sums may round differently (O2).
@@ -268,8 +265,11 @@ class DeferredReduceKernel : public Kernel {
         return {};
     }
     void layout(std::span<const Layout* const> inputs, std::span<Layout> outputs) override {
-        (void)inputs;
-        outputs[0] = Layout::contiguous(outputs[0].dtype, outputs[0].shape);
+        std::array<bool, 64> flags{}; // NumPy's NPY_MAXDIMS
+        std::copy(reduced_.begin(), reduced_.end(), flags.begin());
+        outputs[0] =
+            reduction_result(*inputs[0], std::span<const bool>(flags.data(), reduced_.size()),
+                             keepdims_, outputs[0].dtype);
     }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {

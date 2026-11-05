@@ -17,6 +17,9 @@ Layout Layout::contiguous(DType dtype, Shape shape) {
         l.strides[i] = stride;
         stride *= shape[i];
     }
+    if (stride == 0) { // no elements: NumPy (>= 2.5) gives every axis stride 0
+        std::fill(l.strides.begin(), l.strides.end(), 0);
+    }
     l.shape = std::move(shape);
     return l;
 }
@@ -90,7 +93,26 @@ Layout Layout::keep_order(DType dtype, Shape shape, std::span<const Layout> inpu
         l.strides[ax] = step;
         step *= shape[ax];
     }
+    if (step == 0) { // no elements: all strides 0, as Layout::contiguous
+        std::fill(l.strides.begin(), l.strides.end(), 0);
+    }
     l.shape = std::move(shape);
+    return l;
+}
+
+bool Layout::empty() const { return std::find(shape.begin(), shape.end(), 0) != shape.end(); }
+
+bool Layout::zero_strides_if_empty() {
+    if (!empty()) {
+        return false;
+    }
+    std::fill(strides.begin(), strides.end(), 0);
+    return true;
+}
+
+Layout Layout::fresh() const {
+    Layout l = dense() ? *this : contiguous(dtype, shape);
+    l.zero_strides_if_empty();
     return l;
 }
 
@@ -122,10 +144,15 @@ bool Layout::dense() const {
 }
 
 bool Layout::c_contiguous() const {
+    // _UpdateContiguousFlags: an array without elements is C- and
+    // F-contiguous whatever its strides.
     std::int64_t stride = static_cast<std::int64_t>(itemsize(dtype));
     for (std::size_t i = shape.size(); i-- > 0;) {
+        if (shape[i] == 0) {
+            return true;
+        }
         if (shape[i] != 1 && strides[i] != stride) {
-            return false;
+            return empty(); // the axes left may still hold an extent 0
         }
         stride *= shape[i];
     }
@@ -139,7 +166,7 @@ bool Layout::f_contiguous() const {
             return true;
         }
         if (shape[i] != 1 && strides[i] != stride) {
-            return false;
+            return empty();
         }
         stride *= shape[i];
     }
@@ -243,6 +270,66 @@ bool broadcast_shapes(const Shape& a, const Shape& b, Shape& out) {
     }
     out = std::move(r);
     return true;
+}
+
+Layout reduction_result(const Layout& in, std::span<const bool> reduced, bool keepdims,
+                        DType dtype) {
+    const std::size_t nd = in.shape.size();
+    // Strides of the result with the reduced axes kept (extent 1).
+    Strides st(nd, 0);
+    std::int64_t step = static_cast<std::int64_t>(itemsize(dtype));
+    if (in.c_contiguous()) { // C order (the common case, without sorting)
+        for (std::size_t i = nd; i-- > 0;) {
+            st[i] = step;
+            step *= reduced[i] ? 1 : in.shape[i];
+        }
+    } else {
+        // Layout::iteration_order() for one operand, without heap memory:
+        // insertion sort from C order, innermost first; an extent-1 axis
+        // abstains.
+        SmallVector<std::size_t, kInlineRank> perm(nd);
+        for (std::size_t i = 0; i < nd; ++i) {
+            perm[i] = nd - 1 - i;
+        }
+        auto key = [&](std::size_t ax) {
+            return in.shape[ax] == 1 ? 0 : std::llabs(in.strides[ax]);
+        };
+        for (std::size_t i0 = 1; i0 < nd; ++i0) {
+            const std::size_t j0 = perm[i0];
+            const std::int64_t s0 = key(j0);
+            std::size_t ipos = i0;
+            for (std::size_t i1 = i0; i1-- > 0;) {
+                const std::int64_t s1 = key(perm[i1]);
+                if (s0 == 0 || s1 == 0) {
+                    continue; // ambiguous
+                }
+                if (s1 <= s0) {
+                    break;
+                }
+                ipos = i1;
+            }
+            for (std::size_t k = i0; k > ipos; --k) {
+                perm[k] = perm[k - 1];
+            }
+            perm[ipos] = j0;
+        }
+        for (std::size_t ax : perm) {
+            st[ax] = step;
+            step *= reduced[ax] ? 1 : in.shape[ax];
+        }
+    }
+    Layout out;
+    out.dtype = dtype;
+    for (std::size_t i = 0; i < nd; ++i) {
+        if (!reduced[i]) {
+            out.shape.push_back(in.shape[i]);
+            out.strides.push_back(step == 0 ? 0 : st[i]); // no elements: all 0
+        } else if (keepdims) {
+            out.shape.push_back(1);
+            out.strides.push_back(step == 0 ? 0 : st[i]);
+        }
+    }
+    return out;
 }
 
 Layout broadcast_to(const Layout& in, const Shape& target) {

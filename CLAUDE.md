@@ -262,8 +262,19 @@ ownership, release or reuse of memory.
   layout NumPy would allocate (`Layout::keep_order`: order='K', dense, axes
   ordered by the inputs' strides as NumPy's iterator orders them; F-order
   inputs give an F-order result), and copy-on-write keeps the array's
-  layout. Importing a non-contiguous NumPy array (`asarray`) copies it
-  densely, in its axis order.
+  layout. A new array without elements has all strides 0 (NumPy >= 2.5;
+  `Layout::fresh`, `zero_strides_if_empty`; views compute theirs); such
+  arrays are C- and F-contiguous whatever their strides. A reduction's
+  result is laid out in the input's axis order, extent-1 axes (kept
+  reduced ones too) taking the stride of their position
+  (`reduction_result`); mean/var divide it in place, as NumPy. Importing
+  a NumPy array (`asarray`) keeps its strides where the copy can: an
+  empty or dense one (any axis order, reversed axes, extent-1 axes of any
+  stride) exactly, a strided one densely with its reversed axes reversed
+  (`_import_strided`): NumPy's loops round differently on other strides
+  (`exp` of a reversed float64 vector). `python/tests/test_matrix.py`
+  checks all of this against NumPy (shapes incl. empty 1/2/3/8-d and 0-d,
+  layouts, dtypes, NaN/inf, casts, keepdims, indexing, ready/pending).
 - Memory is handed to plain NumPy only after its writer and task readers
   are done; exports are writable aliases, and while one lives
   (`CountableArray::host_views`) ops on that memory run synchronously
@@ -1099,7 +1110,10 @@ Rules:
   to run asynchronously: the C hot path converts them to NumPy scalars
   and lets NumPy compute it right there (`scalars_of`; operators as NumPy
   scalar math, ufunc calls as NumPy's ufunc), returning NumPy's scalar,
-  as the NumPy program would. Any n-d operand, even of one element, keeps
+  as the NumPy program would. Only `_scalar` arrays become scalars; a
+  plain 0-d array is passed as a borrowed 0-d ndarray: NumPy computes
+  scalars partly with other code than 0-d arrays (complex64 `square`
+  differs in the last bit). Any n-d operand, even of one element, keeps
   the array path and NumPy's output shape. `float()`, `bool()`,
   `format()`, `round()` of a pending 0-d array sync.
 - **Fallback (sync + eager NumPy on viproc memory, `_Host`):** everything

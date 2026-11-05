@@ -426,6 +426,7 @@ void Task::layout_step() {
     }
     for (std::size_t k = 0; k < out.size(); ++k) {
         Operand& op = operands_[ninputs_ + k];
+        out.data()[k].zero_strides_if_empty();
         op.buffer->set_size(out.data()[k].nbytes());
         // Strides and offset only: the shape is published already (readers
         // may read it since SizeCompleted, S5).
