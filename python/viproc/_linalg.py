@@ -88,13 +88,15 @@ _CHECK_FINITE = 2  # VP_GUFUNC_CHECK_FINITE
 _SERIAL = 4  # VP_GUFUNC_SERIAL
 # Matrices of at least this many elements run one LAPACK call at a time:
 # OpenBLAS threads them itself, and several threaded calls at once
-# oversubscribe its threads (vp_gufunc, VP_GUFUNC_SERIAL).
+# oversubscribe its threads (vp_gufunc, VP_GUFUNC_SERIAL). Not at O2, where
+# every BLAS call runs on one thread (_blas.py) and the workers parallelize.
 SERIAL_FROM = 64 * 64
 
 
 def _call(gufunc, inputs, signature, invalid=None, label_sizes=None, check_finite=False):
     flags = _CHECK_FINITE if check_finite else 0
-    if max(math.prod(x.shape[-2:]) for x in inputs) >= SERIAL_FROM:
+    if (max(math.prod(x.shape[-2:]) for x in inputs) >= SERIAL_FROM
+            and _viproc.opt_level() < 2):
         flags |= _SERIAL
     return _ufuncs.gufunc(gufunc, inputs, {"signature": signature}, label_sizes, invalid,
                           flags, _work(inputs[0]))

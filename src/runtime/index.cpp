@@ -348,4 +348,171 @@ std::shared_ptr<Kernel> make_scatter_kernel(IndexSpec spec) {
 
 std::shared_ptr<Kernel> make_mask_assign_kernel() { return std::make_shared<MaskAssignKernel>(); }
 
+namespace {
+
+// Calls f(element pointer) for each element of `l` at `base`, in C order.
+template <typename F> void for_each_c(const Layout& l, const std::byte* base, F&& f) {
+    const std::size_t nd = l.shape.size();
+    for (const std::int64_t e : l.shape) {
+        if (e == 0) {
+            return;
+        }
+    }
+    SmallVector<std::int64_t, 4> idx(nd, 0);
+    const std::byte* p = base;
+    for (;;) {
+        f(p);
+        std::size_t d = nd;
+        for (;;) {
+            if (d == 0) {
+                return;
+            }
+            --d;
+            if (++idx[d] < l.shape[d]) {
+                p += l.strides[d];
+                break;
+            }
+            p -= l.strides[d] * (l.shape[d] - 1);
+            idx[d] = 0;
+        }
+    }
+}
+
+bool nonzero_element(DType dt, const std::byte* p) {
+    switch (dt) {
+    case DType::Bool:
+        return *reinterpret_cast<const std::uint8_t*>(p) != 0;
+    case DType::Int32:
+        return *reinterpret_cast<const std::int32_t*>(p) != 0;
+    case DType::Int64:
+        return *reinterpret_cast<const std::int64_t*>(p) != 0;
+    case DType::Float32:
+        return *reinterpret_cast<const float*>(p) != 0.0f; // NaN != 0
+    case DType::Float64:
+        return *reinterpret_cast<const double*>(p) != 0.0;
+    case DType::Complex64: {
+        const auto* c = reinterpret_cast<const float*>(p);
+        return c[0] != 0.0f || c[1] != 0.0f;
+    }
+    case DType::Complex128: {
+        const auto* c = reinterpret_cast<const double*>(p);
+        return c[0] != 0.0 || c[1] != 0.0;
+    }
+    }
+    return false;
+}
+
+class FlatNonzeroKernel : public Kernel {
+  public:
+    const char* name() const override { return "numpy.flatnonzero"; }
+    bool sizes_from_data() const override { return true; }
+    KernelResult size_from_data(std::span<const Operand> in, std::span<Layout> out) override {
+        std::int64_t n = 0;
+        const DType dt = in[0].layout().dtype;
+        for_each_c(in[0].layout(), in[0].first(),
+                   [&](const std::byte* p) { n += nonzero_element(dt, p) ? 1 : 0; });
+        out[0].shape = Shape{n};
+        return {};
+    }
+    KernelResult run(std::span<const Operand> in, std::span<const Operand> out) override {
+        auto* r = reinterpret_cast<std::int64_t*>(out[0].first());
+        const DType dt = in[0].layout().dtype;
+        std::int64_t i = 0;
+        for_each_c(in[0].layout(), in[0].first(), [&](const std::byte* p) {
+            if (nonzero_element(dt, p)) {
+                *r++ = i;
+            }
+            ++i;
+        });
+        return {};
+    }
+};
+
+class MaskSelectKernel : public Kernel {
+  public:
+    const char* name() const override { return "indexing (a[mask])"; }
+    bool sizes_from_data() const override { return true; }
+    KernelResult size_from_data(std::span<const Operand> in, std::span<Layout> out) override {
+        const Layout& x = in[0].layout();
+        const Layout& m = in[1].layout();
+        if (m.shape.size() > x.shape.size()) {
+            return KernelResult{1,
+                                "IndexError: too many indices for array: array is " +
+                                    std::to_string(x.shape.size()) + "-dimensional, but " +
+                                    std::to_string(m.shape.size()) + " were indexed",
+                                0};
+        }
+        for (std::size_t d = 0; d < m.shape.size(); ++d) {
+            if (m.shape[d] != x.shape[d]) {
+                return KernelResult{
+                    1,
+                    "IndexError: boolean index did not match indexed array along axis " +
+                        std::to_string(d) + "; size of axis is " + std::to_string(x.shape[d]) +
+                        " but size of corresponding boolean axis is " + std::to_string(m.shape[d]),
+                    0};
+            }
+        }
+        std::int64_t n = 0;
+        for_each_c(m, in[1].first(), [&](const std::byte* p) { n += *p != std::byte{0} ? 1 : 0; });
+        Shape shape{n};
+        for (std::size_t d = m.shape.size(); d < x.shape.size(); ++d) {
+            shape.push_back(x.shape[d]);
+        }
+        out[0].shape = std::move(shape);
+        return {};
+    }
+    KernelResult run(std::span<const Operand> in, std::span<const Operand> out) override {
+        const Layout& x = in[0].layout();
+        const Layout& m = in[1].layout();
+        const std::size_t k = m.shape.size();
+        Layout sub; // x's subarray at one mask position
+        sub.dtype = x.dtype;
+        for (std::size_t d = k; d < x.shape.size(); ++d) {
+            sub.shape.push_back(x.shape[d]);
+            sub.strides.push_back(x.strides[d]);
+        }
+        const std::size_t item = itemsize(x.dtype);
+        std::byte* r = out[0].first(); // C order
+        // The mask positions in C order, walking the mask and x's leading axes
+        // together.
+        SmallVector<std::int64_t, 4> idx(k, 0);
+        bool done = false;
+        for (const std::int64_t e : m.shape) {
+            done = done || e == 0;
+        }
+        const std::byte* pm = in[1].first();
+        const std::byte* px = in[0].first();
+        while (!done) {
+            if (*pm != std::byte{0}) {
+                for_each_c(sub, px, [&](const std::byte* p) {
+                    std::memcpy(r, p, item);
+                    r += item;
+                });
+            }
+            std::size_t d = k;
+            for (;;) {
+                if (d == 0) {
+                    done = true;
+                    break;
+                }
+                --d;
+                if (++idx[d] < m.shape[d]) {
+                    pm += m.strides[d];
+                    px += x.strides[d];
+                    break;
+                }
+                pm -= m.strides[d] * (m.shape[d] - 1);
+                px -= x.strides[d] * (m.shape[d] - 1);
+                idx[d] = 0;
+            }
+        }
+        return {};
+    }
+};
+
+} // namespace
+
+std::shared_ptr<Kernel> make_mask_select_kernel() { return std::make_shared<MaskSelectKernel>(); }
+std::shared_ptr<Kernel> make_flatnonzero_kernel() { return std::make_shared<FlatNonzeroKernel>(); }
+
 } // namespace viproc

@@ -34,6 +34,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace viproc::numpy {
@@ -68,6 +69,17 @@ ReducePlan plan_reduction(const Layout& in, std::span<const bool> reduced, const
 // {result}. `loop` must stay alive while tasks use the kernel (LoopCache).
 std::shared_ptr<Kernel> make_reduce_kernel(const UfuncLoop* loop, ReducePlan plan,
                                            std::vector<std::byte> identity);
+
+// O2 (Runtime::issue_deferred): the same reduction of an input whose size and
+// strides its task learns: sizes the result (axes flagged in `reduced`, one
+// flag per input dimension, removed or kept as extent 1), lays it out
+// C-contiguously and plans the loop calls when it runs. A reduced axis of
+// extent 0 without an identity fails the size step with `empty_error`
+// (NumPy's ValueError). `loop` is resolved for unknown strides.
+std::shared_ptr<Kernel> make_deferred_reduce_kernel(const UfuncLoop* loop,
+                                                    std::vector<bool> reduced, bool keepdims,
+                                                    std::vector<std::byte> identity,
+                                                    std::string empty_error);
 
 // ufunc.accumulate along `axis` (cumsum, cumprod, ...), as
 // PyUFunc_Accumulate runs it without casts: per position of the other axes,

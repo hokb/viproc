@@ -5,6 +5,10 @@
     python -m viproc -c "code" [args]    a command, as python -c
     python -m viproc                     interactive console
 
+Options before the program: -O1 ... -O5 (also -O 2, --opt=2, --opt 2) set
+the optimization level (docs/design/goals.md; as env VIPROC_OPT, which
+child processes inherit). Default O1: results bit-identical to NumPy.
+
 ``import numpy`` in the program's own code imports viproc instead; the
 standard library and installed packages keep the real NumPy (_viproc_hook).
 """
@@ -16,10 +20,33 @@ import sys
 
 import _viproc_hook
 
-USAGE = __doc__.split("\n\n")[0] + "\n" + __doc__.split("\n\n")[1]
+USAGE = "\n".join(__doc__.split("\n\n")[i] for i in (0, 1, 2))
+LEVELS = ("1", "2", "3", "4", "5")
+
+
+def take_options(argv):
+    """Takes the leading viproc options off argv (sets VIPROC_OPT)."""
+    while argv:
+        a = argv[0]
+        if a in ("-O", "--opt"):
+            if len(argv) < 2:
+                sys.exit(f"python -m viproc {a}: level missing")
+            value, argv = argv[1], argv[2:]
+        elif a.startswith("--opt="):
+            value, argv = a[len("--opt="):], argv[1:]
+        elif a.startswith("-O") and len(a) > 2:
+            value, argv = a[2:], argv[1:]
+        else:
+            break
+        value = value.upper().removeprefix("O")
+        if value not in LEVELS:
+            sys.exit(f"python -m viproc: optimization level must be one of 1-5, got {value!r}")
+        os.environ["VIPROC_OPT"] = value
+    return argv
 
 
 def main(argv):
+    argv = take_options(argv)  # before the runtime starts: it reads VIPROC_OPT
     _viproc_hook.install()
     if not argv:
         import code

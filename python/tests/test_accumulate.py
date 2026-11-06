@@ -61,6 +61,7 @@ def test_accumulate_errors_and_edges(path):
     same(vout, out)
 
 
+@pytest.mark.o1
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_outer(dtype, path):
     x, y = sample((5,), dtype), sample((3, 2), dtype)

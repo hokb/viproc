@@ -27,3 +27,19 @@ struct Part {
 std::shared_ptr<Kernel> make_place_kernel(std::vector<Part> parts);
 
 } // namespace viproc
+
+namespace viproc {
+
+// A creator with sizes from pending arrays (pipelining.md, S4; O2):
+// np.zeros/ones/empty/full(shape) where `dims` has -1 for each extent taken
+// from an input (a 0-d int32/int64 array, in order), or np.arange(stop)
+// (`iota`: one input, values 0..stop-1 of the output dtype, int64). The task
+// sizes its output when the inputs' data is there (Kernel::sizes_from_data;
+// NumPy's "negative dimensions are not allowed"), lays it out in `order`
+// ('C' or 'F') and fills it with `fill` (itemsize bytes; empty: any). `name`:
+// a string with static storage ("numpy.zeros").
+std::shared_ptr<Kernel> make_create_kernel(std::vector<std::int64_t> dims, char order,
+                                           std::vector<std::byte> fill, bool iota,
+                                           const char* name);
+
+} // namespace viproc

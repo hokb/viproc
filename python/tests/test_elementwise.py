@@ -50,6 +50,7 @@ def identical(e, g):
                                np.ascontiguousarray(g).view(np.uint8)))
 
 
+@pytest.mark.o1
 @pytest.mark.parametrize("seed", range(3))
 def test_ops_on_strided_reversed_and_broadcast_operands_are_bit_identical(seed):
     rng = np.random.default_rng(seed)

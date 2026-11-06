@@ -37,6 +37,7 @@ from ._ndarray import (
     init,
     ndarray,
     offload_stats,
+    opt_level,
     physical_cores,
     pool_stats,
     set_pool_limit,
@@ -49,8 +50,75 @@ from ._ndarray import (
 __version__ = _viproc.version
 
 
+# Creators whose size may come from a pending array at O2 (S4).
+_PENDING_SIZE = {"zeros": 0, "ones": 1, "empty": 2, "full": 3, "arange": 4}
+
+
+def _pending_size(kind, args, kwargs):
+    """np.zeros/ones/empty/full(shape) or np.arange(stop) with a size that is
+    a pending 0-d integer viproc array, at optimization level O2
+    (docs/design/pipelining.md, S4): a task that sizes its result when the
+    size is computed, instead of a sync on it. None where NumPy runs it."""
+    if not _ndarray._enabled[0] or opt_level() < 2:
+        return None
+    if kind == 4:  # arange(stop)
+        if len(args) != 1 or kwargs:
+            return None
+        shape, dtype, order, fill = args[0], _np.dtype(_np.int64), "C", None
+        if not isinstance(shape, ndarray):
+            return None
+    else:
+        names = ("shape", "fill_value", "dtype", "order") if kind == 3 else ("shape", "dtype", "order")
+        if len(args) > len(names):
+            return None
+        for k in kwargs:  # (the module's any/all are NumPy's)
+            if k not in names[len(args):]:
+                return None
+        bound = dict(zip(names, args), **kwargs)
+        if "shape" not in bound or (kind == 3 and "fill_value" not in bound):
+            return None
+        shape, order = bound["shape"], bound.get("order", "C")
+        if order not in ("C", "F"):
+            return None
+        fill = None
+        if kind == 3:
+            value = bound["fill_value"]
+            if isinstance(value, ndarray) or _np.ndim(value) != 0:
+                return None
+            value = _np.asarray(value)
+            dtype = value.dtype if bound.get("dtype") is None else _np.dtype(bound["dtype"])
+            if dtype not in _ndarray._CODES:
+                return None
+            fill = value.astype(dtype).tobytes()  # np.full: copyto(casting='unsafe')
+        else:
+            dtype = _np.dtype(bound.get("dtype") or float)
+            if kind == 1 and dtype in _ndarray._CODES:
+                fill = _np.ones((), dtype).tobytes()
+    if dtype not in _ndarray._CODES:
+        return None
+    dims = tuple(shape) if isinstance(shape, (tuple, list)) else (shape,)
+    pending = False
+    for d in dims:
+        if isinstance(d, ndarray):
+            # (a pending 0-d result is marked a scalar: no wait for its size)
+            if d.dtype not in (_np.int32, _np.int64) or not (d._scalar or d.ndim == 0):
+                return None
+            pending = pending or not d.ready()
+        elif not isinstance(d, int) or isinstance(d, bool):
+            return None
+    if not pending:
+        return None  # NumPy takes the sizes as they are
+    return _viproc.create_deferred(kind, dims, _ndarray._CODES[dtype], order, fill)
+
+
 def _creator(np_func):
+    kind = _PENDING_SIZE.get(np_func.__name__)
+
     def create(*args, **kwargs):
+        if kind is not None:
+            r = _pending_size(kind, args, kwargs)
+            if r is not None:
+                return r
         r = np_func(*args, **kwargs)
         if isinstance(r, tuple):  # linspace(retstep=True), indices(sparse=True), ...
             return type(r)(_fresh(x, args, kwargs) for x in r)

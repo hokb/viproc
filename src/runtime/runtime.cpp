@@ -4,6 +4,7 @@
 #include "pool.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cfenv>
 #include <chrono>
 
@@ -56,7 +57,22 @@ template <class Done> bool spin_until(Done done) {
 
 } // namespace
 
+namespace {
+// The runtime metadata queries of arrays wait on (Array::layout): the one
+// the main thread created last.
+Runtime* g_configuring_runtime = nullptr;
+} // namespace
+
+void Array::wait_configured() const {
+    if (g_configuring_runtime != nullptr) {
+        g_configuring_runtime->wait_stage(const_cast<Array&>(*this), TaskState::Allocated);
+    } else { // no runtime left: its tasks completed
+        meta_->set_task(nullptr);
+    }
+}
+
 Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_(options_.offload) {
+    g_configuring_runtime = this;
     std::size_t n = options_.workers;
     if (n == 0) {
         n = default_worker_count();
@@ -80,6 +96,9 @@ Runtime::Runtime(RuntimeOptions options) : options_(std::move(options)), policy_
 
 Runtime::~Runtime() {
     wait_all();
+    if (g_configuring_runtime == this) {
+        g_configuring_runtime = nullptr;
+    }
     {
         std::lock_guard lock(sleep_mutex_);
         stopping_.store(true, std::memory_order_seq_cst);
@@ -176,6 +195,38 @@ ArrayPtr Runtime::view(const ArrayPtr& base, Layout&& layout) {
     return ArrayPtr(&a);
 }
 
+ArrayPtr Runtime::view_deferred(const ArrayPtr& base, int rank, std::vector<ViewStep> steps,
+                                std::vector<int> perm, const char* issue_site) {
+    assert(unsized(*base));
+    Layout l;
+    l.dtype = base->meta_->sd().dtype;
+    MetadataPtr meta = make_metadata(std::move(l));
+    meta->set_rank(rank);
+    ++views_;
+    meta->set_rule(std::make_shared<const ViewRule>(base->meta_, std::move(steps), std::move(perm),
+                                                    issue_site, ++seq_));
+    meta->set_task(base->meta_->task()); // waited for as the base is (Array::layout)
+    ArrayBlock* block = new_block(1);
+    Array& a = block->array.emplace(std::move(meta), base->group_, block);
+    return ArrayPtr(&a);
+}
+
+ArrayPtr Runtime::reshape_deferred(const ArrayPtr& base, Shape dims, char order,
+                                   const char* issue_site) {
+    assert(unsized(*base) && rank(*base) == 1);
+    Layout l;
+    l.dtype = base->meta_->sd().dtype;
+    MetadataPtr meta = make_metadata(std::move(l));
+    meta->set_rank(static_cast<int>(dims.size()));
+    ++views_;
+    meta->set_rule(
+        std::make_shared<const ViewRule>(base->meta_, std::move(dims), order, issue_site, ++seq_));
+    meta->set_task(base->meta_->task());
+    ArrayBlock* block = new_block(1);
+    Array& a = block->array.emplace(std::move(meta), base->group_, block);
+    return ArrayPtr(&a);
+}
+
 namespace {
 
 // RuntimeOptions::block_enter / block_leave around a blocking wait.
@@ -250,11 +301,13 @@ void Runtime::launch(const std::shared_ptr<Task>& task, const TaskList& producer
     }
     task->add_pending_inputs(producers.size());
     for (std::size_t i = 0; i < producers.size(); ++i) {
-        if (!producers[i]->add_consumer(task, i)) {
-            task->producer_already_done(*producers[i]); // cannot reach 0: issue guard held
-        }
+        producers[i]->add_consumer(task, i); // its passed stages signalled here
     }
-    if (task->release_issue_guard()) {
+    const bool runnable = task->release_issue_guard(task);
+    if (task->configures()) {
+        due_steps(false); // inputs sized already: a pool job sizes it
+    }
+    if (runnable) {
         trigger_from_main(task, elements);
     }
 }
@@ -302,6 +355,18 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
                     std::span<const ArrayPtr> inouts, std::span<const Layout> new_outputs,
                     const char* issue_site, std::span<ArrayPtr> results, std::int64_t work_elements,
                     std::span<const std::shared_ptr<CountableArray>> output_buffers) {
+    // Layouts decided at issue need the operands' layouts: an operand sized
+    // by its task is waited for (a metadata query, S5).
+    for (const ArrayPtr& a : inputs) {
+        if (unsized(*a)) {
+            wait_stage(*a, TaskState::Allocated);
+        }
+    }
+    for (const ArrayPtr& a : inouts) {
+        if (unsized(*a)) {
+            wait_stage(*a, TaskState::Allocated);
+        }
+    }
     std::int64_t elements = work_elements >= 0     ? work_elements
                             : !new_outputs.empty() ? new_outputs[0].size()
                             : !inouts.empty()      ? inouts[0]->layout().size()
@@ -504,8 +569,12 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
         // Dense layouts (C, F, any axis order) are kept: ufunc results follow
         // NumPy's order (Layout::keep_order).
         Layout contiguous = l.dense() ? l : Layout::contiguous(l.dtype, l.shape);
+        const std::size_t nbytes = contiguous.nbytes();
+        if (nbytes == 0) { // no elements: all strides 0 (NumPy >= 2.5)
+            std::fill(contiguous.strides.begin(), contiguous.strides.end(), 0);
+        }
         // The task takes the memory when it runs (D11).
-        auto buffer = make_pooled<CountableArray>(contiguous.nbytes(), CountableArray::deferred);
+        auto buffer = make_pooled<CountableArray>(nbytes, CountableArray::deferred);
         MetadataPtr st = make_metadata(std::move(contiguous));
         in_ops.push_back({buffer, st});
         results[i] = new_array(std::move(st), std::move(buffer), task);
@@ -572,7 +641,11 @@ bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<cons
             continue;
         }
         Layout contiguous = l.dense() ? l : Layout::contiguous(l.dtype, l.shape);
-        auto buffer = make_pooled<CountableArray>(contiguous.nbytes());
+        const std::size_t nbytes = contiguous.nbytes();
+        if (nbytes == 0) { // no elements: all strides 0 (NumPy >= 2.5)
+            std::fill(contiguous.strides.begin(), contiguous.strides.end(), 0);
+        }
+        auto buffer = make_pooled<CountableArray>(nbytes);
         MetadataPtr st = make_metadata(std::move(contiguous));
         ops.push_back({buffer, st, false});
         results[i] = new_array(std::move(st), std::move(buffer), nullptr);
@@ -637,6 +710,145 @@ void Runtime::trigger_from_main(const std::shared_ptr<Task>& task, std::int64_t 
     }
 }
 
+void Runtime::issue_deferred(const std::shared_ptr<Kernel>& kernel,
+                             std::span<const ArrayPtr> inputs, std::span<const DType> outputs,
+                             std::span<const int> ranks, const char* issue_site,
+                             std::span<ArrayPtr> results) {
+    assert(ranks.size() == outputs.size());
+    bool host = false;
+    for (const ArrayPtr& a : inputs) {
+        host = host || a->group_->current_->host_views > 0;
+    }
+    acquire_slot();
+    auto task = make_pooled<Task>(kernel, issue_site);
+    task->set_configures(errors_.get());
+    Operands& ops = task->operands_for_issue();
+    TaskList producers;
+    ErrorRef failed_input;
+    for (const ArrayPtr& ap : inputs) {
+        AliasGroup& g = *ap->group_;
+        if (!g.ready()) {
+            if (std::find(producers.begin(), producers.end(), g.last_writer_) == producers.end()) {
+                producers.emplace_back(g.last_writer_);
+            }
+        } else if (g.last_error_ && !failed_input) {
+            failed_input = g.last_error_;
+        }
+        ops.push_back({g.current_, ap->meta_});
+        g.current_->async_reads.fetch_add(1, std::memory_order_relaxed);
+    }
+    const std::size_t ninputs = ops.size();
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+        Layout l;
+        l.dtype = outputs[i];
+        auto buffer = make_pooled<CountableArray>(CountableArray::unsized);
+        MetadataPtr meta = make_metadata(std::move(l));
+        meta->set_rank(ranks[i]);
+        meta->set_task(task); // incomplete until the task sized it
+        ops.push_back({buffer, meta});
+        results[i] = new_array(std::move(meta), std::move(buffer), task);
+    }
+    task->set_ninputs(ninputs);
+    if (failed_input) {
+        task->add_upstream_error(failed_input); // fails at completion, and
+        task->claim_size_error(failed_input);   // is not sized from failed data
+    }
+    // Not sized here (S2): the dispatch policy sees it as a large op.
+    launch(task, producers, policy_.options().sync_below);
+    if (host) {
+        const Blocking blocking(options_);
+        wait(*results[0]);
+    }
+}
+
+ErrorRef Runtime::wait_stage(Array& a, TaskState s) {
+    const std::shared_ptr<Task> t = a.meta_->task();
+    if (!t) {
+        return {};
+    }
+    if (t->state() < s) {
+        ++size_waits_;
+        help_steps(); // a queued step job may be all it waits for
+    }
+    if (t->state() < s) {
+        const Blocking blocking(options_);
+        if (!spin_until([&] { return t->state() >= s; })) {
+            t->wait_state(s);
+        }
+    }
+    ErrorRef e = t->size_error();
+    const bool laid_out = t->state() >= TaskState::Allocated;
+    if (const ViewRule* r = a.meta_->rule(); r != nullptr && !e) [[unlikely]] {
+        e = r->derive(*a.meta_, laid_out, errors_.get()); // a view: from its base
+    }
+    if (laid_out && !e) {
+        a.meta_->set_task(nullptr); // its SD is complete for good
+    } // else no size: every metadata query raises the op's error again
+    return e;
+}
+
+void Runtime::help_steps() {
+    for (bool progress = true; progress && !main_steps_.empty();) {
+        progress = false;
+        for (std::shared_ptr<Task>& t : main_steps_) {
+            if (t && t->state() < TaskState::Allocated) {
+                t->run_due_steps(); // idempotent: the step job finds them done
+            }
+            if (t && t->state() >= TaskState::Allocated) {
+                t.reset();
+                progress = true;
+            }
+        }
+        std::erase(main_steps_, nullptr);
+        if (!Task::due_steps_empty()) {
+            due_steps(true); // their signals made steps due: run them here
+            progress = true;
+        }
+    }
+}
+
+void Runtime::configure_now(Task& task) {
+    // Its steps before its kernel, and on a worker the steps they make due
+    // too: they are its consumers', which cannot run before this kernel
+    // anyway, and in the pool they waited for a free worker while a waiting
+    // main thread could not help (help_steps knows only the steps it
+    // queued). The main thread hands them to the pool and keeps issuing.
+    task.finish_steps();
+    if (!Task::due_steps_empty()) {
+        due_steps(std::this_thread::get_id() != main_thread_);
+    }
+}
+
+TaskList Runtime::step_job(Task& task) {
+    task.run_due_steps(); // a step job, no run: not counted as active
+    due_steps(std::this_thread::get_id() != main_thread_);
+    return {};
+}
+
+void Runtime::due_steps(bool here) {
+    for (;;) {
+        std::vector<std::shared_ptr<Task>> due = Task::take_due_steps();
+        if (due.empty()) {
+            return;
+        }
+        for (std::shared_ptr<Task>& t : due) {
+            if (here) {
+                t->run_due_steps(); // may make more steps due: loop
+            } else if (t->add_job(Task::Job::Steps)) {
+                if (std::this_thread::get_id() == main_thread_) {
+                    if (main_steps_.size() >= 256) {
+                        std::erase_if(main_steps_, [](const std::shared_ptr<Task>& m) {
+                            return m->state() >= TaskState::Allocated;
+                        });
+                    }
+                    main_steps_.push_back(t);
+                }
+                enqueue(std::move(t));
+            }
+        }
+    }
+}
+
 ErrorRef Runtime::wait(Array& a) {
     AliasGroup& g = *a.group_;
     if (g.last_writer_) {
@@ -676,11 +888,21 @@ void Runtime::wait_all() {
 }
 
 TaskList Runtime::run(const std::shared_ptr<Task>& task) {
-    TaskList runnable = task->execute(errors_.get());
-    const std::size_t left = active_.fetch_sub(1, std::memory_order_seq_cst) - 1;
-    if (active_waiters_.load(std::memory_order_seq_cst) > 0 &&
-        left < wake_below_.load(std::memory_order_seq_cst)) {
-        active_.notify_all();
+    // One named result and one return: NRVO, no move of the inline list.
+    const bool steps = task->configures() && task->take_job() == Task::Job::Steps;
+    if (task->configures() && !steps) [[unlikely]] {
+        configure_now(*task);
+    }
+    TaskList runnable = steps ? step_job(*task) : task->execute(errors_.get());
+    if (!steps) [[likely]] {
+        if (!Task::due_steps_empty()) [[unlikely]] { // its signals made steps due
+            due_steps(std::this_thread::get_id() != main_thread_);
+        }
+        const std::size_t left = active_.fetch_sub(1, std::memory_order_seq_cst) - 1;
+        if (active_waiters_.load(std::memory_order_seq_cst) > 0 &&
+            left < wake_below_.load(std::memory_order_seq_cst)) {
+            active_.notify_all();
+        }
     }
     return runnable;
 }

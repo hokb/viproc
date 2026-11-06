@@ -88,6 +88,7 @@ def messages(caught):
 SHAPES = [(37,), (6, 7), (3000,), (60, 50)]
 
 
+@pytest.mark.o1
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_elementwise(shape, dtype):
@@ -291,9 +292,15 @@ ASYNC = [  # name, call, inputs (shape, dtype), ops, small_steps, syncs[, min_ta
 ]
 
 
+# ops of ASYNC that are casts of an input: from O2 on part of the op's task
+O2_FEWER_OPS = {"round_int": 1}
+
+
 @pytest.mark.parametrize("call, inputs, ops, small_steps, syncs, min_tasks",
                          [c[1:] + (1,) * (len(c) == 6) for c in ASYNC], ids=[c[0] for c in ASYNC])
-def test_async_path(det, call, inputs, ops, small_steps, syncs, min_tasks):
+def test_async_path(request, det, call, inputs, ops, small_steps, syncs, min_tasks):
+    if viproc.opt_level() >= 2:  # casts of inputs run inside the op's task
+        ops -= O2_FEWER_OPS.get(request.node.callspec.id, 0)
     pairs = [big(shape, dtype) for shape, dtype in inputs]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

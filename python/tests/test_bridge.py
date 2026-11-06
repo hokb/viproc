@@ -355,6 +355,7 @@ def test_temporary_elision_is_available_on_linux_and_windows():
         assert len(viproc._viproc.elision_chains()) == 39
 
 
+@pytest.mark.o1
 @pytest.mark.skipif(_ELISION == "off", reason="no safe temporary test on this platform")
 def test_temporary_elision_reuses_buffers_and_keeps_results():
     x = viproc.asarray(rng.standard_normal(100_000))  # 800 KB: above every bound
@@ -397,6 +398,7 @@ def test_temporary_elision_never_touches_referenced_arrays():
     assert same(f, (np.arange(100_000) + 1) / 2)
 
 
+@pytest.mark.o1
 @pytest.mark.skipif(_ELISION == "off", reason="no safe temporary test on this platform")
 def test_temporary_elision_and_views():
     x = viproc.asarray(rng.standard_normal(200_000))

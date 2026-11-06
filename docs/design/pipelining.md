@@ -12,10 +12,10 @@ Status labels as in `memory-management.md`: **Decided**, **Implemented**,
 
 | # | Decision | Status |
 |---|----------|--------|
-| S1 | Six stages per array, each reached exactly once, in increasing order | Decided; stages 1, 2, 4, 5 exist (`TaskState`) |
-| S2 | The main thread guarantees only `Created`; tasks advance the rest | Decided, not implemented (today: `SizeCompleted` at issue) |
-| S3 | Tasks react to every stage of their inputs, not only `Completed` | Decided, not implemented |
-| S4 | Pending size inputs make a task, whatever the size | Decided, not implemented (today: sync) |
+| S1 | Six stages per array, each reached exactly once, in increasing order | Implemented for tasks (`TaskState`, stages 1-5; the direct path has no task) |
+| S2 | The main thread guarantees only `Created`; tasks advance the rest | Implemented for element-wise ufuncs at O2 (`Runtime::issue_deferred`, size and layout steps in the task); other ops and O1: `SizeCompleted` at issue |
+| S3 | Tasks react to every stage of their inputs, not only `Completed` | Signals implemented (three per registration, `Task::add_consumer`); no task reacts to SizeCompleted/Allocated yet |
+| S4 | Pending size inputs make a task, whatever the size | Implemented at O2 for `zeros`, `ones`, `empty`, `full`, `arange(stop)` (module functions) and data-dependent sizes (`x[mask]`, `flatnonzero`, 1-d `nonzero`); O1 and the rest: sync |
 | S5 | An array in stage S gives access to the properties of stages 1..S; handlers run only on their stage signal (no locks) | Decided, not implemented |
 | S6 | `Disposed` is never observed; checked by sanitizer builds, debug assertions, counters and versions | Proposed |
 
@@ -48,8 +48,13 @@ that is skipped (or a handler run twice) can deadlock.
 `TaskState` (`src/runtime/task.hpp`) has `Created`, `SizeCompleted`,
 `DeviceSelected`, `Allocated` and `Completed`; `Disposed` is implicit today
 (reference counting releases the buffer, D2/D11 in `memory-management.md`).
-Today a task may skip states (`DeviceSelected` is unused, the direct path
-sets none); the scheme requires every stage to be reached.
+Every task reaches each of them in order: `SizeCompleted` at issue,
+`DeviceSelected` (the CPU) and `Allocated` in `Task::execute` right before
+the kernel, `Completed` after it; `Task::advance` asserts in debug builds
+that a state is the next one. The direct path has no task and sets none.
+Stage pipelining belongs to optimization level O2 (`goals.md`) where it
+can change results (partial results starting their consumers); stages
+that change nothing (S1, S4) hold at every level.
 
 ## S2, S3: who advances the stages
 
@@ -86,12 +91,149 @@ What it buys:
   (future devices, copies between them) happen when sizes are known, in the
   task, hidden behind other work.
 
+**Signals (implemented).** A consumer registered with a producer
+(`Task::add_consumer`) receives **exactly three signals** from it, each
+exactly once and in this order: **size completed**, **allocated**,
+**completed** (`Signal`). Device selected is a state of its own (S1) but
+not signalled while the CPU is the only device. The protocol is the same
+whatever the producer's state at registration, so the hybrid model below
+needs no special case:
+
+- Ops that know their size early (today: every op, at issue) signal size
+  completed long before their elements exist; allocated follows right
+  before the kernel, completed after it.
+- Ops that only know their size when they run (a NumPy function taken as a
+  whole, a data-dependent result; O2, not implemented yet) give all three
+  in quick succession on the thread that ran them.
+
+Each registration is a node in the producer's consumer list with one
+signal word (`ConsumerNode::signals`: the last signal requested, the last
+delivered). Two threads can find a signal due: the producer advancing
+(it stores its state, then walks the list, both seq_cst) and the main
+thread registering (it pushes the node, then loads the producer's state,
+both seq_cst), so at least one of them sees the other. Whoever raises the
+request while nothing is being delivered delivers, up to whatever is
+requested by the time it is done; the other one only raises the request.
+No lock, no signal lost, none twice, none out of order. Stages the
+producer passed before the node was published are delivered by the
+registering thread; a size known at registration is delivered before the
+node is published (no atomic: counted with the issue guard). The consumer
+counts outstanding signals per stage (`sized_pending_`,
+`allocated_pending_`, `pending_`); the last completed signal makes it
+runnable, and the thread that delivered it runs it as a continuation or
+hands it to the pool's queue (small ones stay local, large ones go to
+the pool, as before). Reactions to the size completed and allocated
+signals of all inputs are the place for S2/S4 (a task computing its own
+size, allocating early); deferred tasks react to them (below). Debug builds assert
+that a task's states advance one at a time and that a task runs only after
+every input's three signals. Cost (callgrind, 1e4-element chains and
+fan-outs): main thread unchanged within noise, worker +46 to +50
+instructions per task (two CAS per consumer for allocated).
+
+**Deferred sizing (runtime, implemented).** `Runtime::issue_deferred`
+issues a task whose outputs the main thread creates without a size: dtype
+only, a buffer without size or memory (`CountableArray::unsized`), the
+metadata pointing to the task. The task then takes the stages itself
+(`Task::configures`):
+
+- **Size step:** when the last input's size completed signal arrives, the
+  task calls `Kernel::size` (output shapes from the input layouts), writes
+  the shapes and signals size completed. An error there (shapes that do not
+  broadcast) is recorded as the op's error (`size_error`, an
+  `ErrorRef` in the runtime's table) and inherited by every consumer, as a
+  run-time error: issue-time errors of deferred ops become asynchronous.
+  An input's size error is taken over without calling the kernel.
+- **Layout step:** when the last input's allocated signal arrives (and the
+  task's own size is set), `Kernel::layout` fixes the strides (the shapes
+  stay; the main thread may read them since size completed), the buffers
+  get their sizes, and the task signals device selected and allocated. The
+  physical block is still taken when the kernel runs (D11: the dying
+  input's block or the pool's).
+- **Run:** completed signals of all inputs, as before.
+
+Steps never nest: a signal that makes a step due only records the task on
+the delivering thread's worklist (`Task::step_due`); a worker runs the list
+after its task (`Runtime::due_steps`), the main thread hands it to the pool
+as step jobs (a task in the pool's queue with the `Job::Steps` bit; the
+same task may also sit there for its run, `Job::Run`, which takes
+precedence). The steps of one task are serialized by a combining word
+(`Task::run_steps`), and `execute` finishes any step not yet run before the
+kernel. Metadata queries of the main thread wait for the stage they need
+(`Runtime::wait_stage`: shape at size completed, strides at allocated);
+an op issued on an unsized input on the regular path still waits for its
+allocated stage (it needs the layout; `Array::layout` waits, so the main
+thread never reads an incomplete one). A step job can wait in the queue
+behind running kernels (all workers busy): a metadata query that finds its
+stage not reached first runs the step jobs the main thread queued itself
+(`Runtime::help_steps`, `main_steps_`; the combining word makes the queued
+job a no-op), and the steps they make due; it waits only if that does not
+reach the stage. Found on a 2-core CI runner: one worker in a 10 ms kernel
+held every metadata query (and an `astype` issued on a deferred output)
+until the kernel was done (`test_deferred_size_wait_helps`). The layout step needs the inputs'
+strides, not their memory: an input sized at issue counts as laid out at
+registration, so a deferred op behind regular ones is laid out at once,
+not when they run (else a regular op's allocated signal, right before its
+kernel, would hold the main thread at the next metadata query). A chain of 50 deferred ops is sized
+while its first producer still runs (`test_deferred_sizes_run_ahead`).
+Cost at O1 (callgrind, chains and fan-outs of 1e4 elements, 1 worker):
+main thread unchanged within noise, worker +25 to +44 instructions per
+task over the signals alone (one more check per run).
+
+**Element-wise ufuncs at O2 (implemented).** The bridge's ufunc fast path
+issues an element-wise ufunc with one output and no casts through
+`vp_ufunc_issue_deferred` when an input is pending or the result is larger
+than the direct path's threshold: the main thread reads no input size. The
+shared element-wise kernel sizes (NumPy's broadcasting and message) and
+lays out (NumPy's result layout, `numpy::elementwise_layout`) the result;
+it runs NumPy's loop in one call where NumPy makes one (dense operands:
+identical results), else per row (strided, broadcast, reversed: NumPy's
+iterator would need the GIL to plan; values may round differently). A
+0-d result is known to be NumPy's scalar without its size: its inputs were
+all 0-d (unsized ones marked so). `x.shape`, `x.ndim`, `x.size` wait for
+the size only and raise the op's error if it could not size the array (as
+a sync point, every time); `offload_stats()["size_waits"]` counts the
+metadata queries that blocked. `out=`, several outputs and the other ops
+take the regular path (casts: see "Casts at O2"). Cost at O1 (callgrind, 1 worker): main
+thread +10 to +30 instructions per op (the layout check of every
+`Array::layout` call), direct path +12.
+
+**Ranks at issue.** Extents may be unknown at issue, the number of
+dimensions never is: element-wise results have the largest input rank,
+creators the shape's length, `x[mask]` `x.ndim - mask.ndim + 1`,
+`flatnonzero` 1, reductions the input's rank less the removed axes. The
+caller passes it to `issue_deferred` (stored in the Metadata, checked
+against the size step in debug builds); `Runtime::rank` / `vp_array_rank`
+read it without a wait, `x.ndim` no longer waits, and ops that need only
+the rank at issue (axis normalization) are issued without one. ILNumerics'
+Accelerator does the same split: `Segment.SetSize` computes "number and
+length of dimensions, but no strides, yet" when all input sizes are
+there, with one size rule per function category (`broadcasting_size`,
+`aggregating_size`).
+
+**Reductions at O2 (implemented).** `sum`, `prod`, `max`, `min`, `any`,
+`all` (methods and module functions with `axis`/`keepdims`, the C path)
+of pending or larger data go through `vp_reduce_deferred`: the axes are
+normalized against the rank at issue, the loop is resolved for the input
+dtype with unknown fixed strides (`UfuncLoop::kAnyStride`), and the shared
+kernel (`make_deferred_reduce_kernel`, cached per ufunc, dtype, rank, axes,
+keepdims and identity) sizes the result (the aggregation rule), lays it out
+C-contiguously (NumPy's fast-path result) and plans the loop calls when it
+runs (`plan_reduction` on the input's final layout). One reduced axis after
+coalescing gives NumPy's loop calls (identical results, tested for C, F and
+strided inputs); several that do not coalesce are visited one by one where
+NumPy's iterator would buffer (floating-point sums may round differently,
+O2). A reduced axis of extent 0 without an identity fails the size step
+with NumPy's ValueError (asynchronously). Reductions that cast (int32
+sums accumulate in int64), `dtype=`, `initial=`, `out=`, `where=` take the
+regular path. Cost at O1 (callgrind, `x.sum(axis=0)` of 100 elements):
+unchanged (8,060 vs. 7,820 instructions per call, noise).
+
 **Today.** Every asynchronous op is a NumPy function taken as a whole: its
 result shape is computed on the main thread at issue, so every task reaches
-`SizeCompleted` at issue (`runtime.cpp`, `issue`), and consumers only
-register for `Completed`. Ops whose result size depends on data
-(`nonzero`, boolean indexing, `unique`) fall back to eager NumPy after a
-sync.
+`SizeCompleted` at issue (`runtime.cpp`, `issue`); consumers receive the
+three signals, but only completed triggers anything. Ops whose result size
+depends on data (`nonzero`, boolean indexing, `unique`) fall back to eager
+NumPy after a sync.
 
 ## S4: pending size inputs
 
@@ -100,7 +242,145 @@ A creator whose size argument is a pending viproc array (`np.zeros(n)`,
 the size will be. Its output is created empty (stage 1 only). The task waits
 for the size input's **completed** (the size is that input's *data*),
 computes the shape, advances its output to **size completed**, allocates and
-fills. Today such calls sync on the size argument.
+fills. At O1 such calls sync on the size argument.
+
+**Implemented at O2** for `viproc.zeros`, `ones`, `empty`, `full` (a
+scalar fill value; order C or F) and `arange(stop)`, with sizes that are
+pending 0-d int32/int64 viproc arrays (in a shape tuple next to ints):
+`vp_create_deferred` issues the task through `Runtime::issue_deferred`
+with a kernel that sizes from data (`Kernel::sizes_from_data`,
+`size_from_data`): its size step does not run on its inputs' size signals
+but in its run, once the sizes are computed; the three signals then
+follow each other. A negative extent fails the op with NumPy's ValueError
+(`AsyncValueError` at the next metadata query or sync point); `arange` of
+a negative stop is empty, as NumPy's. Consumers issued on the result are
+deferred too (element-wise ufuncs) or wait at their issue for its layout
+(the others). Ready sizes and NumPy's own `np.zeros` (which takes the size
+through `operator.index`) still sync.
+
+A running configuring task finishes its steps before its kernel, and on a
+worker also the steps they make due (`Runtime::configure_now`): otherwise a
+consumer's layout step would wait in the worker's list until the kernel is
+done (a view of `np.sin(x)` of 8e6 elements waited 244 ms). They are its
+consumers' steps, whose kernels cannot run before this one anyway. Handed
+to the pool instead, they waited for a free worker: with one worker (2
+cores) a main thread waiting for a consumer's layout (`astype` of
+`sin(sin(x))[:4] * 0`) slept through both kernels, since `help_steps` runs
+only the step jobs the main thread queued itself.
+
+**Data-dependent result sizes at O2.** The same mechanism serves ops whose
+result size is their input's *data*: `x[mask]` with a pending bool mask
+over x's leading axes (`vp_mask_select`: the True positions counted in the
+size step, the subarrays copied in C order in the run; NumPy's IndexError
+for mismatched shapes, asynchronously), `np.flatnonzero(a)` and
+`np.nonzero(a)` of a pending 1-d `a` (`vp_flatnonzero`). Their size step
+is one pass over the mask (count), the run a second one (copy): the size
+is signalled before the elements, and consumers issued meanwhile size
+themselves on it. At O1 they sync on the mask. n-d `nonzero` (NumPy's
+index arrays are column views of one array), `argwhere`, `unique` and
+boolean masks in tuples still sync.
+
+**Views at O2.** Basic indexing (`x[i]`, `x[a:b:c]`, `None`, `...`) and
+transposes (`x.T`, `x.transpose(...)`, `np.transpose`) of an array its task
+still sizes are views by a rule (`vp_array_view_deferred`,
+`Runtime::view_deferred`, `ViewRule` in `task.hpp`): the bridge parses the
+key against the rank only (slices as `PySlice_Unpack` gives them, indices
+as given) and the runtime keeps the steps (keep, slice, index, new axis) or
+the permutation. The view's metadata has its rank, its dtype and the base's
+producer as its task; nothing else is known. Its shape follows from the
+base's shape, its strides and offset from the base's layout, each derived
+once (`std::call_once` per stage, the shape never written again after the
+first stage) by whoever needs it first: a task's size or layout step
+reading the view as an input, or a main-thread wait on it (`wait_stage`).
+A view of a view derives its base first. An index out of bounds is the
+view's own error (NumPy's IndexError message, recorded once with the
+view's issue site and op name `indexing`): its consumers inherit it,
+sync points raise it (`AsyncIndexError`). A **reshape of a 1-d** such
+array (`a.reshape`, `np.reshape`, any order) is a view by a rule too
+(`vp_array_reshape_deferred`): a 1-d array always reshapes without a copy
+(`_attempt_nocopy_reshape`), so the decision NumPy makes from the strides,
+view or copy, is known at issue; the unknown dimension and NumPy's size
+mismatch ValueError follow at the size step, the strides from
+`reshape_view` at the layout step. An n-d reshape still waits for the
+base's layout: whether it is a view (aliasing, `base`) depends on the
+strides, and a view cannot leave its alias group later. Keys that consume more axes
+than the rank, non-basic keys and keys giving a 0-d result (NumPy's
+scalar) take the regular path and wait for the base's layout. Index
+assignment into such an array still waits. Cost at O1 (callgrind, `a[1:3]`
+and `a[5]` of 100 elements): ~5 instructions per subscript, the level test
+(2,216 -> 2,227 per pair).
+
+**Casts at O2 (implemented).** An element-wise ufunc whose loop casts an
+input (`int32 + float64`, `bool * float32`, integer `divide`) is issued
+deferred too: the shared element-wise kernel takes the loop's dtypes
+(`UfuncLoop::dtypes`) for the result layout and, in the task, casts every
+input of another dtype row by row, in chunks of 8,192 elements, into
+per-thread buffers before the loop call (a broadcast input once per row).
+`astype` (orders K, C, F; not complex to real, which warns per call) is a
+deferred task of its own (`DeferredCastKernel`, kernel per (dtype, order)
+cached in the runtime): its size step copies the shape, its layout step is
+`numpy::astype_layout` (`PyArray_NewLikeArray`'s order; all strides 0 for
+an empty array, as NumPy), its run casts along the output's fastest axis.
+The element casts are NumPy's: NumPy 2 leaves the legacy
+`ArrFuncs->cast` table empty, so a cast is a ranged, buffered `NpyIter`
+template per (from, to) over 8,192 contiguous elements, copied per thread
+from the template's pool and pointed at the data
+(`NpyIter_ResetBasePointers`, no GIL), the converted elements copied out
+of its buffer (`numpy::cast_elements`). Every reset of a buffered iterator
+copies its current range from its current base pointers: a range change
+(a short last chunk) is therefore made on pointers to a static block of
+zeros (no FP flags), never on the pointers of an earlier call, which may
+be freed. FP flags of the casts (NaN to int: "invalid value encountered in
+cast") are reported as NumPy's. Cost at O1 (callgrind, `x * y` of 8
+elements, `z.astype(np.float32)` of 100): unchanged within the noise
+(< 10 instructions per op).
+
+**Matmul at O2 (implemented).** `a @ b` / `np.matmul(a, b)` of arrays
+tasks may still size or lay out (`vp_matmul`: either operand pending) is a
+deferred task:
+ranks and dtypes are known at issue (0-d operands and casts take the
+regular path, NumPy's error or iterator copy), the result's rank follows
+from them; `MatmulKernel::size` checks the core dimension and broadcasts
+the batch axes with NumPy's two messages, in NumPy's order (core first),
+`layout` is `matmul_layout`. An unsized operand's data is aligned (a pool
+block, views by item-sized steps), so NumPy would take it as it is; a
+laid-out one is checked as at O1. The test is "pending", not "unsized": an
+array its task has sized is laid out only at its Allocated stage, so a
+regular path reading its layout would still wait.
+`swapaxes` of such arrays is a deferred view (the transpose rule), so
+`a @ a.swapaxes(-1, -2)` keeps NumPy's syrk. `np.dot` still reads strides
+at issue (`_dot_operand`). Cost at O1 (callgrind, `x @ x` of 3 x 3,
+`x.swapaxes(0, 1)`): unchanged within the noise.
+
+**Gathers at O2 (implemented).** `a[key]` for keys of slices and integer
+index arrays (viproc arrays of any state, NumPy integer arrays) where `a`
+or an index array is pending: the bridge places the result axes by the
+ranks alone (NumPy's rule: the broadcast index dimensions replace adjacent
+indexed axes, else go first; `_gather_deferred`, reached through the O2
+hook `_getitem_o2`, so O1 runs no level test in Python), the basic part a
+deferred view, and issues `vp_gather` with `VP_INDEX_DEFERRED` (the C side
+does not decide again: the operands may have completed meanwhile). The
+task (`DeferredGatherKernel`, `index_deferred.cpp`, wrapping the O1 gather
+kernel, whose code stays as it is) broadcasts the index shapes with
+NumPy's IndexError, sizes the result and lays it out as NumPy's mapiter
+allocates it: the index dimensions outermost in C order, the other axes
+inside them in the order NumPy's iterator keeps the source's
+(`Layout::iteration_order`), all strides 0 when empty. Out-of-bounds
+indices are the kernel's `AsyncIndexError`, as at O1. An advanced key on
+an array its task still sizes no longer reads the array's layout in the C
+slot (`advanced_key` in `m_basic_view`). Ints, `None`, `Ellipsis`, masks
+and lists in the key take the regular path. Tasks that size from data
+(S4: `x[mask]`, `flatnonzero`, `nonzero`) derive a view input's strides,
+not only its shape, before sizing: they read its data. Cost at O1
+(callgrind, `x[i]` of 1,000 elements, 334 indices): unchanged
+(~29,900 instructions per op).
+
+**Not yet:** `take`, `np.dot`, assignments and the other regular-path ops
+read their inputs' layouts at issue, so one issued on an array a task
+still sizes (S2/S4) waits at its issue for that array's layout (for an
+S4 array: until its size input is computed). Making them deferred
+(`Kernel::size`/`layout` per kernel, the NumPy iterator templates planned
+without the GIL) is the next step.
 
 This is the first op with an output that is not size-completed at issue, so
 it needs S3 for every consumer: an op issued on such an array computes its
