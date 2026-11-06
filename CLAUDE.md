@@ -477,10 +477,14 @@ python/benchmarks/     strong_scaling.py, sync_latency.py, issue_stalls.py
                        best/median/worst per point, outlier list
   shape_map_cases.py   its cases (dependent/independent/mixed/reductions/sync/
                        expressions/loops/control; --groups selects groups)
+  realworld.py         logreg, heat stencil, features, Black-Scholes:
+                       NumPy vs. viproc (module mode)
   opt_levels.py        BLAS-heavy programs at O1 and O2 vs. NumPy
   array_pipelining.py  ILNumerics' array-pipelining demo (loop over columns,
                        dependent loop, vectorized): NumPy, NumPy threads,
                        viproc at 1..cores workers
+  free_threaded_loop.py  array_pipelining.py's loop as a thread pool on
+                       free-threaded CPython (no GIL; NumPy only)
   shape_map_ilnumerics.py  the same map for ILNumerics Accelerator (vs. NumPy)
                        and viproc vs. ILNumerics, on the grid/reps of a viproc run
   ilnumerics/          its C# side (.NET 8, needs a licensed ILNumerics build)

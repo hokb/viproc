@@ -1,0 +1,7 @@
+label	speedup	text
+8 independent sin/cos chains, 1e7	7.5	7.5x
+FFT: 100x abs(ifft(fft(A))), n = 200+	4.4	4.4-5.7x
+Black-Scholes greeks, 1e6 options	2.8	2.8x
+Heat equation stencil, 2048 x 2048	2.2	2.2x
+Feature engineering, 200,000 x 20	1.8	1.8x
+Logistic regression, 100,000 x 50	0.94	0.94x
