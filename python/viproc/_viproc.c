@@ -2074,7 +2074,9 @@ static int float_arith(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, P
         }
     }
     for (int i = 0; i < 2; ++i) {
-        if (is_array(inputs[i]) && vp_array_ndim(((ArrayObject*)inputs[i])->a) != 0) {
+        // The rank, not vp_array_ndim: an operand sized by its task (O2)
+        // would make that a wait for its size.
+        if (is_array(inputs[i]) && vp_array_rank(((ArrayObject*)inputs[i])->a) != 0) {
             return 0;
         }
     }
@@ -2158,8 +2160,8 @@ static PyObject* binop(const char* name, binaryfunc scalar_op, PyObject* a, PyOb
     }
     PyObject* sc[2];
     PyObject* in2[2] = {a, b};
-    if ((is_array(a) ? vp_array_ndim(((ArrayObject*)a)->a) == 0
-                     : !is_array(b) || vp_array_ndim(((ArrayObject*)b)->a) == 0) &&
+    if ((is_array(a) ? vp_array_rank(((ArrayObject*)a)->a) == 0
+                     : !is_array(b) || vp_array_rank(((ArrayObject*)b)->a) == 0) &&
         (name[0] == 'a' || name[0] == 's' || name[0] == 'm' || name[0] == 't')) {
         PyObject* u = op_ufunc(name);
         PyObject* r = NULL;
