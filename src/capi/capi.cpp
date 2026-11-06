@@ -723,17 +723,21 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
 
 namespace {
 
-// vp_set_like: `inner` with its result laid out like an extra last input
-// (its strides, where shape and item size match and it is dense), as NumPy
-// writes `out=` in place: inner's layout otherwise. The extra input is only
-// read for its layout.
+// vp_set_like: `inner` with its result laid out like input `like` (its
+// strides, where shape and item size match and it is dense), as NumPy writes
+// `out=` in place: inner's layout otherwise. `like` is one of inner's inputs
+// or an extra last input, only read for its layout. Element-wise kernels keep
+// their in-place property: a dying input's block (r in true_divide(r, n)
+// like r) still becomes the result's, as the in-place op of NumPy writes r.
 class LikeKernel : public Kernel {
   public:
-    LikeKernel(std::shared_ptr<Kernel> inner, std::size_t nin)
-        : inner_(std::move(inner)), nin_(nin) {}
+    LikeKernel(std::shared_ptr<Kernel> inner, std::size_t nin, std::size_t like)
+        : inner_(std::move(inner)), nin_(nin), like_(like) {}
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
         return inner_->run(inputs.first(nin_), outputs);
     }
+    bool in_place_ok() const override { return inner_->in_place_ok(); }
+    bool writes_all() const override { return inner_->writes_all(); }
     const char* name() const override { return inner_->name(); }
     const char* fp_name() const override { return inner_->fp_name(); }
     KernelResult size(std::span<const Layout* const> inputs, std::span<Layout> outputs) override {
@@ -741,7 +745,7 @@ class LikeKernel : public Kernel {
     }
     void layout(std::span<const Layout* const> inputs, std::span<Layout> outputs) override {
         inner_->layout(inputs.first(nin_), outputs);
-        const Layout& like = *inputs[nin_];
+        const Layout& like = *inputs[like_];
         Layout& out = outputs[0];
         if (like.shape == out.shape && itemsize(like.dtype) == itemsize(out.dtype)) {
             Layout l = like;
@@ -756,16 +760,28 @@ class LikeKernel : public Kernel {
   private:
     std::shared_ptr<Kernel> inner_;
     std::size_t nin_;
+    std::size_t like_;
 };
 
-// The deferred kernel and inputs of an op, with the one-shot `like` taken.
+// The deferred kernel and inputs of an op, with the one-shot `like` taken:
+// one of the inputs if it is one (a second operand of the same buffer would
+// keep the task from taking over a dying input's block), else an extra one.
 std::shared_ptr<Kernel> take_like(vp_runtime* rt, std::shared_ptr<Kernel> k, ArrayPtr* ins,
                                   std::size_t& nin) {
     if (!rt->like) [[likely]] {
         return k;
     }
-    auto w = std::make_shared<LikeKernel>(std::move(k), nin);
-    ins[nin++] = std::move(rt->like);
+    std::size_t like = nin;
+    for (std::size_t i = 0; i < nin; ++i) {
+        if (ins[i].get() == rt->like.get()) {
+            like = i;
+            break;
+        }
+    }
+    auto w = std::make_shared<LikeKernel>(std::move(k), nin, like);
+    if (like == nin) {
+        ins[nin++] = std::move(rt->like);
+    }
     rt->like = ArrayPtr();
     return w;
 }
@@ -1992,11 +2008,12 @@ int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned 
 }
 
 int vp_reduce_deferred(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
-                       int keepdims, PyObject* identity, int64_t chunk, vp_array** result,
+                       int keepdims, PyObject* identity, int64_t chunk, int acc, vp_array** result,
                        const char* site, char* err, size_t errlen) {
     Array& a = arr(in);
     const int rank = Runtime::rank(a);
-    const DType dt = a.meta()->sd().dtype; // known at issue
+    const DType from = a.meta()->sd().dtype; // known at issue
+    const DType dt = acc < 0 ? from : to_dtype(static_cast<vp_dtype>(acc));
     if (identity == nullptr) {
         identity = Py_None;
     }
@@ -2008,11 +2025,17 @@ int vp_reduce_deferred(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsi
         set_error(err, errlen, "reduce: chunks for 1-d inputs with an identity only");
         return VP_UNSUPPORTED;
     }
-    // Shared per (ufunc, dtype, rank, axes, keepdims, identity): the shape
-    // and strides of the key mark it as a deferred kernel (-1 extents).
+    if (from != dt &&
+        (chunk == 0 || !rt->loops->prepare_cast(from, dt, defer_release(rt->graveyard)))) {
+        set_error(err, errlen, "reduce: casts in chunks only");
+        return VP_UNSUPPORTED;
+    }
+    // Shared per (ufunc, dtype, input dtype, rank, axes, keepdims, identity):
+    // the shape and strides of the key mark it as a deferred kernel
+    // (negative extents: -1 - the input's dtype).
     ReduceKey key{ufunc, Layout{}, 0, {}};
     key.layout.dtype = dt;
-    key.layout.shape = Shape(static_cast<std::size_t>(rank), -1);
+    key.layout.shape = Shape(static_cast<std::size_t>(rank), -1 - static_cast<std::int64_t>(from));
     // (a kernel per buffer size: -1 - 2 chunk, -2 - 2 chunk)
     key.layout.strides =
         Strides(static_cast<std::size_t>(rank), (keepdims != 0 ? -1 : -2) - 2 * chunk);
@@ -2057,7 +2080,7 @@ int vp_reduce_deferred(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsi
         kernel = numpy::make_deferred_reduce_kernel(
             loop, std::move(reduced), keepdims != 0, std::move(init),
             "ValueError: zero-size array to reduction operation " + name + " which has no identity",
-            chunk);
+            chunk, dt);
     }
     rt->graveyard->drain();
     const ArrayPtr ins[] = {ref(in)};

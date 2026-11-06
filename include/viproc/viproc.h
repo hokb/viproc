@@ -464,14 +464,15 @@ int vp_accumulate(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, vp_ar
  * The task sizes the result, lays it out C-contiguously and plans the loop
  * calls; reduced axes that do not coalesce are visited one by one (sums may
  * round differently from NumPy's buffered blocks). VP_UNSUPPORTED where the
- * reduction casts (int32 sums, ...) or the identity is not a Python bool,
- * int or float: the regular path. `chunk` > 0 (a 1-d input of the
- * accumulator dtype, cast by the caller, and an identity): one loop call per
- * `chunk` elements, as NumPy calls the loop on its casting iterator's
- * buffers (np.getbufsize()); 0: as without a cast. */
+ * reduction casts without `chunk` (n-d int32 sums, ...) or the identity is
+ * not a Python bool, int or float: the regular path. `chunk` > 0 (a 1-d input and an
+ * identity): one loop call per `chunk` elements, as NumPy calls the loop on
+ * its casting iterator's buffers (np.getbufsize()); `acc` (a vp_dtype, or -1
+ * for the input's) is the loop's dtype: an input of another dtype is cast
+ * per chunk by the task, with NumPy's cast (chunk > 0 only). 0: no cast. */
 int vp_reduce_deferred(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
-                       int keepdims, PyObject* identity, int64_t chunk, vp_array** result,
-                       const char* site, char* err, size_t errlen);
+                       int keepdims, PyObject* identity, int64_t chunk, int acc,
+                       vp_array** result, const char* site, char* err, size_t errlen);
 
 /* O2: the count NumPy's mean/var divide by (_count_reduce_items), as a
  * 0-d intp array computed by a task from in's size: max(n - ddof, 0), n the

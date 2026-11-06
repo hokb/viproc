@@ -3797,19 +3797,24 @@ static int axis_flags(PyObject* axes, int nd, unsigned char* flags) {
     return 0;
 }
 
-/* reduce_deferred(ufunc, a, axes, keepdims, initial[, chunk]): O2, a
- * reduction sized, laid out and planned in its task (vp_reduce_deferred, no
- * cast: the caller casts first; `chunk`: NumPy's buffer size for a 1-d input
- * it cast); None if unsupported. */
+/* reduce_deferred(ufunc, a, axes, keepdims, initial[, chunk[, acc]]): O2, a
+ * reduction sized, laid out and planned in its task (vp_reduce_deferred);
+ * `chunk`: NumPy's buffer size for a 1-d input NumPy casts, `acc` the dtype
+ * it casts to (the loop's: the task casts per chunk); None if unsupported. */
 static PyObject* m_reduce_deferred(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *ufunc, *a, *axes, *identity;
     int keepdims;
     long long chunk = 0;
-    if (!PyArg_ParseTuple(args, "OO!OpO|L", &ufunc, &ArrayType, &a, &axes, &keepdims, &identity,
-                          &chunk) ||
+    PyObject* acc = NULL;
+    if (!PyArg_ParseTuple(args, "OO!OpO|LO", &ufunc, &ArrayType, &a, &axes, &keepdims, &identity,
+                          &chunk, &acc) ||
         check_runtime() < 0) {
         return NULL;
+    }
+    const int acc_code = acc == NULL ? -1 : dtype_code(acc);
+    if (acc != NULL && acc_code < 0) {
+        Py_RETURN_NONE;
     }
     vp_array* in = array_of(a);
     unsigned char flags[MAXDIMS];
@@ -3819,7 +3824,7 @@ static PyObject* m_reduce_deferred(PyObject* self, PyObject* args) {
     vp_array* res = NULL;
     char err[ERRLEN] = "";
     const int st = vp_reduce_deferred(g_rt, ufunc, in, flags, keepdims, identity, (int64_t)chunk,
-                                      &res, issue_site(), err, sizeof err);
+                                      acc_code, &res, issue_site(), err, sizeof err);
     if (st == VP_UNSUPPORTED) {
         Py_RETURN_NONE;
     }
@@ -4474,7 +4479,7 @@ static int red_async(const RedSpec* sp, PyObject* self, PyObject* const* v, PyOb
     int st = VP_UNSUPPORTED;
     if (g_opt >= 2 && !(vp_array_sized(a) && vp_array_ready(a) && array_size(a) <= g_small)) {
         /* O2: the task sizes, lays out and plans it (pipelining.md, S2) */
-        st = vp_reduce_deferred(g_rt, sp->ufunc, a, flags, keepdims, sp->identity, 0, &r,
+        st = vp_reduce_deferred(g_rt, sp->ufunc, a, flags, keepdims, sp->identity, 0, -1, &r,
                                 issue_site(), err, sizeof err);
     }
     if (st == VP_UNSUPPORTED) {

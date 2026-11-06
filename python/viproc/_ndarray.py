@@ -453,22 +453,21 @@ def _reduce(ufunc, a, axis=None, keepdims=False, dtype=None, initial=_NV, out=No
 
 def _reduce_unsized(ufunc, a, flags, keepdims, acc, start):
     """O2: a reduction of an array its task still sizes (pipelining.md, S4),
-    sized in its own task instead of waiting at issue for a's layout: a cast
-    to the accumulator dtype first (an astype task, where NumPy casts in its
-    iterator's buffers), then the deferred reduction; None if it does not
-    qualify (the regular path waits)."""
-    chunk = 0
-    if a.dtype != acc:
-        if a.dtype.kind == "c" and acc.kind != "c":
-            return None  # NumPy's ComplexWarning: the regular path
-        if ufunc is np.add and acc.kind in "fc":
-            # pairwise sums: NumPy's loop calls on its buffers decide the
-            # rounding, reproduced for 1-d inputs only
-            if a.ndim != 1 or start is None:
-                return None
-            chunk = np.getbufsize()
-        a = a.astype(acc)
-    return _viproc.reduce_deferred(ufunc, a, flags, keepdims, start, chunk)
+    sized in its own task instead of waiting at issue for a's layout. A cast
+    to the accumulator dtype: 1-d inputs with an identity are cast by the
+    task in NumPy's buffers (np.getbufsize() elements, one loop call each,
+    as NumPy's iterator); others are cast first (an astype task: exact for
+    the reductions that remain, whose result does not depend on the loop
+    calls). None if it does not qualify (the regular path waits)."""
+    if a.dtype == acc:
+        return _viproc.reduce_deferred(ufunc, a, flags, keepdims, start)
+    if a.dtype.kind == "c" and acc.kind != "c":
+        return None  # NumPy's ComplexWarning: the regular path
+    if a.ndim == 1 and start is not None:
+        return _viproc.reduce_deferred(ufunc, a, flags, keepdims, start, np.getbufsize(), acc)
+    if ufunc is np.add and acc.kind in "fc":
+        return None  # pairwise sums: NumPy's buffers decide the rounding
+    return _viproc.reduce_deferred(ufunc, a.astype(acc), flags, keepdims, start)
 
 
 def _scalar_result(r):
@@ -607,6 +606,7 @@ def _moments_unsized(a, axis, dtype, keepdims, ddof, var, sqrt):
     if s is None or s.dtype.kind not in "fc":
         return None
     m = _divide_by_count_unsized(s, n)
+    del s  # the division takes over s's block if nothing else holds it (NumPy: in place)
     if not var:
         return m
     x = np.square(np.subtract(a, m))

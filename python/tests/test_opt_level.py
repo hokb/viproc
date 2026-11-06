@@ -370,16 +370,17 @@ def test_o2_moments_of_empty_data_sizes(level2, fn, msg):
 
 
 def test_o2_reductions_of_data_sizes_async(level2):
-    """The cast and the reduction are tasks, no fallback, no wait."""
+    """The reductions are tasks that cast in NumPy's buffers, no fallback,
+    no wait."""
     keep = np.arange(SYNC_BELOW * 4) % 3 == 0
     a = np.arange(SYNC_BELOW * 4, dtype=np.int32)
 
     def v():  # the gather of a pending mask: it sizes its result from the data (S4)
         return _pending(a)[_pending(keep)]
-    for fn, ops in ((lambda r: r.sum(), 2),  # cast, sum
-                    (lambda r: r.mean(axis=0), 4),  # count, cast, sum, divide
-                    # two counts, cast, sum, divide, subtract, square, sum, divide
-                    (lambda r: r.var(), 9)):
+    for fn, ops in ((lambda r: r.sum(), 1),  # sum (casting per buffer)
+                    (lambda r: r.mean(axis=0), 3),  # count, sum, divide
+                    # two counts, sum, divide, subtract, square, sum, divide
+                    (lambda r: r.var(), 8)):
         r = v()
         assert not viproc._viproc.sized(r)
         before = _stats()
