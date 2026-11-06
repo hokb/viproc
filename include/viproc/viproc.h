@@ -171,6 +171,11 @@ int vp_array_from_item(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array
 /* [GIL, main thread] NumPy's scalar of the first element of `a`, which must
  * be ready (vp_array_ready). New reference. */
 PyObject* vp_array_scalar(const vp_array* a);
+/* [main thread] Address of the first element of `a`, which must be ready
+ * (vp_array_ready). */
+const void* vp_array_first(const vp_array* a);
+/* [GIL] NumPy's scalar of `dtype` holding the bytes at `data`. New reference. */
+PyObject* vp_scalar(vp_dtype dtype, const void* data);
 /* [main thread] NumPy's a.reshape(shape, order) as a view of `a` (order 'C'
  * or 'F'; `shape` without -1, same size as `a`), or NULL if NumPy would
  * copy. Metadata only, computed as NumPy computes it (PyArray_Newshape). */

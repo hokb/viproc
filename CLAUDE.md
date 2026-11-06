@@ -1117,7 +1117,13 @@ Rules:
   plain 0-d array is passed as a borrowed 0-d ndarray: NumPy computes
   scalars partly with other code than 0-d arrays (complex64 `square`
   differs in the last bit). Any n-d operand, even of one element, keeps
-  the array path and NumPy's output shape. `float()`, `bool()`,
+  the array path and NumPy's output shape. Float arithmetic (`+ - * /` of
+  float64/float32) with a plain 0-d array is computed in C instead
+  (`float_arith`: NumPy's loop is one IEEE operation in the result dtype),
+  wherever it raises no FP flag but inexact; with a flag, NumPy's path
+  reports it (`x - a` of a 0-d `a`: 700 → 340 ns, NumPy 440; borrowing a
+  0-d view and calling NumPy's ufunc per op had made `scalar_newton`
+  0.95x → 0.74x). `float()`, `bool()`,
   `format()`, `round()` of a pending 0-d array sync.
 - **Fallback (sync + eager NumPy on viproc memory, `_Host`):** everything
   else (`nonzero`, `flatnonzero`, `argwhere`, `count_nonzero` sync on their

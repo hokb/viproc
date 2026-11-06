@@ -14,6 +14,8 @@
 #include "viproc/viproc.h"
 
 #include <assert.h>
+#include <fenv.h>
+#include <float.h>
 #include <limits.h>
 #include <string.h>
 
@@ -1920,6 +1922,8 @@ static int fast_ufunc(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, Py
     return status < 0 ? -1 : handled;
 }
 
+static int float_arith(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, PyObject** result);
+
 /* _Array.__array_ufunc__(self, ufunc, method, *inputs, **kwargs) */
 static PyObject* Array_array_ufunc(PyObject* self, PyObject* const* args, Py_ssize_t nargs,
                                    PyObject* kwnames) {
@@ -1931,6 +1935,7 @@ static PyObject* Array_array_ufunc(PyObject* self, PyObject* const* args, Py_ssi
     const Py_ssize_t nkw = kwnames != NULL ? PyTuple_GET_SIZE(kwnames) : 0;
     PyObject* const* inputs = args + 2;
     const Py_ssize_t n = nargs - 2;
+    PyObject* result_fast = NULL;
     if (PyUnicode_Check(args[1]) && PyUnicode_Compare(args[1], s_call) == 0 &&
         (nkw == 0 || (nkw == 1 && PyUnicode_Compare(PyTuple_GET_ITEM(kwnames, 0), s_out) == 0))) {
         PyObject* out = NULL;
@@ -1943,6 +1948,10 @@ static PyObject* Array_array_ufunc(PyObject* self, PyObject* const* args, Py_ssi
             }
         }
         if (out == NULL) {
+            const int fk = float_arith(args[0], inputs, n, &result_fast);
+            if (fk != 0) {
+                return fk > 0 ? result_fast : NULL;
+            }
             PyObject* sc[MAXIN];
             const int k = SCALARS_OF(inputs, n, sc);
             if (k < 0) {
@@ -2027,12 +2036,138 @@ static int defers(PyObject* other) {
     return r;
 }
 
+/* Arithmetic of float scalars where a plain 0-d array takes part
+ * (scalars_of): NumPy computes it with its add/subtract/multiply/divide
+ * loop on 0-d arrays, viproc as NumPy's view of the array (a borrowed 0-d
+ * ndarray, then a NumPy ufunc call: ~250 ns for `x - a`). For float64 and
+ * float32 that loop computes one IEEE operation in the result dtype, as C
+ * does here (FLT_EVAL_METHOD 0): the same value, fuzzed. Only where the
+ * operation raises no FP flag but inexact: else the regular path runs, and
+ * NumPy reports the error with its text ("in subtract", errstate). Operands:
+ * ready 0-d float64/float32 viproc arrays, NumPy float64/float32 scalars,
+ * Python floats (weak, NEP 50). 1 with *result, 0 if not taken, -1 on
+ * error. */
+static PyObject* g_arith[4];  /* add, subtract, multiply, true_divide */
+static PyObject* g_sctype[2]; /* numpy.float32, numpy.float64 */
+
+static int float_arith(PyObject* ufunc, PyObject* const* inputs, Py_ssize_t n, PyObject** result) {
+#if FLT_EVAL_METHOD == 0
+    if (n != 2 || g_rt == NULL) {
+        return 0;
+    }
+    if (g_arith[0] == NULL) {
+        static const char* const names[4] = {"add", "subtract", "multiply", "true_divide"};
+        for (int i = 0; i < 4; ++i) {
+            if ((g_arith[i] = op_ufunc(names[i])) == NULL) {
+                PyErr_Clear();
+                return 0;
+            }
+        }
+        for (int i = 0; i < 2; ++i) {
+            g_sctype[i] =
+                PyObject_GetAttrString(g_dtypes[i == 0 ? VP_FLOAT32 : VP_FLOAT64], "type");
+            if (g_sctype[i] == NULL) {
+                PyErr_Clear();
+                g_arith[0] = NULL;
+                return 0;
+            }
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (is_array(inputs[i]) && vp_array_ndim(((ArrayObject*)inputs[i])->a) != 0) {
+            return 0;
+        }
+    }
+    int op = 0;
+    while (op < 4 && g_arith[op] != ufunc) {
+        ++op;
+    }
+    if (op == 4) {
+        return 0;
+    }
+    double v[2];
+    int plain = 0, f64 = 0, f32 = 0;
+    for (int i = 0; i < 2; ++i) {
+        PyObject* x = inputs[i];
+        if (is_array(x)) {
+            vp_array* a = ((ArrayObject*)x)->a;
+            const vp_dtype d = vp_array_dtype(a);
+            if ((d != VP_FLOAT64 && d != VP_FLOAT32) || !vp_array_ready(a) || !vp_array_sized(a) ||
+                vp_array_ndim(a) != 0) {
+                return 0;
+            }
+            plain |= !((ArrayObject*)x)->scalar;
+            const void* p = vp_array_first(a);
+            if (d == VP_FLOAT64) {
+                memcpy(&v[i], p, sizeof(double));
+                f64 = 1;
+            } else {
+                float f;
+                memcpy(&f, p, sizeof f);
+                v[i] = f;
+                f32 = 1;
+            }
+        } else if (PyFloat_CheckExact(x)) {
+            v[i] = PyFloat_AS_DOUBLE(x); /* weak */
+        } else if (Py_TYPE(x) == (PyTypeObject*)g_sctype[1]) {
+            v[i] = PyFloat_AS_DOUBLE(x); /* numpy.float64 is a float */
+            f64 = 1;
+        } else if (Py_TYPE(x) == (PyTypeObject*)g_sctype[0]) {
+            v[i] = PyFloat_AsDouble(x); /* exact */
+            if (v[i] == -1.0 && PyErr_Occurred()) {
+                PyErr_Clear();
+                return 0;
+            }
+            f32 = 1;
+        } else {
+            return 0;
+        }
+    }
+    if (!plain || !(f64 || f32)) {
+        return 0;
+    }
+    const int single = !f64; /* float32 with float32 or weak Python floats */
+    feclearexcept(FE_ALL_EXCEPT);
+    double r64 = 0.0;
+    float r32 = 0.0f;
+    if (single) {
+        const volatile float a = (float)v[0], b = (float)v[1]; /* exact or cast as NumPy */
+        r32 = op == 0 ? a + b : op == 1 ? a - b : op == 2 ? a * b : a / b;
+    } else {
+        const volatile double a = v[0], b = v[1];
+        r64 = op == 0 ? a + b : op == 1 ? a - b : op == 2 ? a * b : a / b;
+    }
+    if (fetestexcept(FE_DIVBYZERO | FE_OVERFLOW | FE_UNDERFLOW | FE_INVALID)) {
+        feclearexcept(FE_ALL_EXCEPT);
+        return 0; /* NumPy reports it: the regular path */
+    }
+    *result = single ? vp_scalar(VP_FLOAT32, &r32) : vp_scalar(VP_FLOAT64, &r64);
+    return *result != NULL ? 1 : -1;
+#else
+    (void)ufunc;
+    (void)inputs;
+    (void)n;
+    (void)result;
+    return 0;
+#endif
+}
+
 static PyObject* binop(const char* name, binaryfunc scalar_op, PyObject* a, PyObject* b) {
     if (defers(is_array(a) ? b : a)) {
         Py_RETURN_NOTIMPLEMENTED;
     }
     PyObject* sc[2];
     PyObject* in2[2] = {a, b};
+    if ((is_array(a) ? vp_array_ndim(((ArrayObject*)a)->a) == 0
+                     : !is_array(b) || vp_array_ndim(((ArrayObject*)b)->a) == 0) &&
+        (name[0] == 'a' || name[0] == 's' || name[0] == 'm' || name[0] == 't')) {
+        PyObject* u = op_ufunc(name);
+        PyObject* r = NULL;
+        const int fk = u != NULL ? float_arith(u, in2, 2, &r) : -1;
+        if (fk != 0) {
+            return fk > 0 ? r : NULL;
+        }
+    }
     const int k = scalar_op != NULL ? SCALARS_OF(in2, 2, sc) : 0;
     if (k != 0) {
         PyObject* r = k > 0 ? scalar_op(sc[0], sc[1]) : NULL;
@@ -5410,6 +5545,11 @@ static PyObject* UfuncProxy_vectorcall(PyObject* self, PyObject* const* args, si
             any |= is_array(args[i]);
         }
         if (any) {
+            PyObject* fr = NULL;
+            const int fk = float_arith(uf, args, n, &fr);
+            if (fk != 0) {
+                return fk > 0 ? fr : NULL;
+            }
             PyObject* sc[MAXIN];
             const int k = SCALARS_OF(args, n, sc);
             if (k < 0) {

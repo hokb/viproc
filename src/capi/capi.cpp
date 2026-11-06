@@ -427,6 +427,15 @@ PyObject* vp_array_scalar(const vp_array* a) {
     return numpy::scalar_object(x.layout().dtype, x.buffer()->data() + x.layout().offset);
 }
 
+const void* vp_array_first(const vp_array* a) {
+    const Array& x = arr(a);
+    return x.buffer()->data() + x.layout().offset;
+}
+
+PyObject* vp_scalar(vp_dtype dtype, const void* data) {
+    return numpy::scalar_object(to_dtype(dtype), data);
+}
+
 vp_array* vp_array_reshape(vp_runtime* rt, const vp_array* a, int ndim, const int64_t* shape,
                            char order) {
     const Layout& l = arr(a).layout();
