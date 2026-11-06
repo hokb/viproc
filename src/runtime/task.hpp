@@ -553,6 +553,9 @@ class Task {
     // `elements` in the kernel's DirectCost::task_sample (a re-test of an
     // expensive loop, OffloadPolicy::promote).
     void time_kernel(std::int64_t elements) { timed_elements_ = elements; }
+    // Stores the steady clock's ns in `*stamp` when the kernel has run (the
+    // workers' period of a promotion check, OffloadPolicy::check).
+    void stamp_completion(std::atomic<std::int64_t>* stamp) { stamp_ = stamp; }
     void advance(TaskState next);
     // Announces `n` pending producers before registering on them, and makes
     // room for their consumer nodes (inline up to kInlineNodes).
@@ -702,7 +705,8 @@ class Task {
     std::shared_ptr<Kernel> kernel_;
     Operands operands_; // inputs, then outputs
     std::size_t ninputs_ = 0;
-    std::int64_t timed_elements_ = 0; // > 0: time the kernel (time_kernel)
+    std::int64_t timed_elements_ = 0;            // > 0: time the kernel (time_kernel)
+    std::atomic<std::int64_t>* stamp_ = nullptr; // stamp_completion
     const char* issue_site_;
     std::uint64_t id_ = 0;
     struct Copy {

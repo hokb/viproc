@@ -634,12 +634,28 @@ reference counting.
      decaying average per issue): a promoted op takes them onto the task
      path. Promote if own + followers' time > `direct_budget_ns` +
      followers x `chain_ns` (no observations: 2 followers of no time). A
-     promotion within 4x of its cost is confirmed by measuring (the
-     Accelerator's measurement is the same idea, on the worker, of issue
-     costs only): the main thread's time between two issues at the site, 8
-     periods directly, then 8 as tasks after a warm-up of 16 (sleeping
-     workers), the task side at least the direct time / workers; the faster
-     holds for 64 issues, doubling up to 4096. A promoted op is sized as
+     promotion is confirmed by measuring (the Accelerator's measurement is
+     the same idea, on the worker, of issue costs only), except a site's
+     first and those whose own time is 16x the cost (`kClear`): the main
+     thread's time per issue at the site over a span of >= 16 issues ending
+     on the kernel it started with, directly (after a warm-up of 4), then as
+     tasks (warm-up 16, sleeping workers); as tasks also the workers'
+     period, from the completion stamps of the span's two end tasks
+     (`Task::stamp_completion`): if the workers lag, the main thread's
+     period says nothing. Tasks win below 0.9x the direct time, 0.7x when
+     the workers are the bottleneck (their backlog grows to the look-ahead
+     limit, out of the caches); the faster holds for 256 issues, doubling
+     up to 4096 (at once when tasks are 2x faster). One site checks at a
+     time; while it measures directly no other site promotes, and pending
+     inputs that persist (a loop carrying its data, `z = z * z + c`) are
+     waited for (drained), at most twice, else tasks win; a site decided
+     direct drains once after each check (else a loop-carried chain stays
+     tasks for good). Before (#59 as merged: checks only within 4x, sites
+     without a chain of their own and clear ones unmeasured, the main
+     thread's period only) small serial chains ran as tasks: Mandelbrot of
+     1,000 elements 0.62x (direct 0.75x), now ~0.73x; `chain_serial` small
+     0.81x -> 0.91x; `dtype_chains` float32 small 0.54x -> 0.95x (medians of
+     5, 4 vCPUs); `array_pipelining.py` 1,000² unchanged (2.3x). A promoted op is sized as
      `sync_below` and takes rule 2 like a large op; if its site runs inline
      there, it takes the direct path instead (`prefers_inline`: an inline
      task costs more). Every 32nd promoted op is re-timed by its task on

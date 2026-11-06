@@ -112,51 +112,139 @@ void OffloadPolicy::take_task_sample(DirectCost& c) {
                   static_cast<std::int64_t>(v & 0xffffffffu));
 }
 
-bool OffloadPolicy::check(ChainScore& s, double kernel_ns) {
+bool OffloadPolicy::check(ChainScore& s, const void* kind, bool ready) {
+    std::atomic<std::int64_t>* const st = stamps_.at[chain_index(s.site)];
     if (s.phase == 2) { // a new check
         s.phase = 0;
         s.count = 0;
         s.seen = 0;
-        s.last_ns = 0;
+        s.from_ns = 0;
+        s.drains = 0;
+        s.pending = 0;
     }
-    const std::int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                 std::chrono::steady_clock::now().time_since_epoch())
-                                 .count();
-    // The first periods of a variant are not counted: the switch, and as
+    checking_ = s.site;
+    checking_task_ = s.phase != 0;
+    checking_left_ = kStampWait;
+    if (s.phase == 0 && !ready) {
+        // The direct variant, measured on ready inputs only: in a loop that
+        // carries its data (`z = z * z + c`), a promoted op's pending result
+        // makes every later op a task, and the "direct" periods measured
+        // tasks. So the other sites' promotions are held back (checking_),
+        // and pending inputs are waited for (drained); if they are pending
+        // again, the op cannot run directly without a sync per issue: tasks.
+        // Wait only when pending inputs persist: where each iteration starts
+        // from ready data (`sin(A[:, i])`), the ops after it become ready by
+        // themselves, and a wait for the first pending one waited for the
+        // workers' whole backlog (~1 ms in the 1,000 x 1,000 column loop).
+        s.seen = 0; // no period: warm up again
+        s.count = 0;
+        s.from_ns = 0;
+        if (++s.pending < ChainScore::kPending) {
+            return false;
+        }
+        s.pending = 0;
+        if (++s.drains > 2) {
+            return decide(s, -1.0);
+        }
+        drain_ = true;
+        return false;
+    }
+    if (s.phase == 0) {
+        s.pending = 0;
+    }
+    if (s.phase == 3) {
+        // The workers' period: the spacing of the completions of the span's
+        // first and last task. If the workers lag, the main thread's own
+        // period as tasks says nothing (it runs ahead, until the look-ahead
+        // limit): a serial chain of small ops (Mandelbrot of 1,000 complex
+        // elements) measured as fast as tasks as directly and ran at 0.6x of
+        // NumPy instead of 0.8x. A stamp that never comes (the op ran inline
+        // after all) ends the wait after kStampWait issues.
+        const std::int64_t first = st[0].load(std::memory_order_acquire);
+        const std::int64_t last = st[1].load(std::memory_order_acquire);
+        if (last == 0 && ++s.calls < kStampWait) {
+            return true;
+        }
+        return decide(s, first != 0 && last > first ? static_cast<double>(last - first) / s.count
+                                                    : 0.0);
+    }
+    // The first issues of a variant are not counted: the switch, and as
     // tasks the warm-up (sleeping workers woken by the main thread, ~5 us
     // each, before the pool streams). With only the switch skipped the 200 x
     // 200 loop measured tasks as slow as the direct path on a 12700K, where
     // it runs 1.3x faster as tasks.
-    const int warm = s.phase == 1 ? ChainScore::kWarmTask : 1;
-    if (s.last_ns != 0 && ++s.seen > warm) {
-        s.periods[s.phase][s.count++] = static_cast<float>(now - s.last_ns);
+    const bool task = s.phase == 1;
+    const int warm = task ? ChainScore::kWarmTask : ChainScore::kWarmDirect;
+    if (s.seen < warm) {
+        ++s.seen;
+        return task;
     }
-    s.last_ns = now;
-    if (s.count < ChainScore::kPeriods) {
-        return s.phase == 1;
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+    if (s.from_ns == 0) {
+        s.from_ns = now;
+        s.kind = kind;
+        s.count = 0;
+        if (task) {
+            st[0].store(0, std::memory_order_relaxed);
+            st[1].store(0, std::memory_order_relaxed);
+            stamp_ = &st[0];
+        }
+        return task;
     }
+    ++s.count;
+    if (s.count < ChainScore::kSpan || (kind != s.kind && s.count < ChainScore::kSpanMax)) {
+        return task;
+    }
+    s.spent[s.phase] = static_cast<float>(now - s.from_ns) / s.count;
     s.seen = 0;
-    s.count = 0;
-    s.last_ns = 0;
-    if (++s.phase < 2) {
-        return true; // the task variant next
+    s.from_ns = 0;
+    if (!task) {
+        checking_task_ = true;
+        s.phase = 1; // the task variant next
+        return true;
     }
-    auto median = [](float* v) {
-        std::nth_element(v, v + ChainScore::kPeriods / 2, v + ChainScore::kPeriods);
-        return v[ChainScore::kPeriods / 2];
-    };
-    const double direct = median(s.periods[0]);
-    // As tasks the workers must keep up too: at most the direct time
-    // (kernels included) spread over all of them. The chain's NumPy time
-    // alone left out the workers' task overhead: with 1 worker on the VM the
-    // 200 x 200 loop chose tasks and ran 20% slower.
-    (void)kernel_ns;
-    const double task =
-        std::max<double>(median(s.periods[1]), direct / static_cast<double>(workers_));
-    const bool t = task < 0.95 * direct;
-    s.next = t == s.task && s.next != 0 ? std::min<std::uint32_t>(2 * s.next, 4096) : 64;
-    s.task = t;
+    stamp_ = &st[1];
+    s.phase = 3;
     s.calls = 0;
+    return true;
+}
+
+bool OffloadPolicy::decide(ChainScore& s, double workers_ns) {
+    bool t = true; // workers_ns < 0: the direct variant could not run
+    bool clear = false;
+    if (workers_ns >= 0) {
+        const double direct = s.spent[0];
+        const double issue = s.spent[1];
+        // As tasks the workers must keep up too: their period (completions),
+        // and at least the direct time (kernels included) spread over all of
+        // them. The chain's NumPy time alone left out the workers' task
+        // overhead: with 1 worker on the VM the 200 x 200 loop chose tasks and
+        // ran 20% slower.
+        const double task = std::max({issue, workers_ns, direct / static_cast<double>(workers_)});
+        // Workers slower than the main thread issues: their backlog grows up
+        // to the look-ahead limit, and with it the memory in flight (1,000
+        // results instead of a few, out of the caches the check ran in), so
+        // the steady state is slower than the check measured. Mandelbrot of
+        // 1,000 complex elements, a serial chain, measured tasks 25% faster
+        // and ran 25% slower.
+        t = task < (workers_ns > issue ? 0.7 : 0.9) * direct;
+        // Twice as fast: the next check (a drain of the workers' backlog, a
+        // span directly) only after the longest hold. The column loop of
+        // 1,000 x 1,000 (`sum(abs(sin(A[:, i])))`, 2.4x of NumPy as tasks)
+        // lost a sixth to its checks.
+        clear = task < 0.5 * direct;
+    }
+    s.next = clear                        ? 4096
+             : t == s.task && s.next != 0 ? std::min<std::uint32_t>(2 * s.next, 4096)
+                                          : 256;
+    s.task = t;
+    s.phase = 2;
+    s.calls = 0;
+    s.drains = 0;
+    checking_ = nullptr;
+    ++checks_;
     return t;
 }
 
