@@ -296,6 +296,98 @@ def test_o2_data_dependent_sizes(level2, dtype, order):
     assert isinstance(nz, tuple) and len(nz) == 1
 
 
+def _as_numpy(r):
+    """A result as NumPy gives it: a pending 0-d `_scalar` as NumPy's scalar."""
+    if isinstance(r, viproc.ndarray):
+        return np.asarray(r)[()] if getattr(r, "_scalar", False) else np.asarray(r)
+    return r
+
+
+_S4_REDUCTIONS = [
+    lambda v: v.sum(),  # int32, bool: accumulated in int64 (a cast)
+    lambda v: v.sum(axis=0, keepdims=True),
+    lambda v: np.prod(v),
+    lambda v: v.sum(dtype=np.float32),  # float sums on NumPy's buffer blocks
+    lambda v: v.sum(dtype=np.complex128),
+    lambda v: v.sum(initial=3),
+    lambda v: v.max(initial=100),
+    lambda v: v.mean(),
+    lambda v: v.mean(keepdims=True),
+    lambda v: np.mean(v, dtype=np.float32),
+    lambda v: v.var(),
+    lambda v: v.var(ddof=1),
+    lambda v: np.std(v, keepdims=True),
+]
+
+
+@pytest.mark.parametrize("dtype", [np.float64, np.float32, np.int32, np.int64, np.bool_])
+@pytest.mark.parametrize("fn", range(len(_S4_REDUCTIONS)))
+@pytest.mark.parametrize("n", [5000, 30_000])
+def test_o2_reductions_of_data_sizes(level2, dtype, fn, n):
+    """Reductions of an S4 output that cast (int32 sums), take dtype= or
+    initial=, and mean/var/std issue without waiting for its size: a cast
+    task, the reduction sized in its task, the count of mean/var a task.
+    Bit-identical to NumPy (sums over a cast in NumPy's buffer blocks)."""
+    f = _S4_REDUCTIONS[fn]
+    rng = np.random.default_rng(fn)
+    scale = 1 / 64 if fn == 2 else 2**20 if dtype is np.int32 else 2**40
+    a = (1 + rng.standard_normal(2 * n) * scale).astype(dtype)
+    if dtype is np.int64 and fn != 2:
+        a = rng.integers(-2**62, 2**62, 2 * n)  # beyond float64's exact integers
+    x = _pending(a)
+    keep = rng.random(2 * n) < 0.5
+    ref = f(a[keep])
+    v = x[viproc.asarray(keep)]  # may wait for x's size (a ready mask: not S4)
+    before = _stats()
+    r = f(v)
+    assert _stats() == before  # no sync, no size wait
+    got = _as_numpy(r)
+    assert type(got) is type(ref) and got.dtype == ref.dtype
+    assert np.shape(got) == np.shape(ref) and np.array_equal(got, ref)
+
+
+@pytest.mark.parametrize("fn, msg", [
+    (lambda v: v.mean(axis=0), "Mean of empty slice"),
+    (lambda v: v.var(axis=0, keepdims=True), "Degrees of freedom <= 0 for slice"),
+    (lambda v: v.std(axis=0, ddof=3), "Degrees of freedom <= 0 for slice"),
+])
+def test_o2_moments_of_empty_data_sizes(level2, fn, msg):
+    """NumPy's warnings for an empty slice come from the count's task, in
+    NumPy's order, at the issue site; the values are NumPy's NaNs."""
+    a = np.arange(6.0).reshape(3, 2)
+    x = _pending(a)
+    with warnings.catch_warnings(record=True) as want:
+        warnings.simplefilter("always")
+        ref = fn(a[a[:, 0] > 10])
+    before = _stats()
+    with warnings.catch_warnings(record=True) as got:
+        warnings.simplefilter("always")
+        r = np.asarray(fn(x[x[:, 0] > 10]))
+    assert _stats()[1] == before[1]  # no size wait
+    assert [str(w.message) for w in got] == [str(w.message) for w in want]
+    assert [w.filename for w in got][0] == __file__
+    assert r.dtype == ref.dtype and r.shape == ref.shape and np.array_equal(r, ref, equal_nan=True)
+
+
+def test_o2_reductions_of_data_sizes_async(level2):
+    """The reductions are tasks that cast in NumPy's buffers, no fallback,
+    no wait."""
+    keep = np.arange(SYNC_BELOW * 4) % 3 == 0
+    a = np.arange(SYNC_BELOW * 4, dtype=np.int32)
+
+    def v():  # the gather of a pending mask: it sizes its result from the data (S4)
+        return _pending(a)[_pending(keep)]
+    for fn, ops in ((lambda r: r.sum(), 1),  # sum (casting per buffer)
+                    (lambda r: r.mean(axis=0), 3),  # count, sum, divide
+                    # two counts, sum, divide, subtract, square, sum, divide
+                    (lambda r: r.var(), 8)):
+        r = v()
+        assert not viproc._viproc.sized(r)
+        before = _stats()
+        assert_async(fn, r, ops=ops)
+        assert _stats() == before
+
+
 def test_o2_data_dependent_sizes_of_deferred_views(level2):
     """S4 tasks reading a view a rule derives (its base still sized by its
     task) take the view's strides, not only its shape."""

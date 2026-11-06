@@ -216,6 +216,9 @@ struct vp_runtime {
     std::unordered_map<ReduceKey, ReduceEntry, ReduceKeyHash> reduce_kernels;
     // O2: deferred astype kernels per (dtype, order index K/C/F).
     std::shared_ptr<Kernel> cast_kernels[7][3];
+    // vp_set_like: the array the next deferred element-wise op or cast lays
+    // its result out like (one-shot; main thread).
+    ArrayPtr like;
 };
 
 // A vp_array* is an Array* holding one reference (no wrapper allocation).
@@ -422,6 +425,15 @@ int vp_array_from_item(vp_runtime* rt, PyObject* value, vp_dtype dtype, vp_array
 PyObject* vp_array_scalar(const vp_array* a) {
     const Array& x = arr(a);
     return numpy::scalar_object(x.layout().dtype, x.buffer()->data() + x.layout().offset);
+}
+
+const void* vp_array_first(const vp_array* a) {
+    const Array& x = arr(a);
+    return x.buffer()->data() + x.layout().offset;
+}
+
+PyObject* vp_scalar(vp_dtype dtype, const void* data) {
+    return numpy::scalar_object(to_dtype(dtype), data);
 }
 
 vp_array* vp_array_reshape(vp_runtime* rt, const vp_array* a, int ndim, const int64_t* shape,
@@ -718,6 +730,77 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
     return VP_OK;
 }
 
+namespace {
+
+// vp_set_like: `inner` with its result laid out like input `like` (its
+// strides, where shape and item size match and it is dense), as NumPy writes
+// `out=` in place: inner's layout otherwise. `like` is one of inner's inputs
+// or an extra last input, only read for its layout. Element-wise kernels keep
+// their in-place property: a dying input's block (r in true_divide(r, n)
+// like r) still becomes the result's, as the in-place op of NumPy writes r.
+class LikeKernel : public Kernel {
+  public:
+    LikeKernel(std::shared_ptr<Kernel> inner, std::size_t nin, std::size_t like)
+        : inner_(std::move(inner)), nin_(nin), like_(like) {}
+    KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
+        return inner_->run(inputs.first(nin_), outputs);
+    }
+    bool in_place_ok() const override { return inner_->in_place_ok(); }
+    bool writes_all() const override { return inner_->writes_all(); }
+    const char* name() const override { return inner_->name(); }
+    const char* fp_name() const override { return inner_->fp_name(); }
+    KernelResult size(std::span<const Layout* const> inputs, std::span<Layout> outputs) override {
+        return inner_->size(inputs.first(nin_), outputs);
+    }
+    void layout(std::span<const Layout* const> inputs, std::span<Layout> outputs) override {
+        inner_->layout(inputs.first(nin_), outputs);
+        const Layout& like = *inputs[like_];
+        Layout& out = outputs[0];
+        if (like.shape == out.shape && itemsize(like.dtype) == itemsize(out.dtype)) {
+            Layout l = like;
+            l.offset = 0;
+            if (l.dense()) {
+                out.strides = like.strides;
+                out.offset = 0;
+            }
+        }
+    }
+
+  private:
+    std::shared_ptr<Kernel> inner_;
+    std::size_t nin_;
+    std::size_t like_;
+};
+
+// The deferred kernel and inputs of an op, with the one-shot `like` taken:
+// one of the inputs if it is one (a second operand of the same buffer would
+// keep the task from taking over a dying input's block), else an extra one.
+std::shared_ptr<Kernel> take_like(vp_runtime* rt, std::shared_ptr<Kernel> k, ArrayPtr* ins,
+                                  std::size_t& nin) {
+    if (!rt->like) [[likely]] {
+        return k;
+    }
+    std::size_t like = nin;
+    for (std::size_t i = 0; i < nin; ++i) {
+        if (ins[i].get() == rt->like.get()) {
+            like = i;
+            break;
+        }
+    }
+    auto w = std::make_shared<LikeKernel>(std::move(k), nin, like);
+    if (like == nin) {
+        ins[nin++] = std::move(rt->like);
+    }
+    rt->like = ArrayPtr();
+    return w;
+}
+
+} // namespace
+
+void vp_set_like(vp_runtime* rt, vp_array* like) {
+    rt->like = like != nullptr ? ref(like) : ArrayPtr();
+}
+
 int vp_ufunc_issue_deferred(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
                             vp_array** result, const char* site, char* err, size_t errlen) {
     const int nin = loop->loop->nin();
@@ -745,19 +828,20 @@ int vp_ufunc_issue_deferred(vp_runtime* rt, const vp_loop* loop, vp_array* const
             all_ready = false;
         }
     }
-    if (all_ready && elements < rt->rt->offload_policy().options().sync_below) {
+    if (all_ready && elements < rt->rt->offload_policy().options().sync_below && !rt->like) {
         return VP_UNSUPPORTED; // the direct path, sized on the main thread
     }
     rt->graveyard->drain();
-    ArrayPtr ins[3];
+    ArrayPtr ins[4];
     for (int i = 0; i < nin; ++i) {
         ins[i] = ref(inputs[i]);
     }
     const DType out = loop->dtypes[static_cast<std::size_t>(nin)];
+    std::size_t n = static_cast<std::size_t>(nin);
+    const std::shared_ptr<Kernel> k = take_like(rt, loop->loop->elementwise_kernel(), ins, n);
     ArrayPtr res;
-    rt->rt->issue_deferred(loop->loop->elementwise_kernel(),
-                           std::span<const ArrayPtr>(ins, static_cast<std::size_t>(nin)),
-                           std::span(&out, 1), std::span(&rank, 1), site, std::span(&res, 1));
+    rt->rt->issue_deferred(k, std::span<const ArrayPtr>(ins, n), std::span(&out, 1),
+                           std::span(&rank, 1), site, std::span(&res, 1));
     *result = hand_out(std::move(res));
     return VP_OK;
 }
@@ -999,17 +1083,19 @@ int vp_astype(vp_runtime* rt, vp_array* in, vp_dtype dtype, char order, vp_array
         }
         const bool small = !Runtime::unsized(a) && a.ready() &&
                            a.layout().size() < rt->rt->offload_policy().options().sync_below;
-        if (oi >= 0 && !complex_to_real && !small &&
+        if (oi >= 0 && !complex_to_real && (!small || rt->like) &&
             rt->loops->prepare_cast(from, to, defer_release(rt->graveyard))) {
             std::shared_ptr<Kernel>& k = rt->cast_kernels[static_cast<int>(to)][oi];
             if (!k) {
                 k = numpy::make_deferred_cast_kernel(to, order);
             }
-            const ArrayPtr ins[] = {ref(in)};
+            ArrayPtr ins[2] = {ref(in)};
+            std::size_t n = 1;
+            const std::shared_ptr<Kernel> kl = take_like(rt, k, ins, n);
             const int rank = Runtime::rank(a);
             ArrayPtr res;
-            rt->rt->issue_deferred(k, ins, std::span(&to, 1), std::span(&rank, 1), site,
-                                   std::span(&res, 1));
+            rt->rt->issue_deferred(kl, std::span<const ArrayPtr>(ins, n), std::span(&to, 1),
+                                   std::span(&rank, 1), site, std::span(&res, 1));
             *result = hand_out(std::move(res));
             return VP_OK;
         }
@@ -1931,11 +2017,12 @@ int vp_reduce_out(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned 
 }
 
 int vp_reduce_deferred(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
-                       int keepdims, PyObject* identity, vp_array** result, const char* site,
-                       char* err, size_t errlen) {
+                       int keepdims, PyObject* identity, int64_t chunk, int acc, vp_array** result,
+                       const char* site, char* err, size_t errlen) {
     Array& a = arr(in);
     const int rank = Runtime::rank(a);
-    const DType dt = a.meta()->sd().dtype; // known at issue
+    const DType from = a.meta()->sd().dtype; // known at issue
+    const DType dt = acc < 0 ? from : to_dtype(static_cast<vp_dtype>(acc));
     if (identity == nullptr) {
         identity = Py_None;
     }
@@ -1943,12 +2030,24 @@ int vp_reduce_deferred(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsi
         set_error(err, errlen, "reduce: too many dimensions");
         return VP_UNSUPPORTED;
     }
-    // Shared per (ufunc, dtype, rank, axes, keepdims, identity): the shape
-    // and strides of the key mark it as a deferred kernel (-1 extents).
+    if (chunk < 0 || (chunk > 0 && (rank != 1 || axes[0] == 0 || identity == Py_None))) {
+        set_error(err, errlen, "reduce: chunks for 1-d inputs with an identity only");
+        return VP_UNSUPPORTED;
+    }
+    if (from != dt &&
+        (chunk == 0 || !rt->loops->prepare_cast(from, dt, defer_release(rt->graveyard)))) {
+        set_error(err, errlen, "reduce: casts in chunks only");
+        return VP_UNSUPPORTED;
+    }
+    // Shared per (ufunc, dtype, input dtype, rank, axes, keepdims, identity):
+    // the shape and strides of the key mark it as a deferred kernel
+    // (negative extents: -1 - the input's dtype).
     ReduceKey key{ufunc, Layout{}, 0, {}};
     key.layout.dtype = dt;
-    key.layout.shape = Shape(static_cast<std::size_t>(rank), -1);
-    key.layout.strides = Strides(static_cast<std::size_t>(rank), keepdims != 0 ? -1 : -2);
+    key.layout.shape = Shape(static_cast<std::size_t>(rank), -1 - static_cast<std::int64_t>(from));
+    // (a kernel per buffer size: -1 - 2 chunk, -2 - 2 chunk)
+    key.layout.strides =
+        Strides(static_cast<std::size_t>(rank), (keepdims != 0 ? -1 : -2) - 2 * chunk);
     int out_rank = 0;
     for (int i = 0; i < rank; ++i) {
         if (axes[i] != 0) {
@@ -1989,11 +2088,76 @@ int vp_reduce_deferred(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsi
         }
         kernel = numpy::make_deferred_reduce_kernel(
             loop, std::move(reduced), keepdims != 0, std::move(init),
-            "ValueError: zero-size array to reduction operation " + name +
-                " which has no identity");
+            "ValueError: zero-size array to reduction operation " + name + " which has no identity",
+            chunk, dt);
     }
     rt->graveyard->drain();
     const ArrayPtr ins[] = {ref(in)};
+    ArrayPtr res;
+    rt->rt->issue_deferred(kernel, ins, std::span(&dt, 1), std::span(&out_rank, 1), site,
+                           std::span(&res, 1));
+    *result = hand_out(std::move(res));
+    return VP_OK;
+}
+
+namespace {
+
+// vp_reduced_count: max(n - ddof, 0) as intp, n the elements reduced into
+// one result element; sized at once (0-d), computed from the input's size.
+class ReducedCountKernel : public Kernel {
+  public:
+    ReducedCountKernel(std::vector<bool> reduced, std::int64_t ddof, const char* warning)
+        : reduced_(std::move(reduced)), ddof_(ddof), warning_(warning) {}
+    const char* name() const override { return "numpy.mean"; }
+    KernelResult size(std::span<const Layout* const> inputs, std::span<Layout> outputs) override {
+        (void)inputs;
+        outputs[0].shape = {};
+        return {};
+    }
+    KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
+        const Layout& in = inputs[0].layout();
+        std::int64_t n = 1;
+        for (std::size_t i = 0; i < in.shape.size(); ++i) {
+            if (reduced_[i]) {
+                n *= in.shape[i];
+            }
+        }
+        const std::int64_t v = n - ddof_ > 0 ? n - ddof_ : 0;
+        std::memcpy(outputs[0].first(), &v, sizeof v);
+        KernelResult r;
+        if (ddof_ >= n) {
+            r.warning = warning_;
+        }
+        return r;
+    }
+
+  private:
+    std::vector<bool> reduced_;
+    std::int64_t ddof_;
+    const char* warning_;
+};
+
+} // namespace
+
+int vp_reduced_count(vp_runtime* rt, vp_array* in, const unsigned char* axes, int64_t ddof,
+                     const char* warning, vp_array** result, const char* site, char* err,
+                     size_t errlen) {
+    static_assert(sizeof(void*) == sizeof(std::int64_t), "intp is int64");
+    Array& a = arr(in);
+    const int rank = Runtime::rank(a);
+    if (rank > 64) {
+        set_error(err, errlen, "reduced_count: too many dimensions");
+        return VP_UNSUPPORTED;
+    }
+    rt->graveyard->drain();
+    std::vector<bool> reduced(static_cast<std::size_t>(rank));
+    for (int i = 0; i < rank; ++i) {
+        reduced[static_cast<std::size_t>(i)] = axes[i] != 0;
+    }
+    auto kernel = std::make_shared<ReducedCountKernel>(std::move(reduced), ddof, warning);
+    const ArrayPtr ins[] = {ref(in)};
+    const DType dt = DType::Int64;
+    const int out_rank = 0;
     ArrayPtr res;
     rt->rt->issue_deferred(kernel, ins, std::span(&dt, 1), std::span(&out_rank, 1), site,
                            std::span(&res, 1));

@@ -1,0 +1,975 @@
+{
+ "note": "Summary rows of docs/benchmarks.md, 'Progress per change', from before per-run records existed: no per-case results. 'before <commit>' rows measured the parent of that commit (change.measured). Rows of one cpu string ran on one VM.",
+ "runs": [
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261013-0000_7b2846f_O1_m63344b58",
+   "recorded": "2026-10-13T00:00:00",
+   "change": {
+    "commit": "7b2846f",
+    "measured": null,
+    "description": "suite introduced (2.10)",
+    "pr": null,
+    "baseline": null,
+    "role": "change",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.10 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m63344b58"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 43.0,
+    "speedup_geomean": 1.18,
+    "speedup_w1_geomean": 0.78,
+    "configs": 65,
+    "identical": null,
+    "categories": {
+     "chains": 77.0,
+     "indexing": 38.0,
+     "reductions": 26.0,
+     "algorithms": 42.0,
+     "scalars": 49.0
+    },
+    "sizes": {
+     "scalar": 19.0,
+     "tiny": 64.0,
+     "small": 44.0,
+     "medium": 47.0,
+     "large": 62.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261013-0001_7b2846f_O1_m63344b58",
+   "recorded": "2026-10-13T00:01:00",
+   "change": {
+    "commit": "7b2846f",
+    "measured": "before `e1e3857",
+    "description": "more cases (dtypes) (2.10)",
+    "pr": null,
+    "baseline": null,
+    "role": "baseline",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.10 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m63344b58"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 44.0,
+    "speedup_geomean": 1.19,
+    "speedup_w1_geomean": 0.77,
+    "configs": 89,
+    "identical": null,
+    "categories": {
+     "chains": 73.0,
+     "indexing": 40.0,
+     "reductions": 31.0,
+     "algorithms": 42.0,
+     "dtypes": 43.0,
+     "scalars": 43.0
+    },
+    "sizes": {
+     "scalar": 13.0,
+     "tiny": 57.0,
+     "small": 56.0,
+     "medium": 40.0,
+     "large": 63.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261013-0002_7b2846f_O1_m63344b58",
+   "recorded": "2026-10-13T00:02:00",
+   "change": {
+    "commit": "7b2846f",
+    "measured": "before `e1e3857",
+    "description": "97 cases, baseline for reductions (2.10)",
+    "pr": null,
+    "baseline": null,
+    "role": "baseline",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.10 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m63344b58"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 45.0,
+    "speedup_geomean": 1.25,
+    "speedup_w1_geomean": 0.82,
+    "configs": 97,
+    "identical": null,
+    "categories": {
+     "chains": 80.0,
+     "indexing": 42.0,
+     "reductions": 31.0,
+     "algorithms": 41.0,
+     "dtypes": 42.0
+    },
+    "sizes": {
+     "scalar": 13.0,
+     "tiny": 73.0,
+     "small": 57.0,
+     "medium": 39.0,
+     "large": 62.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261013-0003_e1e3857_O1_m63344b58",
+   "recorded": "2026-10-13T00:03:00",
+   "change": {
+    "commit": "e1e3857",
+    "measured": null,
+    "description": "async reductions with NumPy's loops (2.10)",
+    "pr": null,
+    "baseline": null,
+    "role": "change",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.10 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m63344b58"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 52.0,
+    "speedup_geomean": 1.4,
+    "speedup_w1_geomean": 0.83,
+    "configs": 97,
+    "identical": null,
+    "categories": {
+     "chains": 78.0,
+     "indexing": 42.0,
+     "reductions": 75.0,
+     "algorithms": 41.0,
+     "dtypes": 47.0,
+     "scalars": 42.0
+    },
+    "sizes": {
+     "scalar": 13.0,
+     "tiny": 62.0,
+     "small": 54.0,
+     "medium": 48.0,
+     "large": 69.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261013-0004_bc07d90_O1_m63344b58",
+   "recorded": "2026-10-13T00:04:00",
+   "change": {
+    "commit": "bc07d90",
+    "measured": null,
+    "description": "exact NumPy iteration, casts, astype, views, mean/var/std, argmin/argmax, advanced indexing, direct path, scalar shortcut, `np.where` (`1d42f0f`..`bc07d90`) (2.10)",
+    "pr": null,
+    "baseline": null,
+    "role": "change",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.10 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m63344b58"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 69.0,
+    "speedup_geomean": 1.74,
+    "speedup_w1_geomean": 0.84,
+    "configs": 97,
+    "identical": null,
+    "categories": {
+     "chains": 87.0,
+     "indexing": 52.0,
+     "reductions": 74.0,
+     "algorithms": 64.0,
+     "dtypes": 58.0,
+     "scalars": 89.0
+    },
+    "sizes": {
+     "scalar": 106.0,
+     "tiny": 70.0,
+     "small": 67.0,
+     "medium": 55.0,
+     "large": 85.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261013-0005_2f7cac1_O1_m63344b58",
+   "recorded": "2026-10-13T00:05:00",
+   "change": {
+    "commit": "2f7cac1",
+    "measured": null,
+    "description": "`kmeans_points` case; back-pressure hysteresis, pooled iterators, faster `a[:, idx]` (2.10)",
+    "pr": null,
+    "baseline": null,
+    "role": "change",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.10 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m63344b58"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 68.0,
+    "speedup_geomean": 1.68,
+    "speedup_w1_geomean": 0.87,
+    "configs": 100,
+    "identical": null,
+    "categories": {
+     "chains": 85.0,
+     "indexing": 52.0,
+     "reductions": 80.0,
+     "algorithms": 56.0,
+     "dtypes": 56.0,
+     "scalars": 91.0
+    },
+    "sizes": {
+     "scalar": 101.0,
+     "tiny": 71.0,
+     "small": 69.0,
+     "medium": 52.0,
+     "large": 81.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261014-0006_3111820_O1_m7b016288",
+   "recorded": "2026-10-14T00:06:00",
+   "change": {
+    "commit": "3111820",
+    "measured": null,
+    "description": "same-VM baseline for the view changes: state before them (2.80)",
+    "pr": null,
+    "baseline": null,
+    "role": "baseline",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.80 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m7b016288"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 64.0,
+    "speedup_geomean": 1.6,
+    "speedup_w1_geomean": 0.87,
+    "configs": 100,
+    "identical": null,
+    "categories": {
+     "chains": 82.0,
+     "indexing": 48.0,
+     "reductions": 79.0,
+     "algorithms": 54.0,
+     "dtypes": 53.0,
+     "scalars": 77.0
+    },
+    "sizes": {
+     "scalar": 73.0,
+     "tiny": 68.0,
+     "small": 71.0,
+     "medium": 48.0,
+     "large": 77.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261014-0007_5db8972_O1_m7b016288",
+   "recorded": "2026-10-14T00:07:00",
+   "change": {
+    "commit": "5db8972",
+    "measured": null,
+    "description": "views computed without ndarrays, `a[key]` in the C slot (2.80)",
+    "pr": null,
+    "baseline": null,
+    "role": "change",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.80 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m7b016288"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 64.0,
+    "speedup_geomean": 1.62,
+    "speedup_w1_geomean": 0.87,
+    "configs": 100,
+    "identical": null,
+    "categories": {
+     "chains": 85.0,
+     "indexing": 49.0,
+     "reductions": 78.0,
+     "algorithms": 55.0,
+     "dtypes": 53.0,
+     "scalars": 71.0
+    },
+    "sizes": {
+     "scalar": 96.0,
+     "tiny": 62.0,
+     "small": 72.0,
+     "medium": 48.0,
+     "large": 79.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261015-0008_937393a_O1_m63344b58",
+   "recorded": "2026-10-15T00:08:00",
+   "change": {
+    "commit": "937393a",
+    "measured": null,
+    "description": "same-VM baseline for matmul: state before it (2.10)",
+    "pr": null,
+    "baseline": null,
+    "role": "baseline",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.10 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m63344b58"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 72.0,
+    "speedup_geomean": 1.77,
+    "speedup_w1_geomean": 0.9,
+    "configs": 100,
+    "identical": null,
+    "categories": {
+     "chains": 87.0,
+     "indexing": 58.0,
+     "reductions": 87.0,
+     "algorithms": 58.0,
+     "dtypes": 59.0,
+     "scalars": 93.0
+    },
+    "sizes": {
+     "scalar": 117.0,
+     "tiny": 71.0,
+     "small": 74.0,
+     "medium": 57.0,
+     "large": 80.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261015-0009_233fe84_O1_m63344b58",
+   "recorded": "2026-10-15T00:09:00",
+   "change": {
+    "commit": "233fe84",
+    "measured": null,
+    "description": "async `matmul` / `@` / `np.dot` with NumPy's matmul loop (2.10)",
+    "pr": null,
+    "baseline": null,
+    "role": "change",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.10 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m63344b58"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 68.0,
+    "speedup_geomean": 1.73,
+    "speedup_w1_geomean": 0.9,
+    "configs": 100,
+    "identical": null,
+    "categories": {
+     "chains": 89.0,
+     "indexing": 52.0,
+     "reductions": 78.0,
+     "algorithms": 61.0,
+     "dtypes": 58.0,
+     "scalars": 76.0
+    },
+    "sizes": {
+     "scalar": 80.0,
+     "tiny": 64.0,
+     "small": 72.0,
+     "medium": 56.0,
+     "large": 79.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261023-0010_eb39c38_O1_m63344b58",
+   "recorded": "2026-10-23T00:10:00",
+   "change": {
+    "commit": "eb39c38",
+    "measured": null,
+    "description": "same-VM baseline for the sync spin: `main` before it (2.10)",
+    "pr": null,
+    "baseline": null,
+    "role": "baseline",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.10 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m63344b58"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 78.0,
+    "speedup_geomean": 2.0,
+    "speedup_w1_geomean": 1.1,
+    "configs": 100,
+    "identical": null,
+    "categories": {
+     "chains": 94.0,
+     "indexing": 65.0,
+     "reductions": 99.0,
+     "algorithms": 73.0,
+     "dtypes": 67.0,
+     "scalars": 76.0
+    },
+    "sizes": {
+     "scalar": 93.0,
+     "tiny": 68.0,
+     "small": 86.0,
+     "medium": 70.0,
+     "large": 80.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261023-0011_231f5fe_O1_m63344b58",
+   "recorded": "2026-10-23T00:11:00",
+   "change": {
+    "commit": "231f5fe",
+    "measured": null,
+    "description": "main thread spins up to 50 \u00b5s at sync points before it sleeps (#45) (2.10)",
+    "pr": null,
+    "baseline": null,
+    "role": "change",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.10 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m63344b58"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 79.0,
+    "speedup_geomean": 2.02,
+    "speedup_w1_geomean": 1.1,
+    "configs": 100,
+    "identical": null,
+    "categories": {
+     "chains": 97.0,
+     "indexing": 62.0,
+     "reductions": 98.0,
+     "algorithms": 73.0,
+     "dtypes": 68.0,
+     "scalars": 79.0
+    },
+    "sizes": {
+     "scalar": 98.0,
+     "tiny": 70.0,
+     "small": 87.0,
+     "medium": 68.0,
+     "large": 85.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261023-0012_aa39fda_O1_m63344b58",
+   "recorded": "2026-10-23T00:12:00",
+   "change": {
+    "commit": "aa39fda",
+    "measured": null,
+    "description": "same-VM baseline for the per-op overhead: `main` with joining (#29) (2.10)",
+    "pr": null,
+    "baseline": null,
+    "role": "baseline",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.10 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m63344b58"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 79.0,
+    "speedup_geomean": 2.0,
+    "speedup_w1_geomean": 1.11,
+    "configs": 100,
+    "identical": null,
+    "categories": {
+     "chains": 97.0,
+     "indexing": 61.0,
+     "reductions": 94.0,
+     "algorithms": 75.0,
+     "dtypes": 66.0,
+     "scalars": 89.0
+    },
+    "sizes": {
+     "scalar": 117.0,
+     "tiny": 71.0,
+     "small": 85.0,
+     "medium": 69.0,
+     "large": 80.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261023-0013_0ac2184_O1_m63344b58",
+   "recorded": "2026-10-23T00:13:00",
+   "change": {
+    "commit": "0ac2184",
+    "measured": null,
+    "description": "scalar operands cached, task lists inline (#47) (2.10)",
+    "pr": null,
+    "baseline": null,
+    "role": "change",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.10 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m63344b58"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 81.0,
+    "speedup_geomean": 2.03,
+    "speedup_w1_geomean": 1.16,
+    "configs": 100,
+    "identical": null,
+    "categories": {
+     "chains": 99.0,
+     "indexing": 66.0,
+     "reductions": 93.0,
+     "algorithms": 78.0,
+     "dtypes": 64.0,
+     "scalars": 90.0
+    },
+    "sizes": {
+     "scalar": 96.0,
+     "tiny": 82.0,
+     "small": 93.0,
+     "medium": 68.0,
+     "large": 81.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261023-0014_8e0fbd6_O1_m63344b58",
+   "recorded": "2026-10-23T00:14:00",
+   "change": {
+    "commit": "8e0fbd6",
+    "measured": null,
+    "description": "same-VM baseline for the lock-free consumer list: `main` (2.10)",
+    "pr": null,
+    "baseline": null,
+    "role": "baseline",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.10 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m63344b58"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 83.0,
+    "speedup_geomean": 2.11,
+    "speedup_w1_geomean": 1.2,
+    "configs": 100,
+    "identical": null,
+    "categories": {
+     "chains": 104.0,
+     "indexing": 71.0,
+     "reductions": 86.0,
+     "algorithms": 77.0,
+     "dtypes": 70.0,
+     "scalars": 94.0
+    },
+    "sizes": {
+     "scalar": 97.0,
+     "tiny": 94.0,
+     "small": 95.0,
+     "medium": 69.0,
+     "large": 89.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261023-0015_b2f0544_O1_m63344b58",
+   "recorded": "2026-10-23T00:15:00",
+   "change": {
+    "commit": "b2f0544",
+    "measured": null,
+    "description": "lock-free consumer list, no mutex in the task (2.10)",
+    "pr": 49,
+    "baseline": null,
+    "role": "change",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon @ 2.10 GHz (cloud VM)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "m63344b58"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 83.0,
+    "speedup_geomean": 2.13,
+    "speedup_w1_geomean": 1.21,
+    "configs": 100,
+    "identical": null,
+    "categories": {
+     "chains": 108.0,
+     "indexing": 73.0,
+     "reductions": 101.0,
+     "algorithms": 79.0,
+     "dtypes": 64.0,
+     "scalars": 80.0
+    },
+    "sizes": {
+     "scalar": 65.0,
+     "tiny": 100.0,
+     "small": 102.0,
+     "medium": 67.0,
+     "large": 93.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261029-0016_464ae7a_O1_md16c7f70",
+   "recorded": "2026-10-29T00:16:00",
+   "change": {
+    "commit": "464ae7a",
+    "measured": null,
+    "description": "same-VM baseline for the issue-rate fixes: `main` (#55)",
+    "pr": null,
+    "baseline": null,
+    "role": "baseline",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon (cloud VM, clock not noted)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "md16c7f70"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 84.0,
+    "speedup_geomean": 2.12,
+    "speedup_w1_geomean": 1.21,
+    "configs": 100,
+    "identical": null,
+    "categories": {
+     "chains": 97.0,
+     "indexing": 81.0,
+     "reductions": 100.0,
+     "algorithms": 74.0,
+     "dtypes": 69.0,
+     "scalars": 89.0
+    },
+    "sizes": {
+     "scalar": 99.0,
+     "tiny": 102.0,
+     "small": 100.0,
+     "medium": 70.0,
+     "large": 82.0
+    }
+   },
+   "results": null
+  },
+  {
+   "schema": "viproc-benchmark-run/1",
+   "id": "20261029-0017_976b28a_O1_md16c7f70",
+   "recorded": "2026-10-29T00:17:00",
+   "change": {
+    "commit": "976b28a",
+    "measured": null,
+    "description": "issue rate: re-tests on the worker, shared reduce kernels, initial-exec TLS, `C[i] = v` without a view object",
+    "pr": 56,
+    "baseline": null,
+    "role": "change",
+    "subject": null,
+    "branch": null,
+    "dirty": null
+   },
+   "machine": {
+    "label": "linux",
+    "cpu": "Intel Xeon (cloud VM, clock not noted)",
+    "cores": 4,
+    "logical_cpus": 4,
+    "ram_bytes": 0,
+    "id": "md16c7f70"
+   },
+   "options": {
+    "quick": false,
+    "workers": "1,max",
+    "filter": null,
+    "repeat": null,
+    "opt_level": 1
+   },
+   "summary": {
+    "score": 87.0,
+    "speedup_geomean": 2.21,
+    "speedup_w1_geomean": 1.21,
+    "configs": 100,
+    "identical": null,
+    "categories": {
+     "chains": 98.0,
+     "indexing": 92.0,
+     "reductions": 104.0,
+     "algorithms": 83.0,
+     "dtypes": 67.0,
+     "scalars": 81.0
+    },
+    "sizes": {
+     "scalar": 90.0,
+     "tiny": 86.0,
+     "small": 98.0,
+     "medium": 75.0,
+     "large": 89.0
+    }
+   },
+   "results": null
+  }
+ ]
+}

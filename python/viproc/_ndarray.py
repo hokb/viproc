@@ -70,8 +70,12 @@ def _env_level():
         raise ValueError(f"VIPROC_OPT must be one of {OPT_LEVELS}, got {env!r}") from None
 
 
+_o2 = [False]  # optimization level 2 or higher (_viproc.opt_level() >= 2), no call
+
+
 def _start(workers, max_active_tasks, sync_below, adaptive, level):
     _viproc.init(workers, max_active_tasks, sync_below, adaptive, level)
+    _o2[0] = _viproc.opt_level() >= 2
     _blas.apply_level(level)
     _small_ops[0] = 2048 if sync_below < 0 else sync_below
     _scale_budget(adaptive)
@@ -394,7 +398,8 @@ def _plan_reduce(ufunc, dtype, ndim, axis, keepdims, requested):
     try:  # NumPy's result dtype (int32 sums accumulate in int64); a viproc dtype?
         with warnings.catch_warnings():  # the probe only: the call itself warns
             warnings.simplefilter("ignore")
-            if ufunc.reduce(np.zeros(1, dtype), dtype=requested).dtype not in _CODES:
+            acc = ufunc.reduce(np.zeros(1, dtype), dtype=requested).dtype
+            if acc not in _CODES:
                 return None
     except (TypeError, ValueError):
         return None  # NumPy raises the error
@@ -406,7 +411,7 @@ def _plan_reduce(ufunc, dtype, ndim, axis, keepdims, requested):
         except (TypeError, ValueError, np.exceptions.AxisError):
             return None
         flags = tuple(i in axes for i in range(ndim))
-    return flags, bool(keepdims), None if requested is None else np.dtype(requested)
+    return flags, bool(keepdims), None if requested is None else np.dtype(requested), acc
 
 
 def _reduce(ufunc, a, axis=None, keepdims=False, dtype=None, initial=_NV, out=None):
@@ -434,12 +439,35 @@ def _reduce(ufunc, a, axis=None, keepdims=False, dtype=None, initial=_NV, out=No
             _reduce_plans[key] = plan
     if plan is None:
         return None
-    flags, keep, requested = plan
+    flags, keep, requested, acc = plan
     start = ufunc.identity if initial is _NV else initial
+    if out is None and _o2[0] and not _viproc.sized(a):
+        r = _reduce_unsized(ufunc, a, flags, keep, acc, start)
+        if r is not None:
+            return _scalar_result(r) if r.ndim == 0 else r
     if out is not None:
         return _viproc.reduce(ufunc, a, flags, keep, requested, start, out)
     r = _viproc.reduce(ufunc, a, flags, keep, requested, start)
     return _scalar_result(r) if r is not None and r.ndim == 0 else r
+
+
+def _reduce_unsized(ufunc, a, flags, keepdims, acc, start):
+    """O2: a reduction of an array its task still sizes (pipelining.md, S4),
+    sized in its own task instead of waiting at issue for a's layout. A cast
+    to the accumulator dtype: 1-d inputs with an identity are cast by the
+    task in NumPy's buffers (np.getbufsize() elements, one loop call each,
+    as NumPy's iterator); others are cast first (an astype task: exact for
+    the reductions that remain, whose result does not depend on the loop
+    calls). None if it does not qualify (the regular path waits)."""
+    if a.dtype == acc:
+        return _viproc.reduce_deferred(ufunc, a, flags, keepdims, start)
+    if a.dtype.kind == "c" and acc.kind != "c":
+        return None  # NumPy's ComplexWarning: the regular path
+    if a.ndim == 1 and start is not None:
+        return _viproc.reduce_deferred(ufunc, a, flags, keepdims, start, np.getbufsize(), acc)
+    if ufunc is np.add and acc.kind in "fc":
+        return None  # pairwise sums: NumPy's buffers decide the rounding
+    return _viproc.reduce_deferred(ufunc, a.astype(acc), flags, keepdims, start)
 
 
 def _scalar_result(r):
@@ -516,11 +544,16 @@ def _divide_by_count(r, n):
     and intp (float64, complex128), cast back to r's dtype. In place, as
     NumPy: the result keeps r's layout (a reduction's extent-1 axes)."""
     if r.ndim:
+        if _o2[0] and not _viproc.sized(r):  # an in-place op would wait for r's layout
+            return _divide_by_count_unsized(r, _INTP(n))
         if r.dtype in _WIDE:  # the division's own dtype: no cast
             return np.true_divide(r, _INTP(n), out=r)
         return np.true_divide(r, _INTP(n), out=r, casting="unsafe")
     q = np.true_divide(r, _INTP(n))
-    return q if q.dtype == r.dtype else q.astype(r.dtype)
+    if q.dtype == r.dtype:
+        return q
+    q = q.astype(r.dtype)  # NumPy: r.dtype.type(...), a scalar
+    return _scalar_result(q) if type(q) is ndarray else q
 
 
 def _moment_dtype(a, dtype):
@@ -529,10 +562,74 @@ def _moment_dtype(a, dtype):
     return dtype
 
 
+def _like(r, fn, *args):
+    """fn(*args) with its result laid out like r (vp_set_like), as NumPy's
+    fn(..., out=r) keeps r's strides: an out= op would wait for the layout
+    of r while its task still sizes it (O2)."""
+    _viproc.like(r)
+    try:
+        return fn(*args)
+    finally:
+        _viproc.like(None)
+
+
+def _divide_by_count_unsized(r, n):
+    """_divide_by_count by a pending count (vp_reduced_count) or of an r
+    its task still sizes: the same division and cast, laid out like r."""
+    if r.dtype in _WIDE:
+        q = _like(r, np.true_divide, r, n)
+    else:
+        q = _like(r, np.true_divide(r, n).astype, r.dtype)
+    return _scalar_result(q) if type(q) is ndarray and q.ndim == 0 else q
+
+
+def _moments_unsized(a, axis, dtype, keepdims, ddof, var, sqrt):
+    """O2: mean/var/std of a real array its task still sizes (pipelining.md,
+    S4), as NumPy's _methods composes them, with the count computed by a task
+    (vp_reduced_count, which also gives NumPy's warning for an empty slice).
+    None if it does not qualify: the regular path waits for the size."""
+    if a.dtype.kind not in "fbiu" or (var and (not isinstance(ddof, (int, np.integer)))):
+        return None
+    try:
+        axes = range(a.ndim) if axis is None else normalize_axis_tuple(axis, a.ndim)
+    except (TypeError, ValueError, np.exceptions.AxisError):
+        return None  # NumPy raises
+    flags = tuple(i in axes for i in range(a.ndim))
+    keep = keepdims is True
+    if var:  # NumPy warns before it computes anything
+        dof = _viproc.reduced_count(a, flags, int(ddof), "Degrees of freedom <= 0 for slice")
+        n = _viproc.reduced_count(a, flags, 0, None)
+    else:
+        n = _viproc.reduced_count(a, flags, 0, "Mean of empty slice")
+    dtype = _moment_dtype(a, dtype)
+    s = _reduce(np.add, a, axis, True if var else keep, dtype)
+    if s is None or s.dtype.kind not in "fc":
+        return None
+    m = _divide_by_count_unsized(s, n)
+    del s  # the division takes over s's block if nothing else holds it (NumPy: in place)
+    if not var:
+        return m
+    x = np.square(np.subtract(a, m))
+    v = _reduce(np.add, x, axis, keep, dtype)
+    if v is None:
+        return None
+    v = _divide_by_count_unsized(v, dof)
+    if not sqrt:
+        return v
+    v = _like(v, np.sqrt, v)
+    return _scalar_result(v) if type(v) is ndarray and v.ndim == 0 else v
+
+
 def _r_mean(a, axis=None, dtype=None, out=None, keepdims=_NV, *, where=_NV):
     # NumPy's _methods._mean: sum (in float64 for bool and integers), then
     # divide by the count.
-    if out is not None or where is not _NV or type(a) is not ndarray or not a.size:
+    if out is not None or where is not _NV or type(a) is not ndarray:
+        return _NOPE
+    if _o2[0] and not _viproc.sized(a):
+        r = _moments_unsized(a, axis, dtype, keepdims, 0, False, False)
+        if r is not None:
+            return r
+    if not a.size:
         return _NOPE
     s = _reduce(np.add, a, axis, keepdims is True, _moment_dtype(a, dtype))
     if s is None or s.dtype.kind not in "fcbiu":
@@ -548,7 +645,13 @@ def _r_var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=_NV, *, where=_N
            mean=_NV, correction=_NV, sqrt=False):
     # NumPy's _methods._var (and _std), step by step.
     if (out is not None or where is not _NV or mean is not _NV or correction is not _NV
-            or type(a) is not ndarray or not a.size or a.dtype.kind not in "fcbiu"):
+            or type(a) is not ndarray):
+        return _NOPE
+    if _o2[0] and not _viproc.sized(a):
+        r = _moments_unsized(a, axis, dtype, keepdims, ddof, True, sqrt)
+        if r is not None:
+            return r
+    if not a.size or a.dtype.kind not in "fcbiu":
         return _NOPE
     count = _reduced_count(a, axis)
     if count - ddof <= 0:
@@ -559,8 +662,9 @@ def _r_var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=_NV, *, where=_N
         return _NOPE
     m = _divide_by_count(m, count)
     x = np.subtract(a, m)
-    if a.dtype.kind in "fiu":
-        x = np.square(x, out=x)
+    if x.dtype.kind == "f":  # NumPy: bool as x * conjugate(x), the same correctly rounded x * x
+        # O2: in place, x's layout would be waited for (the values are the same)
+        x = _like(x, np.square, x) if _o2[0] and not _viproc.sized(x) else np.square(x, out=x)
     elif x.dtype in _COMPLEX_TO_FLOAT:
         xv = x.view((_COMPLEX_TO_FLOAT[x.dtype], (2,)))
         np.square(xv, out=xv)
@@ -573,7 +677,9 @@ def _r_var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=_NV, *, where=_N
     v = _divide_by_count(v, max(count - ddof, 0))
     if not sqrt:
         return v
-    return np.sqrt(v, out=v) if isinstance(v, ndarray) else np.sqrt(v)
+    if isinstance(v, ndarray):
+        return _like(v, np.sqrt, v) if _o2[0] and not _viproc.sized(v) else np.sqrt(v, out=v)
+    return np.sqrt(v)
 
 
 def _r_arg(argmax):
@@ -2036,28 +2142,39 @@ def _site(site):
         return site, 0
 
 
+def _warn_at(msg, site):
+    """warnings.warn(msg, RuntimeWarning) attributed to the issue site."""
+    filename, lineno = _site(site)
+    module = None
+    for mod in list(sys.modules.values()):
+        if getattr(mod, "__file__", None) == filename:
+            module = mod
+            break
+    if module is not None:
+        registry = module.__dict__.setdefault("__warningregistry__", {})
+        name_ = module.__name__
+    else:
+        registry = _fp_registries.setdefault(filename, {})
+        name_ = "__main__" if filename == getattr(
+            sys.modules.get("__main__"), "__file__", None) else None
+    warnings.warn_explicit(msg, RuntimeWarning, filename, lineno, name_, registry)
+
+
+_WARNING = 16  # FpEvent kWarning: a RuntimeWarning of NumPy's Python code, `name` its text
+
+
 def _report_fp(events):
     for report, status, mode, ctx, name, site in events:
+        if report & _WARNING:
+            _warn_at(name, site)
+            continue
         for i, kind in enumerate(_FP_KINDS):
             if not report >> i & 1:
                 continue
             m = mode >> (3 * i) & 7
             msg = f"{kind} encountered in {name}"
             if m == 1:
-                filename, lineno = _site(site)
-                module = None
-                for mod in list(sys.modules.values()):
-                    if getattr(mod, "__file__", None) == filename:
-                        module = mod
-                        break
-                if module is not None:
-                    registry = module.__dict__.setdefault("__warningregistry__", {})
-                    name_ = module.__name__
-                else:
-                    registry = _fp_registries.setdefault(filename, {})
-                    name_ = "__main__" if filename == getattr(
-                        sys.modules.get("__main__"), "__file__", None) else None
-                warnings.warn_explicit(msg, RuntimeWarning, filename, lineno, name_, registry)
+                _warn_at(msg, site)
             elif m == 3 or m == 5:
                 call = _fp_calls[ctx] if ctx < len(_fp_calls) else None
                 if call is None:

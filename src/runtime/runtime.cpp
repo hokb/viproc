@@ -371,7 +371,8 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
                             : !new_outputs.empty() ? new_outputs[0].size()
                             : !inouts.empty()      ? inouts[0]->layout().size()
                                                    : 0;
-    std::int64_t retest = 0; // > 0: an expensive loop's re-test, its elements
+    std::int64_t retest = 0;                    // > 0: an expensive loop's re-test, its elements
+    std::atomic<std::int64_t>* stamp = nullptr; // a promotion check's (promote)
     // The chain this op is in (ChainScore): the first input in one's window.
     const char* chain = nullptr;
     std::uint64_t chain_seq = 0;
@@ -395,10 +396,31 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
             chain = issue_site;
             chain_seq = seq_;
         }
-        if (c != nullptr && policy_.promote(*c, elements, issue_site) &&
-            !policy_.prefers_inline(issue_site)) {
-            retest = c->retest ? elements : 0;
-            elements = po.sync_below;
+        auto ready = [&] {
+            for (const ArrayPtr& a : inputs) {
+                if (!a->group_->ready()) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (c != nullptr) {
+            if (policy_.promote(*c, elements, issue_site, ready)) {
+                stamp = policy_.take_stamp();
+                if (!policy_.prefers_inline(issue_site)) {
+                    retest = c->retest ? elements : 0;
+                    elements = po.sync_below;
+                }
+            } else if (policy_.take_drain()) [[unlikely]] {
+                // A promotion check's direct variant: the inputs first.
+                const Blocking blocking(options_);
+                for (const ArrayPtr& a : inputs) {
+                    Task* p = a->group_->last_writer_.get();
+                    if (p != nullptr && !spin_until([&] { return p->completed(); })) {
+                        p->wait_completed();
+                    }
+                }
+            }
         }
     }
     // The new outputs carry the chain on.
@@ -441,6 +463,7 @@ void Runtime::issue(const std::shared_ptr<Kernel>& kernel, std::span<const Array
     if (retest > 0) {
         task->time_kernel(retest);
     }
+    task->stamp_completion(stamp);
     Operands& in_ops = task->operands_for_issue(); // inputs, then outputs
 
     // 1. Snapshot everything this op reads (inputs, then in/outs): buffer,

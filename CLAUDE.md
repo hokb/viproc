@@ -320,7 +320,9 @@ size themselves in the task, pipelining.md S2; `zeros`/`ones`/`empty`/
 `full`/`arange` with pending size arrays and `x[mask]`, `flatnonzero`,
 1-d `nonzero` of pending data are tasks sizing from the data, S4;
 reductions without casts sized, laid out and planned in their tasks,
-`vp_reduce_deferred`; ranks known at issue, `Runtime::rank`; basic
+`vp_reduce_deferred`; on S4 outputs also casting ones (1-d: cast per
+NumPy buffer in the task, else an `astype` task first), `initial=` and
+`mean`/`var`/`std` (the count a task, `vp_reduced_count`); ranks known at issue, `Runtime::rank`; basic
 indexing, transposes, `swapaxes` and 1-d reshapes of such arrays as views by a rule,
 `ViewRule`; advanced indexing with slices and index arrays as deferred
 gathers, `DeferredGatherKernel`; NumPy
@@ -636,12 +638,28 @@ reference counting.
      decaying average per issue): a promoted op takes them onto the task
      path. Promote if own + followers' time > `direct_budget_ns` +
      followers x `chain_ns` (no observations: 2 followers of no time). A
-     promotion within 4x of its cost is confirmed by measuring (the
-     Accelerator's measurement is the same idea, on the worker, of issue
-     costs only): the main thread's time between two issues at the site, 8
-     periods directly, then 8 as tasks after a warm-up of 16 (sleeping
-     workers), the task side at least the direct time / workers; the faster
-     holds for 64 issues, doubling up to 4096. A promoted op is sized as
+     promotion is confirmed by measuring (the Accelerator's measurement is
+     the same idea, on the worker, of issue costs only), except a site's
+     first at a new site and those whose own time is 16x the cost (`kClear`): the main
+     thread's time per issue at the site over a span of >= 16 issues ending
+     on the kernel it started with, directly (after a warm-up of 4), then as
+     tasks (warm-up 16, sleeping workers); as tasks also the workers'
+     period, from the completion stamps of the span's two end tasks
+     (`Task::stamp_completion`): if the workers lag, the main thread's
+     period says nothing. Tasks win below 0.9x the direct time, 0.7x when
+     the workers are the bottleneck (their backlog grows to the look-ahead
+     limit, out of the caches); the faster holds for 256 issues, doubling
+     up to 4096 (at once when tasks are 2x faster). One site checks at a
+     time; while it measures directly no other site promotes, and pending
+     inputs that persist (a loop carrying its data, `z = z * z + c`) are
+     waited for (drained), at most twice, else tasks win; a site decided
+     direct drains once after each check (else a loop-carried chain stays
+     tasks for good). Before (#59 as merged: checks only within 4x, sites
+     without a chain of their own and clear ones unmeasured, the main
+     thread's period only) small serial chains ran as tasks: Mandelbrot of
+     1,000 elements 0.62x (direct 0.75x), now ~0.73x; `chain_serial` small
+     0.81x -> 0.91x; `dtype_chains` float32 small 0.54x -> 0.95x (medians of
+     5, 4 vCPUs); `array_pipelining.py` 1,000² unchanged (2.3x). A promoted op is sized as
      `sync_below` and takes rule 2 like a large op; if its site runs inline
      there, it takes the direct path instead (`prefers_inline`: an inline
      task costs more). Every 32nd promoted op is re-timed by its task on
@@ -1119,7 +1137,13 @@ Rules:
   plain 0-d array is passed as a borrowed 0-d ndarray: NumPy computes
   scalars partly with other code than 0-d arrays (complex64 `square`
   differs in the last bit). Any n-d operand, even of one element, keeps
-  the array path and NumPy's output shape. `float()`, `bool()`,
+  the array path and NumPy's output shape. Float arithmetic (`+ - * /` of
+  float64/float32) with a plain 0-d array is computed in C instead
+  (`float_arith`: NumPy's loop is one IEEE operation in the result dtype),
+  wherever it raises no FP flag but inexact; with a flag, NumPy's path
+  reports it (`x - a` of a 0-d `a`: 700 → 340 ns, NumPy 440; borrowing a
+  0-d view and calling NumPy's ufunc per op had made `scalar_newton`
+  0.95x → 0.74x). `float()`, `bool()`,
   `format()`, `round()` of a pending 0-d array sync.
 - **Fallback (sync + eager NumPy on viproc memory, `_Host`):** everything
   else (`nonzero`, `flatnonzero`, `argwhere`, `count_nonzero` sync on their
@@ -1576,9 +1600,18 @@ Rules:
   reductions, int16/float16, advanced indexing) should show up as fewer
   fallbacks and higher category scores. Cases are plain NumPy code and
   must stay bit-identical; add a case for every new kind of program.
-  Record every full run that a change is judged by in
-  `docs/benchmarks.md` (progress table: commit, build stamp, machine,
-  score, categories, size classes). Compare runs only on the same
+  **Every significant change commits a recorded full suite run**
+  (`suite.py --record "what changed" [--pr N]`, design, kernel, issue
+  path, bridge per-op code, scheduling): one JSON file per run in
+  `docs/benchmarks/runs/` (schema in `history.py`: commit, change, machine,
+  options incl. optimization level, summary, every configuration), committed
+  with the change, so the impact of each change stays readable by machine
+  later (`history.py list | impact | compare A B`). With it a same-machine
+  baseline (`--role baseline`, the change's base commit in a git worktree)
+  when no comparable record of the base exists; changes at O2 and higher
+  record a run at that level too (`VIPROC_OPT=2`). Add new cases to
+  `suite_cases.py` with the change that needs them. The progress table in
+  `docs/benchmarks.md` stays the readable summary. Compare runs only on the same
   machine; `--quick` runs are noisier and not comparable to full runs.
   Single configurations vary by ±25-30% between full runs, the score by a
   few points: judge a change by the cases it targets (same-machine

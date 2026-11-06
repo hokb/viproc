@@ -24,7 +24,10 @@ Usage:
     python3 python/benchmarks/suite.py --merge a/results.json b/results.json --out DIR
     docker run --rm -v "$PWD:/work" viproc:linux benchmark suite
 
-Writes DIR/results.json, DIR/report.md and DIR/report.html.
+Writes DIR/results.json, DIR/report.md and DIR/report.html. With
+--record "what changed" the run is also kept in the benchmark history
+(docs/benchmarks/runs/, one JSON file per run, read by history.py); commit
+that file with the change.
 """
 
 import argparse
@@ -368,6 +371,7 @@ def run_suite(args):
     ram = physical_memory()
     viproc.init()  # the runtime's default worker count (physical cores - 1)
     default = viproc.workers()
+    level = viproc.opt_level()
     viproc.shutdown()
     spec = (args.workers.replace("max", str(cores)).replace("default", str(default))
             .replace("threads", str(usable_threads())))
@@ -434,7 +438,10 @@ def run_suite(args):
               + (f"  stays NumPy: {','.join(r['not_in_viproc'])}" if r["not_in_viproc"] else "")
               + mark, flush=True)
 
-    return {"machine": info, "results": results, "summary": score(results, wmax)}
+    options = {"quick": bool(args.quick), "workers": args.workers, "filter": args.filter,
+               "repeat": args.repeat, "opt_level": level}
+    return {"machine": info, "options": options, "results": results,
+            "summary": score(results, wmax)}
 
 
 def main():
@@ -455,6 +462,14 @@ def main():
     p.add_argument("--repeat", type=int, help="timed runs per measurement (best of)")
     p.add_argument("--merge", nargs="+", metavar="RESULTS_JSON",
                    help="combine results of several machines/platforms into one report")
+    p.add_argument("--record", metavar="CHANGE",
+                   help="also keep the run in the benchmark history (docs/benchmarks/runs/, "
+                        "history.py): what changed, in one line; commit the file with the change")
+    p.add_argument("--pr", type=int, help="with --record: the pull request of the change")
+    p.add_argument("--role", choices=("change", "baseline"), default="change",
+                   help="with --record: 'baseline' marks a run of the state before a change")
+    p.add_argument("--baseline", help="with --record: id of the record this run is judged "
+                                      "against (default: the previous comparable run)")
     p.add_argument("--reference", action="store_true",
                    help="allow --out to replace results committed to git (reference runs)")
     args = p.parse_args()
@@ -471,6 +486,12 @@ def main():
     with open(os.path.join(args.out, "results.json"), "w") as f:
         json.dump(run, f, indent=1)
     suite_report.write_reports(run, args.out)
+    if args.record:
+        import history
+
+        record = history.make_record(run, args.record, pr=args.pr, baseline=args.baseline,
+                                     role=args.role)
+        print(f"recorded: {history.write_record(record)}")
     s = run["summary"]
     print()
     print(suite_report.summary_markdown(run))

@@ -797,7 +797,16 @@ TaskList Task::execute(ErrorTable* errors) {
                                      std::memory_order_relaxed);
             }
         }
+        if (stamp_ != nullptr) [[unlikely]] {
+            stamp_->store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count(),
+                          std::memory_order_release);
+        }
         fp_flags_ = r.fp_flags | std::fetestexcept(FE_ALL_EXCEPT);
+        if (r.warning != nullptr && r.status == 0 && errors != nullptr) [[unlikely]] {
+            errors->record_fp(FpEvent{kWarning, 0, fp_mode_, r.warning, issue_site_, id_});
+        }
         if (r.status != 0) {
             if (errors != nullptr) {
                 error_ = errors->record(

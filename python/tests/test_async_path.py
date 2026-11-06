@@ -136,6 +136,8 @@ def test_argmax_of_ready_data(call):
 @pytest.mark.parametrize("name, ops", [("mean", 2), ("var", 6), ("std", 7)])
 def test_moments(name, ops):
     x, v = data()
+    if viproc.opt_level() >= 2 and not viproc._viproc.sized(v):
+        ops += 1 if name == "mean" else 2  # the counts are tasks (no wait for v's size)
     same(assert_async(getattr(v, name), ops=ops, small_steps=True), getattr(x, name)())
 
 

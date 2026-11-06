@@ -220,6 +220,10 @@ struct KernelResult {
     int status = 0; // 0 = success
     std::string message;
     int fp_flags = 0; // FE_* flags raised while running (see <cfenv>)
+    // A RuntimeWarning NumPy's Python code gives for the op ("Mean of empty
+    // slice"), reported in the main thread at the issue site (kWarning event).
+    // A string with static storage, or null.
+    const char* warning = nullptr;
 };
 
 // The computation of an op. Runs on a worker or the main thread, without the
@@ -296,6 +300,9 @@ struct FpMode {
 inline constexpr int kFpRaise = 2;
 
 // FP errors of an op to report in the main thread (modes other than raise).
+// kWarning in `report`: a RuntimeWarning whose message is `name`
+// (KernelResult::warning), reported whatever the errstate.
+inline constexpr int kWarning = 16;
 struct FpEvent {
     int report = 0; // NumPy's FPE bits (1 divide, 2 over, 4 under, 8 invalid) to report
     int status = 0; // all FPE bits the op raised (passed to an errstate call)
@@ -546,6 +553,9 @@ class Task {
     // `elements` in the kernel's DirectCost::task_sample (a re-test of an
     // expensive loop, OffloadPolicy::promote).
     void time_kernel(std::int64_t elements) { timed_elements_ = elements; }
+    // Stores the steady clock's ns in `*stamp` when the kernel has run (the
+    // workers' period of a promotion check, OffloadPolicy::check).
+    void stamp_completion(std::atomic<std::int64_t>* stamp) { stamp_ = stamp; }
     void advance(TaskState next);
     // Announces `n` pending producers before registering on them, and makes
     // room for their consumer nodes (inline up to kInlineNodes).
@@ -695,7 +705,8 @@ class Task {
     std::shared_ptr<Kernel> kernel_;
     Operands operands_; // inputs, then outputs
     std::size_t ninputs_ = 0;
-    std::int64_t timed_elements_ = 0; // > 0: time the kernel (time_kernel)
+    std::int64_t timed_elements_ = 0;            // > 0: time the kernel (time_kernel)
+    std::atomic<std::int64_t>* stamp_ = nullptr; // stamp_completion
     const char* issue_site_;
     std::uint64_t id_ = 0;
     struct Copy {
