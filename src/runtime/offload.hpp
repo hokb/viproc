@@ -211,15 +211,15 @@ class OffloadPolicy {
         // starts no chain after its first iteration). Promoting those
         // unmeasured, and all up to 4x the cost, made Mandelbrot of 1,000
         // elements run every op as a task (0.6x of NumPy, 0.75x directly).
-        // A site's first promotion is not checked either: a check runs its
-        // first issues directly, and a site issued once would never get the
-        // task the estimate proposes.
+        // A new site's first promotion is not checked either: a check runs
+        // its first issues directly, and a site issued once would never get
+        // the task the estimate proposes. (A site seen twice is checked.)
         if (own >= kClear * cost) {
             c.retest = ++c.promoted % kRetest == 0;
             return true;
         }
         ChainScore& m = s.site == site ? s : chain_of(site, true);
-        if (!m.promoted) {
+        if (!m.promoted && !known) {
             m.promoted = true;
             c.retest = ++c.promoted % kRetest == 0;
             return true;

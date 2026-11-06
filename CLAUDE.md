@@ -636,7 +636,7 @@ reference counting.
      followers x `chain_ns` (no observations: 2 followers of no time). A
      promotion is confirmed by measuring (the Accelerator's measurement is
      the same idea, on the worker, of issue costs only), except a site's
-     first and those whose own time is 16x the cost (`kClear`): the main
+     first at a new site and those whose own time is 16x the cost (`kClear`): the main
      thread's time per issue at the site over a span of >= 16 issues ending
      on the kernel it started with, directly (after a warm-up of 4), then as
      tasks (warm-up 16, sleeping workers); as tasks also the workers'
