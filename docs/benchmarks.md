@@ -258,6 +258,7 @@ NumPy (one BLAS thread, as designed): 99 of 100 identical.
 | 11-06 | `976b28a` | O1: same-VM rerun of `976b28a` (87 on the VM of 10-29) (2.30) | 100 | 78 | 1.96x | 1.13x | 95 | 64 | 91 | 78 | 60 | 91 | 99 | 91 | 107 | 60 | 76 |
 | 11-06 | `5512fdf` | O1: same-VM baseline: `main` (#62), second run (2.30) | 100 | 78 | 1.99x | 1.08x | 93 | 76 | 96 | 72 | 63 | 75 | 84 | 82 | 92 | 68 | 77 |
 | 11-06 | `28ce0c4` | O1: float arithmetic with 0-d arrays in C (#63) (2.30) | 100 | 77 | 1.92x | 1.03x | 91 | 67 | 89 | 70 | 60 | 91 | 115 | 74 | 76 | 68 | 77 |
+| 11-06 | `19e720a` | O1: promotion checks see the workers and loops carrying data (#59 fix, #63) (2.30) | 100 | 82 | 2.03x | 1.10x | 93 | 79 | 94 | 73 | 63 | 94 | 115 | 76 | 95 | 68 | 78 |
 
 View changes, same VM (`3111820` → `5db8972`): score 64.0 → 63.7,
 unchanged within noise; the programs dominated by slicing gained:
