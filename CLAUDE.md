@@ -320,7 +320,9 @@ size themselves in the task, pipelining.md S2; `zeros`/`ones`/`empty`/
 `full`/`arange` with pending size arrays and `x[mask]`, `flatnonzero`,
 1-d `nonzero` of pending data are tasks sizing from the data, S4;
 reductions without casts sized, laid out and planned in their tasks,
-`vp_reduce_deferred`; ranks known at issue, `Runtime::rank`; basic
+`vp_reduce_deferred`; on S4 outputs also casting ones (an `astype` task
+first, float sums on NumPy's buffer blocks), `initial=` and
+`mean`/`var`/`std` (the count a task, `vp_reduced_count`); ranks known at issue, `Runtime::rank`; basic
 indexing, transposes, `swapaxes` and 1-d reshapes of such arrays as views by a rule,
 `ViewRule`; advanced indexing with slices and index arrays as deferred
 gathers, `DeferredGatherKernel`; NumPy

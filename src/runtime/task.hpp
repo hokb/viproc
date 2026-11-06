@@ -220,6 +220,10 @@ struct KernelResult {
     int status = 0; // 0 = success
     std::string message;
     int fp_flags = 0; // FE_* flags raised while running (see <cfenv>)
+    // A RuntimeWarning NumPy's Python code gives for the op ("Mean of empty
+    // slice"), reported in the main thread at the issue site (kWarning event).
+    // A string with static storage, or null.
+    const char* warning = nullptr;
 };
 
 // The computation of an op. Runs on a worker or the main thread, without the
@@ -296,6 +300,9 @@ struct FpMode {
 inline constexpr int kFpRaise = 2;
 
 // FP errors of an op to report in the main thread (modes other than raise).
+// kWarning in `report`: a RuntimeWarning whose message is `name`
+// (KernelResult::warning), reported whatever the errstate.
+inline constexpr int kWarning = 16;
 struct FpEvent {
     int report = 0; // NumPy's FPE bits (1 divide, 2 over, 4 under, 8 invalid) to report
     int status = 0; // all FPE bits the op raised (passed to an errstate call)

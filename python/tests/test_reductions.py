@@ -341,3 +341,16 @@ def test_shared_reduce_kernels_keep_each_identity():
             with pytest.raises(OverflowError) as got:
                 f.reduce(vx, initial=initial)
             assert str(got.value) == str(want.value)
+
+
+@pytest.mark.parametrize("fn", [np.mean, np.var, np.std])
+@pytest.mark.parametrize("dtype", [np.float32, np.complex64, np.int32])
+def test_moments_of_pending_data_are_scalars(fn, dtype):
+    """A full mean/var/std is NumPy's scalar (r.dtype.type(r / n)), also
+    where the division is cast back (float32): a pending 0-d result is marked
+    as a scalar, not a 0-d array."""
+    a = (np.arange(10_000) % 7).astype(dtype)
+    x = np.sin(viproc.asarray(np.zeros(10_000))).astype(dtype) + viproc.asarray(a)
+    r, want = fn(x), fn(a)
+    got = np.asarray(r)[()] if getattr(r, "_scalar", False) else r
+    assert type(got) is type(want) and got == want

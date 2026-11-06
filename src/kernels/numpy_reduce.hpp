@@ -75,11 +75,14 @@ std::shared_ptr<Kernel> make_reduce_kernel(const UfuncLoop* loop, ReducePlan pla
 // flag per input dimension, removed or kept as extent 1), lays it out
 // C-contiguously and plans the loop calls when it runs. A reduced axis of
 // extent 0 without an identity fails the size step with `empty_error`
-// (NumPy's ValueError). `loop` is resolved for unknown strides.
+// (NumPy's ValueError). `loop` is resolved for unknown strides. `chunk` > 0
+// (a 1-d input, all reduced, with an identity): the loop is called once per
+// `chunk` elements, as NumPy calls it on the buffers of a casting iterator.
 std::shared_ptr<Kernel> make_deferred_reduce_kernel(const UfuncLoop* loop,
                                                     std::vector<bool> reduced, bool keepdims,
                                                     std::vector<std::byte> identity,
-                                                    std::string empty_error);
+                                                    std::string empty_error,
+                                                    std::int64_t chunk = 0);
 
 // ufunc.accumulate along `axis` (cumsum, cumprod, ...), as
 // PyUFunc_Accumulate runs it without casts: per position of the other axes,

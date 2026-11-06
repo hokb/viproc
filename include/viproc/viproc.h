@@ -330,6 +330,13 @@ int vp_ufunc_issue(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
 int vp_ufunc_issue_deferred(vp_runtime* rt, const vp_loop* loop, vp_array* const* inputs,
                             vp_array** result, const char* site, char* err, size_t errlen);
 
+/* [main thread] O2: the next deferred element-wise op or cast
+ * (vp_ufunc_issue_deferred, vp_astype) lays its result out like `like`
+ * (NULL: clears it): its strides where shape and item size match, as NumPy's
+ * in-place `out=like` would keep them (an out= op itself waits for like's
+ * layout). One-shot: taken by that op. */
+void vp_set_like(vp_runtime* rt, vp_array* like);
+
 /* Optimization level O2, pending sizes (docs/design/pipelining.md, S4):
  * creates np.zeros / ones / empty / full (`kind` 0-3) of `ndim` extents
  * `dims`, each >= 0 or -1 for the value of the next of `sizes` (0-d int32 or
@@ -458,10 +465,23 @@ int vp_accumulate(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, vp_ar
  * calls; reduced axes that do not coalesce are visited one by one (sums may
  * round differently from NumPy's buffered blocks). VP_UNSUPPORTED where the
  * reduction casts (int32 sums, ...) or the identity is not a Python bool,
- * int or float: the regular path. */
+ * int or float: the regular path. `chunk` > 0 (a 1-d input of the
+ * accumulator dtype, cast by the caller, and an identity): one loop call per
+ * `chunk` elements, as NumPy calls the loop on its casting iterator's
+ * buffers (np.getbufsize()); 0: as without a cast. */
 int vp_reduce_deferred(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
-                       int keepdims, PyObject* identity, vp_array** result, const char* site,
-                       char* err, size_t errlen);
+                       int keepdims, PyObject* identity, int64_t chunk, vp_array** result,
+                       const char* site, char* err, size_t errlen);
+
+/* O2: the count NumPy's mean/var divide by (_count_reduce_items), as a
+ * 0-d intp array computed by a task from in's size: max(n - ddof, 0), n the
+ * product of the extents of the axes flagged in `axes` (one flag per
+ * dimension, vp_array_rank(in)). If ddof >= n and `warning` is not NULL,
+ * the task reports `warning` (a string with static storage) as a
+ * RuntimeWarning at the issue site, as NumPy's _mean and _var warn. */
+int vp_reduced_count(vp_runtime* rt, vp_array* in, const unsigned char* axes, int64_t ddof,
+                     const char* warning, vp_array** result, const char* site, char* err,
+                     size_t errlen);
 
 /* vp_reduce() into an existing array `out` (in place, *result set to NULL):
  * only where `out` has the dtype and layout of the result NumPy would

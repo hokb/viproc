@@ -280,6 +280,14 @@ ufunc call (`_check_ufunc_fperr`) under the `np.errstate` in effect: a
   apply; `call(kind, status)` and `log.write("Warning: ...\n")` with NumPy's
   arguments; `print` to stderr; NumPy's `NameError` if no call object is set.
 
+- **Warnings of NumPy's Python code** that a task decides at O2
+  (`KernelResult::warning`, an `FpEvent` with `kWarning` and the message as
+  its name): "Mean of empty slice" and "Degrees of freedom <= 0 for slice"
+  of `mean`/`var`/`std` of an array whose size a task computes
+  (pipelining.md, "Reductions of S4 outputs"). Reported in issue order with
+  the FP events, as a `RuntimeWarning` at the issue site, whatever the
+  errstate (NumPy's `warnings.warn`).
+
 Accepted differences (E7): the warning comes a little after the call (at the
 next call into viproc, the interpreter's next check, a sync point or
 `wait_all()`), and NumPy functions written in Python (`np.sum`, `mean`)

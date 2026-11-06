@@ -228,6 +228,61 @@ sums accumulate in int64), `dtype=`, `initial=`, `out=`, `where=` take the
 regular path. Cost at O1 (callgrind, `x.sum(axis=0)` of 100 elements):
 unchanged (8,060 vs. 7,820 instructions per call, noise).
 
+**Reductions of S4 outputs (implemented at O2).** An array whose size a
+task computes from data (S4: `x[mask]`, `flatnonzero`, `zeros(n)`) has no
+layout until its input data is there; an op that reads the layout at its
+issue blocks the main thread that long, as a sync would. Reductions whose
+input is still sized by its task (`vp_array_sized` 0) therefore issue
+without that wait:
+
+- **Casts** (int32 and bool sums accumulate in int64, `dtype=`): an
+  `astype` task to the accumulator dtype NumPy picks (the plan's probe),
+  then the deferred reduction. Integer, min/max and product reductions give
+  the same values whatever the blocks. Floating-point sums over a cast
+  depend on NumPy's iterator, which casts into buffers of `np.getbufsize()`
+  elements and calls the pairwise loop once per buffer onto the
+  accumulator: the deferred kernel makes the same calls for a 1-d input
+  (`chunk`, read at issue; fuzzed bit-identical for f8→f4, int64→f8,
+  f4→f8, c16→c8, strided and reversed inputs, buffer sizes 1024-20000).
+  Inputs of more dimensions with such a cast and complex-to-real casts
+  (NumPy's ComplexWarning) keep the regular path.
+- **`initial=`** is the deferred kernel's identity (Python bool, int or
+  float).
+- **`mean`, `var`, `std`** of real data are composed as NumPy's `_methods`
+  composes them, with the count NumPy divides by as a task
+  (`vp_reduced_count`: a 0-d intp computed from the input's size,
+  `max(n - ddof, 0)`); the divisions, casts back, squares and square
+  roots NumPy runs in place (`out=r`) are new deferred ops laid out like
+  `r` (`vp_set_like`: the task copies r's strides once r is laid out, so
+  extent-1 axes keep NumPy's strides): an `out=` op would wait for r's
+  layout at issue. The same values and layouts. The count's
+  task gives NumPy's "Mean of empty slice" and "Degrees of freedom <= 0 for
+  slice" (`KernelResult::warning`, error-handling.md, E8). Where NumPy
+  divides a scalar result by scalar math ("invalid value encountered in
+  scalar divide" for an empty slice), the pending scalar's division is an
+  op and its warning reads "in divide" (an open difference of every
+  operator on pending scalars). Complex data keep the regular path (NumPy
+  squares through a float view).
+- At O2 the regular `var`/`std` do the same where their operand is not
+  sized yet, and `mean`/`var` of a 0-d result return NumPy's scalar type
+  at every level (a pending float32 result was a 0-d array: the cast back
+  lost the scalar mark).
+
+Measured (4 vCPUs, Release; 16 rows of 200,000 doubles, per row
+`m = sin(x) > 0.3; v = x[m]` and `v.mean()`, `v.std()`, `xi[m].sum()`
+(int32), `v.sum(dtype=float32)`): before, O2 waited 20 times per run at
+issue, 65.9 ms (NumPy 61.4 ms, 0.93x); now no wait, the main thread issues
+everything in 0.74 ms, 31.6 ms in all (1.93x; O1, which syncs on each
+mask, 39.2 ms), bit-identical. Cost at O1 (callgrind, 1 worker, 3,000
+doubles): `x.mean()` +700-1,000 instructions per call (~42,000; the level
+and size tests in the Python handlers), `x.var()` +400 (~107,000), `x * y`,
+`xi.sum()`, `m.mean(axis=0)` unchanged. Tests: `test_o2_reductions_of_data_sizes`
+(no size wait, no sync, values, types). Still waiting: `argmin`/
+`argmax`, `any`/`all` of non-bool data, `cumsum`, `take`, `np.dot`,
+assignments, and a boolean index with a ready mask on an array still
+sized by its task (its count is known, the gather reads the array's
+layout at issue).
+
 **Today.** Every asynchronous op is a NumPy function taken as a whole: its
 result shape is computed on the main thread at issue, so every task reaches
 `SizeCompleted` at issue (`runtime.cpp`, `issue`); consumers receive the
@@ -376,6 +431,7 @@ not only its shape, before sizing: they read its data. Cost at O1
 (~29,900 instructions per op).
 
 **Not yet:** `take`, `np.dot`, assignments and the other regular-path ops
+(reductions: see "Reductions of S4 outputs")
 read their inputs' layouts at issue, so one issued on an array a task
 still sizes (S2/S4) waits at its issue for that array's layout (for an
 S4 array: until its size input is computed). Making them deferred

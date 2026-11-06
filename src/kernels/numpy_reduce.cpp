@@ -238,9 +238,10 @@ class ReduceKernel : public Kernel {
 class DeferredReduceKernel : public Kernel {
   public:
     DeferredReduceKernel(const UfuncLoop* loop, std::vector<bool> reduced, bool keepdims,
-                         std::vector<std::byte> identity, std::string empty_error)
+                         std::vector<std::byte> identity, std::string empty_error,
+                         std::int64_t chunk)
         : loop_(loop), reduced_(std::move(reduced)), keepdims_(keepdims),
-          identity_(std::move(identity)), empty_error_(std::move(empty_error)) {}
+          identity_(std::move(identity)), empty_error_(std::move(empty_error)), chunk_(chunk) {}
     const char* name() const override { return loop_->name(); }
     const char* fp_name() const override { return loop_->reports_fp_errors() ? "reduce" : nullptr; }
 
@@ -283,6 +284,9 @@ class DeferredReduceKernel : public Kernel {
             }
             return {};
         }
+        if (chunk_ > 0) {
+            return run_chunked(inputs[0], outputs[0]);
+        }
         std::array<bool, 64> flags{}; // NumPy's NPY_MAXDIMS
         std::copy(reduced_.begin(), reduced_.end(), flags.begin());
         const ReducePlan plan =
@@ -291,11 +295,30 @@ class DeferredReduceKernel : public Kernel {
     }
 
   private:
+    // A 1-d input NumPy's iterator casts in buffers of chunk_ elements: one
+    // loop call per buffer onto the accumulator, from the identity.
+    KernelResult run_chunked(const Operand& input, const Operand& output) const {
+        const Layout& in = input.layout();
+        char* const src = reinterpret_cast<char*>(input.first());
+        char* const dst = reinterpret_cast<char*>(output.first());
+        std::memcpy(dst, identity_.data(), identity_.size());
+        const std::intptr_t strides[3] = {0, static_cast<std::intptr_t>(in.strides[0]), 0};
+        for (std::int64_t i = 0; i < in.shape[0]; i += chunk_) {
+            std::intptr_t count = static_cast<std::intptr_t>(std::min(chunk_, in.shape[0] - i));
+            char* data[3] = {dst, src + i * in.strides[0], dst};
+            if (loop_->call(data, &count, strides) != 0) {
+                return KernelResult{1, "NumPy reduction loop failed", 0};
+            }
+        }
+        return {};
+    }
+
     const UfuncLoop* loop_;
     std::vector<bool> reduced_;
     bool keepdims_;
     std::vector<std::byte> identity_;
     std::string empty_error_;
+    std::int64_t chunk_;
 };
 
 } // namespace
@@ -308,9 +331,9 @@ std::shared_ptr<Kernel> make_reduce_kernel(const UfuncLoop* loop, ReducePlan pla
 std::shared_ptr<Kernel> make_deferred_reduce_kernel(const UfuncLoop* loop,
                                                     std::vector<bool> reduced, bool keepdims,
                                                     std::vector<std::byte> identity,
-                                                    std::string empty_error) {
-    return std::make_shared<DeferredReduceKernel>(loop, std::move(reduced), keepdims,
-                                                  std::move(identity), std::move(empty_error));
+                                                    std::string empty_error, std::int64_t chunk) {
+    return std::make_shared<DeferredReduceKernel>(
+        loop, std::move(reduced), keepdims, std::move(identity), std::move(empty_error), chunk);
 }
 
 namespace {

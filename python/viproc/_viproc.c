@@ -53,6 +53,7 @@ static PyObject* AsyncLinAlgError = NULL;        /* AsyncError and numpy.linalg.
 static PyObject* AsyncFloatingPointError = NULL; /* AsyncError and FloatingPointError */
 static long long g_small = 2048; /* the runtime's sync_below: ops this small run directly */
 static int g_opt = 1;            /* the optimization level (vp_opt_level) */
+static int g_like = 0;           /* vp_set_like is set: the next op is the runtime's (O2) */
 
 /* Registered by _ndarray.py via _viproc.setup(). */
 static PyTypeObject* g_array_cls = NULL; /* viproc.ndarray */
@@ -1513,14 +1514,13 @@ static PyObject* elision_candidate(PyObject* const* inputs, vp_array* const* ins
 /* --- scalar shortcut ------------------------------------------------------ */
 
 /* An op on scalars only (ready 0-d viproc arrays standing for NumPy scalars,
- * `_scalar`; Python and NumPy scalars) has nothing to run asynchronously: NumPy computes it right here, on NumPy
- * scalars, as the NumPy program would (its 0-d values are NumPy scalars:
- * reductions and scalar indexing return them, and ufuncs on 0-d arrays do
- * too). Its result is NumPy's: a NumPy scalar. Any n-d operand (even of one
- * element) and a plain 0-d array (NumPy's 0-d array) keep the array path, so NumPy's output shapes stay as they
- * are. Fills `out` (capacity `out_len` entries, at least `n`) with new
- * references and returns 1, or 0 if an operand is not a ready scalar. Call it
- * through SCALARS_OF, which passes the length of the `out` array. */
+ * `_scalar`; Python and NumPy scalars) has nothing to run asynchronously: NumPy computes it right
+ * here, on NumPy scalars, as the NumPy program would (its 0-d values are NumPy scalars: reductions
+ * and scalar indexing return them, and ufuncs on 0-d arrays do too). Its result is NumPy's: a NumPy
+ * scalar. Any n-d operand (even of one element) and a plain 0-d array (NumPy's 0-d array) keep the
+ * array path, so NumPy's output shapes stay as they are. Fills `out` (capacity `out_len` entries,
+ * at least `n`) with new references and returns 1, or 0 if an operand is not a ready scalar. Call
+ * it through SCALARS_OF, which passes the length of the `out` array. */
 static int end_borrow(vp_array* a, PyObject* view);
 
 /* Releases what scalars_of() filled in: borrowed views end their borrow. */
@@ -1564,7 +1564,7 @@ static int scalars_of(PyObject* const* inputs, Py_ssize_t n, PyObject** out, Py_
          * plain 0-d array stays one (a borrowed view): NumPy computes on
          * 0-d arrays with its array loops, on scalars partly with other
          * code (complex64 square differs in the last bit). */
-        out[i] = !is_array(x)                  ? Py_NewRef(x)
+        out[i] = !is_array(x)                ? Py_NewRef(x)
                  : ((ArrayObject*)x)->scalar ? vp_array_scalar(((ArrayObject*)x)->a)
                                              : vp_array_borrow(((ArrayObject*)x)->a);
         if (out[i] == NULL) {
@@ -2308,9 +2308,8 @@ static PyObject* Array_subscript(PyObject* self, PyObject* key) {
         PyErr_SetString(PyExc_RuntimeError, "viproc: setup() was not called");
         return NULL;
     }
-    return PyObject_CallFunctionObjArgs(g_opt >= 2 && g_getitem_o2 != NULL ? g_getitem_o2
-                                                                           : g_getitem,
-                                        self, key, NULL);
+    return PyObject_CallFunctionObjArgs(
+        g_opt >= 2 && g_getitem_o2 != NULL ? g_getitem_o2 : g_getitem, self, key, NULL);
 }
 
 static int64_t array_size(vp_array* a);
@@ -3775,6 +3774,124 @@ static PyObject* m_reduce(PyObject* self, PyObject* args) {
     return out != Py_None ? Py_NewRef(out) : wrap_array(res);
 }
 
+/* Fills one flag per dimension of `a` (its rank) from a sequence of bools. */
+static int axis_flags(PyObject* axes, int nd, unsigned char* flags) {
+    PyObject* fast = PySequence_Fast(axes, "axes must be a sequence");
+    if (fast == NULL) {
+        return -1;
+    }
+    if (PySequence_Fast_GET_SIZE(fast) != nd || nd > MAXDIMS) {
+        Py_DECREF(fast);
+        PyErr_SetString(PyExc_ValueError, "one axis flag per dimension expected");
+        return -1;
+    }
+    for (int i = 0; i < nd; ++i) {
+        const int t = PyObject_IsTrue(PySequence_Fast_GET_ITEM(fast, i));
+        if (t < 0) {
+            Py_DECREF(fast);
+            return -1;
+        }
+        flags[i] = (unsigned char)t;
+    }
+    Py_DECREF(fast);
+    return 0;
+}
+
+/* reduce_deferred(ufunc, a, axes, keepdims, initial[, chunk]): O2, a
+ * reduction sized, laid out and planned in its task (vp_reduce_deferred, no
+ * cast: the caller casts first; `chunk`: NumPy's buffer size for a 1-d input
+ * it cast); None if unsupported. */
+static PyObject* m_reduce_deferred(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject *ufunc, *a, *axes, *identity;
+    int keepdims;
+    long long chunk = 0;
+    if (!PyArg_ParseTuple(args, "OO!OpO|L", &ufunc, &ArrayType, &a, &axes, &keepdims, &identity,
+                          &chunk) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    vp_array* in = array_of(a);
+    unsigned char flags[MAXDIMS];
+    if (axis_flags(axes, vp_array_rank(in), flags) < 0) {
+        return NULL;
+    }
+    vp_array* res = NULL;
+    char err[ERRLEN] = "";
+    const int st = vp_reduce_deferred(g_rt, ufunc, in, flags, keepdims, identity, (int64_t)chunk,
+                                      &res, issue_site(), err, sizeof err);
+    if (st == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(st, err) < 0) {
+        return NULL;
+    }
+    return wrap_array(res);
+}
+
+/* like(a | None): the next deferred element-wise op or cast lays its result
+ * out like `a` (vp_set_like). */
+static PyObject* m_like(PyObject* self, PyObject* o) {
+    (void)self;
+    if (check_runtime() < 0) {
+        return NULL;
+    }
+    if (o != Py_None && !is_array(o)) {
+        PyErr_SetString(PyExc_TypeError, "like: a viproc array or None expected");
+        return NULL;
+    }
+    vp_set_like(g_rt, o == Py_None ? NULL : array_of(o));
+    g_like = o != Py_None;
+    Py_RETURN_NONE;
+}
+
+/* reduced_count(a, axes, ddof, warning): O2, NumPy's mean/var count as a
+ * pending 0-d intp array (vp_reduced_count). `warning` must be one of the
+ * messages below (the task keeps the pointer) or None. */
+static PyObject* m_reduced_count(PyObject* self, PyObject* args) {
+    (void)self;
+    static const char* const warnings[] = {"Mean of empty slice",
+                                           "Degrees of freedom <= 0 for slice"};
+    PyObject *a, *axes, *warning;
+    long long ddof;
+    if (!PyArg_ParseTuple(args, "O!OLO", &ArrayType, &a, &axes, &ddof, &warning) ||
+        check_runtime() < 0) {
+        return NULL;
+    }
+    const char* w = NULL;
+    if (warning != Py_None) {
+        const char* text = PyUnicode_AsUTF8(warning);
+        if (text == NULL) {
+            return NULL;
+        }
+        for (size_t i = 0; i < sizeof warnings / sizeof *warnings; ++i) {
+            if (strcmp(text, warnings[i]) == 0) {
+                w = warnings[i];
+            }
+        }
+        if (w == NULL) {
+            PyErr_SetString(PyExc_ValueError, "reduced_count: unknown warning");
+            return NULL;
+        }
+    }
+    vp_array* in = array_of(a);
+    unsigned char flags[MAXDIMS];
+    if (axis_flags(axes, vp_array_rank(in), flags) < 0) {
+        return NULL;
+    }
+    vp_array* res = NULL;
+    char err[ERRLEN] = "";
+    const int st =
+        vp_reduced_count(g_rt, in, flags, (int64_t)ddof, w, &res, issue_site(), err, sizeof err);
+    if (st == VP_UNSUPPORTED) {
+        Py_RETURN_NONE;
+    }
+    if (raise_status(st, err) < 0) {
+        return NULL;
+    }
+    return wrap_array(res);
+}
+
 static PyObject* m_ufunc_typed(PyObject* self, PyObject* args) {
     (void)self;
     PyObject *ufunc, *ins, *codes, *out, *where = Py_None;
@@ -4270,7 +4387,7 @@ static int64_t array_size(vp_array* a) {
 /* 1 if NumPy computes the call right away on `self`'s data (small, ready,
  * no other viproc array among the arguments). */
 static int red_delegates(PyObject* self, PyObject* const* v, Py_ssize_t n) {
-    if (Py_TYPE(self) != g_array_cls || !vp_array_ready(((ArrayObject*)self)->a) ||
+    if (g_like || Py_TYPE(self) != g_array_cls || !vp_array_ready(((ArrayObject*)self)->a) ||
         array_size(((ArrayObject*)self)->a) > g_small) {
         return 0;
     }
@@ -4357,10 +4474,13 @@ static int red_async(const RedSpec* sp, PyObject* self, PyObject* const* v, PyOb
     int st = VP_UNSUPPORTED;
     if (g_opt >= 2 && !(vp_array_sized(a) && vp_array_ready(a) && array_size(a) <= g_small)) {
         /* O2: the task sizes, lays out and plans it (pipelining.md, S2) */
-        st = vp_reduce_deferred(g_rt, sp->ufunc, a, flags, keepdims, sp->identity, &r, issue_site(),
-                                err, sizeof err);
+        st = vp_reduce_deferred(g_rt, sp->ufunc, a, flags, keepdims, sp->identity, 0, &r,
+                                issue_site(), err, sizeof err);
     }
     if (st == VP_UNSUPPORTED) {
+        if (g_opt >= 2 && !vp_array_sized(a)) {
+            return 0; /* a cast first (int32 sums): _reduce, no wait for the size */
+        }
         st = vp_reduce(g_rt, sp->ufunc, a, flags, keepdims, Py_None, sp->identity, &r, issue_site(),
                        err, sizeof err);
     }
@@ -5567,6 +5687,12 @@ static PyMethodDef methods[] = {
      "ufunc_at(ufunc, a, indices, values|None): async ufunc.at along axis 0; False if unsupported"},
     {"accumulate", m_accumulate, METH_VARARGS,
      "accumulate(ufunc, a, axis): async ufunc.accumulate without casts, or None"},
+    {"reduce_deferred", m_reduce_deferred, METH_VARARGS,
+     "reduce_deferred(ufunc, a, axes, keepdims, initial): O2 reduction sized in its task, or None"},
+    {"like", m_like, METH_O,
+     "like(a | None): the next deferred element-wise op or cast is laid out like a"},
+    {"reduced_count", m_reduced_count, METH_VARARGS,
+     "reduced_count(a, axes, ddof, warning): O2 mean/var count as a pending 0-d intp array"},
     {"reduce", m_reduce, METH_VARARGS,
      "reduce(ufunc, a, axes, keepdims, dtype, initial[, out]): async reduction (into out), or "
      "None if unsupported"},
