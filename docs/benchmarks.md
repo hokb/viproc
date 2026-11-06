@@ -255,6 +255,9 @@ NumPy (one BLAS thread, as designed): 99 of 100 identical.
 | 11-06 | `5512fdf` | O2: same-VM baseline: `main` (#62) (2.30) | 100 | 72 | 1.82x | 0.98x | 93 | 67 | 94 | 62 | 54 | 69 | 85 | 71 | 64 | 67 | 77 |
 | 11-06 | `7f568bd` | O2: O2 S4 reductions without a size wait (#63, first version) (2.30) | 100 | 70 | 1.77x | 0.96x | 94 | 63 | 85 | 64 | 51 | 72 | 84 | 69 | 64 | 64 | 77 |
 | 11-06 | `7708aba` | O2: same, casts per buffer in the task, in-place divides kept (#63) (2.30) | 100 | 74 | 1.85x | 0.99x | 97 | 67 | 100 | 63 | 53 | 73 | 85 | 75 | 67 | 66 | 80 |
+| 11-06 | `976b28a` | O1: same-VM rerun of `976b28a` (87 on the VM of 10-29) (2.30) | 100 | 78 | 1.96x | 1.13x | 95 | 64 | 91 | 78 | 60 | 91 | 99 | 91 | 107 | 60 | 76 |
+| 11-06 | `5512fdf` | O1: same-VM baseline: `main` (#62), second run (2.30) | 100 | 78 | 1.99x | 1.08x | 93 | 76 | 96 | 72 | 63 | 75 | 84 | 82 | 92 | 68 | 77 |
+| 11-06 | `28ce0c4` | O1: float arithmetic with 0-d arrays in C (#63) (2.30) | 100 | 77 | 1.92x | 1.03x | 91 | 67 | 89 | 70 | 60 | 91 | 115 | 74 | 76 | 68 | 77 |
 
 View changes, same VM (`3111820` → `5db8972`): score 64.0 → 63.7,
 unchanged within noise; the programs dominated by slicing gained:
