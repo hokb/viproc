@@ -222,8 +222,12 @@ Category x size (score of the configurations in the cell):
 ## Progress per change
 
 Full suite runs, Linux, 4 cores, Release. Rows marked (2.10) ran on the
-Xeon @ 2.10 GHz VM, (2.80) on the 2.80 GHz VM; only rows of the same VM
-compare directly.
+Xeon @ 2.10 GHz VM, (2.80) on the 2.80 GHz VM, (2.30) on the 2.30 GHz VM;
+only rows of the same VM compare directly. Rows without an optimization
+level ran at O1. Every run from 11-06 on is recorded in full in
+`docs/benchmarks/runs/` (`history.py`, see "Adding a run"); the rows
+before are there as summaries. At O2 `matmul_batch` medium C differs from
+NumPy (one BLAS thread, as designed): 99 of 100 identical.
 
 | date | commit | change | cases | score | w=4 | w=1 | chains | index. | reduct. | algor. | dtypes | scalars | scalar | tiny | small | medium | large |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -245,6 +249,12 @@ compare directly.
 | 10-23 | this PR | lock-free consumer list, no mutex in the task (2.10) | 100 | 83 | 2.13x | 1.21x | 108 | 73 | 101 | 79 | 64 | 80 | 65 | 100 | 102 | 67 | 93 |
 | 10-29 | `464ae7a` | same-VM baseline for the issue-rate fixes: `main` (#55) | 100 | 84 | 2.12x | 1.21x | 97 | 81 | 100 | 74 | 69 | 89 | 99 | 102 | 100 | 70 | 82 |
 | 10-29 | this PR | issue rate: re-tests on the worker, shared reduce kernels, initial-exec TLS, `C[i] = v` without a view object | 100 | 87 | 2.21x | 1.21x | 98 | 92 | 104 | 83 | 67 | 81 | 90 | 86 | 98 | 75 | 89 |
+| 11-06 | `5512fdf` | O1: same-VM baseline: `main` (#62) (2.30) | 100 | 76 | 1.94x | 1.08x | 91 | 72 | 91 | 71 | 61 | 76 | 87 | 80 | 87 | 66 | 77 |
+| 11-06 | `7f568bd` | O1: O2 S4 reductions without a size wait (#63, first version) (2.30) | 100 | 77 | 1.96x | 1.08x | 93 | 72 | 91 | 69 | 63 | 79 | 86 | 79 | 92 | 67 | 75 |
+| 11-06 | `7708aba` | O1: same, casts per buffer in the task, in-place divides kept (#63) (2.30) | 100 | 76 | 1.92x | 1.07x | 92 | 71 | 99 | 67 | 59 | 78 | 85 | 83 | 86 | 65 | 75 |
+| 11-06 | `5512fdf` | O2: same-VM baseline: `main` (#62) (2.30) | 100 | 72 | 1.82x | 0.98x | 93 | 67 | 94 | 62 | 54 | 69 | 85 | 71 | 64 | 67 | 77 |
+| 11-06 | `7f568bd` | O2: O2 S4 reductions without a size wait (#63, first version) (2.30) | 100 | 70 | 1.77x | 0.96x | 94 | 63 | 85 | 64 | 51 | 72 | 84 | 69 | 64 | 64 | 77 |
+| 11-06 | `7708aba` | O2: same, casts per buffer in the task, in-place divides kept (#63) (2.30) | 100 | 74 | 1.85x | 0.99x | 97 | 67 | 100 | 63 | 53 | 73 | 85 | 75 | 67 | 66 | 80 |
 
 View changes, same VM (`3111820` → `5db8972`): score 64.0 → 63.7,
 unchanged within noise; the programs dominated by slicing gained:
@@ -927,11 +937,39 @@ questions). Re-run with the current build before drawing conclusions
 
 ## Adding a run
 
-1. Release build; `PYTHONPATH=build/python python3
-   python/benchmarks/suite.py --out <dir>` (or `docker/benchmark.sh`).
-2. Check `results.json`: build stamp, machine, all results identical.
-3. Add a row to "Progress per change" (commit, what changed, VM/machine);
-   when the machine changed, also run the previous commit on it (git
-   worktree) so the change has a same-machine before/after.
-4. Refresh "Current results" from `results.json` when it is the newest
-   full run on the reference machine.
+Every significant change commits a full suite run with it, machine-readable,
+so that later every change's impact can be read off (`docs/benchmarks/runs/`,
+one JSON file per run; schema `viproc-benchmark-run/1`, described in
+`python/benchmarks/history.py`).
+
+1. Release build of the change (committed: the record names `HEAD` and
+   marks uncommitted changes as dirty); `PYTHONPATH=build/python python3
+   python/benchmarks/suite.py --record "what changed" --pr N`.
+2. Same machine, no comparable record of the base yet: run the base commit
+   too (git worktree, Release build) with `--record "..." --role baseline`,
+   and pass `--baseline <its id>` to the change's run (else `history.py`
+   pairs the change with the previous comparable run). Changes gated on an
+   optimization level record a run at that level as well (`VIPROC_OPT=2`).
+3. Check the run: build stamp, all results identical
+   (`history.py impact`, `history.py compare <base> <change>`).
+4. Commit the record files with the change; add a row to "Progress per
+   change" and refresh "Current results" when it is the newest full run on
+   the reference machine.
+
+A run made without `--record` (its `results.json`) can be recorded later:
+`history.py record <dir>/results.json --change "..." --commit <sha> [--opt N]`.
+
+**Reading the history** (`python3 python/benchmarks/history.py`):
+
+- `list [--json]`: every recorded run (date, commit, optimization level,
+  machine id, score, speedups, change).
+- `impact [--json]`: every change against its baseline: score, categories,
+  the configurations that moved most.
+- `compare A B [--json]`: two runs, per category, size class and
+  configuration (ids, id prefixes or commit prefixes).
+- `show ID [--json]`: one run.
+
+Machine ids hash the CPU model, cores, RAM and OS: runs compare only within
+one id and with the same options and level. `progress-2026-10.json` holds
+the summary rows of "Progress per change" from before records existed (no
+per-configuration results; "before" rows name the measured parent commit).

@@ -235,17 +235,21 @@ issue blocks the main thread that long, as a sync would. Reductions whose
 input is still sized by its task (`vp_array_sized` 0) therefore issue
 without that wait:
 
-- **Casts** (int32 and bool sums accumulate in int64, `dtype=`): an
-  `astype` task to the accumulator dtype NumPy picks (the plan's probe),
-  then the deferred reduction. Integer, min/max and product reductions give
-  the same values whatever the blocks. Floating-point sums over a cast
-  depend on NumPy's iterator, which casts into buffers of `np.getbufsize()`
-  elements and calls the pairwise loop once per buffer onto the
-  accumulator: the deferred kernel makes the same calls for a 1-d input
-  (`chunk`, read at issue; fuzzed bit-identical for f8→f4, int64→f8,
-  f4→f8, c16→c8, strided and reversed inputs, buffer sizes 1024-20000).
-  Inputs of more dimensions with such a cast and complex-to-real casts
-  (NumPy's ComplexWarning) keep the regular path.
+- **Casts** (int32 and bool sums accumulate in int64, `dtype=`) of 1-d
+  inputs with an identity are cast by the deferred kernel itself, as
+  NumPy's iterator casts them: into a per-thread buffer of
+  `np.getbufsize()` elements (read at issue; NumPy's cast,
+  `cast_elements`), one loop call per buffer onto the accumulator. This is
+  what decides the rounding of floating-point sums over a cast (the
+  pairwise loop sums each call); fuzzed bit-identical for f8→f4, int64→f8,
+  f4→f8, c16→c8, int32/bool→f8 means, strided and reversed inputs, buffer
+  sizes 1024-20000. Other casting reductions of more dimensions (integer,
+  min/max, products: the same values whatever the blocks) cast first (an
+  `astype` task to the accumulator dtype, the plan's probe), then reduce;
+  float sums of more dimensions over a cast and complex-to-real casts
+  (NumPy's ComplexWarning) keep the regular path. The first version cast
+  every 1-d input first too: one more pass over the data, measured
+  (`dtype_reduce` int32 at O2: 3.0x → 2.0-2.3x of NumPy, see below).
 - **`initial=`** is the deferred kernel's identity (Python bool, int or
   float).
 - **`mean`, `var`, `std`** of real data are composed as NumPy's `_methods`
@@ -255,7 +259,12 @@ without that wait:
   roots NumPy runs in place (`out=r`) are new deferred ops laid out like
   `r` (`vp_set_like`: the task copies r's strides once r is laid out, so
   extent-1 axes keep NumPy's strides): an `out=` op would wait for r's
-  layout at issue. The same values and layouts. The count's
+  layout at issue. The same values and layouts. They stay in place as
+  NumPy's: when nothing else holds r, the task takes r's block over
+  (`LikeKernel` keeps the element-wise kernel's `in_place_ok` and reads
+  the layout from r's own operand; the first version did neither, and
+  every divide and square of `std(axis=0)` wrote a fresh block:
+  `reduce_axis` medium at O2 3.8x → 2.5-3.0x of NumPy). The count's
   task gives NumPy's "Mean of empty slice" and "Degrees of freedom <= 0 for
   slice" (`KernelResult::warning`, error-handling.md, E8). Where NumPy
   divides a scalar result by scalar math ("invalid value encountered in
@@ -276,7 +285,9 @@ everything in 0.74 ms, 31.6 ms in all (1.93x; O1, which syncs on each
 mask, 39.2 ms), bit-identical. Cost at O1 (callgrind, 1 worker, 3,000
 doubles): `x.mean()` +700-1,000 instructions per call (~42,000; the level
 and size tests in the Python handlers), `x.var()` +400 (~107,000), `x * y`,
-`xi.sum()`, `m.mean(axis=0)` unchanged. Tests: `test_o2_reductions_of_data_sizes`
+`xi.sum()`, `m.mean(axis=0)` unchanged. Suite runs of the change and of
+`main` before it, O1 and O2, are recorded in `docs/benchmarks/runs/`
+(`history.py impact`). Tests: `test_o2_reductions_of_data_sizes`
 (no size wait, no sync, values, types). Still waiting: `argmin`/
 `argmax`, `any`/`all` of non-bool data, `cumsum`, `take`, `np.dot`,
 assignments, and a boolean index with a ready mask on an array still

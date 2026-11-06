@@ -320,8 +320,8 @@ size themselves in the task, pipelining.md S2; `zeros`/`ones`/`empty`/
 `full`/`arange` with pending size arrays and `x[mask]`, `flatnonzero`,
 1-d `nonzero` of pending data are tasks sizing from the data, S4;
 reductions without casts sized, laid out and planned in their tasks,
-`vp_reduce_deferred`; on S4 outputs also casting ones (an `astype` task
-first, float sums on NumPy's buffer blocks), `initial=` and
+`vp_reduce_deferred`; on S4 outputs also casting ones (1-d: cast per
+NumPy buffer in the task, else an `astype` task first), `initial=` and
 `mean`/`var`/`std` (the count a task, `vp_reduced_count`); ranks known at issue, `Runtime::rank`; basic
 indexing, transposes, `swapaxes` and 1-d reshapes of such arrays as views by a rule,
 `ViewRule`; advanced indexing with slices and index arrays as deferred
@@ -1574,9 +1574,18 @@ Rules:
   reductions, int16/float16, advanced indexing) should show up as fewer
   fallbacks and higher category scores. Cases are plain NumPy code and
   must stay bit-identical; add a case for every new kind of program.
-  Record every full run that a change is judged by in
-  `docs/benchmarks.md` (progress table: commit, build stamp, machine,
-  score, categories, size classes). Compare runs only on the same
+  **Every significant change commits a recorded full suite run**
+  (`suite.py --record "what changed" [--pr N]`, design, kernel, issue
+  path, bridge per-op code, scheduling): one JSON file per run in
+  `docs/benchmarks/runs/` (schema in `history.py`: commit, change, machine,
+  options incl. optimization level, summary, every configuration), committed
+  with the change, so the impact of each change stays readable by machine
+  later (`history.py list | impact | compare A B`). With it a same-machine
+  baseline (`--role baseline`, the change's base commit in a git worktree)
+  when no comparable record of the base exists; changes at O2 and higher
+  record a run at that level too (`VIPROC_OPT=2`). Add new cases to
+  `suite_cases.py` with the change that needs them. The progress table in
+  `docs/benchmarks.md` stays the readable summary. Compare runs only on the same
   machine; `--quick` runs are noisier and not comparable to full runs.
   Single configurations vary by ±25-30% between full runs, the score by a
   few points: judge a change by the cases it targets (same-machine
