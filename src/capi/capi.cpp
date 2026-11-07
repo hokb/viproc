@@ -12,6 +12,9 @@
 #include "runtime/element_pool.hpp"
 #include "runtime/index.hpp"
 #include "runtime/runtime.hpp"
+#ifdef VIPROC_OPENCL
+#include "device/opencl/cl_kernels.hpp"
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -219,6 +222,12 @@ struct vp_runtime {
     // vp_set_like: the array the next deferred element-wise op or cast lays
     // its result out like (one-shot; main thread).
     ArrayPtr like;
+#ifdef VIPROC_OPENCL
+    // O4: the OpenCL device (vp_opencl_select; null: none) and the device
+    // kernels wrapping CPU kernels (by the CPU kernel), made for it.
+    std::shared_ptr<opencl::Context> device;
+    std::unordered_map<const Kernel*, std::shared_ptr<Kernel>> device_kernels;
+#endif
 };
 
 // A vp_array* is an Array* holding one reference (no wrapper allocation).
@@ -226,6 +235,40 @@ namespace {
 Array& arr(const vp_array* a) { return *reinterpret_cast<Array*>(const_cast<vp_array*>(a)); }
 ArrayPtr ref(const vp_array* a) { return ArrayPtr(&arr(a)); } // a new reference
 vp_array* hand_out(ArrayPtr a) { return reinterpret_cast<vp_array*>(a.release()); }
+
+// O4 (docs/design/opencl.md): the device kernel for the gufunc or matmul op
+// whose CPU kernel is `cpu` (loop dtypes `dtypes`), or `cpu` itself where
+// there is no device, no device op or no support for the dtypes. The device
+// kernel decides by the op's sizes when it runs (Kernel::run). Main thread.
+const std::shared_ptr<Kernel>& device_kernel(vp_runtime* rt, const std::shared_ptr<Kernel>& cpu,
+                                             const numpy::UfuncLoop* loop,
+                                             const numpy::GufuncCore* core, const DType* dtypes,
+                                             const char* invalid_error) {
+#ifdef VIPROC_OPENCL
+    if (rt->device == nullptr || rt->rt->opt_level() < 4) {
+        return cpu;
+    }
+    if (auto it = rt->device_kernels.find(cpu.get()); it != rt->device_kernels.end()) {
+        return it->second;
+    }
+    const opencl::Op op = opencl::gufunc_op(loop->ufunc_name(), loop->nin(), loop->nout());
+    std::shared_ptr<Kernel> k = cpu;
+    if (op != opencl::Op::None && opencl::supports(*rt->device, op, dtypes[0])) {
+        if (core == nullptr) {
+            k = opencl::make_matmul_kernel(rt->device, cpu, dtypes[0]);
+        } else {
+            k = opencl::make_gufunc_kernel(
+                rt->device, op, cpu, *core,
+                std::vector<DType>(dtypes, dtypes + loop->nin() + loop->nout()),
+                invalid_error != nullptr ? invalid_error : "");
+        }
+    }
+    return rt->device_kernels.emplace(cpu.get(), std::move(k)).first->second;
+#else
+    (void)rt, (void)loop, (void)core, (void)dtypes, (void)invalid_error;
+    return cpu;
+#endif
+}
 } // namespace
 
 extern "C" {
@@ -366,6 +409,91 @@ uint64_t vp_sync_count(const vp_runtime* rt) { return rt->rt->sync_count(); }
 uint64_t vp_size_wait_count(const vp_runtime* rt) { return rt->rt->size_wait_count(); }
 
 uint64_t vp_wake_count(const vp_runtime* rt) { return rt->rt->wake_count(); }
+
+namespace {
+void copy_text(char* dst, std::size_t n, const std::string& s) {
+    const std::size_t k = std::min(n - 1, s.size());
+    std::memcpy(dst, s.data(), k);
+    dst[k] = '\0';
+}
+} // namespace
+
+void vp_opencl_info(const vp_runtime* rt, vp_device_info* info) {
+    *info = vp_device_info{};
+#ifdef VIPROC_OPENCL
+    if (rt->device == nullptr) {
+        copy_text(info->reason, sizeof info->reason, "no device selected");
+        return;
+    }
+    const opencl::Context& c = *rt->device;
+    info->selected = 1;
+    info->gpu = c.is_gpu() ? 1 : 0;
+    info->fp64 = c.fp64() ? 1 : 0;
+    std::string why;
+    info->clblast = opencl::load_clblast(&why) != nullptr ? 1 : 0;
+    info->global_memory = c.global_memory();
+    copy_text(info->platform, sizeof info->platform, c.platform_name());
+    copy_text(info->name, sizeof info->name, c.name());
+    if (!info->clblast) {
+        copy_text(info->reason, sizeof info->reason, why);
+    }
+#else
+    (void)rt;
+    copy_text(info->reason, sizeof info->reason, "viproc was built without OpenCL");
+#endif
+}
+
+int vp_opencl_select(vp_runtime* rt, const char* spec, vp_device_info* info) {
+    vp_device_info tmp;
+    if (info == nullptr) {
+        info = &tmp;
+    }
+#ifdef VIPROC_OPENCL
+    std::string why;
+    rt->device = opencl::select(spec, &why);
+    rt->device_kernels.clear();
+    vp_opencl_info(rt, info);
+    if (rt->device == nullptr) {
+        copy_text(info->reason, sizeof info->reason, why);
+    }
+#else
+    (void)spec;
+    vp_opencl_info(rt, info);
+#endif
+    return info->selected;
+}
+
+void vp_opencl_set_min_work(int64_t work) {
+#ifdef VIPROC_OPENCL
+    opencl::set_min_work(work);
+#else
+    (void)work;
+#endif
+}
+
+int64_t vp_opencl_min_work(void) {
+#ifdef VIPROC_OPENCL
+    return opencl::min_work();
+#else
+    return 0;
+#endif
+}
+
+uint64_t vp_device_count(void) {
+#ifdef VIPROC_OPENCL
+    return opencl::device_ops.load(std::memory_order_relaxed);
+#else
+    return 0;
+#endif
+}
+
+uint64_t vp_device_fallback_count(void) {
+#ifdef VIPROC_OPENCL
+    return opencl::device_fallbacks.load(std::memory_order_relaxed);
+#else
+    return 0;
+#endif
+}
 
 void vp_offload_counts(const vp_runtime* rt, uint64_t* inline_ops, uint64_t* offloaded_ops) {
     *inline_ops = rt->rt->offload_policy().inline_count();
@@ -1449,10 +1577,11 @@ int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_arra
             set_error(err, errlen, e);
             return VP_UNSUPPORTED;
         }
-        std::shared_ptr<Kernel>& kernel = rt->matmul_kernels[loop];
-        if (!kernel) {
-            kernel = numpy::make_matmul_kernel(loop);
+        std::shared_ptr<Kernel>& cpu = rt->matmul_kernels[loop];
+        if (!cpu) {
+            cpu = numpy::make_matmul_kernel(loop);
         }
+        const std::shared_ptr<Kernel>& kernel = device_kernel(rt, cpu, loop, nullptr, d, nullptr);
         const int rank = std::max(ra - (ra >= 2 ? 2 : 1), rb - (rb >= 2 ? 2 : 1)) +
                          (ra >= 2 ? 1 : 0) + (rb >= 2 ? 1 : 0);
         const ArrayPtr ins[] = {ref(a), ref(b)};
@@ -1482,10 +1611,11 @@ int vp_matmul(vp_runtime* rt, PyObject* ufunc, vp_array* a, vp_array* b, vp_arra
         set_error(err, errlen, e);
         return VP_UNSUPPORTED;
     }
-    std::shared_ptr<Kernel>& kernel = rt->matmul_kernels[loop];
-    if (!kernel) {
-        kernel = numpy::make_matmul_kernel(loop);
+    std::shared_ptr<Kernel>& cpu = rt->matmul_kernels[loop];
+    if (!cpu) {
+        cpu = numpy::make_matmul_kernel(loop);
     }
+    const std::shared_ptr<Kernel>& kernel = device_kernel(rt, cpu, loop, nullptr, d, nullptr);
     const ArrayPtr ins[] = {ref(a), ref(b)};
     ArrayPtr res;
     rt->rt->issue(kernel, ins, {}, std::span(&out, 1), site, std::span(&res, 1), work);
@@ -1697,11 +1827,13 @@ int vp_gufunc(vp_runtime* rt, PyObject* ufunc, int nin, vp_array* const* inputs,
     const int options = flags & (VP_GUFUNC_CHECK_FINITE | VP_GUFUNC_SERIAL);
     static_assert(int{VP_GUFUNC_CHECK_FINITE} == int{numpy::kGufuncCheckFinite} &&
                   int{VP_GUFUNC_SERIAL} == int{numpy::kGufuncSerial});
-    std::shared_ptr<Kernel>& kernel = rt->gufunc_kernels[{
+    std::shared_ptr<Kernel>& cpu = rt->gufunc_kernels[{
         loop, core.axes, invalid_error != nullptr ? invalid_error : "", options}];
-    if (!kernel) {
-        kernel = numpy::make_gufunc_kernel(loop, core, invalid_error ? invalid_error : "", options);
+    if (!cpu) {
+        cpu = numpy::make_gufunc_kernel(loop, core, invalid_error ? invalid_error : "", options);
     }
+    const std::shared_ptr<Kernel>& kernel =
+        device_kernel(rt, cpu, loop, &core, d.data(), invalid_error);
     if (given) {
         ArrayPtr io[kMax];
         for (std::size_t j = 0; j < no; ++j) {
