@@ -2743,11 +2743,13 @@ static PyObject* m_offload_counts(PyObject* self, PyObject* noargs) {
     uint64_t inl = 0, off = 0;
     vp_offload_counts(g_rt, &inl, &off);
     return Py_BuildValue(
-        "{s:K,s:K,s:K,s:K,s:K,s:K,s:K}", "inline", (unsigned long long)inl, "offloaded",
+        "{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}", "inline", (unsigned long long)inl, "offloaded",
         (unsigned long long)off, "direct", (unsigned long long)vp_direct_count(g_rt), "tasks",
         (unsigned long long)vp_task_count(g_rt), "syncs", (unsigned long long)vp_sync_count(g_rt),
         "wakes", (unsigned long long)vp_wake_count(g_rt), "size_waits",
-        (unsigned long long)vp_size_wait_count(g_rt));
+        (unsigned long long)vp_size_wait_count(g_rt), "device",
+        (unsigned long long)vp_device_count(), "device_fallbacks",
+        (unsigned long long)vp_device_fallback_count());
 }
 
 static PyObject* m_pool_stats(PyObject* self, PyObject* noargs) {
@@ -2918,6 +2920,70 @@ static PyObject* m_opt_level(PyObject* self, PyObject* noargs) {
         return NULL;
     }
     return PyLong_FromLong(vp_opt_level(g_rt));
+}
+
+static PyObject* device_info_dict(const vp_device_info* d) {
+    if (!d->selected) {
+        Py_RETURN_NONE;
+    }
+    return Py_BuildValue("{s:s,s:s,s:O,s:O,s:O,s:K}", "platform", d->platform, "name", d->name,
+                         "gpu", d->gpu ? Py_True : Py_False, "fp64", d->fp64 ? Py_True : Py_False,
+                         "clblast", d->clblast ? Py_True : Py_False, "global_memory",
+                         (unsigned long long)d->global_memory);
+}
+
+/* opencl_select(spec or None) -> (info dict or None, reason) */
+static PyObject* m_opencl_select(PyObject* self, PyObject* arg) {
+    (void)self;
+    if (check_runtime() < 0) {
+        return NULL;
+    }
+    const char* spec = NULL;
+    if (arg != Py_None) {
+        spec = PyUnicode_AsUTF8(arg);
+        if (spec == NULL) {
+            return NULL;
+        }
+    }
+    vp_device_info d;
+    vp_opencl_select(g_rt, spec, &d);
+    PyObject* info = device_info_dict(&d);
+    if (info == NULL) {
+        return NULL;
+    }
+    return Py_BuildValue("(Ns)", info, d.reason);
+}
+
+static PyObject* m_opencl_info(PyObject* self, PyObject* noargs) {
+    (void)self;
+    (void)noargs;
+    if (check_runtime() < 0) {
+        return NULL;
+    }
+    vp_device_info d;
+    vp_opencl_info(g_rt, &d);
+    PyObject* info = device_info_dict(&d);
+    if (info == NULL) {
+        return NULL;
+    }
+    return Py_BuildValue("(Ns)", info, d.reason);
+}
+
+/* opencl_min_work(n=None) -> the threshold (n given: set it first; < 0 resets) */
+static PyObject* m_opencl_min_work(PyObject* self, PyObject* args) {
+    (void)self;
+    PyObject* n = Py_None;
+    if (!PyArg_ParseTuple(args, "|O", &n)) {
+        return NULL;
+    }
+    if (n != Py_None) {
+        const long long w = PyLong_AsLongLong(n);
+        if (w == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
+        vp_opencl_set_min_work(w);
+    }
+    return PyLong_FromLongLong(vp_opencl_min_work());
 }
 
 static PyObject* m_workers(PyObject* self, PyObject* noargs) {
@@ -5750,6 +5816,9 @@ static PyMethodDef methods[] = {
     {"shutdown", m_shutdown, METH_NOARGS, "Wait for all tasks and destroy the runtime."},
     {"initialized", m_initialized, METH_NOARGS, NULL},
     {"opt_level", m_opt_level, METH_NOARGS, NULL},
+    {"opencl_select", m_opencl_select, METH_O, NULL},
+    {"opencl_info", m_opencl_info, METH_NOARGS, NULL},
+    {"opencl_min_work", m_opencl_min_work, METH_VARARGS, NULL},
     {"create_deferred", m_create_deferred, METH_VARARGS, NULL},
     {"mask_select", m_mask_select, METH_VARARGS, NULL},
     {"flatnonzero", m_flatnonzero, METH_O, NULL},

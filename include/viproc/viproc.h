@@ -114,8 +114,9 @@ void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive);
 /* [main thread] Optimization level (docs/design/goals.md): 1 (default)
  * gives results bit-identical to NumPy; 2 allows optimizations whose results
  * are correct but may deviate from NumPy's (stage pipelining,
- * single-threaded BLAS calls); 3-5 act as 2 until implemented. Set it
- * before issuing ops. */
+ * single-threaded BLAS calls); 4 adds device offloading of linalg, fft and
+ * matmul ops (vp_opencl_select); 3 and 5 act as 2. Set it before issuing
+ * ops. */
 void vp_set_opt_level(vp_runtime* rt, int level);
 int vp_opt_level(const vp_runtime* rt);
 /* Number of ops the policy ran inline / handed to workers so far. */
@@ -137,6 +138,36 @@ uint64_t vp_size_wait_count(const vp_runtime* rt);
  * thread issuing ready ops; a futex call each). */
 uint64_t vp_wake_count(const vp_runtime* rt);
 size_t vp_active_tasks(const vp_runtime* rt);
+
+/* --- OpenCL device (optimization level O4; docs/design/opencl.md) -------- */
+
+typedef struct {
+    int selected;           /* 1 if a device is selected */
+    int gpu;                /* a GPU or accelerator (else a CPU device) */
+    int fp64;               /* double precision supported */
+    int clblast;            /* CLBlast loaded (matmul, large factorizations) */
+    uint64_t global_memory; /* bytes */
+    char platform[128];
+    char name[128];
+    char reason[256]; /* why no device is selected */
+} vp_device_info;
+
+/* [main thread] Selects the device O4 offloads linalg, fft and matmul ops to
+ * (process-wide): spec NULL or "" (env VIPROC_OPENCL_DEVICE, else "gpu":
+ * the first GPU or accelerator), "cpu", "any", "none", "P:D" (platform and
+ * device index), "N" (device index over all platforms) or part of the
+ * device's name. Ops issued before keep their device. Fills `info` (may be
+ * NULL); returns info->selected. Without OpenCL in the build, selects none. */
+int vp_opencl_select(vp_runtime* rt, const char* spec, vp_device_info* info);
+void vp_opencl_info(const vp_runtime* rt, vp_device_info* info);
+/* Device ops whose flop estimate is below `work` run their CPU kernel
+ * (process-wide; < 0: env VIPROC_OPENCL_MIN_WORK, else 2^24). */
+void vp_opencl_set_min_work(int64_t work);
+int64_t vp_opencl_min_work(void);
+/* Ops computed on the device so far, and ones that ran their CPU kernel
+ * because the device failed (process-wide). */
+uint64_t vp_device_count(void);
+uint64_t vp_device_fallback_count(void);
 
 /* --- Element memory pool (process-wide; docs/design/memory-management.md) */
 
@@ -476,8 +507,8 @@ int vp_accumulate(vp_runtime* rt, PyObject* ufunc, vp_array* in, int axis, vp_ar
  * for the input's) is the loop's dtype: an input of another dtype is cast
  * per chunk by the task, with NumPy's cast (chunk > 0 only). 0: no cast. */
 int vp_reduce_deferred(vp_runtime* rt, PyObject* ufunc, vp_array* in, const unsigned char* axes,
-                       int keepdims, PyObject* identity, int64_t chunk, int acc,
-                       vp_array** result, const char* site, char* err, size_t errlen);
+                       int keepdims, PyObject* identity, int64_t chunk, int acc, vp_array** result,
+                       const char* site, char* err, size_t errlen);
 
 /* O2: the count NumPy's mean/var divide by (_count_reduce_items), as a
  * 0-d intp array computed by a task from in's size: max(n - ddof, 0), n the
