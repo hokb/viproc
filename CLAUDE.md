@@ -327,11 +327,17 @@ indexing, transposes, `swapaxes` and 1-d reshapes of such arrays as views by a r
 `ViewRule`; advanced indexing with slices and index arrays as deferred
 gathers, `DeferredGatherKernel`; NumPy
 functions may still run as a whole), **O3** micro kernels (own, fused or split kernels, re-implemented
-NumPy internals), **O4** automatic device offloading, **O5** reserved.
+NumPy internals), **O4** automatic device offloading (started:
+`det`, `slogdet`, `inv`, `solve`, `cholesky`, `fft` & co. and float/complex
+`matmul` on an OpenCL device, `docs/design/opencl.md`: CLBlast, VkFFT and
+viproc's own LU/Cholesky kernels, ICD loader and CLBlast opened at run time;
+`viproc.init(level=4, device=...)`, `device_info()`; the device kernel wraps
+the CPU kernel and decides by size in the task, `device_min_work`; device
+failures run the CPU kernel), **O5** reserved.
 The level is chosen per process: `viproc.init(level=n)`,
 `VIPROC_OPT=n` (or `On`), `python -m viproc -On prog.py`; `opt_level()`
-reads it (stored in the runtime, `RuntimeOptions::opt_level`); 3-5 run as
-O2 until built. O1 stays available and the default. Every change at O1
+reads it (stored in the runtime, `RuntimeOptions::opt_level`); 3 and 5 run
+as O2 until built, 4 as O2 plus the device kernels. O1 stays available and the default. Every change at O1
 must stay bit-identical; optimizations that may deviate are gated on the
 level.
 
@@ -380,6 +386,7 @@ execution.
 docs/design/           Design documents (decisions with rationale)
   goals.md             goals, non-goals, G2 (bit-identical) before G3 (speed), roadmap
   error-handling.md    run-time errors on any thread, asynchronous reporting
+  opencl.md            O4: OpenCL device kernels (library choice, semantics)
   memory-management.md ownership, release, pools, NumPy interop, COW
   pipelining.md        array stages, partial completion, pending sizes (roadmap)
   array-data-model.md  array data model: Array, Metadata (SD + task),
@@ -430,6 +437,12 @@ src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
                        batch row as PyUFunc_GeneralizedFunctionInternal
   numpy_sort.*         sort/argsort kernel: NumPy's per-dtype sort functions
                        (ArrFuncs->sort/argsort), one call per row
+src/device/opencl/     O4 device kernels (library `viproc_opencl`, opencl.md)
+  cl_loader.*          ICD loader and CLBlast opened at run time; cl* forwarders
+  cl_device.*          device selection, context, per-thread queues, buffers
+  cl_linalg_source.cpp viproc's OpenCL kernels (getf2, laswp, getrs, potf2)
+  cl_fft.*             VkFFT plans (compiled without viproc's warnings)
+  cl_kernels.*         device kernels wrapping the CPU gufunc/matmul kernels
 src/capi/capi.cpp      Implementation of the C ABI (library `viproc_capi`)
 src/viproc_python.h    the only way to include Python.h (MSVC debug fix)
 python/viproc/         Python package
@@ -454,7 +467,9 @@ python/viproc/         Python package
                        where=, ufunc.at, ufunc.reduceat, gufunc calls
                        (vp_gufunc: casts, out=, axes=/axis=, 1-d matmul)
   _linalg.py           numpy.linalg wrappers ported onto vp_gufunc (det, inv,
-                       solve, cholesky, eig*, svd; AsyncLinAlgError)
+                       solve, cholesky, eig*, svd; AsyncLinAlgError) and
+                       compositions (matrix_power, multi_dot, tensordot,
+                       tensorsolve, tensorinv, linalg aliases)
   _fft.py              numpy.fft wrappers ported onto vp_gufunc (fft, rfft,
                        irfft, hfft, n-d transforms)
   _sort.py             np.sort/np.argsort/a.sort beyond the C path (axis=None
@@ -885,7 +900,11 @@ Rules:
   `_assert_finite` (eig, eigvals) runs in the kernel before the loop
   (`VP_GUFUNC_CHECK_FINITE`), no sync. `qr` (its `qr_r_raw` writes its
   input), `lstsq` (data-dependent residual shape), `pinv`, `matrix_rank`,
-  `cond` and `matrix_power` still fall back. Linalg
+  and `cond` still fall back; `matrix_power`, `multi_dot`, `tensordot`,
+  `tensorsolve`, `tensorinv` and the `np.linalg` aliases (`matmul`,
+  `vecdot`, `outer`, `tensordot`, `diagonal`, `trace`, `matrix_transpose`,
+  `matrix_norm`) are NumPy's code on viproc's ops
+  (`python/tests/test_linalg_compositions.py`). Linalg
   loops call LAPACK, which OpenBLAS threads itself for larger matrices:
   matrices of >= 64 x 64 elements run one loop call at a time
   (`VP_GUFUNC_SERIAL`, a process-wide mutex; `_linalg.SERIAL_FROM`).

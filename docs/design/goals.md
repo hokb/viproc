@@ -148,12 +148,13 @@ a property of a level, not a fixed promise of viproc.
 | **O1** (current implementation) | array ILP only: independent array instructions overlap; NumPy itself executes every function (its loops, operators and BLAS, called exactly as NumPy calls them) | bit-identical to NumPy (G2) |
 | **O2** | stage pipelining (`pipelining.md`: tasks advance through size, device, allocation and completion on their inputs' stage events; partial results start their consumers); BLAS threading removed (viproc's workers parallelize, each BLAS call runs on one thread) | correct; may deviate from NumPy's (OpenBLAS splits products by its thread count, and the values depend on that split) |
 | **O3** | micro kernels: viproc's own kernels where NumPy's calling pattern costs (fusion of element-wise chains, splitting single ops, other summation orders, re-implemented NumPy internals) | correct; may deviate in rounding |
-| **O4** | automatic device offloading: cost-based device selection per array instruction (GPUs and other accelerators) | correct; may deviate (device kernels and their rounding) |
+| **O4** | automatic device offloading: cost-based device selection per array instruction (GPUs and other accelerators); started: linalg factorizations, fft and matmul on an OpenCL device (`opencl.md`) | correct; may deviate (device kernels and their rounding) |
 | **O5** | reserved | |
 
 **Configuration (implemented):** `viproc.init(level=n)`, env `VIPROC_OPT=n`
 (or `On`), `python -m viproc -On prog.py` (also `-O n`, `--opt=n`); levels
-1-5 are accepted, O1 is the default, 3-5 run as O2 until they are built.
+1-5 are accepted, O1 is the default, 3 and 5 run as O2 until they are
+built; 4 runs as O2 plus the OpenCL device kernels (`opencl.md`).
 **O2 so far:** every BLAS call runs on one thread (OpenBLAS's process-wide
 setting, through `_blas.py`, restored at shutdown) and LAPACK calls are no
 longer serialized; element-wise ufuncs (no casts, one output) on pending

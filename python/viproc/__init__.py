@@ -36,6 +36,7 @@ from ._ndarray import (
     asarray,
     init,
     ndarray,
+    device_info,
     offload_stats,
     opt_level,
     physical_cores,

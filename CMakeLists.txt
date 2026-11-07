@@ -75,9 +75,57 @@ add_library(viproc_numpy src/kernels/numpy_ufunc.cpp src/kernels/numpy_reduce.cp
                          src/kernels/numpy_sort.cpp)
 target_link_libraries(viproc_numpy PUBLIC viproc Python3::Module Python3::NumPy PRIVATE viproc_warnings)
 
+# OpenCL device kernels for optimization level O4 (docs/design/opencl.md):
+# linalg and fft gufuncs and matmul on an OpenCL device. Nothing is linked:
+# the ICD loader and CLBlast are opened at run time, so viproc imports and
+# runs (on the CPU) without them. Building needs the OpenCL headers and
+# VkFFT's (header-only, MIT), taken from the system or fetched.
+option(VIPROC_OPENCL "Build the OpenCL device kernels (optimization level O4)" ON)
+if(VIPROC_OPENCL)
+    include(FetchContent)
+    find_path(VIPROC_OPENCL_INCLUDE NAMES CL/cl.h OpenCL/cl.h)
+    if(NOT VIPROC_OPENCL_INCLUDE)
+        FetchContent_Declare(opencl_headers
+            URL https://github.com/KhronosGroup/OpenCL-Headers/archive/refs/tags/v2024.10.24.tar.gz
+            SOURCE_SUBDIR none)
+        FetchContent_MakeAvailable(opencl_headers)
+        set(VIPROC_OPENCL_INCLUDE ${opencl_headers_SOURCE_DIR})
+    endif()
+    find_path(VIPROC_VKFFT_INCLUDE NAMES vkFFT.h)
+    if(NOT VIPROC_VKFFT_INCLUDE)
+        FetchContent_Declare(vkfft
+            URL https://github.com/DTolm/VkFFT/archive/refs/tags/v1.3.4.tar.gz
+            SOURCE_SUBDIR none)
+        FetchContent_MakeAvailable(vkfft)
+        set(VIPROC_VKFFT_INCLUDE ${vkfft_SOURCE_DIR}/vkFFT)
+    endif()
+    add_library(viproc_opencl
+        src/device/opencl/cl_loader.cpp
+        src/device/opencl/cl_device.cpp
+        src/device/opencl/cl_linalg_source.cpp
+        src/device/opencl/cl_kernels.cpp
+        src/device/opencl/cl_fft.cpp)
+    target_include_directories(viproc_opencl SYSTEM PUBLIC ${VIPROC_OPENCL_INCLUDE})
+    target_include_directories(viproc_opencl SYSTEM PRIVATE ${VIPROC_VKFFT_INCLUDE})
+    target_compile_definitions(viproc_opencl PUBLIC CL_TARGET_OPENCL_VERSION=120
+                                                    CL_USE_DEPRECATED_OPENCL_1_2_APIS)
+    target_link_libraries(viproc_opencl PUBLIC viproc_numpy PRIVATE ${CMAKE_DL_LIBS})
+    # viproc's own files with viproc's warnings; VkFFT (cl_fft.cpp) without.
+    set_source_files_properties(src/device/opencl/cl_loader.cpp src/device/opencl/cl_device.cpp
+        src/device/opencl/cl_linalg_source.cpp src/device/opencl/cl_kernels.cpp
+        PROPERTIES COMPILE_OPTIONS
+        "$<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic>;$<$<AND:$<BOOL:${VIPROC_WARNINGS_AS_ERRORS}>,$<CXX_COMPILER_ID:GNU,Clang>>:-Werror>")
+    set_source_files_properties(src/device/opencl/cl_fft.cpp PROPERTIES COMPILE_OPTIONS
+        "$<IF:$<CXX_COMPILER_ID:MSVC>,/w,-w>")
+endif()
+
 # Public C ABI (include/viproc/viproc.h).
 add_library(viproc_capi src/capi/capi.cpp)
 target_link_libraries(viproc_capi PUBLIC viproc_numpy PRIVATE viproc_warnings)
+if(VIPROC_OPENCL)
+    target_link_libraries(viproc_capi PRIVATE viproc_opencl)
+    target_compile_definitions(viproc_capi PRIVATE VIPROC_OPENCL=1)
+endif()
 
 # Python package: viproc/*.py plus the _viproc extension module, assembled
 # in ${CMAKE_BINARY_DIR}/python (put that directory on PYTHONPATH).

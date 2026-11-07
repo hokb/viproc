@@ -283,3 +283,36 @@ FFT = {f: _small_ready(f, h) for f, h in {
     np.fft.rfftn: _rfftn, np.fft.irfftn: _irfftn, np.fft.rfft2: _two(_rfftn),
     np.fft.irfft2: _two(_irfftn),
 }.items()}
+
+
+def _fftshift(x, axes=None):
+    """numpy.fft.fftshift: np.roll by half of each axis (a placement task)."""
+    x = _array(x)
+    if x is None:
+        return _NOPE
+    if axes is None:
+        axes = tuple(range(x.ndim))
+        shift = [dim // 2 for dim in x.shape]
+    elif isinstance(axes, (int, np.integer)):
+        shift = x.shape[axes] // 2
+    else:
+        shift = [x.shape[ax] // 2 for ax in axes]
+    return np.roll(x, shift, axes)
+
+
+def _ifftshift(x, axes=None):
+    x = _array(x)
+    if x is None:
+        return _NOPE
+    if axes is None:
+        axes = tuple(range(x.ndim))
+        shift = [-(dim // 2) for dim in x.shape]
+    elif isinstance(axes, (int, np.integer)):
+        shift = -(x.shape[axes] // 2)
+    else:
+        shift = [-(x.shape[ax] // 2) for ax in axes]
+    return np.roll(x, shift, axes)
+
+
+FFT[np.fft.fftshift] = _fftshift
+FFT[np.fft.ifftshift] = _ifftshift

@@ -73,8 +73,13 @@ def _env_level():
 _o2 = [False]  # optimization level 2 or higher (_viproc.opt_level() >= 2), no call
 
 
-def _start(workers, max_active_tasks, sync_below, adaptive, level):
+def _start(workers, max_active_tasks, sync_below, adaptive, level, device=None,
+           device_min_work=None):
     _viproc.init(workers, max_active_tasks, sync_below, adaptive, level)
+    if device_min_work is not None:
+        _viproc.opencl_min_work(int(device_min_work))
+    if level >= 4:  # O4: device offloading (docs/design/opencl.md)
+        _viproc.opencl_select(device)
     _o2[0] = _viproc.opt_level() >= 2
     _blas.apply_level(level)
     _small_ops[0] = 2048 if sync_below < 0 else sync_below
@@ -2198,7 +2203,8 @@ def wait_all():
         _viproc.wait_all()
 
 
-def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None, level=None):
+def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None, level=None,
+         device=None, device_min_work=None):
     """(Re)starts the runtime.
 
     workers: worker threads (0: one per physical core but one, the main
@@ -2217,7 +2223,16 @@ def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None, level=No
         broadcasting error is raised asynchronously, AsyncValueError), every
         BLAS call runs on one thread (process-wide while the runtime runs;
         viproc's workers parallelize), LAPACK calls are no longer
-        serialized. 3-5: not implemented yet, run as 2.
+        serialized. 4: as 2, and linalg (det, slogdet, inv, solve,
+        cholesky), fft and matmul ops large enough run on an OpenCL device
+        (docs/design/opencl.md; results within the device's rounding).
+        3 and 5: not implemented yet, run as 2.
+    device: the OpenCL device at level 4 (default: env VIPROC_OPENCL_DEVICE,
+        else "gpu", the first GPU or accelerator; "cpu", "any", "none",
+        "P:D" platform and device index, "N" device index, or part of the
+        device's name). device_info() tells which one was selected.
+    device_min_work: ops with a smaller flop estimate run on the CPU
+        (default: env VIPROC_OPENCL_MIN_WORK, else 2**24; process-wide).
     """
     env_sync, env_adaptive = _env_policy()
     sync_below = env_sync if sync_below is None else sync_below
@@ -2226,7 +2241,22 @@ def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None, level=No
         shutdown()  # raises an error of the old runtime nothing reported yet
     finally:
         adaptive = env_adaptive if adaptive is None else adaptive
-        _start(workers, max_active_tasks, sync_below, adaptive, level)
+        _start(workers, max_active_tasks, sync_below, adaptive, level, device, device_min_work)
+
+
+def device_info():
+    """The OpenCL device of optimization level 4: {'selected', 'platform',
+    'name', 'gpu', 'fp64', 'clblast', 'global_memory', 'min_work', 'reason'}
+    ('reason': why none is selected, or why CLBlast is missing)."""
+    _ensure_runtime()
+    info, reason = _viproc.opencl_info()
+    d = {"selected": info is not None, "platform": None, "name": None, "gpu": False,
+         "fp64": False, "clblast": False, "global_memory": 0}
+    if info is not None:
+        d.update(info)
+    d["min_work"] = _viproc.opencl_min_work()
+    d["reason"] = reason
+    return d
 
 
 def opt_level():
@@ -2237,7 +2267,7 @@ def opt_level():
 
 def offload_stats():
     """{'inline': n, 'offloaded': m, 'direct': d, 'tasks': t, 'syncs': s,
-    'wakes': w, 'size_waits': z}:
+    'wakes': w, 'size_waits': z, 'device': g, 'device_fallbacks': f}:
     ready ops run inline as a task / handed to workers / run directly without
     a task (small, inputs ready); t counts every task issued, whether its
     inputs were ready or pending (inline and offloaded count only the ready
@@ -2245,7 +2275,9 @@ def offload_stats():
     thread blocked; wait_all() not counted); w counts sleeping workers woken
     by the thread queuing a task (mostly the issuing main thread); z counts
     metadata queries that found a size or layout still unknown (O2: a task
-    sizes the array) and blocked."""
+    sizes the array) and blocked; g counts ops computed on the OpenCL device
+    (O4), f device ops that ran on the CPU because the device failed (both
+    process-wide)."""
     _ensure_runtime()
     return _viproc.offload_counts()
 
