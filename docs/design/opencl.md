@@ -161,5 +161,13 @@ use (CLBlast's take seconds each) and caches them (`~/.cache/pocl`).
 - Device-resident arrays (no transfer between consecutive device ops) and
   asynchronous queues (events instead of blocking reads).
 - eig/eigh/svd/qr/lstsq on the device.
-- A calibrated cost model per device (transfer bandwidth, launch latency,
-  flop rate) instead of one threshold.
+- A state-dependent cost function instead of one threshold (follow-up PR,
+  decided with the maintainer): a swappable policy like `OffloadPolicy`
+  that weighs the op's sizes, the bytes to transfer, where the operands
+  live (host or device, once arrays can stay on the device), the load of
+  the workers and of the device queue, and the device's rates (bandwidth,
+  launch latency, gemm rate) measured once at device selection against the
+  CPU kernels' measured costs (`DirectCost`).
+- Remembering device failures that would recur (an allocation larger than
+  the device allows) per op and size class, so the same op does not pay an
+  upload before every CPU fallback.
