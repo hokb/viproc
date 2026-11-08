@@ -160,10 +160,41 @@ typedef struct {
  * NULL); returns info->selected. Without OpenCL in the build, selects none. */
 int vp_opencl_select(vp_runtime* rt, const char* spec, vp_device_info* info);
 void vp_opencl_info(const vp_runtime* rt, vp_device_info* info);
-/* Device ops whose flop estimate is below `work` run their CPU kernel
- * (process-wide; < 0: env VIPROC_OPENCL_MIN_WORK, else 2^24). */
+/* Device ops whose work estimate is below `work` run their CPU kernel, the
+ * others on the device (threshold mode, process-wide); < 0 unsets it: env
+ * VIPROC_OPENCL_MIN_WORK if set, else the cost model decides (in
+ * deterministic mode a threshold of 2^24). vp_opencl_min_work: the user's
+ * threshold or -1. */
 void vp_opencl_set_min_work(int64_t work);
 int64_t vp_opencl_min_work(void);
+
+/* Where device ops run (docs/design/opencl.md, "Device or CPU"). */
+typedef struct {
+    int threshold_mode;   /* 1: a threshold decides, 0: the cost model */
+    int64_t threshold;    /* the threshold in effect (threshold mode) */
+    int resident;         /* results stay on the device */
+    int measured;         /* latency and bandwidths measured on the device */
+    double latency_ns;    /* the device's fixed cost per op */
+    double upload_gbps;   /* host -> device, GB/s */
+    double download_gbps; /* device -> host, GB/s */
+    uint64_t to_device;   /* decisions: device */
+    uint64_t to_cpu;      /* decisions: CPU */
+    uint64_t explored;    /* of them, explorations of the side not chosen */
+    uint64_t skipped;     /* ops sent to the CPU because the device failed on that size */
+} vp_device_policy;
+void vp_opencl_policy(vp_device_policy* out);
+/* Results of device ops stay on the device (default 1; env
+ * VIPROC_OPENCL_RESIDENT=0 at device selection turns it off). */
+void vp_opencl_set_resident(int on);
+/* Tests: replaces the cost model's profile (rates in work units per ns for
+ * every op class; clears what was measured and the failure memory), and
+ * limits the device's allocations to `bytes` (0: its own limit). */
+void vp_opencl_set_profile(double latency_ns, double upload_gbps, double download_gbps,
+                           double device_rate, double cpu_rate);
+void vp_opencl_limit_allocation(vp_runtime* rt, uint64_t bytes);
+/* 0: the array's values are on the host only; 1: also on the device; 2:
+ * only on the device (the host's are stale until read). */
+int vp_array_device_state(const vp_array* a);
 /* Ops computed on the device so far, and ones that ran their CPU kernel
  * because the device failed (process-wide). */
 uint64_t vp_device_count(void);

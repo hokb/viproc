@@ -2986,6 +2986,68 @@ static PyObject* m_opencl_min_work(PyObject* self, PyObject* args) {
     return PyLong_FromLongLong(vp_opencl_min_work());
 }
 
+/* opencl_policy() -> dict: where device ops run (vp_device_policy) */
+static PyObject* m_opencl_policy(PyObject* self, PyObject* noargs) {
+    (void)self;
+    (void)noargs;
+    vp_device_policy p;
+    vp_opencl_policy(&p);
+    return Py_BuildValue(
+        "{s:s,s:L,s:O,s:O,s:d,s:d,s:d,s:K,s:K,s:K,s:K}", "mode",
+        p.threshold_mode ? "threshold" : "cost", "threshold", (long long)p.threshold, "resident",
+        p.resident ? Py_True : Py_False, "measured", p.measured ? Py_True : Py_False,
+        "latency_ns", p.latency_ns, "upload_gbps", p.upload_gbps, "download_gbps",
+        p.download_gbps, "to_device", (unsigned long long)p.to_device, "to_cpu",
+        (unsigned long long)p.to_cpu, "explored", (unsigned long long)p.explored, "skipped",
+        (unsigned long long)p.skipped);
+}
+
+/* opencl_resident(on) */
+static PyObject* m_opencl_resident(PyObject* self, PyObject* on) {
+    (void)self;
+    const int v = PyObject_IsTrue(on);
+    if (v < 0) {
+        return NULL;
+    }
+    vp_opencl_set_resident(v);
+    Py_RETURN_NONE;
+}
+
+/* opencl_set_profile(latency_ns, upload_gbps, download_gbps, device_rate, cpu_rate): tests */
+static PyObject* m_opencl_set_profile(PyObject* self, PyObject* args) {
+    (void)self;
+    double l, u, d, dr, cr;
+    if (!PyArg_ParseTuple(args, "ddddd", &l, &u, &d, &dr, &cr)) {
+        return NULL;
+    }
+    vp_opencl_set_profile(l, u, d, dr, cr);
+    Py_RETURN_NONE;
+}
+
+/* opencl_limit_allocation(bytes): tests (0: the device's own limit) */
+static PyObject* m_opencl_limit_allocation(PyObject* self, PyObject* n) {
+    (void)self;
+    if (check_runtime() < 0) {
+        return NULL;
+    }
+    const unsigned long long b = PyLong_AsUnsignedLongLong(n);
+    if (b == (unsigned long long)-1 && PyErr_Occurred()) {
+        return NULL;
+    }
+    vp_opencl_limit_allocation(g_rt, b);
+    Py_RETURN_NONE;
+}
+
+/* device_state(a) -> 0 host only, 1 host and device, 2 device only */
+static PyObject* m_device_state(PyObject* self, PyObject* x) {
+    (void)self;
+    if (!is_array(x)) {
+        PyErr_SetString(PyExc_TypeError, "device_state: a viproc array expected");
+        return NULL;
+    }
+    return PyLong_FromLong(vp_array_device_state(((ArrayObject*)x)->a));
+}
+
 static PyObject* m_workers(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
@@ -5819,6 +5881,11 @@ static PyMethodDef methods[] = {
     {"opencl_select", m_opencl_select, METH_O, NULL},
     {"opencl_info", m_opencl_info, METH_NOARGS, NULL},
     {"opencl_min_work", m_opencl_min_work, METH_VARARGS, NULL},
+    {"opencl_policy", m_opencl_policy, METH_NOARGS, NULL},
+    {"opencl_resident", m_opencl_resident, METH_O, NULL},
+    {"opencl_set_profile", m_opencl_set_profile, METH_VARARGS, NULL},
+    {"opencl_limit_allocation", m_opencl_limit_allocation, METH_O, NULL},
+    {"device_state", m_device_state, METH_O, NULL},
     {"create_deferred", m_create_deferred, METH_VARARGS, NULL},
     {"mask_select", m_mask_select, METH_VARARGS, NULL},
     {"flatnonzero", m_flatnonzero, METH_O, NULL},

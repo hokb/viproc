@@ -32,6 +32,7 @@ current data version, last writer); a data version is a `CountableArray`
 | D9 | `viproc.ndarray` is a wrapper, not a subclass of `numpy.ndarray` | Decided, implemented |
 | D10 | Access model: pool allocations on the main thread only, releases from any thread | Superseded by D11 for element memory; holds for D4 |
 | D11 | Element memory as late as possible: the task producing a buffer takes its block when it runs, from a dying input or the pool | Implemented |
+| D12 | Device memory (O4): a data version's values may also live on the device, as a mirror of its host block owned by the CountableArray | Implemented |
 
 ## Background: the ILNumerics model
 
@@ -773,6 +774,27 @@ buffer as aligned (pool blocks are at least 64-byte aligned).
   the hot path). D11 pays one uncontended CAS per release and an exchange
   per allocation, and gains cache-hot memory, lower peak memory and in-place
   chains; the measurements above decide it.
+
+## D12 — Device memory (O4)
+
+A device op at O4 may leave its result on the OpenCL device
+(docs/design/opencl.md, "Device-resident arrays"). Ownership follows the
+data version:
+
+- The `CountableArray` owns a `DeviceCopy` (a `shared_ptr`, set by the task
+  producing the version, before it completes): a device buffer the size of
+  the host block, with the same bytes. The host block is still taken as
+  late as possible (D11) and stays allocated, stale until read: every view
+  keeps one address on both sides, and a download needs no allocation.
+- `data()` downloads on the first host read (any thread, once; a lock
+  striped by address, so no mutex per buffer); writers on the host (a task
+  writing in place, writable exports, `prepare_write`) download first and
+  release the copy. Copy-on-write (D8) and block reuse (D5, D11) read
+  through `data()`, so a block moves only with valid values.
+- The device buffer is released with the copy: when the version dies (any
+  thread, D2), or when a host write drops it. No pool and no eviction on
+  the device yet: an op that does not fit fails over to the CPU (the
+  device policy remembers the size).
 
 ## Open questions
 

@@ -148,7 +148,7 @@ a property of a level, not a fixed promise of viproc.
 | **O1** (current implementation) | array ILP only: independent array instructions overlap; NumPy itself executes every function (its loops, operators and BLAS, called exactly as NumPy calls them) | bit-identical to NumPy (G2) |
 | **O2** | stage pipelining (`pipelining.md`: tasks advance through size, device, allocation and completion on their inputs' stage events; partial results start their consumers); BLAS threading removed (viproc's workers parallelize, each BLAS call runs on one thread) | correct; may deviate from NumPy's (OpenBLAS splits products by its thread count, and the values depend on that split) |
 | **O3** | micro kernels: viproc's own kernels where NumPy's calling pattern costs (fusion of element-wise chains, splitting single ops, other summation orders, re-implemented NumPy internals) | correct; may deviate in rounding |
-| **O4** | automatic device offloading: cost-based device selection per array instruction (GPUs and other accelerators); started: linalg factorizations, fft and matmul on an OpenCL device (`opencl.md`) | correct; may deviate (device kernels and their rounding) |
+| **O4** | automatic device offloading: cost-based device selection per array instruction (GPUs and other accelerators); started: linalg factorizations, fft and matmul on an OpenCL device, placed per op by a cost model (transfers, where the operands are, the device's load and measured rates), results kept on the device (`opencl.md`) | correct; may deviate (device kernels and their rounding) |
 | **O5** | reserved | |
 
 **Configuration (implemented):** `viproc.init(level=n)`, env `VIPROC_OPT=n`

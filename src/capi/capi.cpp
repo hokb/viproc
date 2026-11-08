@@ -14,6 +14,7 @@
 #include "runtime/runtime.hpp"
 #ifdef VIPROC_OPENCL
 #include "device/opencl/cl_kernels.hpp"
+#include "device/opencl/cl_policy.hpp"
 #endif
 
 #include <algorithm>
@@ -452,6 +453,12 @@ int vp_opencl_select(vp_runtime* rt, const char* spec, vp_device_info* info) {
     std::string why;
     rt->device = opencl::select(spec, &why);
     rt->device_kernels.clear();
+    opencl::DevicePolicy& pol = opencl::policy();
+    pol.set_deterministic(!rt->rt->offload_policy().options().adaptive);
+    if (rt->device != nullptr) {
+        // priors from its properties, latency and bandwidths measured
+        pol.configure(*rt->device, true);
+    }
     vp_opencl_info(rt, info);
     if (rt->device == nullptr) {
         copy_text(info->reason, sizeof info->reason, why);
@@ -465,7 +472,7 @@ int vp_opencl_select(vp_runtime* rt, const char* spec, vp_device_info* info) {
 
 void vp_opencl_set_min_work(int64_t work) {
 #ifdef VIPROC_OPENCL
-    opencl::set_min_work(work);
+    opencl::policy().set_min_work(work);
 #else
     (void)work;
 #endif
@@ -473,10 +480,73 @@ void vp_opencl_set_min_work(int64_t work) {
 
 int64_t vp_opencl_min_work(void) {
 #ifdef VIPROC_OPENCL
-    return opencl::min_work();
+    return opencl::policy().min_work();
 #else
     return 0;
 #endif
+}
+
+void vp_opencl_policy(vp_device_policy* out) {
+    *out = vp_device_policy{};
+#ifdef VIPROC_OPENCL
+    const opencl::DevicePolicy& pol = opencl::policy();
+    const std::int64_t t = pol.threshold();
+    out->threshold_mode = t >= 0 ? 1 : 0;
+    out->threshold = t;
+    out->resident = pol.resident() ? 1 : 0;
+    const opencl::DeviceProfile p = pol.profile();
+    out->measured = p.measured ? 1 : 0;
+    out->latency_ns = p.latency_ns;
+    out->upload_gbps = p.upload_bpns;
+    out->download_gbps = p.download_bpns;
+    const opencl::PolicyCounts c = pol.counts();
+    out->to_device = c.device;
+    out->to_cpu = c.cpu;
+    out->explored = c.explored;
+    out->skipped = c.skipped;
+#endif
+}
+
+void vp_opencl_set_resident(int on) {
+#ifdef VIPROC_OPENCL
+    opencl::policy().set_resident(on != 0);
+#else
+    (void)on;
+#endif
+}
+
+void vp_opencl_set_profile(double latency_ns, double upload_gbps, double download_gbps,
+                           double device_rate, double cpu_rate) {
+#ifdef VIPROC_OPENCL
+    opencl::DeviceProfile p;
+    p.latency_ns = latency_ns;
+    p.upload_bpns = upload_gbps;
+    p.download_bpns = download_gbps;
+    for (int c = 0; c < 3; ++c) {
+        for (int d = 0; d < 2; ++d) {
+            p.device_rate[c][d] = device_rate;
+            p.cpu_rate[c][d] = cpu_rate;
+        }
+    }
+    opencl::policy().set_profile(p);
+#else
+    (void)latency_ns, (void)upload_gbps, (void)download_gbps, (void)device_rate, (void)cpu_rate;
+#endif
+}
+
+void vp_opencl_limit_allocation(vp_runtime* rt, uint64_t bytes) {
+#ifdef VIPROC_OPENCL
+    if (rt->device != nullptr) {
+        rt->device->limit_allocation(bytes);
+    }
+#else
+    (void)rt, (void)bytes;
+#endif
+}
+
+int vp_array_device_state(const vp_array* a) {
+    const CountableArray& b = *arr(a).buffer();
+    return !b.has_device_copy() ? 0 : b.host_stale() ? 2 : 1;
 }
 
 uint64_t vp_device_count(void) {
@@ -1539,7 +1609,7 @@ bool numpy_aligned(const Array& a) {
                                   : itemsize(l.dtype);
     // A deferred buffer has no address yet; its pool block will be aligned
     // (element_pool.cpp: alignment_for), so only the offset counts.
-    const std::byte* data = a.buffer()->data();
+    const std::byte* data = a.buffer()->raw_data();
     std::uintptr_t bits =
         reinterpret_cast<std::uintptr_t>(data) + static_cast<std::uintptr_t>(l.offset);
     for (std::size_t i = 0; i < l.shape.size(); ++i) {

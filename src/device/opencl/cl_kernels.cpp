@@ -1,9 +1,11 @@
 #include "device/opencl/cl_kernels.hpp"
 
 #include "device/opencl/cl_fft.hpp"
+#include "device/opencl/cl_policy.hpp"
 
 #include <algorithm>
 #include <cfenv>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstring>
@@ -93,7 +95,9 @@ std::vector<std::int64_t> dense_strides(const std::vector<std::int64_t>& shape, 
 // One operand of a gufunc op: its first element, its strides along the
 // outputs' batch axes (0 where it broadcasts) and its core axes.
 struct View {
-    std::byte* base = nullptr;
+    std::byte* base = nullptr; // host address (values possibly stale: on the device)
+    CountableArray* ca = nullptr;
+    std::int64_t off = 0; // base's byte offset in ca's block
     std::vector<std::int64_t> bstr;
     std::vector<int> labels; // present core labels, in axis order
     std::vector<std::int64_t> cshape, cstr;
@@ -121,7 +125,9 @@ Plan make_plan(const numpy::GufuncCore& core, std::size_t nin, std::span<const O
         const Operand& op = i < nin ? inputs[i] : outputs[i - nin];
         const Layout& l = op.layout();
         View v;
-        v.base = op.first();
+        v.ca = op.buffer.get();
+        v.off = l.offset;
+        v.base = op.buffer->raw_data() + l.offset;
         const std::size_t lb = l.shape.size() - core.present(i);
         v.bstr.assign(nb, 0);
         for (std::size_t a = 0; a < lb; ++a) {
@@ -183,26 +189,106 @@ void scatter(const Plan& p, const View& v, const std::byte* dense, std::size_t e
     copy_nd(shape.size(), shape.data(), dense, sstr.data(), v.base, dstr.data(), es);
 }
 
+// --- device-resident arrays -----------------------------------------------
+
+// An array's values on the device (DeviceCopy): a mirror of its host block,
+// byte for byte, made by the device op that computed them.
+class ClCopy final : public DeviceCopy {
+  public:
+    ClCopy(std::shared_ptr<Context> ctx, Buffer buf) : ctx_(std::move(ctx)), buf_(std::move(buf)) {}
+    bool download(std::byte* dst, std::size_t nbytes) noexcept override {
+        // Called inside CPU kernels (CountableArray::data()), whose FP flags
+        // the task reports: the OpenCL implementation's must not add to them.
+        std::fexcept_t flags;
+        std::fegetexceptflag(&flags, FE_ALL_EXCEPT);
+        bool ok = true;
+        try {
+            read(ctx_->queue(), buf_, dst, nbytes);
+        } catch (...) {
+            ok = false;
+        }
+        std::fesetexceptflag(&flags, FE_ALL_EXCEPT);
+        return ok;
+    }
+    const Context& context() const { return *ctx_; }
+    const Buffer& buffer() const { return buf_; }
+
+  private:
+    std::shared_ptr<Context> ctx_;
+    Buffer buf_;
+};
+
+// shape and two stride vectors without the extent-1 axes (fewer axes for
+// the device's copy kernel).
+void squeeze(std::vector<std::int64_t>& shape, std::vector<std::int64_t>& a,
+             std::vector<std::int64_t>& b) {
+    std::size_t j = 0;
+    for (std::size_t i = 0; i < shape.size(); ++i) {
+        if (shape[i] != 1) {
+            shape[j] = shape[i], a[j] = a[i], b[j] = b[i];
+            ++j;
+        }
+    }
+    shape.resize(j), a.resize(j), b.resize(j);
+}
+
+// True if the device's copy kernel takes the block: at most 8 axes, offsets
+// and strides in whole 32-bit words.
+bool device_copyable(std::size_t nd, std::int64_t soff, const std::vector<std::int64_t>& sstr,
+                     std::int64_t doff, const std::vector<std::int64_t>& dstr, std::size_t es) {
+    if (nd > 8 || es % 4 != 0 || soff % 4 != 0 || doff % 4 != 0) {
+        return false;
+    }
+    for (std::size_t a = 0; a < nd; ++a) {
+        if (sstr[a] % 4 != 0 || dstr[a] % 4 != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Copies an n-d block on the device (device_copyable; offsets and strides
+// in bytes), as copy_nd on the host.
+void device_copy_nd(Context& ctx, cl_command_queue q, DType d, const Buffer& src, std::int64_t soff,
+                    const std::vector<std::int64_t>& shape, const std::vector<std::int64_t>& sstr,
+                    Buffer& dst, std::int64_t doff, const std::vector<std::int64_t>& dstr,
+                    std::size_t es) {
+    std::uint64_t total = 1;
+    for (std::int64_t e : shape) {
+        total *= static_cast<std::uint64_t>(e);
+    }
+    if (total == 0) {
+        return;
+    }
+    cl_long8 sh{}, ss{}, ds{};
+    for (std::size_t a = 0; a < shape.size(); ++a) {
+        sh.s[a] = shape[a], ss.s[a] = sstr[a], ds.s[a] = dstr[a];
+    }
+    const cl_ulong so = static_cast<cl_ulong>(soff), dof = static_cast<cl_ulong>(doff);
+    const int nd = static_cast<int>(shape.size()), words = static_cast<int>(es / 4);
+    const cl_ulong n = total;
+    KernelCall k(ctx.program(d), "copy_nd");
+    const std::size_t wg = ctx.work_group(k.get(), 256);
+    k.arg(src.get()).arg(so).arg(dst.get()).arg(dof).arg(nd).arg(sh).arg(ss).arg(ds).arg(words).arg(
+        n);
+    k.run(q, static_cast<std::size_t>((total + wg - 1) / wg), wg);
+}
+
+// A 1-d launch of one of viproc's element kernels over n items.
+void launch(Context& ctx, KernelCall& k, cl_command_queue q, std::uint64_t n) {
+    if (n == 0) {
+        return;
+    }
+    const std::size_t wg = ctx.work_group(k.get(), 256);
+    k.run(q, static_cast<std::size_t>((n + wg - 1) / wg), wg);
+}
+
 bool all_zero(const std::vector<std::int64_t>& v) {
     return std::all_of(v.begin(), v.end(), [](std::int64_t x) { return x == 0; });
 }
 
 bool is_complex(DType d) { return d == DType::Complex64 || d == DType::Complex128; }
 bool is_double(DType d) { return d == DType::Float64 || d == DType::Complex128; }
-
-void conj_in_place(Bytes& b, DType d) {
-    if (d == DType::Complex128) {
-        auto* x = reinterpret_cast<double*>(b.data());
-        for (std::size_t i = 1; i < b.size() / sizeof(double); i += 2) {
-            x[i] = -x[i];
-        }
-    } else if (d == DType::Complex64) {
-        auto* x = reinterpret_cast<float*>(b.data());
-        for (std::size_t i = 1; i < b.size() / sizeof(float); i += 2) {
-            x[i] = -x[i];
-        }
-    }
-}
 
 std::int64_t log2_ceil(std::int64_t n) {
     std::int64_t l = 0;
@@ -589,21 +675,41 @@ class DeviceKernel : public Kernel {
         for (std::int64_t s : p.sizes) {
             empty = empty || s == 0;
         }
-        if (empty || work(p) < min_work()) {
+        if (empty) {
             return cpu_->run(inputs, outputs);
+        }
+        DevicePolicy& pol = policy();
+        OpRequest req = request(p, nin);
+        bool timed = false;
+        if (!pol.use_device(req, nullptr, &timed)) {
+            // The CPU kernel reads its inputs through CountableArray::data():
+            // values on the device are downloaded there.
+            const double t0 = timed ? now_ns() : 0;
+            KernelResult r = cpu_->run(inputs, outputs);
+            if (timed && r.status == 0) {
+                pol.record(req, false, now_ns() - t0);
+            }
+            return r;
         }
         // The task reads the FP flags after the kernel (NumPy's errstate):
         // only the host math NumPy's loops do too may leave flags (det's
-        // exp and log, fft's normalization); OpenCL, CLBlast and VkFFT's
-        // host code (plans) must not, so each op clears them before its
-        // host math (det, fft) or at its end.
+        // exp and log); OpenCL, CLBlast and VkFFT's host code (plans) must
+        // not, so each op clears them before its host math (det) or at its
+        // end.
+        req.sharing = pol.in_flight.fetch_add(1, std::memory_order_relaxed);
+        const double t0 = now_ns();
         try {
             KernelResult r = run_device(p);
+            pol.in_flight.fetch_sub(1, std::memory_order_relaxed);
+            pol.succeeded(req);
+            pol.record(req, true, now_ns() - t0);
             device_ops.fetch_add(1, std::memory_order_relaxed);
             return r;
         } catch (const Error&) {
         } catch (const std::bad_alloc&) {
         }
+        pol.in_flight.fetch_sub(1, std::memory_order_relaxed);
+        pol.failed(req);
         device_fallbacks.fetch_add(1, std::memory_order_relaxed);
         std::feclearexcept(FE_ALL_EXCEPT);
         return cpu_->run(inputs, outputs);
@@ -626,6 +732,174 @@ class DeviceKernel : public Kernel {
     }
 
   private:
+    static double now_ns() {
+        return static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count());
+    }
+
+    // The operand's elements in the order the device packs them: [batch...,
+    // core...] (`transpose`: the two core axes swapped), and its strides.
+    static void view_layout(const Plan& p, const View& v, bool transpose, bool once,
+                            std::vector<std::int64_t>& shape, std::vector<std::int64_t>& str) {
+        shape = once ? std::vector<std::int64_t>{} : p.batch;
+        str = once ? std::vector<std::int64_t>{} : v.bstr;
+        std::vector<std::int64_t> cs = v.cshape, cst = v.cstr;
+        if (transpose && cs.size() == 2) {
+            std::swap(cs[0], cs[1]);
+            std::swap(cst[0], cst[1]);
+        }
+        shape.insert(shape.end(), cs.begin(), cs.end());
+        str.insert(str.end(), cst.begin(), cst.end());
+    }
+
+    // The operand's values on this op's device, or null.
+    std::shared_ptr<ClCopy> mirror_of(const View& v) const {
+        if (v.ca == nullptr) {
+            return nullptr;
+        }
+        std::shared_ptr<DeviceCopy> c = v.ca->device_copy();
+        auto* cc = dynamic_cast<ClCopy*>(c.get());
+        if (cc == nullptr || &cc->context() != ctx_.get()) {
+            return nullptr;
+        }
+        return std::static_pointer_cast<ClCopy>(std::move(c));
+    }
+
+    // True if output `v` (elements `shape`, strides `str`) may keep its
+    // values on the device: they are all of its buffer's bytes (a new
+    // result, or an out= array written whole), and no NumPy view aliases
+    // its host memory (ops on such memory run synchronously, and the
+    // views must see the values).
+    bool resident_ok(const View& v, const std::vector<std::int64_t>& shape,
+                     const std::vector<std::int64_t>& str, std::size_t es) const {
+        if (!policy().resident() || v.ca == nullptr || v.ca->host_views != 0) {
+            return false;
+        }
+        std::uint64_t n = 1;
+        for (std::size_t a = 0; a < shape.size(); ++a) {
+            n *= static_cast<std::uint64_t>(shape[a]);
+            if (shape[a] > 1 && str[a] == 0) {
+                return false;
+            }
+        }
+        return n != 0 && n * es == v.ca->nbytes() && v.ca->allocated();
+    }
+
+    // The operand dense on the device: [count][core axes...] (gather()'s
+    // order). From its device values if it has them (a copy on the
+    // device), else gathered on the host (values downloaded first if the
+    // host's are stale) and uploaded.
+    Buffer stage(const Plan& p, const View& v, std::size_t es, cl_command_queue q,
+                 bool transpose = false, bool once = false) {
+        if (std::shared_ptr<ClCopy> m = mirror_of(v)) {
+            std::vector<std::int64_t> shape, str;
+            view_layout(p, v, transpose, once, shape, str);
+            std::int64_t total = 1;
+            for (std::int64_t e : shape) {
+                total *= e;
+            }
+            std::vector<std::int64_t> dstr = dense_strides(shape, es);
+            squeeze(shape, str, dstr);
+            if (device_copyable(shape.size(), v.off, str, 0, dstr, es)) {
+                Buffer out(*ctx_, static_cast<std::size_t>(total) * es);
+                device_copy_nd(*ctx_, q, dtypes_[0], m->buffer(), v.off, shape, str, out, 0, dstr,
+                               es);
+                return out;
+            }
+        }
+        if (v.ca != nullptr) {
+            (void)v.ca->data(); // the host's values, downloaded if stale
+        }
+        Bytes h = gather(p, v, es, transpose, once);
+        Buffer out(*ctx_, h.size());
+        write(q, out, h.data(), h.size());
+        return out;
+    }
+
+    // The result `src` (elements `shape`, byte strides `sstr` from its
+    // start) into output `v` (its strides `dstr`): kept on the device as
+    // the output's values where resident_ok (src itself if it is laid out
+    // as the output's block, else copied into a block-shaped buffer), else
+    // downloaded and scattered on the host.
+    void deliver(const View& v, Buffer& src, std::vector<std::int64_t> shape,
+                 std::vector<std::int64_t> sstr, std::vector<std::int64_t> dstr, std::size_t es,
+                 cl_command_queue q) {
+        if (resident_ok(v, shape, dstr, es)) {
+            std::vector<std::int64_t> sh = shape, ss = sstr, ds = dstr;
+            squeeze(sh, ss, ds);
+            Buffer mirror;
+            bool ok = false;
+            if (v.off == 0 && ss == ds && src.bytes() == v.ca->nbytes()) {
+                mirror = std::move(src);
+                ok = true;
+            } else if (device_copyable(sh.size(), 0, ss, v.off, ds, es)) {
+                mirror = Buffer(*ctx_, v.ca->nbytes());
+                device_copy_nd(*ctx_, q, dtypes_[0], src, 0, sh, ss, mirror, v.off, ds, es);
+                ok = true;
+            }
+            if (ok) {
+                // Finished before the task completes: readers on other
+                // threads use other queues.
+                check(clFinish(q), "clFinish");
+                v.ca->set_device_copy(std::make_shared<ClCopy>(ctx_, std::move(mirror)));
+                return;
+            }
+        }
+        Bytes h(src.bytes());
+        read(q, src, h.data(), h.size());
+        copy_nd(shape.size(), shape.data(), h.data(), sstr.data(), v.base, dstr.data(), es);
+    }
+
+    // deliver() of a dense [count][core...] result (scatter()'s order).
+    void deliver_dense(const Plan& p, const View& v, Buffer& src, std::size_t es,
+                       cl_command_queue q, bool transpose = false) {
+        std::vector<std::int64_t> shape, str;
+        view_layout(p, v, transpose, false, shape, str);
+        std::vector<std::int64_t> sstr = dense_strides(shape, es);
+        deliver(v, src, std::move(shape), std::move(sstr), std::move(str), es, q);
+    }
+
+    // The policy's view of this op: work, bytes moved, where the operands'
+    // values are.
+    OpRequest request(const Plan& p, std::size_t nin) const {
+        OpRequest r;
+        r.op = op_;
+        r.dtype = dtypes_[0];
+        r.work = work(p);
+        for (std::size_t i = 0; i < p.ops.size(); ++i) {
+            const View& v = p.ops[i];
+            std::uint64_t n = all_zero(v.bstr) ? 1 : static_cast<std::uint64_t>(p.count);
+            for (std::int64_t e : v.cshape) {
+                n *= static_cast<std::uint64_t>(e);
+            }
+            const std::uint64_t bytes = n * itemsize(dtypes_[std::min(i, dtypes_.size() - 1)]);
+            if (i < nin) {
+                r.bytes_in += bytes;
+                if (v.ca != nullptr && v.ca->has_device_copy()) {
+                    if (mirror_of(v) != nullptr) {
+                        r.bytes_resident += bytes;
+                    }
+                    if (v.ca->host_stale()) {
+                        r.bytes_stale += bytes;
+                    }
+                }
+            } else {
+                r.bytes_out += bytes;
+                std::vector<std::int64_t> shape, str;
+                view_layout(p, v, false, false, shape, str);
+                r.output_resident =
+                    r.output_resident ||
+                    resident_ok(v, shape, str, itemsize(dtypes_[std::min(i, dtypes_.size() - 1)]));
+            }
+        }
+        // det/slogdet compute their results on the host
+        if (op_ == Op::Det || op_ == Op::Slogdet) {
+            r.output_resident = false;
+        }
+        return r;
+    }
+
     std::int64_t work(const Plan& p) const {
         const std::int64_t b = p.count;
         switch (op_) {
@@ -697,23 +971,18 @@ class DeviceKernel : public Kernel {
         const std::size_t n = static_cast<std::size_t>(p.sizes[2]);
         const std::size_t count = static_cast<std::size_t>(p.count);
         const bool a1 = all_zero(p.ops[0].bstr), b1 = all_zero(p.ops[1].bstr);
-        Bytes ha = gather(p, p.ops[0], es, false, a1);
-        Bytes hb = gather(p, p.ops[1], es, false, b1);
         const std::size_t cbytes = count * m * n * es;
-        check_fits(std::max({ha.size(), hb.size(), cbytes}));
         cl_command_queue q = ctx_->queue();
-        Buffer A(*ctx_, ha.size()), B(*ctx_, hb.size()), C(*ctx_, cbytes);
-        write(q, A, ha.data(), ha.size());
-        write(q, B, hb.data(), hb.size());
+        Buffer A = stage(p, p.ops[0], es, q, false, a1);
+        Buffer B = stage(p, p.ops[1], es, q, false, b1);
+        Buffer C(*ctx_, cbytes);
         if (count == 1) {
             gemm(*blas, d, q, m, n, k, 1.0, A.get(), 0, k, B.get(), 0, n, 0.0, C.get(), 0, n);
         } else {
             gemm_batched(*blas, d, q, m, n, k, A.get(), a1 ? 0 : m * k, B.get(), b1 ? 0 : k * n,
                          C.get(), m * n, count);
         }
-        Bytes hc(cbytes);
-        read(q, C, hc.data(), cbytes);
-        scatter(p, p.ops[2], hc.data(), es);
+        deliver_dense(p, p.ops[2], C, es, q);
     }
 
     // The LU factors of input 0 on the device; returns n.
@@ -722,10 +991,7 @@ class DeviceKernel : public Kernel {
         const std::size_t es = itemsize(d);
         const int n = static_cast<int>(p.sizes[0]);
         const std::size_t count = static_cast<std::size_t>(p.count);
-        Bytes ha = gather(p, p.ops[0], es);
-        check_fits(ha.size());
-        A = Buffer(*ctx_, ha.size());
-        write(q, A, ha.data(), ha.size());
+        A = stage(p, p.ops[0], es, q);
         std::vector<int> zeros(count * static_cast<std::size_t>(n), 0);
         piv = Buffer(*ctx_, zeros.size() * sizeof(int));
         write(q, piv, zeros.data(), zeros.size() * sizeof(int));
@@ -839,6 +1105,7 @@ class DeviceKernel : public Kernel {
         }
         int nrhs = 1;
         Bytes hb;
+        Buffer B;
         const View* out = nullptr;
         if (op_ == Op::Inv) {
             nrhs = n;
@@ -856,17 +1123,16 @@ class DeviceKernel : public Kernel {
                 }
             }
             out = &p.ops[1];
+            B = Buffer(*ctx_, hb.size());
+            write(q, B, hb.data(), hb.size());
         } else {
             nrhs = op_ == Op::Solve ? static_cast<int>(p.sizes[1]) : 1;
-            hb = gather(p, p.ops[1], es);
+            B = stage(p, p.ops[1], es, q);
             out = &p.ops[2];
         }
-        Buffer B(*ctx_, hb.size());
-        write(q, B, hb.data(), hb.size());
         const Clblast* blas = load_clblast();
         getrs(*ctx_, q, d, blas, A, n, count, piv, B, nrhs);
-        read(q, B, hb.data(), hb.size());
-        scatter(p, *out, hb.data(), es);
+        deliver_dense(p, *out, B, es, q);
         return {};
     }
 
@@ -879,14 +1145,14 @@ class DeviceKernel : public Kernel {
         const std::size_t count = static_cast<std::size_t>(p.count);
         // upper: the lower factor of A^H (whose lower triangle is the
         // conjugated upper triangle of A), U = L^H
-        Bytes ha = gather(p, p.ops[0], es, up);
-        if (up) {
-            conj_in_place(ha, d);
-        }
-        check_fits(ha.size());
         cl_command_queue q = ctx_->queue();
-        Buffer A(*ctx_, ha.size());
-        write(q, A, ha.data(), ha.size());
+        Buffer A = stage(p, p.ops[0], es, q, up);
+        const cl_ulong nel = static_cast<cl_ulong>(count * nn * nn);
+        if (up && is_complex(d)) {
+            KernelCall c(ctx_->program(d), "conj_all");
+            c.arg(A.get()).arg(nel);
+            launch(*ctx_, c, q, nel);
+        }
         std::vector<int> hi(count, 0);
         Buffer info(*ctx_, count * sizeof(int));
         write(q, info, hi.data(), count * sizeof(int));
@@ -901,16 +1167,18 @@ class DeviceKernel : public Kernel {
                 return KernelResult{1, invalid_, 0};
             }
         }
-        read(q, A, ha.data(), ha.size());
-        for (std::size_t m = 0; m < count; ++m) {
-            for (std::size_t i = 0; i < nn; ++i) {
-                std::memset(ha.data() + (m * nn * nn + i * nn + i + 1) * es, 0, (nn - i - 1) * es);
-            }
+        {
+            const cl_ulong cnt = static_cast<cl_ulong>(count);
+            KernelCall z(ctx_->program(d), "zero_upper");
+            z.arg(A.get()).arg(n).arg(cnt);
+            launch(*ctx_, z, q, nel);
         }
-        if (up) {
-            conj_in_place(ha, d);
+        if (up && is_complex(d)) {
+            KernelCall c(ctx_->program(d), "conj_all");
+            c.arg(A.get()).arg(nel);
+            launch(*ctx_, c, q, nel);
         }
-        scatter(p, p.ops[1], ha.data(), es, up);
+        deliver_dense(p, p.ops[1], A, es, q, up);
         return {};
     }
 
@@ -949,11 +1217,12 @@ class DeviceKernel : public Kernel {
         // one row: npts complex values, or the in-place real layout of h
         // complex values
         const std::int64_t row_bytes = static_cast<std::int64_t>(real ? h * cs : npts * cs);
-        Bytes host(count * static_cast<std::size_t>(row_bytes), std::byte{0});
-        check_fits(host.size());
+        const std::size_t total = count * static_cast<std::size_t>(row_bytes);
         const View& in = p.ops[0];
+        cl_command_queue q = ctx_->queue();
+        Buffer buf(*ctx_, total);
         {
-            // the input rows into host: min(nin, length) elements each
+            // the input rows: min(nin, length) elements each, zero-padded
             std::int64_t take = 0, es = 0;
             if (kind == FftKind::RealForward) {
                 take = std::min(nin, npts), es = static_cast<std::int64_t>(rs);
@@ -966,57 +1235,81 @@ class DeviceKernel : public Kernel {
             shape.push_back(take);
             sstr.push_back(in.cstr[0]);
             std::vector<std::int64_t> dstr = dense_strides(p.batch, 1);
-            for (std::int64_t& s : dstr) {
-                s *= row_bytes;
+            for (std::int64_t& st : dstr) {
+                st *= row_bytes;
             }
             dstr.push_back(es);
-            copy_nd(shape.size(), shape.data(), in.base, sstr.data(), host.data(), dstr.data(),
-                    static_cast<std::size_t>(es));
-            if (kind == FftKind::RealBackward) {
-                // pocketfft's irfft ignores the imaginary parts of the zero
-                // and (n even) the Nyquist frequency
-                for (std::size_t r = 0; r < count; ++r) {
-                    std::byte* row = host.data() + r * static_cast<std::size_t>(row_bytes);
-                    std::memset(row + rs, 0, rs);
-                    if (npts % 2 == 0 && npts / 2 < nin) {
-                        std::memset(row + static_cast<std::size_t>(npts / 2) * cs + rs, 0, rs);
+            const std::size_t ues = static_cast<std::size_t>(es);
+            std::shared_ptr<ClCopy> m = mirror_of(in);
+            std::vector<std::int64_t> sh = shape, ss = sstr, ds = dstr;
+            squeeze(sh, ss, ds);
+            if (m != nullptr && device_copyable(sh.size(), in.off, ss, 0, ds, ues)) {
+                const cl_ulong words = total / 4;
+                KernelCall z(ctx_->program(din), "fill_zero");
+                z.arg(buf.get()).arg(words);
+                launch(*ctx_, z, q, words);
+                device_copy_nd(*ctx_, q, din, m->buffer(), in.off, sh, ss, buf, 0, ds, ues);
+                if (kind == FftKind::RealBackward) {
+                    const cl_ulong stride = static_cast<cl_ulong>(row_bytes) / rs;
+                    const int np = static_cast<int>(npts);
+                    const cl_long ni = nin;
+                    const cl_ulong cnt = count;
+                    KernelCall k(ctx_->program(din), "irfft_prep");
+                    k.arg(buf.get()).arg(stride).arg(np).arg(ni).arg(cnt);
+                    launch(*ctx_, k, q, count);
+                }
+            } else {
+                if (in.ca != nullptr) {
+                    (void)in.ca->data(); // the host's values, downloaded if stale
+                }
+                Bytes host(total, std::byte{0});
+                copy_nd(shape.size(), shape.data(), in.base, sstr.data(), host.data(), dstr.data(),
+                        ues);
+                if (kind == FftKind::RealBackward) {
+                    // pocketfft's irfft ignores the imaginary parts of the
+                    // zero and (n even) the Nyquist frequency
+                    for (std::size_t r = 0; r < count; ++r) {
+                        std::byte* row = host.data() + r * static_cast<std::size_t>(row_bytes);
+                        std::memset(row + rs, 0, rs);
+                        if (npts % 2 == 0 && npts / 2 < nin) {
+                            std::memset(row + static_cast<std::size_t>(npts / 2) * cs + rs, 0, rs);
+                        }
                     }
                 }
+                write(q, buf, host.data(), total);
             }
         }
-        cl_command_queue q = ctx_->queue();
-        Buffer buf(*ctx_, host.size());
-        write(q, buf, host.data(), host.size());
         opencl::fft(*ctx_, q, kind, dbl, static_cast<std::uint64_t>(npts),
                     static_cast<std::uint64_t>(count), buf);
-        read(q, buf, host.data(), host.size());
-        std::feclearexcept(FE_ALL_EXCEPT); // what follows is pocketfft's scaling
-        // NumPy's normalization factor, one per batch element (input 1)
+        // NumPy's normalization factor, one per batch element (input 1, host
+        // data), applied on the device (factors <= 1: no overflow to report)
+        if (p.ops[1].ca != nullptr) {
+            (void)p.ops[1].ca->data();
+        }
         Bytes fb = gather(p, p.ops[1], rs);
         const std::int64_t len = kind == FftKind::RealBackward ? npts : nout;
         const std::size_t es = kind == FftKind::RealBackward ? rs : cs;
-        for (std::size_t r = 0; r < count; ++r) {
-            std::byte* row = host.data() + r * static_cast<std::size_t>(row_bytes);
-            const std::size_t nreal = static_cast<std::size_t>(len) * es / rs;
+        bool ones = true;
+        for (std::size_t r = 0; r < count && ones; ++r) {
             if (dbl) {
                 double f;
                 std::memcpy(&f, fb.data() + r * rs, 8);
-                if (f != 1.0) {
-                    auto* x = reinterpret_cast<double*>(row);
-                    for (std::size_t i = 0; i < nreal; ++i) {
-                        x[i] *= f;
-                    }
-                }
+                ones = f == 1.0;
             } else {
                 float f;
                 std::memcpy(&f, fb.data() + r * rs, 4);
-                if (f != 1.0f) {
-                    auto* x = reinterpret_cast<float*>(row);
-                    for (std::size_t i = 0; i < nreal; ++i) {
-                        x[i] *= f;
-                    }
-                }
+                ones = f == 1.0f;
             }
+        }
+        if (!ones) {
+            Buffer fdev(*ctx_, fb.size());
+            write(q, fdev, fb.data(), fb.size());
+            const cl_ulong stride = static_cast<cl_ulong>(row_bytes) / rs;
+            const cl_ulong nreal = static_cast<cl_ulong>(len) * es / rs;
+            const cl_ulong cnt = count;
+            KernelCall k(ctx_->program(dbl ? DType::Float64 : DType::Float32), "scale_rows");
+            k.arg(buf.get()).arg(stride).arg(nreal).arg(fdev.get()).arg(cnt);
+            launch(*ctx_, k, q, cnt * nreal);
         }
         (void)dout;
         const View& out = p.ops[2];
@@ -1024,11 +1317,12 @@ class DeviceKernel : public Kernel {
         shape.push_back(len);
         dstr.push_back(out.cstr[0]);
         std::vector<std::int64_t> sstr = dense_strides(p.batch, 1);
-        for (std::int64_t& s : sstr) {
-            s *= row_bytes;
+        for (std::int64_t& st : sstr) {
+            st *= row_bytes;
         }
         sstr.push_back(static_cast<std::int64_t>(es));
-        copy_nd(shape.size(), shape.data(), host.data(), sstr.data(), out.base, dstr.data(), es);
+        deliver(out, buf, std::move(shape), std::move(sstr), std::move(dstr), es, q);
+        std::feclearexcept(FE_ALL_EXCEPT);
     }
 
     std::shared_ptr<Context> ctx_;

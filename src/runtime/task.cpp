@@ -779,6 +779,14 @@ TaskList Task::execute(ErrorTable* errors) {
                                             : std::chrono::steady_clock::time_point{};
         KernelResult r;
         try {
+            // An output written in place loses its accelerator copy (O4):
+            // the host values are made valid first (a partial write keeps
+            // the others).
+            for (const Operand& o : outputs) {
+                if (o.buffer->has_device_copy()) [[unlikely]] {
+                    o.buffer->drop_device_copy();
+                }
+            }
             r = kernel_->run(inputs, outputs);
         } catch (const std::exception& e) {
             r = KernelResult{1, e.what(), 0};

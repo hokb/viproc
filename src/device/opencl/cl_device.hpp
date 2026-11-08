@@ -46,7 +46,17 @@ class Context {
     bool is_gpu() const { return gpu_; }
     std::size_t max_work_group() const { return max_wg_; }
     std::uint64_t global_memory() const { return global_mem_; }
-    std::uint64_t max_allocation() const { return max_alloc_; }
+    std::uint64_t max_allocation() const {
+        const std::uint64_t l = alloc_limit_.load(std::memory_order_relaxed);
+        return l != 0 && l < max_alloc_ ? l : max_alloc_;
+    }
+    // CL_DEVICE_MAX_COMPUTE_UNITS and CL_DEVICE_MAX_CLOCK_FREQUENCY (MHz):
+    // the cost policy's prior of the device's compute rate.
+    unsigned compute_units() const { return compute_units_; }
+    unsigned clock_mhz() const { return clock_mhz_; }
+    // Tests: pretend the device allows allocations of at most `bytes`
+    // (0: its own limit), to exercise the failure memory.
+    void limit_allocation(std::uint64_t bytes) { alloc_limit_ = bytes; }
     // Unique per context in the process (thread queues are keyed by it).
     std::uint64_t id() const { return id_; }
 
@@ -66,6 +76,8 @@ class Context {
     bool fp64_ = false, gpu_ = false;
     std::size_t max_wg_ = 1;
     std::uint64_t global_mem_ = 0, max_alloc_ = 0;
+    std::atomic<std::uint64_t> alloc_limit_{0};
+    unsigned compute_units_ = 1, clock_mhz_ = 1000;
     std::uint64_t id_;
     std::mutex mutex_;
     cl_program programs_[4] = {};
@@ -127,11 +139,6 @@ std::shared_ptr<Context> current();
 // "gpu"). Returns the context or null; `why` receives the reason for null.
 // Main thread; device kernels issued before keep their context.
 std::shared_ptr<Context> select(const char* spec, std::string* why);
-
-// Ops offloaded smaller than this (in the op's flop estimate) run their CPU
-// kernel (env VIPROC_OPENCL_MIN_WORK; default 2^24, about a 256^3 product).
-std::int64_t min_work();
-void set_min_work(std::int64_t w);
 
 // Counters (offload_stats): ops a device kernel ran on the device, and ones
 // it handed to its CPU kernel because the device failed (Error).

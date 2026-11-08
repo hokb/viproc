@@ -52,8 +52,11 @@ Task T ── operands: (Metadata, CountableArray captured at issue), …
   device, each empty or a valid copy of the same values (the physical
   register). `async_reads` and `host_views` live here, because readers read
   a version and all views share the version. Which device a reader uses is
-  decided by its task (phase 2: cost functions); a copy to another device
-  fills a handle of the *same* version and changes no values.
+  decided by its task (O4: the device policy, opencl.md); a copy to another device
+  fills a handle of the *same* version and changes no values. Implemented
+  for one accelerator at O4 (opencl.md, "Device-resident arrays"): a
+  `DeviceCopy` beside the host memory, a byte-for-byte mirror; host reads
+  download through `data()`, host writes drop it.
 - **Task** (T): one per op invocation, the Accelerator's *awaiter*. Each
   operand holds the Metadata (for the SD) and the CountableArray the op was
   issued against (all device copies of that version). A task never reaches
@@ -331,8 +334,8 @@ Metadata: a reader captured a version, and a handle added later belongs to
 that same version.
 
 **Follow-ups, each measured on its own (G3):** stage-wise SD publication
-and `Metadata::task` with pipelining S2/S4; further device handles with the
-first non-CPU device (phase 2); a flat SD block if callgrind shows a gain;
+and `Metadata::task` with pipelining S2/S4; device handles with the
+first non-CPU device (done at O4: `DeviceCopy`, opencl.md); a flat SD block if callgrind shows a gain;
 a NEP 49 allocator for large fallback results if measurements call for it.
 
 **Naming.** The object holding the SD and its task was first called

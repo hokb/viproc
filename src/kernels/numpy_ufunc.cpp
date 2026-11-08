@@ -1506,8 +1506,20 @@ PyObject* ndarray_over(const Array& a, bool writable) {
     }
     // Read-only unless the caller prepared the buffer for writing (see header).
     const int flags = writable ? NPY_ARRAY_ALIGNED | NPY_ARRAY_WRITEABLE : NPY_ARRAY_ALIGNED;
+    std::byte* data = nullptr;
+    try {
+        // Values computed on the accelerator (O4) are downloaded here; NumPy
+        // may write a writable view, so the accelerator's copy goes.
+        if (writable) {
+            a.buffer()->drop_device_copy();
+        }
+        data = a.buffer()->data();
+    } catch (const std::exception& e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        return nullptr;
+    }
     return PyArray_New(&PyArray_Type, static_cast<int>(l.shape.size()), shape, type_num(l.dtype),
-                       strides, a.buffer()->data() + l.offset, 0, flags, nullptr);
+                       strides, data + l.offset, 0, flags, nullptr);
 }
 
 // Makes `view` (over a's buffer, no base yet) an export: its base keeps the

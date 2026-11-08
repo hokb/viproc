@@ -2231,8 +2231,14 @@ def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None, level=No
         else "gpu", the first GPU or accelerator; "cpu", "any", "none",
         "P:D" platform and device index, "N" device index, or part of the
         device's name). device_info() tells which one was selected.
-    device_min_work: ops with a smaller flop estimate run on the CPU
-        (default: env VIPROC_OPENCL_MIN_WORK, else 2**24; process-wide).
+    device_min_work: a fixed threshold instead of the cost model: ops with a
+        smaller work estimate run on the CPU, the others on the device
+        (process-wide; default: env VIPROC_OPENCL_MIN_WORK, else none: the
+        cost model decides per op from its sizes, its transfers, where its
+        operands are and the device's load, with the device's measured
+        latency and bandwidths and the measured run times; deterministic
+        mode (adaptive=False) without a threshold uses 2**24; a negative
+        value unsets it).
     """
     env_sync, env_adaptive = _env_policy()
     sync_below = env_sync if sync_below is None else sync_below
@@ -2246,8 +2252,13 @@ def init(workers=0, max_active_tasks=0, sync_below=None, adaptive=None, level=No
 
 def device_info():
     """The OpenCL device of optimization level 4: {'selected', 'platform',
-    'name', 'gpu', 'fp64', 'clblast', 'global_memory', 'min_work', 'reason'}
-    ('reason': why none is selected, or why CLBlast is missing)."""
+    'name', 'gpu', 'fp64', 'clblast', 'global_memory', 'min_work', 'policy',
+    'reason'} ('min_work': the threshold set, or -1; 'policy': how ops are
+    placed: 'mode' ('cost' or 'threshold'), 'threshold', 'resident' (results
+    stay on the device), the measured 'latency_ns', 'upload_gbps',
+    'download_gbps', and decision counts 'to_device', 'to_cpu', 'explored',
+    'skipped' (the device failed on that size before); 'reason': why none is
+    selected, or why CLBlast is missing)."""
     _ensure_runtime()
     info, reason = _viproc.opencl_info()
     d = {"selected": info is not None, "platform": None, "name": None, "gpu": False,
@@ -2255,6 +2266,7 @@ def device_info():
     if info is not None:
         d.update(info)
     d["min_work"] = _viproc.opencl_min_work()
+    d["policy"] = _viproc.opencl_policy()
     d["reason"] = reason
     return d
 
