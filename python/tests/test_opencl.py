@@ -403,6 +403,44 @@ def test_writes_to_device_values(o4):
     close(big, want, 1e-12)
 
 
+
+def test_overwrites_of_device_values(o4):
+    """A write that replaces a resident buffer whole and reads none of it
+    discards the device copy without a download; partial writes and writes
+    reading the buffer see the device's values first."""
+    a = sample((50, 50), np.float64)
+    b = sample((50, 50), np.float64)
+    A, B = viproc.asarray(a), viproc.asarray(b)
+    # a device op into a resident out=: stays on the device
+    C = A @ A
+    viproc.wait_all()
+    assert state(C) == 2
+    np.matmul(B, B, out=C)
+    viproc.wait_all()
+    assert state(C) == 2
+    close(C, b @ b, 1e-12)
+    # a CPU op into a resident out=, whole: the host values
+    C = A @ A
+    viproc.wait_all()
+    np.multiply(B, 2.0, out=C)
+    viproc.wait_all()
+    assert state(C) == 0
+    np.testing.assert_array_equal(np.asarray(C), b * 2.0)
+    # a CPU op into a part: the other values are the device's
+    C = A @ A
+    viproc.wait_all()
+    np.multiply(B[:5], 2.0, out=C[:5])
+    want = a @ a
+    want[:5] = b[:5] * 2.0
+    viproc.wait_all()
+    close(C, want, 1e-12)
+    # a CPU op reading the buffer it writes whole
+    C = A @ A
+    viproc.wait_all()
+    np.add(C, 1.0, out=C)
+    close(C, a @ a + 1.0, 1e-12)
+
+
 def test_exports_of_device_values(o4):
     a = sample((40, 40), np.float64)
     C = viproc.asarray(a) @ viproc.asarray(a)

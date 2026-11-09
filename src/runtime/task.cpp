@@ -78,6 +78,32 @@ void Task::wait_state(TaskState s) const {
     }
 }
 
+void drop_device_copies_of(const Kernel& kernel, std::span<const Operand> inputs,
+                           std::span<const Operand> outputs) {
+    for (const Operand& o : outputs) {
+        CountableArray& b = *o.buffer;
+        if (!b.has_device_copy()) [[likely]] {
+            continue;
+        }
+        // The whole block, each byte once: as many bytes as the buffer and
+        // no axis repeating elements (NumPy's outputs never overlap
+        // themselves otherwise).
+        const Layout& l = o.layout();
+        bool whole = kernel.writes_all() && l.nbytes() == b.nbytes() && l.offset == 0;
+        for (std::size_t a = 0; whole && a < l.shape.size(); ++a) {
+            whole = l.shape[a] <= 1 || l.strides[a] != 0;
+        }
+        for (const Operand& in : inputs) {
+            whole = whole && in.buffer.get() != &b;
+        }
+        if (whole) {
+            b.discard_device_copy();
+        } else {
+            b.drop_device_copy(); // a partial write keeps the other values
+        }
+    }
+}
+
 namespace {
 
 // Steps (size, layout) of configuring tasks that became due on this thread,
@@ -779,14 +805,8 @@ TaskList Task::execute(ErrorTable* errors) {
                                             : std::chrono::steady_clock::time_point{};
         KernelResult r;
         try {
-            // An output written in place loses its accelerator copy (O4):
-            // the host values are made valid first (a partial write keeps
-            // the others).
-            for (const Operand& o : outputs) {
-                if (o.buffer->has_device_copy()) [[unlikely]] {
-                    o.buffer->drop_device_copy();
-                }
-            }
+            // An output written in place loses its accelerator copy (O4).
+            drop_device_copies(*kernel_, inputs, outputs);
             r = kernel_->run(inputs, outputs);
         } catch (const std::exception& e) {
             r = KernelResult{1, e.what(), 0};

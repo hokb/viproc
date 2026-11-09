@@ -60,6 +60,20 @@ void CountableArray::drop_device_copy() {
     }
 }
 
+void CountableArray::discard_device_copy() {
+    if (!has_device_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::shared_ptr<DeviceCopy> old;
+    {
+        std::lock_guard<std::mutex> lock(stripe(this));
+        old = std::move(device_);
+        device_.reset();
+        has_device_.store(false, std::memory_order_release);
+        host_stale_.store(false, std::memory_order_release);
+    }
+}
+
 CountableArray::CountableArray(std::size_t nbytes) : nbytes_(nbytes) {
     // Inline also for 0 bytes: a buffer never has a null pointer.
     if (nbytes_ <= kInlineBytes) {

@@ -95,6 +95,10 @@ class CountableArray {
     // Before the values change on the host (a task writing in place, a
     // writable export): makes the host memory valid and drops the copy.
     void drop_device_copy();
+    // Before a write that replaces every byte of the host block and reads
+    // none: drops the copy without downloading it (the host values are
+    // overwritten anyway).
+    void discard_device_copy();
     // Element memory from the element pool (now or, deferred, later): a block
     // of capacity_for(nbytes) bytes, reusable by another buffer of the bin.
     bool pooled() const { return handles_[kHost].capacity != 0; }

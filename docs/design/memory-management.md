@@ -789,7 +789,8 @@ data version:
 - `data()` downloads on the first host read (any thread, once; a lock
   striped by address, so no mutex per buffer); writers on the host (a task
   writing in place, writable exports, `prepare_write`) download first and
-  release the copy. Copy-on-write (D8) and block reuse (D5, D11) read
+  release the copy; a task replacing every byte without reading the buffer
+  releases it without the download (`discard_device_copy`). Copy-on-write (D8) and block reuse (D5, D11) read
   through `data()`, so a block moves only with valid values.
 - The device buffer is released with the copy: when the version dies (any
   thread, D2), or when a host write drops it. No pool and no eviction on

@@ -171,10 +171,19 @@ handle per device in a `CountableArray`); O4 fills it in:
   device was lost) throws; inside a task the op fails with the message.
   `raw_data()` is the address without a download (allocation checks, the
   device kernels' own offsets).
-- **Writers.** Before a task or the direct path writes an output in place,
-  the output's host values are made valid and its device copy is dropped
-  (`drop_device_copy`); so are writable exports (`np.asarray`, borrowed
-  views) and the eager fallback's `prepare_write`. Copy-on-write and
+- **One valid copy owner per write.** A write on either side invalidates
+  the other: a device op's result makes the host block stale
+  (`set_device_copy`), a host write drops the device copy. There is one
+  device, so there are no further copies.
+- **Writers.** Before a task or the direct path writes an output in place
+  (`drop_device_copies`), the output's device copy is dropped. Its values
+  are downloaded first unless the kernel replaces every byte of the
+  buffer and reads none of it (`writes_all`, the whole block, the buffer
+  not among the inputs: `discard_device_copy`); a device op writing a
+  resident array whole (`out=`) so pays no download and leaves a new
+  copy on the device. Partial writes and in/out ops (`C += 1`) download
+  first. Writable exports (`np.asarray`, borrowed views) and the eager
+  fallback's `prepare_write` download and drop. Copy-on-write and
   temporary elision read through `data()` / download before moving a
   block.
 - **Memory.** A device copy lives as long as its data version (released

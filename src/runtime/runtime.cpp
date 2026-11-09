@@ -682,11 +682,8 @@ bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<cons
     std::feclearexcept(FE_ALL_EXCEPT);
     KernelResult r;
     try {
-        for (std::size_t o = ninputs; o < ops.size(); ++o) {
-            if (ops[o].buffer->has_device_copy()) [[unlikely]] {
-                ops[o].buffer->drop_device_copy(); // as Task::execute
-            }
-        }
+        drop_device_copies(*kernel, std::span<const Operand>(ops.data(), ninputs),
+                           std::span<const Operand>(ops.data() + ninputs, ops.size() - ninputs));
         r = kernel->run(std::span<const Operand>(ops.data(), ninputs),
                         std::span<const Operand>(ops.data() + ninputs, ops.size() - ninputs));
     } catch (const std::exception& e) {

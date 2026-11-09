@@ -288,6 +288,23 @@ class Kernel {
     }
 };
 
+// Before `kernel` writes `outputs` (O4): an output buffer whose values are
+// on the accelerator loses that copy. Downloaded first, unless the kernel
+// replaces every byte of the buffer and reads none of it (then discarded:
+// a device op writing a resident array in place pays no download). Any
+// thread, the writing task's; takes the buffers' stripe locks.
+void drop_device_copies_of(const Kernel& kernel, std::span<const Operand> inputs,
+                           std::span<const Operand> outputs);
+inline void drop_device_copies(const Kernel& kernel, std::span<const Operand> inputs,
+                               std::span<const Operand> outputs) {
+    for (const Operand& o : outputs) {
+        if (o.buffer->has_device_copy()) [[unlikely]] {
+            drop_device_copies_of(kernel, inputs, outputs);
+            return;
+        }
+    }
+}
+
 // NumPy's floating-point error modes (np.errstate), captured at issue: three
 // bits per category, NumPy's UFUNC_ERR_* values (0 ignore, 1 warn, 2 raise,
 // 3 call, 4 print, 5 log), categories in NumPy's order of reporting:
