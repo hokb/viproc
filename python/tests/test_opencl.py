@@ -252,6 +252,30 @@ def test_small_work_stays_on_cpu(o4):
         start()
 
 
+
+def test_small_chains_stay_on_the_device(o4):
+    """Below the threshold an op whose operands are on the device only runs
+    there too (the chain stays); one of host operands runs on the CPU."""
+    a = sample((40, 40), np.float64)
+    A = viproc.asarray(a)
+    C = A @ A  # min_work 0: on the device, resident
+    viproc.wait_all()
+    assert state(C) == 2
+    viproc._viproc.opencl_min_work(1 << 40)
+    try:
+        d0 = viproc.offload_stats()["device"]
+        D = L.inv(C @ A)  # both read the device's values
+        viproc.wait_all()
+        assert viproc.offload_stats()["device"] == d0 + 2
+        assert state(D) == 2
+        close(D, L.inv((a @ a) @ a), 1e-6)
+        E = A @ A  # host operands: the CPU, NumPy's bits
+        assert np.array_equal(np.asarray(E), a @ a)
+        assert viproc.offload_stats()["device"] == d0 + 2
+    finally:
+        viproc._viproc.opencl_min_work(0)
+
+
 @pytest.mark.parametrize("level", [1, 2])
 def test_lower_levels_never_offload(level):
     """A device is used from O4 on only; O1 stays bit-identical."""
@@ -279,4 +303,266 @@ def test_no_device_selected():
         close(L.inv(viproc.asarray(a)), L.inv(a), 1e-12)
         assert viproc.offload_stats()["device"] == d0
     finally:
+        start()
+
+
+# --- device-resident arrays ---------------------------------------------------
+
+state = viproc._viproc.device_state  # 0 host, 1 host and device, 2 device only
+
+
+def test_results_stay_on_device(o4):
+    """A device op's result keeps its values on the device; the next device
+    op reads them there (no upload), the host gets them when it reads."""
+    a, b = sample((96, 96), np.float64), sample((96, 40), np.float64)
+    A, B = viproc.asarray(a), viproc.asarray(b)
+    d0 = viproc.offload_stats()
+    C = A @ A
+    X = L.solve(C, B)  # C read on the device
+    I = L.inv(C)
+    viproc.wait_all()
+    assert state(C) == 2 and state(X) == 2 and state(I) == 2
+    d1 = viproc.offload_stats()
+    assert d1["device"] - d0["device"] == 3 and d1["device_fallbacks"] == d0["device_fallbacks"]
+    c = a @ a
+    close(X, L.solve(c, b), 1e-9)
+    close(I, L.inv(c), 1e-9)
+    close(C, c, 1e-12)
+
+
+def test_cpu_ops_read_device_values(o4):
+    """CPU ops (element-wise, reductions, indexing, copies) read a result
+    kept on the device: downloaded once, the device copy stays."""
+    a = sample((64, 64), np.complex128)
+    C = viproc.asarray(a) @ viproc.asarray(a)
+    viproc.wait_all()
+    assert state(C) == 2
+    c = a @ a
+    close(C * 2 + 1, c * 2 + 1, 1e-12)
+    assert state(C) == 1  # downloaded, still on the device too
+    close(C.sum(axis=0), c.sum(axis=0), 1e-12)
+    close(C[::3, 1::2].copy(), c[::3, 1::2].copy(), 1e-12)
+    D = C @ viproc.asarray(a)  # from the device copy
+    viproc.wait_all()
+    close(D, c @ a, 1e-11)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.complex64, np.complex128])
+def test_views_of_device_values(dtype, o4):
+    """Views (transposed, strided, reversed, broadcast batches) of a result
+    on the device feed device ops from the device copy."""
+    a = sample((4, 40, 40), dtype)
+    t = tolerance(dtype, 40)
+    A = viproc.asarray(a)
+    C = A @ A
+    viproc.wait_all()
+    c = a @ a
+    cases = [
+        lambda x: x.swapaxes(-1, -2) @ x,
+        lambda x: x[:, ::2, ::-1] @ x[:, ::-1, 1::2],
+        lambda x: x[0] @ x,
+        lambda x: L.inv(x[1:3].swapaxes(-1, -2)),
+        lambda x: np.fft.fft(x[:, 3, ::-2]),
+        lambda x: np.fft.ifft(x[::2], n=50, axis=1, norm="ortho"),
+    ]
+    for f in cases:
+        if np.dtype(dtype).kind != "c" and f is cases[-1]:
+            continue
+        before = viproc.offload_stats()["device"]
+        got = f(C)
+        viproc.wait_all()
+        assert viproc.offload_stats()["device"] > before
+        close(got, f(c), t * 4)
+
+
+def test_fft_round_trip_on_device(o4):
+    x = sample((6, 300), np.float64)
+    X = np.fft.rfft(viproc.asarray(x))
+    Y = np.fft.irfft(X, n=300)
+    viproc.wait_all()
+    assert state(Y) == 2
+    close(Y, np.fft.irfft(np.fft.rfft(x), n=300), 1e-12)
+    z = sample((5, 128), np.complex128)
+    Z = np.fft.ifft(np.fft.fft(viproc.asarray(z), norm="forward"), norm="forward")
+    close(Z, np.fft.ifft(np.fft.fft(z, norm="forward"), norm="forward"), 1e-12)
+
+
+def test_cholesky_on_device_values(o4):
+    a = spd(sample((3, 70, 70), np.complex128))
+    A = viproc.asarray(a)
+    S = A @ viproc.asarray(np.eye(70))  # A on the device
+    for upper in (False, True):
+        U = L.cholesky(S, upper=upper)
+        viproc.wait_all()
+        assert state(U) == 2
+        close(U, L.cholesky(a, upper=upper), 1e-10)
+
+
+def test_writes_to_device_values(o4):
+    """Writes on the host (in place, assignment, out=) see the device's
+    values first and drop the device copy."""
+    a = sample((50, 50), np.float64)
+    c = a @ a
+    C = viproc.asarray(a) @ viproc.asarray(a)
+    viproc.wait_all()
+    C += 1  # in place on the host
+    C[0, :5] = -7.0
+    c = c + 1
+    c[0, :5] = -7.0
+    viproc.wait_all()
+    assert state(C) == 0
+    close(C, c, 1e-12)
+    # out= of a device op: written whole, it may stay on the device
+    O = viproc.asarray(np.zeros((50, 50)))
+    np.matmul(viproc.asarray(a), viproc.asarray(a), out=O)
+    viproc.wait_all()
+    close(O, a @ a, 1e-12)
+    # out= a view (part of a buffer): downloaded into the host block
+    big = viproc.asarray(np.zeros((60, 50)))
+    np.matmul(viproc.asarray(a), viproc.asarray(a), out=big[5:55])
+    viproc.wait_all()
+    assert state(big) == 0
+    want = np.zeros((60, 50))
+    want[5:55] = a @ a
+    close(big, want, 1e-12)
+
+
+
+def test_overwrites_of_device_values(o4):
+    """A write that replaces a resident buffer whole and reads none of it
+    discards the device copy without a download; partial writes and writes
+    reading the buffer see the device's values first."""
+    a = sample((50, 50), np.float64)
+    b = sample((50, 50), np.float64)
+    A, B = viproc.asarray(a), viproc.asarray(b)
+    # a device op into a resident out=: stays on the device
+    C = A @ A
+    viproc.wait_all()
+    assert state(C) == 2
+    np.matmul(B, B, out=C)
+    viproc.wait_all()
+    assert state(C) == 2
+    close(C, b @ b, 1e-12)
+    # a CPU op into a resident out=, whole: the host values
+    C = A @ A
+    viproc.wait_all()
+    np.multiply(B, 2.0, out=C)
+    viproc.wait_all()
+    assert state(C) == 0
+    np.testing.assert_array_equal(np.asarray(C), b * 2.0)
+    # a CPU op into a part: the other values are the device's
+    C = A @ A
+    viproc.wait_all()
+    np.multiply(B[:5], 2.0, out=C[:5])
+    want = a @ a
+    want[:5] = b[:5] * 2.0
+    viproc.wait_all()
+    close(C, want, 1e-12)
+    # a CPU op reading the buffer it writes whole
+    C = A @ A
+    viproc.wait_all()
+    np.add(C, 1.0, out=C)
+    close(C, a @ a + 1.0, 1e-12)
+
+
+def test_exports_of_device_values(o4):
+    a = sample((40, 40), np.float64)
+    C = viproc.asarray(a) @ viproc.asarray(a)
+    viproc.wait_all()
+    v = np.asarray(C)  # a writable alias: the device copy goes
+    assert state(C) == 0
+    np.testing.assert_allclose(v, a @ a, rtol=1e-12)
+    v[0, 0] = 123.0
+    D = C @ viproc.asarray(np.eye(40))
+    assert float(D[0, 0]) == pytest.approx(123.0)
+
+
+def test_resident_off(o4):
+    viproc._viproc.opencl_resident(False)
+    try:
+        a = sample((40, 40), np.float64)
+        C = viproc.asarray(a) @ viproc.asarray(a)
+        viproc.wait_all()
+        assert state(C) == 0
+        close(C, a @ a, 1e-12)
+    finally:
+        viproc._viproc.opencl_resident(True)
+
+
+# --- the cost model and the failure memory -----------------------------------
+
+
+def cost_mode(latency_ns, upload_gbps, download_gbps, device_rate, cpu_rate):
+    viproc.init(sync_below=0, adaptive=True, level=4, device=SPEC, device_min_work=-1)
+    viproc._viproc.opencl_set_profile(latency_ns, upload_gbps, download_gbps, device_rate,
+                                      cpu_rate)
+    assert viproc.device_info()["policy"]["mode"] == "cost"
+
+
+def test_cost_model_follows_the_profile(o4):
+    a = sample((64, 64), np.float64)
+    try:
+        cost_mode(1, 1e3, 1e3, 1e6, 1e-3)  # a device far faster than the CPU
+        d0 = viproc.offload_stats()["device"]
+        close(viproc.asarray(a) @ viproc.asarray(a), a @ a, 1e-12)
+        assert viproc.offload_stats()["device"] == d0 + 1
+        cost_mode(1e9, 1e-3, 1e-3, 1e-3, 1e6)  # a device far slower
+        d0 = viproc.offload_stats()["device"]
+        r = viproc.asarray(a) @ viproc.asarray(a)
+        assert np.array_equal(np.asarray(r), a @ a)  # the CPU: NumPy's bits
+        assert viproc.offload_stats()["device"] == d0
+        p = viproc.device_info()["policy"]
+        assert p["to_cpu"] >= 1 and p["to_device"] == 0
+    finally:
+        start()
+
+
+def test_cost_model_counts_where_operands_are(o4):
+    """Same op, same sizes: host operands go to the CPU (uploads are slow),
+    operands already on the device stay there (the CPU would download)."""
+    a = sample((64, 64), np.float64)
+    try:
+        cost_mode(1, 1e3, 1e3, 1e6, 1e-3)  # C on the device
+        A = viproc.asarray(a)
+        C = A @ A
+        viproc.wait_all()
+        assert state(C) == 2
+        viproc._viproc.opencl_set_profile(1, 1e-3, 1e-3, 1.0, 1.0)
+        d0 = viproc.offload_stats()["device"]
+        H = viproc.asarray(a @ a)
+        R1 = H @ H  # host operands: CPU
+        viproc.wait_all()
+        assert viproc.offload_stats()["device"] == d0
+        C2 = viproc.asarray(a) @ viproc.asarray(a)  # host again: CPU
+        viproc.wait_all()
+        assert state(C2) == 0
+        R2 = C @ C  # device operands: device
+        viproc.wait_all()
+        assert viproc.offload_stats()["device"] == d0 + 1
+        close(R1, (a @ a) @ (a @ a), 1e-11)
+        close(R2, (a @ a) @ (a @ a), 1e-11)
+    finally:
+        start()
+
+
+def test_failures_are_remembered(o4):
+    """A device that fails on a size (here: its largest allocation) is not
+    asked again for that size: the op runs on the CPU at once."""
+    a = sample((300, 300), np.float64)  # 720 KB per operand
+    try:
+        start()
+        viproc._viproc.opencl_limit_allocation(256 << 10)
+        s0 = viproc.offload_stats()
+        p0 = viproc.device_info()["policy"]["skipped"]
+        for _ in range(5):
+            close(viproc.asarray(a) @ viproc.asarray(a), a @ a, 1e-12)
+        s1 = viproc.offload_stats()
+        assert s1["device_fallbacks"] - s0["device_fallbacks"] == 1
+        assert viproc.device_info()["policy"]["skipped"] - p0 == 4
+        # smaller ops still go to the device
+        b = sample((40, 40), np.float64)
+        close(viproc.asarray(b) @ viproc.asarray(b), b @ b, 1e-12)
+        assert viproc.offload_stats()["device"] == s1["device"] + 1
+    finally:
+        viproc._viproc.opencl_limit_allocation(0)
         start()

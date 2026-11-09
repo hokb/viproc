@@ -682,6 +682,8 @@ bool Runtime::issue_direct(const std::shared_ptr<Kernel>& kernel, std::span<cons
     std::feclearexcept(FE_ALL_EXCEPT);
     KernelResult r;
     try {
+        drop_device_copies(*kernel, std::span<const Operand>(ops.data(), ninputs),
+                           std::span<const Operand>(ops.data() + ninputs, ops.size() - ninputs));
         r = kernel->run(std::span<const Operand>(ops.data(), ninputs),
                         std::span<const Operand>(ops.data() + ninputs, ops.size() - ninputs));
     } catch (const std::exception& e) {
@@ -899,6 +901,7 @@ ErrorRef Runtime::prepare_host_write(Array& a) {
     // as NumPy's own views would (D7).
     ErrorRef e = wait(a);
     a.group_->current_->wait_task_readers();
+    a.group_->current_->drop_device_copy(); // NumPy writes the host memory (O4)
     return e;
 }
 

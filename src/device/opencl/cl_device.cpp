@@ -73,7 +73,6 @@ std::mutex g_select_mutex;
 // Never destroyed: releasing OpenCL objects from static destructors at exit
 // races with the OpenCL implementation's own teardown.
 std::shared_ptr<Context>& g_current = *new std::shared_ptr<Context>;
-std::atomic<std::int64_t> g_min_work{-1};
 
 std::string lower(std::string s) {
     for (char& c : s) {
@@ -102,6 +101,9 @@ Context::Context(cl_platform_id platform, cl_device_id device)
         std::max<std::size_t>(device_value<std::size_t>(device, CL_DEVICE_MAX_WORK_GROUP_SIZE), 1);
     global_mem_ = device_value<cl_ulong>(device, CL_DEVICE_GLOBAL_MEM_SIZE);
     max_alloc_ = device_value<cl_ulong>(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE);
+    compute_units_ =
+        std::max<cl_uint>(device_value<cl_uint>(device, CL_DEVICE_MAX_COMPUTE_UNITS), 1);
+    clock_mhz_ = std::max<cl_uint>(device_value<cl_uint>(device, CL_DEVICE_MAX_CLOCK_FREQUENCY), 1);
 }
 
 Context::~Context() {
@@ -191,6 +193,9 @@ std::size_t Context::work_group(cl_kernel kernel, std::size_t want) {
 }
 
 Buffer::Buffer(Context& ctx, std::size_t bytes) : bytes_(bytes) {
+    if (bytes > ctx.max_allocation()) {
+        throw Error("buffer larger than the device's largest allocation");
+    }
     cl_int err = CL_SUCCESS;
     mem_ = clCreateBuffer(ctx.context(), CL_MEM_READ_WRITE, std::max<std::size_t>(bytes, 16),
                           nullptr, &err);
@@ -341,18 +346,5 @@ std::shared_ptr<Context> select(const char* spec_in, std::string* why) {
     }
     return g_current;
 }
-
-std::int64_t min_work() {
-    std::int64_t w = g_min_work.load(std::memory_order_relaxed);
-    if (w < 0) {
-        const char* env = std::getenv("VIPROC_OPENCL_MIN_WORK");
-        w = env != nullptr && *env ? std::max<std::int64_t>(std::atoll(env), 0)
-                                   : std::int64_t{1} << 24;
-        g_min_work.store(w, std::memory_order_relaxed);
-    }
-    return w;
-}
-
-void set_min_work(std::int64_t w) { g_min_work.store(w < 0 ? -1 : w, std::memory_order_relaxed); }
 
 } // namespace viproc::opencl

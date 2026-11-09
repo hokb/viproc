@@ -8,8 +8,22 @@
 
 namespace viproc {
 
-// Devices a CountableArray can hold a copy on. Phase 1: the host only.
+// Host memory handles of a CountableArray (element memory, always
+// allocated). An accelerator's copy (O4, docs/design/opencl.md,
+// "Device-resident arrays") is a DeviceCopy beside them.
 enum Device : std::uint8_t { kHost = 0, kDeviceCount };
+
+// A data version's values on an accelerator (O4): a mirror of the host block,
+// byte for byte (same size and layout), so that any view of the version
+// addresses the same bytes on both. Made by the device kernel that computed
+// them; the runtime knows only this interface.
+class DeviceCopy {
+  public:
+    virtual ~DeviceCopy() = default;
+    // Writes the values into `dst` (nbytes bytes). Any thread. False: the
+    // device failed.
+    virtual bool download(std::byte* dst, std::size_t nbytes) noexcept = 0;
+};
 
 // One version of an array's data (docs/design/array-data-model.md, A1): one handle
 // per device, each empty or a valid copy of the same values. Host memory is up
@@ -53,9 +67,38 @@ class CountableArray {
     CountableArray(const CountableArray&) = delete;
     CountableArray& operator=(const CountableArray&) = delete;
 
-    // Null for a deferred buffer whose memory was not taken yet.
-    std::byte* data() const { return handles_[kHost].data.load(std::memory_order_acquire); }
-    bool allocated() const { return data() != nullptr; }
+    // The host memory with valid values: null for a deferred buffer whose
+    // memory was not taken yet. If the values are only on the accelerator
+    // (host_stale()), the first call downloads them (any thread, once;
+    // throws std::runtime_error if the device fails).
+    std::byte* data() const {
+        if (host_stale_.load(std::memory_order_acquire)) [[unlikely]] {
+            return download();
+        }
+        return handles_[kHost].data.load(std::memory_order_acquire);
+    }
+    // The host memory without a download (its values may be stale): for
+    // addresses only, and for the accelerator's own kernels.
+    std::byte* raw_data() const { return handles_[kHost].data.load(std::memory_order_acquire); }
+    bool allocated() const { return raw_data() != nullptr; }
+
+    // --- the accelerator's copy (O4) ---
+    // The producing task, before it completes (or a task writing the buffer
+    // in place, alone): the values are `copy`'s, the host memory is stale
+    // until data() downloads it.
+    void set_device_copy(std::shared_ptr<DeviceCopy> copy);
+    // The accelerator's copy, or null. Readers of the version (after its
+    // producer completed), any thread.
+    std::shared_ptr<DeviceCopy> device_copy() const;
+    bool has_device_copy() const { return has_device_.load(std::memory_order_acquire); }
+    bool host_stale() const { return host_stale_.load(std::memory_order_acquire); }
+    // Before the values change on the host (a task writing in place, a
+    // writable export): makes the host memory valid and drops the copy.
+    void drop_device_copy();
+    // Before a write that replaces every byte of the host block and reads
+    // none: drops the copy without downloading it (the host values are
+    // overwritten anyway).
+    void discard_device_copy();
     // Element memory from the element pool (now or, deferred, later): a block
     // of capacity_for(nbytes) bytes, reusable by another buffer of the bin.
     bool pooled() const { return handles_[kHost].capacity != 0; }
@@ -116,7 +159,11 @@ class CountableArray {
     static constexpr std::size_t kInlineBytes = 128;
 
   private:
+    std::byte* download() const;
     std::atomic<int> read_waiters_{0};
+    mutable std::atomic<bool> host_stale_{false};
+    std::atomic<bool> has_device_{false};
+    std::shared_ptr<DeviceCopy> device_; // guarded by a striped mutex (countable_array.cpp)
     alignas(64) std::byte inline_[kInlineBytes];
     // Memory on one device; capacity > 0: data is (or will be) a pool block.
     struct DeviceHandle {

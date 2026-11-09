@@ -18,6 +18,17 @@ add_executable(test_numpy_runtime test_numpy_runtime.cpp)
 target_link_libraries(test_numpy_runtime PRIVATE viproc_numpy Python3::Python viproc_warnings)
 add_test(NAME numpy_runtime COMMAND test_numpy_runtime)
 
+# O4 device policy: the cost model without a device.
+if(VIPROC_OPENCL)
+    add_executable(test_cl_policy test_cl_policy.cpp)
+    target_link_libraries(test_cl_policy PRIVATE viproc_opencl Python3::Python viproc_warnings)
+    add_test(NAME cl_policy COMMAND test_cl_policy)
+    if(WIN32 AND Python3_RUNTIME_LIBRARY_DIRS)
+        set_tests_properties(cl_policy PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:${Python3_RUNTIME_LIBRARY_DIRS}")
+    endif()
+endif()
+
 # Python bridge (pytest), against the package assembled in the build tree.
 execute_process(COMMAND ${Python3_EXECUTABLE} -c "import pytest"
                 RESULT_VARIABLE VIPROC_NO_PYTEST OUTPUT_QUIET ERROR_QUIET)

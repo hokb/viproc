@@ -2,7 +2,77 @@
 
 #include "element_pool.hpp"
 
+#include <functional>
+#include <mutex>
+#include <stdexcept>
+
 namespace viproc {
+
+namespace {
+// Guards device_ and the download of each CountableArray, striped by address
+// (no mutex per buffer: buffers are pooled and many).
+std::mutex& stripe(const void* p) {
+    static std::mutex locks[64];
+    return locks[(reinterpret_cast<std::uintptr_t>(p) >> 6) % 64];
+}
+} // namespace
+
+void CountableArray::set_device_copy(std::shared_ptr<DeviceCopy> copy) {
+    std::lock_guard<std::mutex> lock(stripe(this));
+    device_ = std::move(copy);
+    const bool has = device_ != nullptr;
+    has_device_.store(has, std::memory_order_release);
+    host_stale_.store(has, std::memory_order_release);
+}
+
+std::shared_ptr<DeviceCopy> CountableArray::device_copy() const {
+    if (!has_device_.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(stripe(this));
+    return device_;
+}
+
+std::byte* CountableArray::download() const {
+    std::lock_guard<std::mutex> lock(stripe(this));
+    std::byte* p = handles_[kHost].data.load(std::memory_order_acquire);
+    if (host_stale_.load(std::memory_order_acquire)) {
+        if (p == nullptr || device_ == nullptr || !device_->download(p, nbytes_)) {
+            throw std::runtime_error("the device failed: an array computed there could not be "
+                                     "read back");
+        }
+        host_stale_.store(false, std::memory_order_release);
+    }
+    return p;
+}
+
+void CountableArray::drop_device_copy() {
+    if (!has_device_.load(std::memory_order_acquire)) {
+        return;
+    }
+    (void)data();
+    std::shared_ptr<DeviceCopy> old;
+    {
+        std::lock_guard<std::mutex> lock(stripe(this));
+        old = std::move(device_);
+        device_.reset();
+        has_device_.store(false, std::memory_order_release);
+    }
+}
+
+void CountableArray::discard_device_copy() {
+    if (!has_device_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::shared_ptr<DeviceCopy> old;
+    {
+        std::lock_guard<std::mutex> lock(stripe(this));
+        old = std::move(device_);
+        device_.reset();
+        has_device_.store(false, std::memory_order_release);
+        host_stale_.store(false, std::memory_order_release);
+    }
+}
 
 CountableArray::CountableArray(std::size_t nbytes) : nbytes_(nbytes) {
     // Inline also for 0 bytes: a buffer never has a null pointer.
@@ -60,6 +130,9 @@ std::byte* CountableArray::ensure_allocated() {
 }
 
 bool CountableArray::take_block(CountableArray& src) {
+    if (src.host_stale()) {
+        (void)src.data(); // the block's values must be valid on the host
+    }
     std::byte* block = src.handles_[kHost].data.load(std::memory_order_acquire);
     if (handles_[kHost].capacity == 0 || src.handles_[kHost].capacity != handles_[kHost].capacity ||
         block == nullptr) {

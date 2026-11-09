@@ -231,6 +231,87 @@ __kernel void potf2(__global T* A, int n, int lda, ulong mstride, int k0, int b,
         barrier(CLK_GLOBAL_MEM_FENCE);
     }
 }
+/* --- device-resident arrays (cl_kernels.cpp: stage, deliver) -------------
+ * Elements are copied as 32-bit words: every dtype on the device is a
+ * multiple of 4 bytes, and offsets and strides are (checked on the host). */
+
+/* An n-d block (nd <= 8; nd = 0: one element) of elements of `words` words
+ * between two strided layouts, offsets and strides in bytes. One work-item
+ * per element, `total` of them. */
+__kernel void copy_nd(__global const uint* src, ulong soff, __global uint* dst, ulong doff,
+                      int nd, long8 shape, long8 sstr, long8 dstr, int words, ulong total) {
+    const ulong i = get_global_id(0);
+    if (i < total) {
+        long sh[8], ss[8], ds[8];
+        vstore8(shape, 0, sh);
+        vstore8(sstr, 0, ss);
+        vstore8(dstr, 0, ds);
+        long s = (long)soff, d = (long)doff;
+        ulong r = i;
+        for (int a = nd - 1; a >= 0; --a) {
+            const ulong e = (ulong)sh[a];
+            const long k = (long)(r % e);
+            r /= e;
+            s += k * ss[a];
+            d += k * ds[a];
+        }
+        for (int w = 0; w < words; ++w) {
+            dst[d / 4 + w] = src[s / 4 + w];
+        }
+    }
+}
+
+/* n words of zeros. */
+__kernel void fill_zero(__global uint* a, ulong n) {
+    const ulong i = get_global_id(0);
+    if (i < n) {
+        a[i] = 0;
+    }
+}
+
+/* Conjugates n elements (real types: nothing to do). */
+__kernel void conj_all(__global T* a, ulong n) {
+    const ulong i = get_global_id(0);
+    if (i < n) {
+        a[i] = CONJ(a[i]);
+    }
+}
+
+/* Zeroes the strict upper triangle of `count` row-major n x n matrices. */
+__kernel void zero_upper(__global T* a, int n, ulong count) {
+    const ulong i = get_global_id(0);
+    const ulong nn = (ulong)n * (ulong)n;
+    if (i < count * nn) {
+        const ulong e = i % nn;
+        if (e % (ulong)n > e / (ulong)n) {
+            a[i] = FROM_REAL(0);
+        }
+    }
+}
+
+/* Row r (`stride` reals apart) of `count` rows: its first nreal reals times
+ * f[r]. */
+__kernel void scale_rows(__global real* x, ulong stride, ulong nreal, __global const real* f,
+                         ulong count) {
+    const ulong i = get_global_id(0);
+    if (i < count * nreal) {
+        const ulong r = i / nreal;
+        x[r * stride + i % nreal] *= f[r];
+    }
+}
+
+/* pocketfft's irfft ignores the imaginary parts of the zero and (npts even,
+ * the input long enough) the Nyquist frequency: zeroes them in each row
+ * (`stride` reals apart). */
+__kernel void irfft_prep(__global real* x, ulong stride, int npts, long nin, ulong count) {
+    const ulong r = get_global_id(0);
+    if (r < count) {
+        x[r * stride + 1] = 0;
+        if (npts % 2 == 0 && npts / 2 < nin) {
+            x[r * stride + (ulong)(npts / 2) * 2 + 1] = 0;
+        }
+    }
+}
 )CLC";
 
 } // namespace viproc::opencl

@@ -104,6 +104,7 @@ if(VIPROC_OPENCL)
         src/device/opencl/cl_device.cpp
         src/device/opencl/cl_linalg_source.cpp
         src/device/opencl/cl_kernels.cpp
+        src/device/opencl/cl_policy.cpp
         src/device/opencl/cl_fft.cpp)
     target_include_directories(viproc_opencl SYSTEM PUBLIC ${VIPROC_OPENCL_INCLUDE})
     target_include_directories(viproc_opencl SYSTEM PRIVATE ${VIPROC_VKFFT_INCLUDE})
@@ -113,6 +114,7 @@ if(VIPROC_OPENCL)
     # viproc's own files with viproc's warnings; VkFFT (cl_fft.cpp) without.
     set_source_files_properties(src/device/opencl/cl_loader.cpp src/device/opencl/cl_device.cpp
         src/device/opencl/cl_linalg_source.cpp src/device/opencl/cl_kernels.cpp
+        src/device/opencl/cl_policy.cpp
         PROPERTIES COMPILE_OPTIONS
         "$<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic>;$<$<AND:$<BOOL:${VIPROC_WARNINGS_AS_ERRORS}>,$<CXX_COMPILER_ID:GNU,Clang>>:-Werror>")
     set_source_files_properties(src/device/opencl/cl_fft.cpp PROPERTIES COMPILE_OPTIONS

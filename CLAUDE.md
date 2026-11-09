@@ -56,7 +56,10 @@ to plain sequential NumPy execution.
   its `Metadata` (size descriptor + the task configuring it, one per array
   and view, atomic count, referenced by task operands) and its
   `AliasGroup`; the group holds the current data version, a
-  `CountableArray` (one handle per device, `async_reads`, `host_views`).
+  `CountableArray` (host memory, at O4 possibly a `DeviceCopy` of the
+  values on the OpenCL device, `async_reads`, `host_views`; `data()`
+  downloads stale host values, `raw_data()` does not; memory-management.md
+  D12).
 - **Views share an alias group.** A base array and all its views refer to
   one shared *AliasGroup* (main thread only), which holds the current data
   version and the last task writing it. Readiness and the producer belong
@@ -332,8 +335,13 @@ NumPy internals), **O4** automatic device offloading (started:
 `matmul` on an OpenCL device, `docs/design/opencl.md`: CLBlast, VkFFT and
 viproc's own LU/Cholesky kernels, ICD loader and CLBlast opened at run time;
 `viproc.init(level=4, device=...)`, `device_info()`; the device kernel wraps
-the CPU kernel and decides by size in the task, `device_min_work`; device
-failures run the CPU kernel), **O5** reserved.
+the CPU kernel and asks the device policy in the task, `cl_policy.*`: a cost
+model of transfers, where the operands are, the device's load (the compute
+times of the ops in flight) and measured
+rates, or a threshold, `device_min_work`, in deterministic mode; results
+stay on the device, `DeviceCopy`, read there by the next device op and
+downloaded by host readers; device failures run the CPU kernel and are
+remembered per size), **O5** reserved.
 The level is chosen per process: `viproc.init(level=n)`,
 `VIPROC_OPT=n` (or `On`), `python -m viproc -On prog.py`; `opt_level()`
 reads it (stored in the runtime, `RuntimeOptions::opt_level`); 3 and 5 run
@@ -442,7 +450,10 @@ src/device/opencl/     O4 device kernels (library `viproc_opencl`, opencl.md)
   cl_device.*          device selection, context, per-thread queues, buffers
   cl_linalg_source.cpp viproc's OpenCL kernels (getf2, laswp, getrs, potf2)
   cl_fft.*             VkFFT plans (compiled without viproc's warnings)
-  cl_kernels.*         device kernels wrapping the CPU gufunc/matmul kernels
+  cl_kernels.*         device kernels wrapping the CPU gufunc/matmul kernels;
+                       device-resident results (ClCopy, stage, deliver)
+  cl_policy.*          DevicePolicy: device or CPU per op (cost model,
+                       threshold, failure memory)
 src/capi/capi.cpp      Implementation of the C ABI (library `viproc_capi`)
 src/viproc_python.h    the only way to include Python.h (MSVC debug fix)
 python/viproc/         Python package
