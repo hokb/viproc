@@ -10,8 +10,9 @@
 // - Cost (default): compares the estimated time on the CPU with the
 //   estimated time on the device: a fixed cost per op (the device's round
 //   trip), the transfers of the operands not on the device yet and of the
-//   results (bandwidth up and down), and the compute time, scaled by the
-//   device ops in flight (they share the device). Latency and bandwidths
+//   results (bandwidth up and down), the compute time, and the wait for
+//   the device ops in flight (they share the device; weighted by their
+//   estimated compute times, see wait_ns()). Latency and bandwidths
 //   are measured once per device (measure()); compute rates start from a
 //   prior (device properties, a single CPU core) and follow the measured
 //   run times per op, dtype and size class (record()), with rare
@@ -53,7 +54,11 @@ struct OpRequest {
     // The results stay on the device (no download now; a host reader pays
     // it later, a device reader never).
     bool output_resident = false;
-    // Device ops in flight when this one started (set by the kernel).
+    // Set by the policy: the op's estimated compute time on an idle device
+    // (use_device in cost mode, else begin()), and at begin() the wait for
+    // the device ops in flight and their number.
+    double compute_ns = 0;
+    double wait_ns = 0;
     int sharing = 0;
 };
 
@@ -95,7 +100,19 @@ class DevicePolicy {
     // True: run `r` on the device. *explore: the decision is an
     // exploration; *timed: record() the run's time (cost mode, above the
     // cheap first test).
-    bool use_device(const OpRequest& r, bool* explore = nullptr, bool* timed = nullptr);
+    bool use_device(OpRequest& r, bool* explore = nullptr, bool* timed = nullptr);
+
+    // A device run of `r` starts / ended (begin and end once each, also on
+    // failure): the device's load, which later decisions wait for.
+    void begin(OpRequest& r);
+    void end(const OpRequest& r);
+    // The wait of an op of `compute_ns` behind the device ops in flight: the
+    // device shares its time between them, so each delays it by at most its
+    // own remaining compute time, and by at most the op's own (fair share):
+    // min(backlog, ops x compute_ns). A large matmul in flight delays a small
+    // op by about the small op's own time, a small one in flight delays a
+    // large op by its own time only.
+    double wait_ns(double compute_ns) const;
 
     // Device ops leave their results on the device (default; env
     // VIPROC_OPENCL_RESIDENT=0 or set_resident(false): downloaded at once).
@@ -108,8 +125,9 @@ class DevicePolicy {
     // A device run of `r` succeeded (clears a failure the size reached).
     void succeeded(const OpRequest& r);
 
-    // Device ops running now (they share the device).
-    std::atomic<int> in_flight{0};
+    // Device ops running now and their summed estimated compute times.
+    int in_flight() const { return in_flight_.load(std::memory_order_relaxed); }
+    double backlog_ns() const { return backlog_ns_.load(std::memory_order_relaxed); }
 
     DeviceProfile profile() const;
     // Tests: replace the profile (priors and measurements), clear the rates.
@@ -117,7 +135,7 @@ class DevicePolicy {
     PolicyCounts counts() const;
 
     // Estimated ns of `r` on the device and on the CPU (with the current
-    // rates and the device ops in flight).
+    // rates and the device's load).
     void estimate(const OpRequest& r, double* device_ns, double* cpu_ns);
 
   private:
@@ -153,6 +171,8 @@ class DevicePolicy {
     std::atomic<double> fastest_cpu_ns_per_work_{0};
     std::unique_ptr<Class[]> classes_ = std::make_unique<Class[]>(kOps * kDtypes * kClasses);
     Failure failures_[kOps][kDtypes];
+    std::atomic<int> in_flight_{0};
+    std::atomic<double> backlog_ns_{0};
     std::atomic<std::uint64_t> n_device_{0}, n_cpu_{0}, n_explored_{0}, n_skipped_{0};
 };
 

@@ -336,7 +336,8 @@ NumPy internals), **O4** automatic device offloading (started:
 viproc's own LU/Cholesky kernels, ICD loader and CLBlast opened at run time;
 `viproc.init(level=4, device=...)`, `device_info()`; the device kernel wraps
 the CPU kernel and asks the device policy in the task, `cl_policy.*`: a cost
-model of transfers, where the operands are, the device's load and measured
+model of transfers, where the operands are, the device's load (the compute
+times of the ops in flight) and measured
 rates, or a threshold, `device_min_work`, in deterministic mode; results
 stay on the device, `DeviceCopy`, read there by the next device op and
 downloaded by host readers; device failures run the CPU kernel and are

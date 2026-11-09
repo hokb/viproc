@@ -96,8 +96,16 @@ modes:
   smaller.
   - Device: a fixed cost per op (the device's round trip), the upload of
     the operands not on the device yet, the download of the results unless
-    they stay on the device, and the compute time, multiplied by
-    1 + the device ops in flight (they share the device).
+    they stay on the device, the compute time, and the wait for the device
+    ops in flight. The device shares its time between them, so each delays
+    the op by at most its own remaining compute time and by at most the
+    op's own (a fair share): wait = min(backlog, ops in flight x the op's
+    compute time), the backlog being the summed estimated compute times of
+    the ops in flight (`DevicePolicy::begin`/`end`, atomics). A large
+    matmul in flight delays a small op by about the small op's own time; a
+    small op in flight delays a large one by its own time only. (First
+    version: compute time x (1 + ops in flight), whatever their sizes; a
+    tiny `det` in flight doubled the estimate of a large matmul.)
   - CPU: the download of operands whose values are only on the device, and
     the compute time of NumPy's loop on one core.
   - Latency and bandwidths are measured when the device is selected (a
@@ -105,7 +113,10 @@ modes:
     ms). Compute rates start from a prior (device: compute units x clock x
     lanes x a share per op class; CPU: one core) and then follow the run
     times measured per op, dtype and size class (log2 of the work), as a
-    decaying average (the device's normalized to an unshared device).
+    decaying average (the device's normalized to an idle device: the
+    measured time less the wait estimated at the start, at least the fair
+    share of it). `tests/test_cl_policy.cpp` checks the model without a
+    device.
   - Every 8th decision of a class runs the other side if its estimate is
     within 4x (an exploration, so that both sides stay measured); the
     period doubles up to 1024 while the choice holds and restarts when it

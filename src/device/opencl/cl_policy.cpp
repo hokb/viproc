@@ -239,12 +239,37 @@ void DevicePolicy::estimate(const OpRequest& r, double* device_ns, double* cpu_n
     std::lock_guard<std::mutex> lock(mutex_);
     const Class& c = cls(r);
     const double w = static_cast<double>(r.work);
-    *device_ns = fixed_ns(r) +
-                 w * device_ns_per_work(r, c) * (1 + in_flight.load(std::memory_order_relaxed));
+    const double compute = w * device_ns_per_work(r, c);
+    *device_ns = fixed_ns(r) + compute + wait_ns(compute);
     *cpu_ns = cpu_fixed_ns(r) + w * cpu_ns_per_work(r, c);
 }
 
-bool DevicePolicy::use_device(const OpRequest& r, bool* explore, bool* timed) {
+double DevicePolicy::wait_ns(double compute_ns) const {
+    const int n = in_flight_.load(std::memory_order_relaxed);
+    if (n <= 0) {
+        return 0;
+    }
+    const double backlog = std::max(backlog_ns_.load(std::memory_order_relaxed), 0.0);
+    return std::min(backlog, n * compute_ns);
+}
+
+void DevicePolicy::begin(OpRequest& r) {
+    if (r.compute_ns <= 0 && r.work > 0) {
+        // threshold mode, a retry, below the cheap first test: not estimated yet
+        std::lock_guard<std::mutex> lock(mutex_);
+        r.compute_ns = static_cast<double>(r.work) * device_ns_per_work(r, cls(r));
+    }
+    r.wait_ns = wait_ns(r.compute_ns);
+    r.sharing = in_flight_.fetch_add(1, std::memory_order_relaxed);
+    backlog_ns_.fetch_add(r.compute_ns, std::memory_order_relaxed);
+}
+
+void DevicePolicy::end(const OpRequest& r) {
+    backlog_ns_.fetch_sub(r.compute_ns, std::memory_order_relaxed);
+    in_flight_.fetch_sub(1, std::memory_order_relaxed);
+}
+
+bool DevicePolicy::use_device(OpRequest& r, bool* explore, bool* timed) {
     if (explore != nullptr) {
         *explore = false;
     }
@@ -279,8 +304,8 @@ bool DevicePolicy::use_device(const OpRequest& r, bool* explore, bool* timed) {
     std::lock_guard<std::mutex> lock(mutex_);
     Class& c = cls(r);
     const double w = static_cast<double>(r.work);
-    const double dev_ns = fixed_ns(r) + w * device_ns_per_work(r, c) *
-                                            (1 + in_flight.load(std::memory_order_relaxed));
+    r.compute_ns = w * device_ns_per_work(r, c);
+    const double dev_ns = fixed_ns(r) + r.compute_ns + wait_ns(r.compute_ns);
     const double cpu_ns = cpu_fixed_ns(r) + w * cpu_ns_per_work(r, c);
     bool dev = dev_ns < cpu_ns;
     if (timed != nullptr) {
@@ -319,9 +344,11 @@ void DevicePolicy::record(const OpRequest& r, bool device, double ns) {
     const double w = static_cast<double>(r.work);
     double v = 0;
     if (device) {
-        // The compute part, as if the device were not shared.
+        // The compute part, as if the device were idle: without the wait
+        // for the ops in flight at the start (estimated), at least the fair
+        // share of the measured time.
         const double compute = std::max(ns - fixed_ns(r), 0.1 * ns);
-        v = compute / (1 + r.sharing) / w;
+        v = std::max(compute - r.wait_ns, compute / (1 + r.sharing)) / w;
     } else {
         v = std::max(ns - cpu_fixed_ns(r), 0.1 * ns) / w;
         const double half = v / 2;

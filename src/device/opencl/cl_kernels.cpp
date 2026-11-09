@@ -696,11 +696,11 @@ class DeviceKernel : public Kernel {
         // exp and log); OpenCL, CLBlast and VkFFT's host code (plans) must
         // not, so each op clears them before its host math (det) or at its
         // end.
-        req.sharing = pol.in_flight.fetch_add(1, std::memory_order_relaxed);
+        pol.begin(req);
         const double t0 = now_ns();
         try {
             KernelResult r = run_device(p);
-            pol.in_flight.fetch_sub(1, std::memory_order_relaxed);
+            pol.end(req);
             pol.succeeded(req);
             pol.record(req, true, now_ns() - t0);
             device_ops.fetch_add(1, std::memory_order_relaxed);
@@ -708,7 +708,7 @@ class DeviceKernel : public Kernel {
         } catch (const Error&) {
         } catch (const std::bad_alloc&) {
         }
-        pol.in_flight.fetch_sub(1, std::memory_order_relaxed);
+        pol.end(req);
         pol.failed(req);
         device_fallbacks.fetch_add(1, std::memory_order_relaxed);
         std::feclearexcept(FE_ALL_EXCEPT);
