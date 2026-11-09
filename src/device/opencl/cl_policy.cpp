@@ -288,7 +288,11 @@ bool DevicePolicy::use_device(OpRequest& r, bool* explore, bool* timed) {
         return true; // the retry
     }
     if (const std::int64_t t = threshold(); t >= 0) {
-        const bool dev = r.work >= t;
+        // Also below the threshold where an operand's values are on the
+        // device only: the chain stays there (the CPU would download them,
+        // a device reader of the result would upload it again). Where an
+        // op's operands are follows from earlier decisions, not timings.
+        const bool dev = r.work >= t || r.bytes_stale > 0;
         (dev ? n_device_ : n_cpu_).fetch_add(1, std::memory_order_relaxed);
         return dev;
     }

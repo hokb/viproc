@@ -252,6 +252,30 @@ def test_small_work_stays_on_cpu(o4):
         start()
 
 
+
+def test_small_chains_stay_on_the_device(o4):
+    """Below the threshold an op whose operands are on the device only runs
+    there too (the chain stays); one of host operands runs on the CPU."""
+    a = sample((40, 40), np.float64)
+    A = viproc.asarray(a)
+    C = A @ A  # min_work 0: on the device, resident
+    viproc.wait_all()
+    assert state(C) == 2
+    viproc._viproc.opencl_min_work(1 << 40)
+    try:
+        d0 = viproc.offload_stats()["device"]
+        D = L.inv(C @ A)  # both read the device's values
+        viproc.wait_all()
+        assert viproc.offload_stats()["device"] == d0 + 2
+        assert state(D) == 2
+        close(D, L.inv((a @ a) @ a), 1e-6)
+        E = A @ A  # host operands: the CPU, NumPy's bits
+        assert np.array_equal(np.asarray(E), a @ a)
+        assert viproc.offload_stats()["device"] == d0 + 2
+    finally:
+        viproc._viproc.opencl_min_work(0)
+
+
 @pytest.mark.parametrize("level", [1, 2])
 def test_lower_levels_never_offload(level):
     """A device is used from O4 on only; O1 stays bit-identical."""

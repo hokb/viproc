@@ -91,7 +91,12 @@ modes:
   transform). Taken when the user sets one (`viproc.init(device_min_work=
   ...)`, env `VIPROC_OPENCL_MIN_WORK`) and in deterministic mode
   (`adaptive=False`: where an op runs must not depend on timings), there
-  with 2^24 unless set.
+  with 2^24 unless set. Smaller ops run on the device too where an
+  operand's values are on the device only (a result of an earlier device
+  op): the chain stays there instead of a download for the CPU and an
+  upload for the next device op. Where operands are follows from earlier
+  decisions, not from timings (a live export, which keeps results on the
+  host, excepted).
 - **Cost model** (default): the op runs where its estimated time is
   smaller.
   - Device: a fixed cost per op (the device's round trip), the upload of

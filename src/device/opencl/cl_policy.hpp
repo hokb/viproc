@@ -4,9 +4,10 @@
 // A device kernel asks the process-wide DevicePolicy (policy()) once per op,
 // in its task, with the op's actual sizes (OpRequest). Two policies:
 //
-// - Threshold: the device for work >= min_work (deterministic mode, or a
-//   min_work set by the user: viproc.init(device_min_work=...), env
-//   VIPROC_OPENCL_MIN_WORK).
+// - Threshold: the device for work >= min_work, and for smaller ops whose
+//   operands' values are on the device only (a chain stays there;
+//   deterministic mode, or a min_work set by the user:
+//   viproc.init(device_min_work=...), env VIPROC_OPENCL_MIN_WORK).
 // - Cost (default): compares the estimated time on the CPU with the
 //   estimated time on the device: a fixed cost per op (the device's round
 //   trip), the transfers of the operands not on the device yet and of the
