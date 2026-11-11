@@ -236,7 +236,10 @@ def test_scalar_indexing_of_pending_arrays_all_dtypes_and_keys():
 def test_scalar_indexing_of_a_pending_array_is_one_task_and_no_sync():
     from async_path import SIZE, assert_async, deterministic, pending
 
-    x = np.random.default_rng(12).standard_normal(SIZE)
+    # 1e6 elements behind 20 copies: tens of milliseconds of work, so y is
+    # still pending when y[17] is issued (at SIZE the chain could finish
+    # first on a fast runner, and y[17] then took the ready path: no task)
+    x = np.random.default_rng(12).standard_normal(200 * SIZE)
     with deterministic():
         y = pending(viproc.asarray(x))
         s = assert_async(lambda: y[17], ops=1)
