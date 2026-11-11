@@ -1434,6 +1434,28 @@ ArrayPtr wrap_ndarray(Runtime& rt, PyObject* obj, std::string& error, std::share
 }
 
 ArrayPtr scalar_array(Runtime& rt, PyObject* value, DType dtype) {
+    // A NumPy scalar of exactly this dtype (a[i] of a ready array, a full
+    // reduction) or a Python float as float64: its bytes as they are. A new
+    // object per op misses the bridge's scalar cache, and NumPy's conversion
+    // builds and frees an array (~1 µs per op in a loop adding a[i - 1]).
+    const Layout l0 = Layout::contiguous(dtype, {});
+    if (PyFloat_CheckExact(value) && dtype == DType::Float64) {
+        auto buffer = make_pooled<CountableArray>(l0.nbytes());
+        const double v = PyFloat_AS_DOUBLE(value);
+        std::memcpy(buffer->data(), &v, sizeof v);
+        return rt.wrap(Layout(l0), std::move(buffer));
+    }
+    if (PyArray_IsScalar(value, Generic)) {
+        PyArray_Descr* d = PyArray_DescrFromScalar(value);
+        const bool same = d != nullptr && d->type_num == type_num(dtype) &&
+                          PyDataType_ISNOTSWAPPED(d);
+        Py_XDECREF(d);
+        if (same) {
+            auto buffer = make_pooled<CountableArray>(l0.nbytes());
+            PyArray_ScalarAsCtype(value, buffer->data());
+            return rt.wrap(Layout(l0), std::move(buffer));
+        }
+    }
     PyArray_Descr* descr = PyArray_DescrFromType(type_num(dtype));
     PyObject* arr = PyArray_FromAny(value, descr, 0, 0, 0, nullptr); // steals descr
     if (arr == nullptr) {

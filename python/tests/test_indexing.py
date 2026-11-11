@@ -209,6 +209,79 @@ def test_scalar_indexing_of_pending_arrays_does_not_sync():
     assert isinstance(ready[0, 1], np.float64)  # ready data: NumPy's scalar
 
 
+def test_scalar_indexing_of_pending_arrays_all_dtypes_and_keys():
+    rng = np.random.default_rng(11)
+    for dt in ("?", "i4", "i8", "f4", "f8", "c8", "c16"):
+        x = (rng.standard_normal((5, 7)) * 9).astype(dt)
+        e = np.asarray(np.positive(x) if dt != "?" else np.logical_not(np.logical_not(x)))
+        v = viproc.asarray(x)
+        y = np.positive(v) if dt != "?" else np.logical_not(np.logical_not(v))
+        for key in [(1, 2), (-1, -7), (4, 0), (np.int64(2), np.int32(-3)), (0, 6)]:
+            s = y[key]
+            if not viproc._viproc.ready(y):
+                assert type(s) is viproc.ndarray and s.ndim == 0 and s._scalar
+            got = np.asarray(s)[()] if isinstance(s, viproc.ndarray) else s
+            assert np.asarray(got).dtype == e.dtype
+            assert np.asarray(got).tobytes() == np.asarray(e[key]).tobytes()
+        for key in [(5, 0), (0, -8)]:
+            with pytest.raises(IndexError) as got:
+                (np.positive(v) if dt != "?" else np.logical_not(v))[key]
+            with pytest.raises(IndexError) as expected:
+                x[key]
+            assert str(got.value) == str(expected.value)
+    w = viproc.asarray(np.arange(6.0)) * 2.0  # 1-d, an int key
+    assert float(w[3]) == 6.0 and float(w[-1]) == 10.0
+
+
+def test_scalar_indexing_of_a_pending_array_is_one_task_and_no_sync():
+    from async_path import SIZE, assert_async, deterministic, pending
+
+    x = np.random.default_rng(12).standard_normal(SIZE)
+    with deterministic():
+        y = pending(viproc.asarray(x))
+        s = assert_async(lambda: y[17], ops=1)
+        assert s._scalar
+        y[17] = 0.0  # s is a snapshot
+        assert float(s) == x[17]
+
+
+def test_cumulative_loop_over_columns_is_bit_identical():
+    # ES[i] = ES[i - 1] + reduction: pending elements read, added and stored
+    rng = np.random.default_rng(13)
+    for n, dt in [(200, "f8"), (150, "f4")]:
+        a = rng.standard_normal((n, n)).astype(dt)
+
+        def run(xp, A):
+            ES = xp.zeros(A.shape[1], dtype=dt)
+            for i in range(A.shape[1]):
+                ES[i] = (ES[i - 1] if i > 0 else 0) + xp.abs(xp.sin(A[:, i])).sum()
+            return np.asarray(ES)
+
+        got = run(np, viproc.asarray(a))
+        expected = run(np, a)
+        assert got.dtype == expected.dtype
+        assert got.tobytes() == expected.tobytes()
+
+
+def test_numpy_scalars_of_every_dtype_as_operands():
+    rng = np.random.default_rng(14)
+    for dt in ("i4", "i8", "f4", "f8", "c8", "c16", "?"):
+        x = (rng.standard_normal(3000) * 5).astype(dt)
+        s = x[7]  # NumPy's scalar of that dtype (strong, NEP 50)
+        v = viproc.asarray(x)
+        for op in (np.add, np.multiply, np.not_equal):
+            if dt == "?" and op is not np.not_equal:
+                continue
+            for got, expected in [(op(v, s), op(x, s)), (op(s, v), op(s, x))]:
+                g = np.asarray(got)
+                assert g.dtype == expected.dtype
+                assert g.tobytes() == expected.tobytes()
+        if dt in ("f4", "f8"):
+            g = np.asarray(v + np.float64(0.1))  # another dtype: promoted as NumPy
+            e = x + np.float64(0.1)
+            assert g.dtype == e.dtype and g.tobytes() == e.tobytes()
+
+
 def test_where_runs_as_a_select_task():
     rng = np.random.default_rng(8)
     f0 = fallbacks()
