@@ -1060,7 +1060,8 @@ Rules:
   indices raise `AsyncIndexError` (an `IndexError`) asynchronously
   (error-handling.md);
   scalar indexing returns NumPy's scalar if the array is ready, else a 0-d
-  copy (no sync); `np.where(cond, x, y)` as a select task (NumPy's result
+  copy (no sync; issued in the C slot as one placement task, `pending_item`:
+  1.95 → 0.53 µs); `np.where(cond, x, y)` as a select task (NumPy's result
   dtype, x and y cast to it, layout order K; dense rows branch-free: a
   random condition mispredicts a branch per element, 1e4 elements 5 µs,
   NumPy 40 µs);
