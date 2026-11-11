@@ -712,7 +712,9 @@ class Task {
     struct Copy {
         std::shared_ptr<CountableArray> from, to;
     };
-    std::vector<Copy> copies_; // copy-on-write, empty for most tasks
+    // Copy-on-write, empty for most tasks; inline: a write into an array a
+    // pending task reads (`x[i] = x[i - 1] + s`) did a heap allocation per op.
+    InlineVector<Copy, 1> copies_;
 
     // The consumers registered for this task's completion: a lock-free stack
     // of ConsumerNodes (the main thread pushes with a CAS), closed for good

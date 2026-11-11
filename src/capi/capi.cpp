@@ -40,14 +40,21 @@ struct Graveyard {
     std::mutex mutex;
     std::vector<PyObject*> objects;
     std::vector<std::function<void()>> releases; // kernels' Python state
+    // Set under the mutex when something is parked: drain() runs at every C
+    // ABI call and took the mutex (a cache line the workers write) each time.
+    std::atomic<bool> nonempty{false};
 
     void drain() {
+        if (!nonempty.load(std::memory_order_acquire)) {
+            return;
+        }
         std::vector<PyObject*> dead;
         std::vector<std::function<void()>> todo;
         {
             std::lock_guard lock(mutex);
             dead.swap(objects);
             todo.swap(releases);
+            nonempty.store(false, std::memory_order_relaxed);
         }
         for (PyObject* o : dead) {
             Py_DECREF(o);
@@ -69,6 +76,7 @@ numpy::DeferRelease defer_release(const std::shared_ptr<Graveyard>& graveyard) {
         } else if (auto g = weak.lock()) {
             std::lock_guard lock(g->mutex);
             g->releases.push_back(std::move(f));
+            g->nonempty.store(true, std::memory_order_release);
         }
     };
 }
@@ -83,6 +91,7 @@ std::shared_ptr<void> python_owner(const std::shared_ptr<Graveyard>& graveyard, 
         } else if (auto g = weak.lock()) {
             std::lock_guard lock(g->mutex);
             g->objects.push_back(o);
+            g->nonempty.store(true, std::memory_order_release);
         } // else: runtime gone, interpreter shutting down; leak
     });
 }
