@@ -282,6 +282,27 @@ def test_numpy_scalars_of_every_dtype_as_operands():
             assert g.dtype == e.dtype and g.tobytes() == e.tobytes()
 
 
+def test_zero_d_ops_on_pending_operands():
+    # the 0-d fast path of vp_ufunc_issue: pending 0-d inputs of the loop's
+    # dtypes, a 0-d result (values, dtypes, FP errors as NumPy)
+    rng = np.random.default_rng(15)
+    for dt in ("i4", "i8", "f4", "f8", "c8", "c16"):
+        x = (rng.standard_normal(4000) * 3).astype(dt)
+        v = viproc.asarray(x)
+        a, b = np.positive(v)[5], np.negative(v)[9]  # pending 0-d elements
+        ea, eb = x[5], -x[9]
+        for f in (np.add, np.subtract, np.multiply, np.maximum, np.equal):
+            if dt[0] == "c" and f is np.maximum:
+                continue
+            got, expected = f(a, b), f(ea, eb)
+            g = np.asarray(got)
+            assert g.dtype == np.asarray(expected).dtype
+            assert g.tobytes() == np.asarray(expected).tobytes()
+    z = np.positive(viproc.asarray(np.zeros(3000)))[0]  # pending 0.0
+    with np.errstate(divide="raise"), pytest.raises(FloatingPointError):
+        float(1.0 / z)  # raised at the next check or at the sync point
+
+
 def test_where_runs_as_a_select_task():
     rng = np.random.default_rng(8)
     f0 = fallbacks()
