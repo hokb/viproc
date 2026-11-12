@@ -281,6 +281,19 @@ ownership, release or reuse of memory.
   (`CountableArray::host_views`) ops on that memory run synchronously
   (design doc D7).
 
+### Design rules R1–R3 (maintainer; goals.md)
+
+Every design decision is checked against these rules (`docs/design/goals.md`,
+"R1–R3"; they hold for the ILNumerics Accelerator too):
+1. **The main thread runs ahead as far and as fast as possible.** Removing
+   every barrier to that comes first. All ops run asynchronously, and issuing
+   is as cheap as possible.
+2. **Every op can run on every device, with costs that can be determined.**
+3. **Costs are reliably predictable, at least after an adaptation phase.**
+The device of an op is decided as late as possible, when all its inputs have
+selected their devices, by the task and not by the main thread at issue. A
+chain may switch devices in the middle when the costs favor it.
+
 ### Goals and non-goals
 
 **`docs/design/goals.md`** collects the goals, non-goals and rules every

@@ -60,6 +60,40 @@ The 0.95x / 3% target of G3 for single expressions stays the long-term
 target; the 0.8x floor for whole programs is the goal that changes are
 judged by now.
 
+## R1–R3 — Design rules for scheduling (maintainer, 2026-11-12)
+
+These rules hold for viproc and the ILNumerics Accelerator alike. Every
+design decision is checked against them.
+
+- **R1: The main thread runs ahead as far and as fast as possible.**
+  Removing every barrier to that comes first. Every op must be able to run
+  asynchronously, and issuing must be as cheap as possible. A sync point that
+  the program does not ask for, such as a fallback that waits, a data-dependent
+  shape resolved on the main thread or an issue-time check that reads data, is
+  a defect to remove.
+- **R2: Every op can run on every device, with costs that can be
+  determined.** An op that only one device can run, such as a host-only
+  BLAS/LAPACK call next to device-capable element-wise ops, breaks the
+  scheduling: chains either stay on that device or pay a transfer at every
+  such op. Each op therefore needs an implementation per device and a cost
+  estimate per device.
+- **R3: Costs are reliably predictable, at least after an adaptation
+  phase.** A device decision is only as good as its cost estimates. Estimates
+  may start from a model (FLOP, bytes, calibration) and are corrected by
+  measurement until predictions and measured times agree.
+
+**Where the device is decided.** The device of an op is chosen as late as
+possible: when all its inputs have selected their devices (or are ready),
+and by the task itself, on the thread that delivers that event, not by the
+main thread at issue. A chain may switch devices at any op, also in the
+middle, whenever the costs make that the better choice. Issue only creates
+the task (R1).
+
+In viproc today, O1 runs everything on the CPU workers. R2 and R3 apply to
+the device kernels of O4 (`docs/design/opencl.md`, where the device kernel
+already decides by size in the task) and to the per-op costs that the dispatch
+policy uses (`DirectCost`, calibration).
+
 ## G2 — Results identical to NumPy
 
 Results are always identical to plain sequential NumPy execution:
