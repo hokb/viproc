@@ -26,7 +26,7 @@ from numpy.linalg import _linalg as _np_linalg
 from numpy.linalg._linalg import EighResult, EigResult, SlogdetResult, SVDResult
 
 from . import _ndarray as _nd
-from . import _ufuncs, _viproc
+from . import _blas, _ufuncs, _viproc
 
 _NOPE = _nd._NOPE
 ndarray = _nd.ndarray
@@ -88,17 +88,18 @@ def _assert_stacked_square(a):
 
 _CHECK_FINITE = 2  # VP_GUFUNC_CHECK_FINITE
 _SERIAL = 4  # VP_GUFUNC_SERIAL
-# Matrices of at least this many elements run one LAPACK call at a time:
-# OpenBLAS threads them itself, and several threaded calls at once
-# oversubscribe its threads (vp_gufunc, VP_GUFUNC_SERIAL). Not at O2, where
-# every BLAS call runs on one thread (_blas.py) and the workers parallelize.
+# Without control over the BLAS threads (no OpenBLAS found, `_blas.single()`
+# false), matrices of at least this many elements run one LAPACK call at a
+# time: OpenBLAS threads them itself, and several threaded calls at once
+# oversubscribe its threads (vp_gufunc, VP_GUFUNC_SERIAL). With one BLAS
+# thread (the normal case, `_blas.apply`) the workers parallelize, at every
+# optimization level.
 SERIAL_FROM = 64 * 64
 
 
 def _call(gufunc, inputs, signature, invalid=None, label_sizes=None, check_finite=False):
     flags = _CHECK_FINITE if check_finite else 0
-    if (max(math.prod(x.shape[-2:]) for x in inputs) >= SERIAL_FROM
-            and _viproc.opt_level() < 2):
+    if not _blas.single() and max(math.prod(x.shape[-2:]) for x in inputs) >= SERIAL_FROM:
         flags |= _SERIAL
     return _ufuncs.gufunc(gufunc, inputs, {"signature": signature}, label_sizes, invalid,
                           flags, _work(inputs[0]))

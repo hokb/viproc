@@ -1,16 +1,19 @@
 """Thread count of the BLAS library NumPy uses (OpenBLAS in NumPy's wheels).
 
-Optimization level O2 (docs/design/goals.md) runs every BLAS call on one
-thread: viproc's workers parallelize across ops, and OpenBLAS's own threads
-on top of them oversubscribe the cores (8 concurrent 300 x 300 `inv` took
-20 ms to 1.1 s, NumPy ~22 ms; see CLAUDE.md, "BLAS threads decide BLAS
-results"). O1 must not do this: OpenBLAS splits a product by its thread
-count, and the values depend on that split.
+viproc runs every BLAS call on one thread, at every optimization level
+(docs/design/goals.md): viproc's workers parallelize across ops, and
+OpenBLAS's own threads on top of them oversubscribe the cores (8 concurrent
+300 x 300 `inv` took 20 ms to 1.1 s, NumPy ~22 ms; see CLAUDE.md, "BLAS
+threads decide BLAS results"). With one BLAS thread, LAPACK calls need no
+serialization either (`_linalg._call`).
 
-OpenBLAS has no per-thread setting, so the count is process-wide: plain
-NumPy calls in the same process run single-threaded too while O2 is on.
-The count found before is restored when the runtime shuts down or a level
-below 2 is chosen. No BLAS library found: nothing changes.
+OpenBLAS splits a product by its thread count, and the values depend on
+that split. Results are therefore those of NumPy with one BLAS thread
+(`OPENBLAS_NUM_THREADS=1`). OpenBLAS has no per-thread setting, so the
+count is process-wide: plain NumPy calls in the same process run
+single-threaded too while the runtime runs, and give the same values. The
+count found before is restored when the runtime shuts down. No BLAS library
+found: nothing changes, and large LAPACK calls stay serialized.
 """
 
 import ctypes
@@ -21,7 +24,7 @@ import sys
 import numpy as np
 
 _funcs = None  # (set, get) once looked up; False: no BLAS library found
-_saved = None  # thread count before O2 took over, while it is in effect
+_saved = None  # thread count before viproc set one thread, while that is in effect
 
 
 def _candidates():
@@ -73,17 +76,27 @@ def threads():
     return funcs[1]() if funcs else None
 
 
-def apply_level(level):
-    """One BLAS thread from level 2 on; the previous count below it."""
+def single():
+    """True while viproc runs BLAS on one thread (`apply`), no call."""
+    return _saved is not None
+
+
+def apply():
+    """One BLAS thread while the runtime runs (every optimization level)."""
     global _saved
     funcs = _get_funcs()
     if not funcs:
         return
     set_, get = funcs
-    if level >= 2:
-        if _saved is None:
-            _saved = get()
-        set_(1)
-    elif _saved is not None:
-        set_(_saved)
+    if _saved is None:
+        _saved = get()
+    set_(1)
+
+
+def restore():
+    """The thread count from before `apply` (runtime shut down)."""
+    global _saved
+    funcs = _get_funcs()
+    if funcs and _saved is not None:
+        funcs[0](_saved)
         _saved = None

@@ -81,7 +81,7 @@ def _start(workers, max_active_tasks, sync_below, adaptive, level, device=None,
     if level >= 4:  # O4: device offloading (docs/design/opencl.md)
         _viproc.opencl_select(device)
     _o2[0] = _viproc.opt_level() >= 2
-    _blas.apply_level(level)
+    _blas.apply()
     _small_ops[0] = 2048 if sync_below < 0 else sync_below
     _scale_budget(adaptive)
 
@@ -2308,7 +2308,7 @@ def shutdown():
         try:
             _viproc.shutdown()
         finally:
-            _blas.apply_level(1)  # the BLAS thread count from before O2
+            _blas.restore()  # the BLAS thread count from before the runtime
 
 
 def workers():
