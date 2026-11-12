@@ -310,10 +310,11 @@ reordered sums, no fusion or splitting of an op that changes rounding. The
 small per-op overhead on small data that this costs is accepted; work it
 down, never at G2's expense. Bit-identity is the property of optimization
 level **O1**, the default (array ILP only, NumPy executes every
-function). Higher levels (goals.md, "Optimization levels") each add to
+function; BLAS runs on one thread at every level, so results are NumPy's
+with `OPENBLAS_NUM_THREADS=1`, see "BLAS threads decide BLAS results").
+Higher levels (goals.md, "Optimization levels") each add to
 the one below and compute correct but possibly deviating results: **O2**
-stage pipelining and BLAS threading removed (started: one BLAS thread,
-LAPACK calls no longer serialized; element-wise ufuncs (casts of inputs
+stage pipelining (started: element-wise ufuncs (casts of inputs
 in the task) and `astype` on pending or large inputs, `matmul` of pending
 ones, are issued unsized, `vp_ufunc_issue_deferred`, and
 size themselves in the task, pipelining.md S2; `zeros`/`ones`/`empty`/
@@ -475,7 +476,8 @@ python/viproc/         Python package
   _sort.py             np.sort/np.argsort/a.sort beyond the C path (axis=None
                        copies, kinds, NumPy's errors)
   _blas.py             BLAS thread count (OpenBLAS via ctypes): one thread
-                       from optimization level O2 on, restored at shutdown
+                       while the runtime runs (every level), restored at
+                       shutdown
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -905,29 +907,40 @@ Rules:
   `vecdot`, `outer`, `tensordot`, `diagonal`, `trace`, `matrix_transpose`,
   `matrix_norm`) are NumPy's code on viproc's ops
   (`python/tests/test_linalg_compositions.py`). Linalg
-  loops call LAPACK, which OpenBLAS threads itself for larger matrices:
-  matrices of >= 64 x 64 elements run one loop call at a time
-  (`VP_GUFUNC_SERIAL`, a process-wide mutex; `_linalg.SERIAL_FROM`).
-  Several threaded OpenBLAS calls at once oversubscribe its threads: 8
-  concurrent 300 x 300 `inv` took 20 ms to 1.1 s (NumPy ~22 ms), serialized
-  17–47 ms. Small ready inputs (at most `sync_below` elements) run NumPy's
+  loops call LAPACK, which OpenBLAS threads itself for larger matrices.
+  viproc runs BLAS on one thread (`_blas.py`), so linalg calls overlap
+  freely on the workers. Only where viproc cannot set the thread count
+  (no OpenBLAS found) matrices of >= 64 x 64 elements run one loop call at
+  a time (`VP_GUFUNC_SERIAL`, a process-wide mutex; `_linalg.SERIAL_FROM`):
+  several threaded OpenBLAS calls at once oversubscribe its threads (8
+  concurrent 300 x 300 `inv` took 20 ms to 1.1 s, NumPy ~22 ms; serialized
+  17–47 ms). Serializing by size had made 8 independent `inv` of 64 x 64
+  0.77x of NumPy at O1; with one BLAS thread 2.35x. Small ready inputs (at most `sync_below` elements) run NumPy's
   own function on read-only exports, results adopted (`_small_ready`, as
   `_join.py`). Fuzzed in `python/tests/test_linalg.py`.
 - **BLAS threads decide BLAS results.** OpenBLAS (NumPy's wheels, 0.3.34)
   splits large products differently with 1, 2 or 4 threads, and the values
   differ (`a @ b` of 513 x 513 float64: three different results for
-  `OPENBLAS_NUM_THREADS` 1, 2, 4). So viproc must not change BLAS
-  threading (no "1 BLAS thread per worker"): bit-identity with NumPy means
-  the same BLAS configuration. Concurrent calls from several threads give
+  `OPENBLAS_NUM_THREADS` 1, 2, 4). **Decided (maintainer):** viproc runs
+  BLAS on one thread at every level, O1 included (`_blas.py`: OpenBLAS's
+  process-wide count set to 1 at `init`, restored at shutdown): viproc's
+  workers parallelize instead of OpenBLAS. O1's results are NumPy's with
+  `OPENBLAS_NUM_THREADS=1`, bit-identical to that; against NumPy's default
+  thread count, products and factorizations of matrices large enough for
+  OpenBLAS to thread may differ in the last bits. Cost: a single large
+  product with nothing to overlap loses OpenBLAS's own threading
+  (`opt_levels.py`, 4 vCPUs: 0.24-0.41x of NumPy); independent linalg
+  calls gain (8 `inv`/`solve` of 64-500: 1.0-2.6x, before 0.6-0.9x).
+  Concurrent calls from several threads give
   the values of the same calls made one after the other (checked: 4 threads,
   sizes 513–1000, gemm/syrk/gemv). Measured on 4 cores: overlapping
   products that OpenBLAS already threads (side >= ~300) gains little
   (BLAS already uses the cores); serializing them with a lock did not
   help either. Small products (side < ~200, single-threaded inside BLAS)
-  overlap well. **Open:** concurrent threaded OpenBLAS calls have a heavy
-  tail (8 independent 128 x 128 `a @ a`: median 2x NumPy's time, p90 25x;
-  with `OPENBLAS_NUM_THREADS=1` 2.7x faster than NumPy): the matmul
-  kernel may need linalg's `VP_GUFUNC_SERIAL`.
+  overlap well. Concurrent threaded OpenBLAS calls had a heavy tail (8
+  independent 128 x 128 `a @ a`: median 2x NumPy's time, p90 25x; with
+  `OPENBLAS_NUM_THREADS=1` 2.7x faster than NumPy), one more reason for
+  one BLAS thread.
 - **`matmul`** (`src/kernels/numpy_matmul.*`, `vp_matmul`): NumPy's matmul
   gufunc loop `(m?,n),(n,p?)->(m?,p?)`, called as
   `PyUFunc_GeneralizedFunctionInternal` calls it: no buffering, one call

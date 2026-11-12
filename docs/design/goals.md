@@ -145,8 +145,8 @@ a property of a level, not a fixed promise of viproc.
 
 | Level | Adds | Results |
 |-------|------|---------|
-| **O1** (current implementation) | array ILP only: independent array instructions overlap; NumPy itself executes every function (its loops, operators and BLAS, called exactly as NumPy calls them) | bit-identical to NumPy (G2) |
-| **O2** | stage pipelining (`pipelining.md`: tasks advance through size, device, allocation and completion on their inputs' stage events; partial results start their consumers); BLAS threading removed (viproc's workers parallelize, each BLAS call runs on one thread) | correct; may deviate from NumPy's (OpenBLAS splits products by its thread count, and the values depend on that split) |
+| **O1** (current implementation) | array ILP only: independent array instructions overlap; NumPy itself executes every function (its loops, operators and BLAS, called exactly as NumPy calls them); BLAS on one thread, viproc's workers parallelize | bit-identical to NumPy with `OPENBLAS_NUM_THREADS=1` (G2); large BLAS products may differ in the last bits from NumPy's default thread count |
+| **O2** | stage pipelining (`pipelining.md`: tasks advance through size, device, allocation and completion on their inputs' stage events; partial results start their consumers) | correct; may deviate from NumPy's |
 | **O3** | micro kernels: viproc's own kernels where NumPy's calling pattern costs (fusion of element-wise chains, splitting single ops, other summation orders, re-implemented NumPy internals) | correct; may deviate in rounding |
 | **O4** | automatic device offloading: cost-based device selection per array instruction (GPUs and other accelerators); started: linalg factorizations, fft and matmul on an OpenCL device (`opencl.md`) | correct; may deviate (device kernels and their rounding) |
 | **O5** | reserved | |
@@ -155,9 +155,11 @@ a property of a level, not a fixed promise of viproc.
 (or `On`), `python -m viproc -On prog.py` (also `-O n`, `--opt=n`); levels
 1-5 are accepted, O1 is the default, 3 and 5 run as O2 until they are
 built; 4 runs as O2 plus the OpenCL device kernels (`opencl.md`).
-**O2 so far:** every BLAS call runs on one thread (OpenBLAS's process-wide
-setting, through `_blas.py`, restored at shutdown) and LAPACK calls are no
-longer serialized; element-wise ufuncs (no casts, one output) on pending
+**BLAS at every level:** every BLAS call runs on one thread (OpenBLAS's
+process-wide setting, through `_blas.py`, restored at shutdown) and LAPACK
+calls are not serialized (maintainer's decision: O1 too; OpenBLAS splits
+large products by its thread count, so O1 is bit-identical to NumPy run
+with `OPENBLAS_NUM_THREADS=1`). **O2 so far:** element-wise ufuncs (no casts, one output) on pending
 or large inputs are issued without their size: the task computes it on
 its inputs' size signals and its strides on their layouts
 (`pipelining.md`, S2), so the main thread does not wait for pending
@@ -170,10 +172,11 @@ values may round differently from NumPy's SIMD/scalar choice);
 signals exist at every level (they change no result). O2 is not strict: NumPy functions taken as a
 whole may still run where nothing better exists; such ops give their three
 stage signals in quick succession. Measured (4 vCPUs,
-`python/benchmarks/opt_levels.py`): 8 independent `inv` of 64 x 64 2.35x
-vs. NumPy (O1 0.77x), `solve` 1.0-2.0x; **a single large product loses**
-(0.24-0.36x, O1 0.5-1.1x): OpenBLAS no longer parallelizes it, and one op
-has no array ILP to replace that.
+`python/benchmarks/opt_levels.py`, one BLAS thread at O1 and O2): 8
+independent `inv`/`solve` of 64-500 1.0-2.6x vs. NumPy (before, at O1
+with NumPy's BLAS threads and LAPACK serialized from 64 x 64: 0.6-0.9x);
+**a single large product loses** (0.24-0.41x): OpenBLAS no longer
+parallelizes it, and one op has no array ILP to replace that.
 
 "Correct" means a result NumPy's semantics allow: the same dtypes,
 shapes, errors and warnings, values within the floating-point error of a
@@ -194,8 +197,9 @@ the target can become a firm rule.
 - **Global program analysis:** no dependency graph (DAG) of the program, no
   ahead-of-time (AOT) analysis. Every decision is local.
 - **Changing what NumPy computes** to gain speed: no other summation order,
-  no other BLAS threading, no approximations (G2; only the planned
-  optimization levels above O1 may deviate, see "Optimization levels").
+  no approximations (G2; only the planned optimization levels above O1
+  may deviate, see "Optimization levels"). Exception, decided: BLAS runs
+  on one thread at every level (see above).
 - **Dedicated array types or scopes in user code** (temporary/return types,
   scope APIs as on .NET): they would rule out running unchanged NumPy
   programs (`docs/design/memory-management.md`, D1).

@@ -165,7 +165,8 @@ described in the paper [*A Virtual Processor brings back the Free Lunch*](https:
 
 ## Status
 
-- **Phase 1: multi-core CPUs, optimization level O1** (array ILP only, bit-identical).
+- **Phase 1: multi-core CPUs, optimization level O1** (array ILP only, bit-identical; BLAS
+  runs on one thread, so large matrix products match NumPy with `OPENBLAS_NUM_THREADS=1`).
   Element-wise ufuncs, reductions, indexing, `np.where`, matmul/dot, most of `numpy.linalg`
   and `numpy.fft`, sort and many composed functions run asynchronously; the rest falls back
   to NumPy.
@@ -173,8 +174,7 @@ described in the paper [*A Virtual Processor brings back the Free Lunch*](https:
   ~1,000 elements per array the shape map's programs are there (median 0.93x and up); on
   tiny arrays the median is 0.63-0.96x, single operations down to 0.44x: the per-operation
   overhead is being worked down.
-- **Planned levels**, each correct and faster but no longer bit-identical: O2 stage pipelining and
-  viproc-owned BLAS threading, O3 own and fused kernels, O4 automatic device offloading
+- **Planned levels**, each correct and faster but no longer bit-identical: O2 stage pipelining, O3 own and fused kernels, O4 automatic device offloading
   (GPUs). O1 stays available.
 
 ## Documentation
