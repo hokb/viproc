@@ -87,7 +87,21 @@ possible: when all its inputs have selected their devices (or are ready),
 and by the task itself, on the thread that delivers that event, not by the
 main thread at issue. A chain may switch devices at any op, also in the
 middle, whenever the costs make that the better choice. Issue only creates
-the task (R1).
+the task (R1): the main thread records the op and its dependencies; it
+selects no device, computes nothing and waits for nothing. The criterion per
+device d is ETA_d + kernel time + transfers; affinity to the device of the
+inputs is a cost term (transfers), not a rule. Measurements correct the model
+slowly; they do not replace it (R3).
+
+Known violations (2026-11-12, to be removed or justified):
+- The direct path and the scalar shortcut run small ready ops on the main
+  thread (`sync_below`, `DirectCost`). They are deliberate (an op of a few
+  elements costs less than its task), but they are a main-thread cost that R1
+  weighs against.
+- BLAS threads are set process-wide (`_blas.py`); without OpenBLAS, LAPACK
+  calls from 64 x 64 run one at a time (`VP_GUFUNC_SERIAL`).
+- O4 device kernels decide CPU or device in the task by size, not yet from
+  per-device costs and an ETA per device (R2, R3).
 
 In viproc today, O1 runs everything on the CPU workers. R2 and R3 apply to
 the device kernels of O4 (`docs/design/opencl.md`, where the device kernel
