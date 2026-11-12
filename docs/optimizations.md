@@ -126,6 +126,7 @@ NumPy's own loops the way NumPy calls them.
 | Branch-free `np.where` | Random condition | Masked blend per word instead of a branch per element | Done (`0c99e19`) | 1e4 elements: 5 µs (NumPy 40 µs) |
 | `matmul`, `@`, `np.dot` | Matrix products | NumPy's matmul gufunc loop per batch row | Done (`233fe84`) | `matmul_batch`: 11,540 fallbacks → 0; small 0.48 → 1.04x |
 | Linalg serialized from 64 x 64 | Many concurrent LAPACK calls | Process-wide mutex (`VP_GUFUNC_SERIAL`) | Superseded (only without BLAS control) | 8 concurrent `inv` of 300 x 300: 20 ms-1.1 s → 17-47 ms; one BLAS thread replaces it |
+| Dynamic BLAS threads | A single large product with nothing to overlap; concurrent BLAS calls | The task sets OpenBLAS's count per call: its own count alone (no other BLAS call, active tasks <= 1, 5 ms quiet), one thread otherwise (`BlasCallScope`, `blas_threads.*`) | Done (hokb/viproc#67) | `opt_levels.py` one product 300-1000: 0.28-0.33x → 0.84-0.95x of NumPy; concurrent products and `inv`/`solve` as with one thread |
 | Linalg, FFT, sort asynchronously | `numpy.linalg`, `numpy.fft`, `np.sort` | NumPy's wrappers ported onto `vp_gufunc` and `vp_sort` | Done (#34-#37) | `np.sort` of 10 elements 0.76 µs (NumPy 0.79); FFT see plans |
 | Joining, compositions, indexing functions, accumulation, ufunc methods | `concatenate`, `clip`, `take`, `cumsum`, `where=`, ... | One placement task per join; NumPy's code ported without the syncing `asanyarray` | Done (#27-#33) | Fewer fallbacks; no overall measurement |
 

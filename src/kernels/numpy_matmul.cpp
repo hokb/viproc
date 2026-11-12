@@ -1,5 +1,7 @@
 #include "kernels/numpy_matmul.hpp"
 
+#include "kernels/blas_threads.hpp"
+
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -42,6 +44,7 @@ class MatmulKernel : public Kernel {
     const char* fp_name() const override { return loop_->fp_name(); }
 
     KernelResult run(std::span<const Operand> inputs, std::span<const Operand> outputs) override {
+        const BlasCallScope blas; // BLAS threads for this call (blas_threads.hpp)
         const Layout& a = inputs[0].layout();
         const Layout& b = inputs[1].layout();
         const Layout& o = outputs[0].layout();

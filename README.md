@@ -166,7 +166,9 @@ described in the paper [*A Virtual Processor brings back the Free Lunch*](https:
 ## Status
 
 - **Phase 1: multi-core CPUs, optimization level O1** (array ILP only, bit-identical; BLAS
-  runs on one thread, so large matrix products match NumPy with `OPENBLAS_NUM_THREADS=1`).
+  threads are chosen per call: OpenBLAS's own count for a product alone, one thread while other
+  work runs, so large matrix products match NumPy with the thread count they ran with;
+  `VIPROC_BLAS_THREADS=1` fixes one thread).
   Element-wise ufuncs, reductions, indexing, `np.where`, matmul/dot, most of `numpy.linalg`
   and `numpy.fft`, sort and many composed functions run asynchronously; the rest falls back
   to NumPy.

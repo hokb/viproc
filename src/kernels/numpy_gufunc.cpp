@@ -1,5 +1,7 @@
 #include "kernels/numpy_gufunc.hpp"
 
+#include "kernels/blas_threads.hpp"
+
 #include <cfenv>
 #include <cmath>
 #include <cstring>
@@ -135,6 +137,7 @@ class GufuncKernel : public Kernel {
         if (total == 0) {
             return {}; // NumPy's iterator is empty: the loop is not called
         }
+        const BlasCallScope blas; // BLAS threads for this call (blas_threads.hpp)
         std::unique_lock<std::mutex> serial;
         if ((options_ & kGufuncSerial) != 0) {
             serial = std::unique_lock<std::mutex>(serial_mutex());

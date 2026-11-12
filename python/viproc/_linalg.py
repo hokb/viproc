@@ -88,18 +88,18 @@ def _assert_stacked_square(a):
 
 _CHECK_FINITE = 2  # VP_GUFUNC_CHECK_FINITE
 _SERIAL = 4  # VP_GUFUNC_SERIAL
-# Without control over the BLAS threads (no OpenBLAS found, `_blas.single()`
-# false), matrices of at least this many elements run one LAPACK call at a
-# time: OpenBLAS threads them itself, and several threaded calls at once
-# oversubscribe its threads (vp_gufunc, VP_GUFUNC_SERIAL). With one BLAS
-# thread (the normal case, `_blas.apply`) the workers parallelize, at every
-# optimization level.
+# Without control over the BLAS threads (no OpenBLAS found,
+# `_blas.controlled()` false), matrices of at least this many elements run one
+# LAPACK call at a time: OpenBLAS threads them itself, and several threaded
+# calls at once oversubscribe its threads (vp_gufunc, VP_GUFUNC_SERIAL). With
+# control (the normal case, `_blas.apply`) concurrent calls run on one BLAS
+# thread each and the workers parallelize, at every optimization level.
 SERIAL_FROM = 64 * 64
 
 
 def _call(gufunc, inputs, signature, invalid=None, label_sizes=None, check_finite=False):
     flags = _CHECK_FINITE if check_finite else 0
-    if not _blas.single() and max(math.prod(x.shape[-2:]) for x in inputs) >= SERIAL_FROM:
+    if not _blas.controlled() and max(math.prod(x.shape[-2:]) for x in inputs) >= SERIAL_FROM:
         flags |= _SERIAL
     return _ufuncs.gufunc(gufunc, inputs, {"signature": signature}, label_sizes, invalid,
                           flags, _work(inputs[0]))

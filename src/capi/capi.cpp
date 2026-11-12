@@ -2,6 +2,7 @@
 
 #include "viproc/viproc.h"
 
+#include "kernels/blas_threads.hpp"
 #include "kernels/numpy_gufunc.hpp"
 #include "kernels/numpy_matmul.hpp"
 #include "kernels/numpy_reduce.hpp"
@@ -320,6 +321,7 @@ void vp_runtime_destroy(vp_runtime* rt) {
     Py_BEGIN_ALLOW_THREADS;
     rt->rt.reset(); // waits for all tasks, stops the workers
     Py_END_ALLOW_THREADS;
+    numpy::configure_blas_threads(nullptr, 1, false, nullptr); // the counter is gone
     rt->loops.reset();
     rt->graveyard->drain();
     delete rt;
@@ -390,6 +392,13 @@ void vp_set_chain_ns(vp_runtime* rt, double ns) {
     rt->rt->set_offload_options(o);
 }
 size_t vp_active_tasks(const vp_runtime* rt) { return rt->rt->active_tasks(); }
+
+void vp_blas_threads(vp_runtime* rt, void (*set_threads)(int), int alone_threads, int dynamic) {
+    numpy::configure_blas_threads(set_threads, alone_threads, dynamic != 0,
+                                  &rt->rt->active_counter());
+}
+int vp_blas_threads_current(void) { return numpy::blas_threads_current(); }
+uint64_t vp_blas_threads_changes(void) { return numpy::blas_threads_changes(); }
 
 void vp_set_offload_policy(vp_runtime* rt, int64_t sync_below, int adaptive) {
     OffloadOptions o = rt->rt->offload_policy().options();

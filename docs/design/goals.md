@@ -98,8 +98,10 @@ Known violations (2026-11-12, to be removed or justified):
   thread (`sync_below`, `DirectCost`). They are deliberate (an op of a few
   elements costs less than its task), but they are a main-thread cost that R1
   weighs against.
-- BLAS threads are set process-wide (`_blas.py`); without OpenBLAS, LAPACK
-  calls from 64 x 64 run one at a time (`VP_GUFUNC_SERIAL`).
+- BLAS threads are set process-wide (OpenBLAS has no per-thread count in
+  NumPy's wheels): the task decides per call (dynamic, "BLAS threads"
+  below), but a call already running keeps its split. Without OpenBLAS,
+  LAPACK calls from 64 x 64 run one at a time (`VP_GUFUNC_SERIAL`).
 - O4 device kernels decide CPU or device in the task by size, not yet from
   per-device costs and an ETA per device (R2, R3).
 
@@ -193,7 +195,7 @@ a property of a level, not a fixed promise of viproc.
 
 | Level | Adds | Results |
 |-------|------|---------|
-| **O1** (current implementation) | array ILP only: independent array instructions overlap; NumPy itself executes every function (its loops, operators and BLAS, called exactly as NumPy calls them); BLAS on one thread, viproc's workers parallelize | bit-identical to NumPy with `OPENBLAS_NUM_THREADS=1` (G2); large BLAS products may differ in the last bits from NumPy's default thread count |
+| **O1** (current implementation) | array ILP only: independent array instructions overlap; NumPy itself executes every function (its loops, operators and BLAS, called exactly as NumPy calls them); BLAS threads dynamic: OpenBLAS's own count for a call alone, one thread while other asynchronous work runs | bit-identical to NumPy (G2), for BLAS calls large enough for OpenBLAS to thread with the thread count the call ran with (as NumPy's own results depend on the machine's core count); `VIPROC_BLAS_THREADS=1` or the deterministic mode: NumPy's with `OPENBLAS_NUM_THREADS=1`, reproducible |
 | **O2** | stage pipelining (`pipelining.md`: tasks advance through size, device, allocation and completion on their inputs' stage events; partial results start their consumers) | correct; may deviate from NumPy's |
 | **O3** | micro kernels: viproc's own kernels where NumPy's calling pattern costs (fusion of element-wise chains, splitting single ops, other summation orders, re-implemented NumPy internals) | correct; may deviate in rounding |
 | **O4** | automatic device offloading: cost-based device selection per array instruction (GPUs and other accelerators); started: linalg factorizations, fft and matmul on an OpenCL device (`opencl.md`) | correct; may deviate (device kernels and their rounding) |
@@ -203,11 +205,24 @@ a property of a level, not a fixed promise of viproc.
 (or `On`), `python -m viproc -On prog.py` (also `-O n`, `--opt=n`); levels
 1-5 are accepted, O1 is the default, 3 and 5 run as O2 until they are
 built; 4 runs as O2 plus the OpenCL device kernels (`opencl.md`).
-**BLAS at every level:** every BLAS call runs on one thread (OpenBLAS's
-process-wide setting, through `_blas.py`, restored at shutdown) and LAPACK
-calls are not serialized (maintainer's decision: O1 too; OpenBLAS splits
-large products by its thread count, so O1 is bit-identical to NumPy run
-with `OPENBLAS_NUM_THREADS=1`). **O2 so far:** element-wise ufuncs (no casts, one output) on pending
+**BLAS threads at every level (maintainer's decision, 2026-11-12,
+hokb/viproc#67):** dynamic, the same in viproc and the ILNumerics
+Accelerator. Bit-exactness of BLAS results holds within one setup only:
+NumPy's own results differ between machines with different core counts,
+because OpenBLAS splits large products by its thread count. So the task
+making a BLAS call decides its thread count (`src/kernels/blas_threads.*`,
+`_blas.py`): a call alone (no other BLAS call in flight, no other active
+task, none found for 5 ms) runs with the count found at init, as plain
+NumPy; while other asynchronous work runs, every call runs on one thread
+and viproc's workers parallelize across ops (concurrent threaded OpenBLAS
+calls oversubscribe the cores and have a heavy tail). OpenBLAS's count is
+process-wide: lowered at any time (a running call keeps its split), raised
+only by the only call in flight; restored at shutdown. LAPACK calls are
+not serialized. `VIPROC_BLAS_THREADS=1` and the deterministic mode
+(`adaptive=False`) fix one thread for every call: results are NumPy's with
+`OPENBLAS_NUM_THREADS=1`, whatever runs concurrently. (Before, one thread
+for every call at every level: a single large product ran at 0.24-0.41x of
+NumPy.) **O2 so far:** element-wise ufuncs (no casts, one output) on pending
 or large inputs are issued without their size: the task computes it on
 its inputs' size signals and its strides on their layouts
 (`pipelining.md`, S2), so the main thread does not wait for pending
@@ -220,11 +235,11 @@ values may round differently from NumPy's SIMD/scalar choice);
 signals exist at every level (they change no result). O2 is not strict: NumPy functions taken as a
 whole may still run where nothing better exists; such ops give their three
 stage signals in quick succession. Measured (4 vCPUs,
-`python/benchmarks/opt_levels.py`, one BLAS thread at O1 and O2): 8
-independent `inv`/`solve` of 64-500 1.0-2.6x vs. NumPy (before, at O1
-with NumPy's BLAS threads and LAPACK serialized from 64 x 64: 0.6-0.9x);
-**a single large product loses** (0.24-0.41x): OpenBLAS no longer
-parallelizes it, and one op has no array ILP to replace that.
+`python/benchmarks/opt_levels.py`, O1): 8 independent `inv`/`solve` of
+64-1000 1.0-2.1x vs. NumPy with dynamic BLAS threads, as with one thread
+throughout (before, NumPy's BLAS threads and LAPACK serialized from 64 x
+64: 0.6-0.9x); a single product with nothing to overlap 0.84-0.95x from
+300 x 300 on (one thread throughout: 0.28-0.33x).
 
 "Correct" means a result NumPy's semantics allow: the same dtypes,
 shapes, errors and warnings, values within the floating-point error of a
@@ -246,8 +261,8 @@ the target can become a firm rule.
   ahead-of-time (AOT) analysis. Every decision is local.
 - **Changing what NumPy computes** to gain speed: no other summation order,
   no approximations (G2; only the planned optimization levels above O1
-  may deviate, see "Optimization levels"). Exception, decided: BLAS runs
-  on one thread at every level (see above).
+  may deviate, see "Optimization levels"). Exception, decided: BLAS
+  thread counts are chosen per call (see "BLAS threads" above).
 - **Dedicated array types or scopes in user code** (temporary/return types,
   scope APIs as on .NET): they would rule out running unchanged NumPy
   programs (`docs/design/memory-management.md`, D1).

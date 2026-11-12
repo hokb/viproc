@@ -72,13 +72,19 @@ def _blas_before():
 
 
 @pytest.mark.parametrize("level", [1, 2])
-def test_blas_one_thread_and_restored(level):
+def test_blas_threads_controlled_and_restored(level):
     before = _blas_before()
     try:
         viproc.init(level=level)
+        assert _blas.controlled()
+        # dynamic: the count found at init while nothing runs; one thread if
+        # OpenBLAS had one anyway
+        assert _blas.threads() == before
+        assert _blas.mode() == ("dynamic" if before > 1 else "single")
+        viproc.init(level=level, adaptive=False)  # deterministic: one thread
         assert _blas.threads() == 1 and _blas.single()
         viproc.shutdown()
-        assert _blas.threads() == before and not _blas.single()
+        assert _blas.threads() == before and not _blas.controlled()
     finally:
         viproc.init()
 
@@ -104,7 +110,7 @@ def _inv80():
 def test_lapack_not_serialized(monkeypatch, level):
     viproc.init(level=level)
     try:
-        if not _blas.single():
+        if not _blas.controlled():
             pytest.skip("no BLAS library with a thread setting found")
         seen = _flags_seen(monkeypatch)
         _inv80()
@@ -116,7 +122,7 @@ def test_lapack_not_serialized(monkeypatch, level):
 def test_lapack_serialized_without_blas_control(monkeypatch):
     viproc.init()
     seen = _flags_seen(monkeypatch)
-    monkeypatch.setattr(_blas, "single", lambda: False)
+    monkeypatch.setattr(_blas, "controlled", lambda: False)
     _inv80()
     assert seen[-1] & _linalg._SERIAL
 
