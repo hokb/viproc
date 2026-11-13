@@ -258,6 +258,8 @@ class Runtime {
 
     // --- Any thread ---------------------------------------------------------
     std::size_t active_tasks() const { return active_.load(std::memory_order_acquire); }
+    // The counter behind active_tasks(), for readers on any thread (BLAS threads).
+    const std::atomic<std::size_t>& active_counter() const { return active_; }
     // Main thread: the dispatch policy and its counters.
     const OffloadPolicy& offload_policy() const { return policy_; }
     // Ops that took the direct path (see issue()).

@@ -1,10 +1,12 @@
 """BLAS-heavy programs at optimization levels O1 and O2 vs. NumPy.
 
-O2 (docs/design/goals.md) runs every BLAS call on one thread and lets
-viproc's workers overlap independent calls; O1 keeps NumPy's BLAS threading
-(bit-identical) and serializes large LAPACK calls. Per case and size: NumPy's
-time (its default BLAS threads), viproc O1 and O2 as speedups vs. NumPy, and
-O2's largest relative deviation from NumPy's result.
+viproc runs every BLAS call on one thread at every level (docs/design/goals.md)
+and lets its workers overlap independent calls. Per case and size: NumPy's
+time with its default BLAS threads (measured with the runtime shut down: the
+BLAS setting is process-wide), viproc O1 and O2 as speedups vs. NumPy, and
+the largest relative deviation of viproc's results from NumPy's (multi-
+threaded BLAS splits products differently; vs. NumPy with one BLAS thread
+they are bit-identical at O1).
 
     PYTHONPATH=build/python python3 python/benchmarks/opt_levels.py [--quick]
 """
@@ -63,12 +65,12 @@ def main():
     reps = 3 if args.quick else 7
     rng = np.random.default_rng(0)
     print(f"cores {viproc.physical_cores()}, p = {args.p}")
-    print(f"{'case':12} {'n':>5} {'numpy ms':>9} {'O1':>6} {'O2':>6} {'O2 rel.dev':>10}")
+    print(f"{'case':12} {'n':>5} {'numpy ms':>9} {'O1':>6} {'O2':>6} {'rel.dev':>8}")
     for name, fn in CASES.items():
         for n in sizes:
             ms_np = [rng.random((n, n)) + n * np.eye(n) for _ in range(args.p)]
-            with viproc.disabled():
-                t_np, ref = run(fn, ms_np, args.p, reps)
+            viproc.shutdown()  # NumPy's default BLAS threads
+            t_np, ref = run(fn, ms_np, args.p, reps)
             res = {}
             for level in (1, 2):
                 viproc.init(level=level)
@@ -77,9 +79,9 @@ def main():
                 res[level] = (t, r)
             viproc.init()
             dev = max(float(np.max(np.abs(a - b)) / max(np.max(np.abs(b)), 1e-300))
-                      for a, b in zip(res[2][1], ref))
+                      for level in (1, 2) for a, b in zip(res[level][1], ref))
             print(f"{name:12} {n:5d} {t_np * 1e3:9.2f} {t_np / res[1][0]:6.2f} "
-                  f"{t_np / res[2][0]:6.2f} {dev:10.1e}")
+                  f"{t_np / res[2][0]:6.2f} {dev:8.1e}")
 
 
 if __name__ == "__main__":

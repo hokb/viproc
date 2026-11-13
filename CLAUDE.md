@@ -281,6 +281,19 @@ ownership, release or reuse of memory.
   (`CountableArray::host_views`) ops on that memory run synchronously
   (design doc D7).
 
+### Design rules R1–R3 (maintainer; goals.md)
+
+Every design decision is checked against these rules (`docs/design/goals.md`,
+"R1–R3"; they hold for the ILNumerics Accelerator too):
+1. **The main thread runs ahead as far and as fast as possible.** Removing
+   every barrier to that comes first. All ops run asynchronously, and issuing
+   is as cheap as possible.
+2. **Every op can run on every device, with costs that can be determined.**
+3. **Costs are reliably predictable, at least after an adaptation phase.**
+The device of an op is decided as late as possible, when all its inputs have
+selected their devices, by the task and not by the main thread at issue. A
+chain may switch devices in the middle when the costs favor it.
+
 ### Goals and non-goals
 
 **`docs/design/goals.md`** collects the goals, non-goals and rules every
@@ -310,10 +323,12 @@ reordered sums, no fusion or splitting of an op that changes rounding. The
 small per-op overhead on small data that this costs is accepted; work it
 down, never at G2's expense. Bit-identity is the property of optimization
 level **O1**, the default (array ILP only, NumPy executes every
-function). Higher levels (goals.md, "Optimization levels") each add to
+function; BLAS threads are chosen per call, so large BLAS results are
+NumPy's with the thread count the call ran with, see "BLAS threads decide
+BLAS results").
+Higher levels (goals.md, "Optimization levels") each add to
 the one below and compute correct but possibly deviating results: **O2**
-stage pipelining and BLAS threading removed (started: one BLAS thread,
-LAPACK calls no longer serialized; element-wise ufuncs (casts of inputs
+stage pipelining (started: element-wise ufuncs (casts of inputs
 in the task) and `astype` on pending or large inputs, `matmul` of pending
 ones, are issued unsized, `vp_ufunc_issue_deferred`, and
 size themselves in the task, pipelining.md S2; `zeros`/`ones`/`empty`/
@@ -437,6 +452,8 @@ src/kernels/           Kernel adapters using NumPy (library `viproc_numpy`)
                        batch row as PyUFunc_GeneralizedFunctionInternal
   numpy_sort.*         sort/argsort kernel: NumPy's per-dtype sort functions
                        (ArrFuncs->sort/argsort), one call per row
+  blas_threads.*       BLAS thread count per call (BlasCallScope): OpenBLAS's
+                       own count alone, one thread with other async work
 src/device/opencl/     O4 device kernels (library `viproc_opencl`, opencl.md)
   cl_loader.*          ICD loader and CLBlast opened at run time; cl* forwarders
   cl_device.*          device selection, context, per-thread queues, buffers
@@ -474,8 +491,9 @@ python/viproc/         Python package
                        irfft, hfft, n-d transforms)
   _sort.py             np.sort/np.argsort/a.sort beyond the C path (axis=None
                        copies, kinds, NumPy's errors)
-  _blas.py             BLAS thread count (OpenBLAS via ctypes): one thread
-                       from optimization level O2 on, restored at shutdown
+  _blas.py             BLAS thread count (OpenBLAS via ctypes): handed to the
+                       runtime (dynamic per call, VIPROC_BLAS_THREADS=1:
+                       one thread), restored at shutdown
   __init__.py          module API (asarray, zeros, …, random, enable/disabled;
                        other names from NumPy)
   __main__.py          python -m viproc prog.py | -m mod | -c code
@@ -905,29 +923,52 @@ Rules:
   `vecdot`, `outer`, `tensordot`, `diagonal`, `trace`, `matrix_transpose`,
   `matrix_norm`) are NumPy's code on viproc's ops
   (`python/tests/test_linalg_compositions.py`). Linalg
-  loops call LAPACK, which OpenBLAS threads itself for larger matrices:
-  matrices of >= 64 x 64 elements run one loop call at a time
-  (`VP_GUFUNC_SERIAL`, a process-wide mutex; `_linalg.SERIAL_FROM`).
-  Several threaded OpenBLAS calls at once oversubscribe its threads: 8
-  concurrent 300 x 300 `inv` took 20 ms to 1.1 s (NumPy ~22 ms), serialized
-  17–47 ms. Small ready inputs (at most `sync_below` elements) run NumPy's
+  loops call LAPACK, which OpenBLAS threads itself for larger matrices.
+  viproc runs concurrent BLAS calls on one thread each (`_blas.py`,
+  dynamic BLAS threads), so linalg calls overlap freely on the workers. Only where viproc cannot set the thread count
+  (no OpenBLAS found) matrices of >= 64 x 64 elements run one loop call at
+  a time (`VP_GUFUNC_SERIAL`, a process-wide mutex; `_linalg.SERIAL_FROM`):
+  several threaded OpenBLAS calls at once oversubscribe its threads (8
+  concurrent 300 x 300 `inv` took 20 ms to 1.1 s, NumPy ~22 ms; serialized
+  17–47 ms). Serializing by size had made 8 independent `inv` of 64 x 64
+  0.77x of NumPy at O1; with one BLAS thread 2.35x. Small ready inputs (at most `sync_below` elements) run NumPy's
   own function on read-only exports, results adopted (`_small_ready`, as
   `_join.py`). Fuzzed in `python/tests/test_linalg.py`.
 - **BLAS threads decide BLAS results.** OpenBLAS (NumPy's wheels, 0.3.34)
   splits large products differently with 1, 2 or 4 threads, and the values
   differ (`a @ b` of 513 x 513 float64: three different results for
-  `OPENBLAS_NUM_THREADS` 1, 2, 4). So viproc must not change BLAS
-  threading (no "1 BLAS thread per worker"): bit-identity with NumPy means
-  the same BLAS configuration. Concurrent calls from several threads give
+  `OPENBLAS_NUM_THREADS` 1, 2, 4). **Decided (maintainer, hokb/viproc#67):
+  dynamic BLAS threads**, the same in viproc and the ILNumerics
+  Accelerator: bit-exactness of such results holds within one setup only
+  (NumPy's own differ between machines with other core counts). The task
+  making a BLAS call (matmul, gufunc kernels: `BlasCallScope`,
+  `src/kernels/blas_threads.*`) sets OpenBLAS's process-wide count: a call
+  alone (no other BLAS call in flight, active tasks <= 1, none busy for
+  5 ms) gets the count found at init, as plain NumPy; with other
+  asynchronous work one thread, and viproc's workers parallelize. Lowered
+  at any time (a running call keeps its split), raised only by the only
+  call in flight, restored at shutdown (`_blas.py`; `_blas.stats()`).
+  `VIPROC_BLAS_THREADS=1` and the deterministic mode fix one thread:
+  results are NumPy's with `OPENBLAS_NUM_THREADS=1`, reproducible.
+  Tests comparing concurrent large BLAS results with NumPy use that
+  (`single_blas` fixture); `test_blas_threads.py` checks the dynamic
+  mode. Measured (`opt_levels.py`, 4 vCPUs): a single product with
+  nothing to overlap 0.84-0.95x of NumPy from 300 x 300 on (one thread
+  throughout, as before: 0.28-0.33x); independent `inv`/`solve` unchanged
+  (1.0-2.1x); 8 concurrent 300-1000 products as with one thread (within
+  the VM's noise). The 5 ms hold: a stream of independent products often
+  starts its first before the next is issued; raising for it let
+  OpenBLAS's threads compete with the workers.
+  Concurrent calls from several threads give
   the values of the same calls made one after the other (checked: 4 threads,
   sizes 513–1000, gemm/syrk/gemv). Measured on 4 cores: overlapping
   products that OpenBLAS already threads (side >= ~300) gains little
   (BLAS already uses the cores); serializing them with a lock did not
   help either. Small products (side < ~200, single-threaded inside BLAS)
-  overlap well. **Open:** concurrent threaded OpenBLAS calls have a heavy
-  tail (8 independent 128 x 128 `a @ a`: median 2x NumPy's time, p90 25x;
-  with `OPENBLAS_NUM_THREADS=1` 2.7x faster than NumPy): the matmul
-  kernel may need linalg's `VP_GUFUNC_SERIAL`.
+  overlap well. Concurrent threaded OpenBLAS calls had a heavy tail (8
+  independent 128 x 128 `a @ a`: median 2x NumPy's time, p90 25x; with
+  `OPENBLAS_NUM_THREADS=1` 2.7x faster than NumPy), one more reason for
+  one BLAS thread.
 - **`matmul`** (`src/kernels/numpy_matmul.*`, `vp_matmul`): NumPy's matmul
   gufunc loop `(m?,n),(n,p?)->(m?,p?)`, called as
   `PyUFunc_GeneralizedFunctionInternal` calls it: no buffering, one call

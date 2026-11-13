@@ -3059,6 +3059,31 @@ static PyObject* m_active_tasks(PyObject* self, PyObject* noargs) {
     return PyLong_FromSize_t(vp_active_tasks(g_rt));
 }
 
+static PyObject* m_blas_threads(PyObject* self, PyObject* args) {
+    (void)self;
+    unsigned long long addr = 0;
+    int alone = 1, dynamic = 0;
+    if (!PyArg_ParseTuple(args, "Kii", &addr, &alone, &dynamic)) {
+        return NULL;
+    }
+    if (check_runtime() < 0) {
+        return NULL;
+    }
+    void (*set_threads)(int) = NULL;
+    if (addr != 0) {
+        set_threads = (void (*)(int))(uintptr_t)addr;
+    }
+    vp_blas_threads(g_rt, set_threads, alone, dynamic);
+    Py_RETURN_NONE;
+}
+
+static PyObject* m_blas_stats(PyObject* self, PyObject* noargs) {
+    (void)self;
+    (void)noargs;
+    return Py_BuildValue("(iK)", vp_blas_threads_current(),
+                         (unsigned long long)vp_blas_threads_changes());
+}
+
 static PyObject* m_wait_all(PyObject* self, PyObject* noargs) {
     (void)self;
     (void)noargs;
@@ -5841,6 +5866,8 @@ static PyMethodDef methods[] = {
     {"set_chain_ns", m_set_chain_ns, METH_O, NULL},
     {"set_offload_policy", m_set_offload_policy, METH_VARARGS, NULL},
     {"active_tasks", m_active_tasks, METH_NOARGS, NULL},
+    {"blas_threads", m_blas_threads, METH_VARARGS, NULL},
+    {"blas_stats", m_blas_stats, METH_NOARGS, NULL},
     {"wait_all", m_wait_all, METH_NOARGS, NULL},
     {"from_ndarray", m_from_ndarray, METH_O, "Wrap a NumPy array (no copy)."},
     {"view", m_view, METH_VARARGS, "view(a, shape, strides, offset)"},

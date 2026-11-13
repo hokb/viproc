@@ -138,6 +138,15 @@ uint64_t vp_size_wait_count(const vp_runtime* rt);
  * thread issuing ready ops; a futex call each). */
 uint64_t vp_wake_count(const vp_runtime* rt);
 size_t vp_active_tasks(const vp_runtime* rt);
+/* BLAS thread count (docs/design/goals.md, "BLAS threads"): `set_threads` is
+ * the BLAS library's process-wide setter (NULL: no control). dynamic != 0: a
+ * BLAS call running alone (no other BLAS call, no other active task) gets
+ * `alone_threads`, otherwise one thread; dynamic == 0: always one thread.
+ * Main thread, while no BLAS call runs (after init). Reset at destroy. */
+void vp_blas_threads(vp_runtime* rt, void (*set_threads)(int), int alone_threads, int dynamic);
+/* The count viproc set last (0: none) and how often it changed it. */
+int vp_blas_threads_current(void);
+uint64_t vp_blas_threads_changes(void);
 
 /* --- OpenCL device (optimization level O4; docs/design/opencl.md) -------- */
 

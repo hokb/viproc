@@ -143,8 +143,10 @@ def test_matmul_blas_paths(dtype):
             assert same(f(va, vb, vv), f(a, b, v)), n
 
 
-def test_matmul_many_concurrent():
-    """Independent products overlap on the workers; values as NumPy's."""
+def test_matmul_many_concurrent(single_blas):
+    """Independent products overlap on the workers; values as NumPy's (one
+    BLAS thread: with dynamic BLAS threads each product may run with one or
+    with OpenBLAS's count, test_blas_threads.py)."""
     rng = np.random.default_rng(3)
     ms = [data(rng, (300, 300), np.float64) for _ in range(8)]
     vs = [viproc.asarray(m) for m in ms]

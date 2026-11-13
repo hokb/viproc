@@ -63,19 +63,30 @@ def test_env(monkeypatch, value, level):
     assert viproc.opt_level() == 1
 
 
-def test_blas_threads_restored():
-    viproc.init()
+def _blas_before():
+    viproc.shutdown()
     before = _blas.threads()
     if before is None:
         pytest.skip("no BLAS library with a thread setting found")
-    viproc.init(level=2)
-    assert _blas.threads() == 1
-    viproc.init()
-    assert _blas.threads() == before
-    viproc.init(level=2)
-    viproc.shutdown()
-    assert _blas.threads() == before
-    viproc.init()
+    return before
+
+
+@pytest.mark.parametrize("level", [1, 2])
+def test_blas_threads_controlled_and_restored(level):
+    before = _blas_before()
+    try:
+        viproc.init(level=level)
+        assert _blas.controlled()
+        # dynamic: the count found at init while nothing runs; one thread if
+        # OpenBLAS had one anyway
+        assert _blas.threads() == before
+        assert _blas.mode() == ("dynamic" if before > 1 else "single")
+        viproc.init(level=level, adaptive=False)  # deterministic: one thread
+        assert _blas.threads() == 1 and _blas.single()
+        viproc.shutdown()
+        assert _blas.threads() == before and not _blas.controlled()
+    finally:
+        viproc.init()
 
 
 def _flags_seen(monkeypatch):
@@ -90,16 +101,30 @@ def _flags_seen(monkeypatch):
     return seen
 
 
+def _inv80():
+    a = np.random.default_rng(0).random((80, 80)) + 80 * np.eye(80)
+    np.linalg.inv(viproc.asarray(a)).wait()
+
+
 @pytest.mark.parametrize("level", [1, 2])
-def test_lapack_serialized_only_at_o1(monkeypatch, level):
+def test_lapack_not_serialized(monkeypatch, level):
     viproc.init(level=level)
     try:
+        if not _blas.controlled():
+            pytest.skip("no BLAS library with a thread setting found")
         seen = _flags_seen(monkeypatch)
-        a = np.random.default_rng(0).random((80, 80)) + 80 * np.eye(80)
-        np.linalg.inv(viproc.asarray(a)).wait()
-        assert bool(seen[-1] & _linalg._SERIAL) == (level == 1)
+        _inv80()
+        assert not seen[-1] & _linalg._SERIAL
     finally:
         viproc.init()
+
+
+def test_lapack_serialized_without_blas_control(monkeypatch):
+    viproc.init()
+    seen = _flags_seen(monkeypatch)
+    monkeypatch.setattr(_blas, "controlled", lambda: False)
+    _inv80()
+    assert seen[-1] & _linalg._SERIAL
 
 
 def test_o2_results(level2):

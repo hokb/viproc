@@ -125,7 +125,8 @@ NumPy's own loops the way NumPy calls them.
 | Reduction templates once per signature | Reductions with casts or strides | Template over a dummy address, `NpyIter_ResetBasePointers` on the worker | Done | Side 100: 39-59 → 20-39 µs per step; 8 x 8: 7.7 → 4.3 µs per op |
 | Branch-free `np.where` | Random condition | Masked blend per word instead of a branch per element | Done (`0c99e19`) | 1e4 elements: 5 µs (NumPy 40 µs) |
 | `matmul`, `@`, `np.dot` | Matrix products | NumPy's matmul gufunc loop per batch row | Done (`233fe84`) | `matmul_batch`: 11,540 fallbacks → 0; small 0.48 → 1.04x |
-| Linalg serialized from 64 x 64 | Many concurrent LAPACK calls | Process-wide mutex (`VP_GUFUNC_SERIAL`) | Done | 8 concurrent `inv` of 300 x 300: 20 ms-1.1 s → 17-47 ms |
+| Linalg serialized from 64 x 64 | Many concurrent LAPACK calls | Process-wide mutex (`VP_GUFUNC_SERIAL`) | Superseded (only without BLAS control) | 8 concurrent `inv` of 300 x 300: 20 ms-1.1 s → 17-47 ms; one BLAS thread replaces it |
+| Dynamic BLAS threads | A single large product with nothing to overlap; concurrent BLAS calls | The task sets OpenBLAS's count per call: its own count alone (no other BLAS call, active tasks <= 1, 5 ms quiet), one thread otherwise (`BlasCallScope`, `blas_threads.*`) | Done (hokb/viproc#67) | `opt_levels.py` one product 300-1000: 0.28-0.33x → 0.84-0.95x of NumPy; concurrent products and `inv`/`solve` as with one thread |
 | Linalg, FFT, sort asynchronously | `numpy.linalg`, `numpy.fft`, `np.sort` | NumPy's wrappers ported onto `vp_gufunc` and `vp_sort` | Done (#34-#37) | `np.sort` of 10 elements 0.76 µs (NumPy 0.79); FFT see plans |
 | Joining, compositions, indexing functions, accumulation, ufunc methods | `concatenate`, `clip`, `take`, `cumsum`, `where=`, ... | One placement task per join; NumPy's code ported without the syncing `asanyarray` | Done (#27-#33) | Fewer fallbacks; no overall measurement |
 
@@ -143,7 +144,7 @@ ideas were measured and rejected.
 | Wake sleepers for local tasks | Local queue | Wake-up on every local push | Rejected | Undid the `expr_where` gain, `sum_cores` stayed |
 | Main thread runs a queued task itself | Sync on a task not started yet | Take it from the queue at the sync point | Rejected | No sync found its task queued (1,278 continuations vs. 336 pops) |
 | Memory at issue on the main thread (D10) | Every op | Allocation at issue | Replaced by D11 | Dependent chains 2-4x slower than NumPy |
-| One BLAS thread per worker | Concurrent matrix products | `OPENBLAS_NUM_THREADS=1` | Rejected | Changes the results (O1) |
+| One BLAS thread at every level | Concurrent matrix products and LAPACK calls | OpenBLAS's count set to 1 while the runtime runs (`_blas.py`) | Done (maintainer's decision, also O1) | 8 `inv`/`solve` of 64-500: 0.6-0.9x → 1.0-2.6x; a single large product 0.24-0.41x; O1 = NumPy with `OPENBLAS_NUM_THREADS=1` |
 | Pre-scan of integer exponents | `power` with a negative exponent | Pass over the data before the kernel | Rejected | 3-10% slower; a watched call instead (E6) |
 | Dense copy of strided ndarrays | Strided NumPy views as inputs | Import by copy | Rejected | Other strides may round differently (O1) and cost a pass on the main thread |
 | Caching `ndarray` objects | Every op | Reuse of the Python objects | Rejected | Only ~1% of the instructions per op |
